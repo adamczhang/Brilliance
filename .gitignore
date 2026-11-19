@@ -1,0 +1,13 @@
+/build*/
+compile_commands.json
+*.o
+*.so
+*.rad
+/sync-jarvis.sh
+__pycache__/
+.cache/
+# Brilliance: the machine-local Windows toolchain (win/setup.ps1) and local test and build output
+/.toolchain/
+/artifacts/
+# Brilliance: packages win/package.ps1 writes
+/dist/

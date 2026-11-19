@@ -1,0 +1,2681 @@
+/* device_test.cpp -- the device layer against its own contract.
+ *
+ * The ordering tests matter most. A backend whose "async" calls execute inline lets every ordering
+ * bug above it (a missing rad_event_wait, a staging buffer reused before the mover's copy landed)
+ * pass on the host backend and corrupt weights on a card. The event tests make out-of-order
+ * execution produce wrong bytes, not just odd timestamps, and run each race several times.
+ */
+#include "rad_test.h"
+#include "host_kargs_main.h"
+
+#include "rad_internal.h"
+#include "device/aql.h"
+#include "device/device.h"
+#include "device/directio.h"
+#include "sched/advance.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <functional>
+#include <random>
+#include <vector>
+#include <sys/stat.h>
+#include <unistd.h>
+
+using rad::DirectFile;
+using rad::RAD_DIO_READ;
+using rad::RAD_DIO_WRITE;
+using rad::RAD_DIO_CREATE;
+using rad::RAD_DIO_TRUNC;
+using rad::RAD_DIO_ALLOW_BUFFERED;
+
+namespace {
+
+struct Stream {
+    RadStream s = nullptr;
+    explicit Stream(int hi = 0) { rad_stream_create(&s, hi); }
+    ~Stream() { if (s) rad_stream_destroy(s); }
+};
+
+struct Event {
+    RadEvent e = nullptr;
+    Event() { rad_event_create(&e); }
+    ~Event() { if (e) rad_event_destroy(e); }
+};
+
+/* A rad_dev_alloc allocation of `kind`, freed when it leaves scope (an early return included).
+ * It converts to its pointer, so it reads like one. */
+template <class T> struct DevBuf {
+    T* p;
+    int kind;
+    DevBuf(int64_t bytes, int k) : p((T*)rad_dev_alloc(bytes, k)), kind(k) {}
+    ~DevBuf() { if (p) rad_dev_free(p, kind); }
+    DevBuf(const DevBuf&) = delete;
+    DevBuf& operator=(const DevBuf&) = delete;
+    operator T*() const { return p; }
+    T* operator->() const { return p; }
+};
+
+/* Deterministic filler, so a torn copy shows up as a mismatch at a known index. */
+void fill(uint8_t* p, int64_t n, uint32_t seed) {
+    uint32_t x = seed | 1u;
+    for (int64_t i = 0; i < n; ++i) {
+        x = x * 1664525u + 1013904223u;
+        p[i] = (uint8_t)(x >> 24);
+    }
+}
+
+/* False, with the case marked skipped, unless the backend has virtual memory management, and (with
+ * `host_visible`) the elastic memory is host memory a test can read back. */
+bool need_vmem(bool host_visible = false) {
+    if (rad::VMem::supported() && (!host_visible || rad::device_is_host())) return true;
+    radtest::skip("%s", host_visible ? "needs host-visible elastic memory"
+                                     : "no virtual memory management on this backend");
+    return false;
+}
+
+/* False, with the case marked skipped, unless parking can keep host copies: virtual memory
+ * management and the backend's host-backed mappings and their swap (device.h). Without those a park
+ * goes to the disk tier or back to the container, never to host memory. */
+bool need_host_copies() {
+    if (!need_vmem()) return false;
+    const auto* be = rad::active_backend();
+    if (be->vmem_commit_host && be->vmem_swap) return true;
+    radtest::skip("no host-backed mappings on this backend: parking keeps no host copies");
+    return false;
+}
+
+/* False, with the case marked skipped, on a card. */
+bool need_host_backend() {
+    if (rad::device_is_host()) return true;
+    radtest::skip("host backend only");
+    return false;
+}
+
+std::string temp_path(const char* tag) {
+    /* The working directory (ctest's build directory), not /tmp: /tmp is usually tmpfs, which
+     * refuses O_DIRECT, so only the buffered fallback would be exercised. */
+    return rad::fmt("./rad_%s_test_%d.bin", tag, (int)getpid());
+}
+
+}  /* namespace */
+
+/* ------------------------------------------------------------------ identity */
+
+TEST(backend_reports_itself) {
+    const char* name = rad::device_backend_name();
+    CHECK(name && *name);
+    CHECK_EQ(rad::device_is_host(), std::strcmp(name, "host") == 0);
+
+    const int n = rad_dev_count();
+    CHECK(n >= 1);
+
+    RadDeviceProps p{};
+    CHECK_OK(rad_dev_props(0, &p));
+    CHECK(p.name[0] != '\0');
+    CHECK(p.arch[0] != '\0');
+    CHECK(p.vram_bytes > 0);
+    CHECK(p.vram_free >= 0);
+    CHECK(p.n_cu >= 1);
+    CHECK(p.warp_size >= 1);
+    CHECK_EQ(p.device_id, 0);
+    if (rad::device_is_host()) {
+        CHECK_EQ(p.is_host_backend, 1);
+        CHECK_EQ(std::string(p.arch), std::string("host"));
+    }
+    /* Out of range is refused, not clamped: clamping a bad rank index would put two ranks on one
+     * card. */
+    CHECK(rad_dev_props(n, &p) < 0);
+    CHECK(rad_dev_set(-1) < 0);
+    CHECK_OK(rad_dev_set(0));
+}
+
+/* Chained launches are on only where the engine says the model's plugin measured a gain with its
+ * drafter (rad_dev_chain_infer) and the backend is AQL, which writes the record a chained form
+ * reads: on the host backend a plugin's ask leaves them off. Ends with them off again. */
+TEST(chained_launches_follow_the_plugins_ask_on_the_aql_backend_only) {
+    const bool aql = std::strcmp(rad::device_backend_name(), "aql") == 0;
+    rad_dev_chain_infer(0);
+    CHECK_EQ(rad_dev_chain_enabled(), 0);
+    rad_dev_chain_infer(1);
+    CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    /* Their packets go unfenced only where the engine says every chained form fences itself (2),
+     * and only where launches chain at all. */
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+    rad_dev_chain_infer(2);
+    CHECK_EQ(rad_dev_chain_enabled(), aql ? 1 : 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), aql ? 1 : 0);
+    rad_dev_chain_infer(0);
+    CHECK_EQ(rad_dev_chain_enabled(), 0);
+    CHECK_EQ(rad_dev_chain_unfenced(), 0);
+}
+
+/* A chained kernel reads behind its wait what the launch in front of it wrote, a value all its
+ * lanes share included. The compiler loads such a value through the scalar data cache, which no
+ * fence it emits empties: only the packet processor's acquire did, when the kernel was launched,
+ * before the launch in front had written. A chained launch whose packet goes unfenced
+ * (rad_dev_chain_infer(2)) must therefore empty that cache behind its wait (chain_kernel.h), or
+ * every reader here sees the value the reader before it loaded: 1797 launches in 1800 did on an
+ * R9700 before the wait emptied it. Behind a gate, so the card has the readers launched ahead of
+ * the stores they wait for, as a played pass has them. */
+TEST(a_chained_kernel_sees_a_shared_value_the_launch_in_front_wrote) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned pairs = 400, blocks = 256;
+    Stream st;
+    DevBuf<unsigned> x(64 * sizeof(unsigned), RAD_MEM_DEVICE);
+    DevBuf<unsigned> seen((int64_t)pairs * blocks * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(x && seen);
+    std::vector<unsigned> got((size_t)pairs * blocks);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        /* 2: the packets go unfenced, as an engine whose libraries fence in the kernel issues
+         * them. 1: they keep the packet processor's fences, and the readers must see the same. */
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(x, 0, 64 * sizeof(unsigned), st.s));
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        void* gate = nullptr;
+        REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+        REQUIRE(rad_gate_room(st.s) >= (int64_t)2 * pairs);
+        CHECK_OK(rad::aql::chain_probe(st.s, x, seen, pairs, blocks));
+        CHECK_OK(rad_gate_open(gate));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)pairs * blocks * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        int64_t stale = 0;
+        for (unsigned i = 0; i < pairs; ++i)
+            for (unsigned b = 0; b < blocks; ++b) stale += got[(size_t)i * blocks + b] != i + 1u;
+        CHECK_EQ(stale, 0);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* A chained launch reads its own arguments and its chain record from a slot of the argument ring
+ * that the host wrote and that another launch read a lap of the ring ago; the L2 still holds what
+ * that launch read. Only a system-scope acquire of the packet processor's makes the card forget
+ * it: the one the ring asks for every half lap, which a chained packet keeps while it goes
+ * without every other. Three laps of launches that each store where their own arguments say,
+ * with no host wait between them: without that acquire every launch past the first lap stores
+ * where the launch a lap before did (as they do on a prefetch stream, which never takes one and
+ * counts on the pass beside it to have turned the L2 over). */
+/* The prefetch stream (rad_xp_stream_create, agent-scope acquires) also reads its own arguments
+ * from a host-written ring: across three laps every launch must see its own slot. */
+TEST(a_prefetch_stream_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the prefetch stream is an AQL stream");
+    const unsigned n = 3 * 4096 + 517;
+    RadStream xs = nullptr;
+    if (rad_xp_stream_create(&xs) != RAD_OK || !xs) SKIP("no prefetch stream on this device");
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    {
+        rad_dev_chain_infer(1);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad::aql::chain_marks(xs, seen, n));
+        CHECK_OK(rad_stream_sync(xs));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), xs));
+        CHECK_OK(rad_stream_sync(xs));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+    rad_stream_destroy(xs);
+}
+
+TEST(a_chained_launch_reads_its_own_arguments_after_the_ring_has_lapped) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("launches chain on the AQL backend only");
+    const unsigned n = 3 * 4096 + 517;
+    Stream st;
+    DevBuf<unsigned> seen((int64_t)n * sizeof(unsigned), RAD_MEM_DEVICE);
+    REQUIRE(!!seen);
+    std::vector<unsigned> got(n);
+    for (int fenced = 0; fenced < 2; ++fenced) {
+        rad_dev_chain_infer(fenced ? 1 : 2);
+        CHECK_OK(rad_memset_async(seen, 0, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad::aql::chain_marks(st.s, seen, n));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)n * sizeof(unsigned), st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < n; ++i) wrong += got[i] != i + 1u;
+        CHECK_EQ(wrong, 0u);
+    }
+    rad_dev_chain_infer(0);
+}
+
+/* The host writes a launch's arguments and chain record into VRAM through the BAR, and the card's
+ * host data path keeps such a write until it is flushed (aql.cpp, host_writes_out). A launch the
+ * card starts within a microsecond or two of its doorbell otherwise reads the slot as it was. What
+ * it reads first is its chain record, so that is what this asks every launch for, on every card:
+ * a lap of card-side copies with chaining off leaves every slot with their arguments and a record
+ * no kernel accepts; then the same copies chained and 50 us apart, the host quiet between them as
+ * the mover is between the copies of a loan recall, each saying whether it found a record. One
+ * that does not would count nothing and stall the queue; the probe counts for it. With the
+ * packets unacquired and with the packet processor's acquire on them. */
+TEST(a_copy_issued_after_a_pause_finds_the_record_written_for_it) {
+    if (std::strcmp(rad::device_backend_name(), "aql") != 0) SKIP("the AQL backend's argument ring");
+    const unsigned lap = 4096 + 64, words = 8192;
+    const int64_t bytes = 256 * 1024;
+    for (int card = 0; card < rad_dev_count(); ++card) {
+        REQUIRE_EQ(rad_dev_set(card), RAD_OK);
+        DevBuf<unsigned> seen((int64_t)words * sizeof(unsigned), RAD_MEM_DEVICE);
+        DevBuf<uint8_t> src(bytes, RAD_MEM_DEVICE), dst(bytes, RAD_MEM_DEVICE);
+        REQUIRE(seen && src && dst);
+        std::vector<unsigned> got(words);
+        for (int fenced = 0; fenced < 2; ++fenced) {
+            /* Without the flush four runs in five of this many found unacquired launches that
+             * had read the old slot on an R9700, a few or tens of them at a time. */
+            const unsigned n = fenced ? 1500 : 6000;
+            Stream st;
+            rad_dev_chain_infer(0);
+            CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen, lap));
+            CHECK_OK(rad_memset_async(seen, 0, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            rad_dev_chain_infer(fenced ? 1 : 2);
+            for (unsigned i = 0; i < n; ++i) {
+                /* In runs of eight with a host wait between them, as a recall ends in one. */
+                if (i % 8 == 0) CHECK_OK(rad_stream_sync(st.s));
+                const auto t0 = std::chrono::steady_clock::now();
+                while (std::chrono::steady_clock::now() - t0 < std::chrono::microseconds(50)) {}
+                CHECK_OK(rad::aql::chain_asks(st.s, src, dst, (uint64_t)bytes, seen + i, 1));
+            }
+            CHECK_OK(rad_stream_sync(st.s));
+            CHECK_OK(rad_memcpy_async(got.data(), seen, (int64_t)words * sizeof(unsigned), st.s));
+            CHECK_OK(rad_stream_sync(st.s));
+            /* A launch that read the slot as the lap left it stores where that launch did. */
+            unsigned without = 0, missing = 0;
+            for (unsigned i = 0; i < words; ++i) {
+                without += (got[i] & 0x80000000u) != 0;
+                missing += i < n && got[i] != 1u;
+            }
+            CHECK_EQ(without, 0u);
+            CHECK_EQ(missing, 0u);
+        }
+        rad_dev_chain_infer(0);
+    }
+    rad_dev_set(0);
+}
+
+/* An engine of more than one rank claims its cards (rad_dev_cards_claim). The claim that makes a
+ * card shared returns only once everything issued on that card's queues before it has finished:
+ * from then on no chained launch waits on the card behind a collective, and nothing issued under
+ * the old rule is left. A backend that never launches ahead has nothing to wait for and accepts
+ * any claim. */
+TEST(a_claim_that_shares_a_card_returns_with_the_cards_queues_drained) {
+    const bool aql = std::strcmp(rad::device_backend_name(), "aql") == 0;
+    const int card = 0;
+    CHECK_EQ(rad_dev_cards_claim(nullptr, 1, 1), RAD_E_INVAL);
+    CHECK_EQ(rad_dev_cards_claim(&card, 0, 1), RAD_E_INVAL);
+    CHECK_OK(rad_dev_set(card));
+    const int64_t big = 256 << 20;
+    Stream st;
+    Event done;
+    DevBuf<uint8_t> fat(big, RAD_MEM_DEVICE);
+    CHECK(!!fat);
+    if (!fat) return;
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 1));            /* the first engine: the card is its own */
+    for (int k = 0; k < 24; ++k) CHECK_OK(rad_memset_async(fat, k, big, st.s));
+    CHECK_OK(rad_event_record(done.e, st.s));
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 1));            /* a second: shared from here */
+    if (aql) CHECK_EQ(rad_event_query(done.e), 1);
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 0));
+    CHECK_OK(rad_dev_cards_claim(&card, 1, 0));
+    CHECK_OK(rad_stream_sync(st.s));
+}
+
+TEST(host_vram_budget_comes_from_the_environment) {
+    /* A real card reports its own VRAM. */
+    if (!need_host_backend()) return;
+    const char* old = std::getenv("RADIANCE_HOST_VRAM_MIB");
+    const std::string saved = old ? old : "";
+
+    setenv("RADIANCE_HOST_VRAM_MIB", "777", 1);
+    RadDeviceProps p{};
+    CHECK_OK(rad_dev_props(0, &p));
+    CHECK_EQ(p.vram_bytes, (int64_t)777 << 20);
+
+    unsetenv("RADIANCE_HOST_VRAM_MIB");
+    CHECK_OK(rad_dev_props(0, &p));
+    /* The default derives from physical RAM, so only a plausible lower bound can be checked. */
+    CHECK(p.vram_bytes > (int64_t)64 << 20);
+
+    if (!saved.empty()) setenv("RADIANCE_HOST_VRAM_MIB", saved.c_str(), 1);
+}
+
+/* ------------------------------------------------------------------ allocation */
+
+TEST(alloc_free_roundtrip) {
+    const int kinds[] = { RAD_MEM_DEVICE, RAD_MEM_HOST_PINNED, RAD_MEM_HOST, RAD_MEM_HOST_MAPPED };
+    const int64_t n = 64 * 1024 + 17;   /* deliberately not a page multiple */
+
+    for (int k : kinds) {
+        void* p = rad_dev_alloc(n, k);
+        CHECK(p != nullptr);
+        if (!p) continue;
+
+        /* Host-visible kinds are writable from here; a device allocation on a real card is not. */
+        if (rad::device_is_host() || k != RAD_MEM_DEVICE) {
+            auto* b = (uint8_t*)p;
+            fill(b, n, (uint32_t)k + 5u);
+            uint8_t expect[64];
+            fill(expect, 64, (uint32_t)k + 5u);
+            CHECK_EQ(std::memcmp(b, expect, 64), 0);
+        }
+        if (k == RAD_MEM_HOST_MAPPED) {
+            /* The zero-copy site of spec §5.1: one allocation, addressable from both sides. */
+            CHECK(rad_dev_host_ptr(p) != nullptr);
+            CHECK(rad_dev_device_ptr(p) != nullptr);
+            /* Invariant: both views are the same address on every backend. Ctx::bind_buffers
+             * stores one base pointer per buffer, and the host activation arena is
+             * RAD_MEM_HOST_MAPPED so a host-site op and a device kernel share it. HIP's unified
+             * addressing guarantees this; where it fails, Ctx refuses to start. */
+            CHECK_EQ(rad_dev_host_ptr(p), rad_dev_device_ptr(p));
+            CHECK_EQ(rad_dev_host_ptr(p), p);
+        }
+        /* Host-visible allocations are page-aligned, so a pinned buffer can be an O_DIRECT target
+         * with no bounce (directio.h). A device allocation only needs RAD_ALIGN_SUB, the
+         * container's sub-block. */
+        CHECK_EQ((uintptr_t)p % (k == RAD_MEM_DEVICE && !rad::device_is_host() ? 256u : 4096u), 0u);
+        rad_dev_free(p, k);
+    }
+
+    CHECK(rad_dev_alloc(0, RAD_MEM_HOST) == nullptr);
+    CHECK(rad_dev_alloc(-1, RAD_MEM_HOST) == nullptr);
+    CHECK(rad_dev_alloc(16, 99) == nullptr);
+    rad_dev_free(nullptr, RAD_MEM_HOST);   /* must not fault */
+    CHECK(rad_dev_host_ptr(nullptr) == nullptr);
+}
+
+/* A kernel library's free hook (rad_plugin_freed) is registered by every registry that loads the
+ * library and goes with the last of them: a library closed and opened again can sit at another
+ * address, and a hook left behind called into memory nothing mapped. */
+namespace {
+std::atomic<int> g_hook_calls{0};
+void count_free(const void*, int64_t) { ++g_hook_calls; }
+}  // namespace
+
+TEST(a_free_hook_goes_with_its_last_registration) {
+    auto one_free = [] {
+        void* p = rad_dev_alloc(4096, RAD_MEM_DEVICE);
+        REQUIRE(p != nullptr);
+        rad_dev_free(p, RAD_MEM_DEVICE);
+    };
+    rad::rad_dev_on_free(count_free);
+    rad::rad_dev_on_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 1);
+    rad::rad_dev_off_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 2);
+    rad::rad_dev_off_free(count_free);
+    one_free();
+    CHECK_EQ(g_hook_calls.load(), 2);
+    rad::rad_dev_off_free(count_free);   /* one too many: nothing to take back */
+}
+
+/* A pinned range larger than one pin is locked in pieces (core/device/aql.cpp, pin_pieces),
+ * invisibly above the device layer: one base, every byte at the same address on the card, and
+ * copies and fills across a piece boundary land whole. A fill of pageable memory is refused, so the
+ * fill also checks no piece is treated as pageable. 2.5 GiB is a single-pin size an Intel VT-d host
+ * refused; the crossed boundaries are whole GiBs. Under HSA_USE_SVM=0 (ctest's device_test_nosvm)
+ * the range is one host-pool allocation and the same checks apply. */
+TEST(a_pinned_range_larger_than_one_pin_is_one_range_on_the_card) {
+    const int64_t gib = (int64_t)1 << 30;
+    const int64_t n = 5 * (gib / 2) + 4096 + 17;
+    const int64_t w = 8 << 20;
+    Stream st;
+    DevBuf<uint8_t> h(n, RAD_MEM_HOST_MAPPED);
+    DevBuf<uint8_t> d(w, RAD_MEM_DEVICE);
+    CHECK(h != nullptr);
+    CHECK(d != nullptr);
+    if (!h || !d) return;
+    /* The host backend resolves only an allocation's base; interior addresses are checked on a
+     * card only. */
+    CHECK_EQ(rad_dev_device_ptr(h), (void*)h);
+    if (!rad::device_is_host())
+        for (int64_t off : { gib - 1, gib, 2 * gib - 4096, 2 * gib, n - 1 })
+            CHECK_EQ(rad_dev_device_ptr(h + off), (void*)(h + off));
+
+    std::string expect((size_t)w, '\0');
+    for (int64_t b : { gib, 2 * gib }) {
+        uint8_t* span = h + b - w / 2;
+        fill(span, w, (uint32_t)(b >> 20));
+        std::memcpy(expect.data(), span, (size_t)w);
+        CHECK_OK(rad_memcpy_async(d, span, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        std::memset(span, 0, (size_t)w);
+        CHECK_OK(rad_memcpy_async(span, d, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_EQ(std::memcmp(span, expect.data(), (size_t)w), 0);
+        CHECK_OK(rad_memset_async(span, 0xA5, w, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK(span[0] == 0xA5 && span[w / 2 - 1] == 0xA5 && span[w / 2] == 0xA5 && span[w - 1] == 0xA5);
+    }
+}
+
+/* A device allocation the card cannot take is an error, even after a queue was destroyed. ROCm
+ * 7.2's runtime handles a driver-refused VRAM allocation by walking every queue the process ever
+ * created, destroyed ones included, and segfaults; the backend refuses such a request itself
+ * (core/device/aql.cpp, "the room check"). The test destroys a stream first, then asks for the
+ * whole card: more than the driver has left, but not more than one allocation may be, so without
+ * the check it would reach the driver. */
+TEST(an_allocation_the_card_cannot_take_is_refused_after_a_queue_was_destroyed) {
+    if (rad::device_is_host()) SKIP("a card only");
+    { Stream st; CHECK(st.s != nullptr); }
+    RadDeviceProps p{};
+    CHECK_OK(rad_dev_props(0, &p));
+    void* d = rad_dev_alloc(p.vram_bytes, RAD_MEM_DEVICE);
+    CHECK(d == nullptr);
+    const char* why = rad_dev_last_error();
+    CHECK(std::strstr(why, "on card 0: the driver has") != nullptr);
+    CHECK(std::strstr(why, "this process") != nullptr);
+    if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+
+    /* The card still serves an allocation it can take. */
+    void* ok = rad_dev_alloc(8 << 20, RAD_MEM_DEVICE);
+    CHECK(ok != nullptr);
+    rad_dev_free(ok, RAD_MEM_DEVICE);
+}
+
+TEST(device_allocation_moves_vram_free) {
+    /* On a card, other processes move it too. */
+    if (!need_host_backend()) return;
+    RadDeviceProps before{}, during{};
+    CHECK_OK(rad_dev_props(0, &before));
+    const int64_t n = 32 << 20;
+    void* p = rad_dev_alloc(n, RAD_MEM_DEVICE);
+    CHECK(p != nullptr);
+    CHECK_OK(rad_dev_props(0, &during));
+    /* The host backend must track vram_free, or a plan that overcommits a real card would pass
+     * here. */
+    CHECK_EQ(before.vram_free - during.vram_free, n);
+    rad_dev_free(p, RAD_MEM_DEVICE);
+    CHECK_OK(rad_dev_props(0, &during));
+    CHECK_EQ(before.vram_free, during.vram_free);
+}
+
+/* ------------------------------------------------------------------ transfers */
+
+TEST(memcpy_async_then_stream_sync) {
+    const int64_t n = 4 << 20;
+    Stream st;
+    CHECK(st.s != nullptr);
+
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
+    CHECK(src && dst);
+    if (!src || !dst) return;
+
+    fill(src, n, 0xC0FFEEu);
+    std::memset(dst, 0, (size_t)n);
+
+    CHECK_OK(rad_memcpy_async(dst, src, n, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ(std::memcmp(dst, src, (size_t)n), 0);
+
+    /* Zero bytes is a no-op, not an error, so callers need no branch for an empty span. */
+    CHECK_OK(rad_memcpy_async(dst, src, 0, st.s));
+}
+
+/* A list copy hands many copies to the card's DMA engine at once, so errors appear at segment
+ * boundaries: a copy offset, short, or overrunning its neighbour. Dozens of copies, 16 B to ~200
+ * KiB, sources out of order, destinations separated by sentinel gaps, odd lengths and unaligned
+ * sources; the result is read back by an ordinary copy on the same stream, which must wait for the
+ * list. */
+TEST(memcpy_list_async_copies_every_segment_and_nothing_else) {
+    const int nseg = 77;
+    const int64_t gap = 48, slab = 16 << 20;
+    Stream st;
+    DevBuf<uint8_t> src(slab, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dev(slab, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> back(slab, RAD_MEM_HOST_PINNED);
+    CHECK(src && dev && back);
+    if (!src || !dev || !back) return;
+    fill(src, slab, 0x5EC5u);
+
+    std::vector<RadCopySeg> segs;
+    std::vector<int64_t> s_off, d_off, len;
+    int64_t d = 0, s = slab;
+    for (int i = 0; i < nseg; ++i) {
+        int64_t n = 16 * (1 + (int64_t)((i * 2654435761u) % 13000));   /* 16 B .. ~200 KiB */
+        if (i % 19 == 7) n += 5;                                       /* an odd length */
+        s -= n + 64;                                                   /* sources backwards */
+        if (i % 23 == 11) s -= 4;                                      /* an unaligned source */
+        s_off.push_back(s);
+        d_off.push_back(d);
+        len.push_back(n);
+        d = (d + n + gap + 15) & ~(int64_t)15;
+    }
+    CHECK(s > 0 && d < slab);
+    CHECK_OK(rad_memset_async(dev, 0xA7, slab, st.s));
+    for (int i = 0; i < nseg; ++i) segs.push_back(RadCopySeg{src + s_off[i], dev + d_off[i], len[i]});
+    segs.push_back(RadCopySeg{src, dev, 0});                           /* nothing to copy */
+    CHECK_OK(rad_memcpy_list_async(segs.data(), (int)segs.size(), 0, st.s));
+    CHECK_OK(rad_memcpy_async(back, dev, slab, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    int bad = 0, smashed = 0;
+    for (int i = 0; i < nseg; ++i) {
+        if (std::memcmp(back + d_off[i], src + s_off[i], (size_t)len[i]) != 0) ++bad;
+        const int64_t end = i + 1 < nseg ? d_off[i + 1] : d;
+        for (int64_t j = d_off[i] + len[i]; j < end; ++j)
+            if (back[j] != 0xA7) { ++smashed; break; }
+    }
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(smashed, 0);
+}
+
+/* The DMA queue's ring wraps. Thousands of small-copy lists write several rings' worth of packets,
+ * so lists straddle the wrap and wait behind a full ring; every copy must still land in place.
+ * Every other list yields, so the gate's checks wrap too. */
+TEST(memcpy_list_async_survives_its_ring_wrapping) {
+    const int lists = 1500, per = 64;
+    const int64_t each = 256, total = (int64_t)lists * per * each;
+    Stream st;
+    DevBuf<uint8_t> src(total, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dev(total, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> back(total, RAD_MEM_HOST_PINNED);
+    CHECK(src && dev && back);
+    if (!src || !dev || !back) return;
+    fill(src, total, 0x3A11u);
+    CHECK_OK(rad_memset_async(dev, 0, total, st.s));
+    std::vector<RadCopySeg> segs((size_t)per);
+    for (int k = 0; k < lists; ++k) {
+        for (int i = 0; i < per; ++i) {
+            const int64_t at = ((int64_t)k * per + i) * each;
+            segs[(size_t)i] = RadCopySeg{src + (total - each - at), dev + at, each};   /* mirrored */
+        }
+        CHECK_OK(rad_memcpy_list_async(segs.data(), per, k & 1 ? RAD_COPY_YIELD : 0, st.s));
+    }
+    CHECK_OK(rad_memcpy_async(back, dev, total, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    int64_t bad = 0;
+    for (int64_t at = 0; at < total; at += each)
+        bad += std::memcmp(back + at, src + (total - each - at), (size_t)each) != 0;
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* List copies are coherent with the L2 both ways. A buffer small enough to stay in L2 is read by a
+ * kernel, overwritten by a list, and read again on the same stream: the second read must see the
+ * list's bytes, not stale lines. Conversely, a list copying to the host must read bytes a kernel
+ * just wrote, still dirty in L2. Twelve rounds with new bytes; the inbound list yields, which
+ * splits its copy into pieces that must join exactly. */
+TEST(memcpy_list_async_is_ordered_against_the_l2_both_ways) {
+    const int64_t n = 4 << 20;
+    Stream st;
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> back(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> a(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> b(n, RAD_MEM_DEVICE);
+    CHECK(src && back && a && b);
+    if (!src || !back || !a || !b) return;
+    int stale = 0, lost = 0;
+    for (int r = 0; r < 12; ++r) {
+        fill(src, n, 0x1000u + (uint32_t)r);
+        CHECK_OK(rad_memset_async(a, 0x40 + r, n, st.s));
+        CHECK_OK(rad_memcpy_async(b, a, n, st.s));                  /* a's lines into the L2 */
+        const RadCopySeg in{src, a, n};
+        CHECK_OK(rad_memcpy_list_async(&in, 1, RAD_COPY_YIELD, st.s));   /* in pieces */
+        CHECK_OK(rad_memcpy_async(b, a, n, st.s));                  /* must read the list's bytes */
+        CHECK_OK(rad_memcpy_async(back, b, n, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        stale += std::memcmp(back, src, (size_t)n) != 0;
+
+        CHECK_OK(rad_memset_async(b, 0x80 + r, n, st.s));          /* dirty in the L2 */
+        const RadCopySeg out{b, back, n};
+        CHECK_OK(rad_memcpy_list_async(&out, 1, 0, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        for (int64_t i = 0; i < n; i += 4093)
+            if (back[i] != (uint8_t)(0x80 + r)) { ++lost; break; }
+    }
+    CHECK_EQ(stale, 0);
+    CHECK_EQ(lost, 0);
+}
+
+/* A held link stops a yielding list until released. Stream `c` holds the link and waits on a long
+ * chain of fills on `slow` before releasing, so a yielding list on `t` behind the hold finishes
+ * only after the chain. Without the gate the 64 MiB list (a few ms) would finish well before the
+ * fills (tens of ms). A backend without a DMA engine holds nothing and accepts a second hold. */
+TEST(link_hold_stops_a_yielding_list_until_released) {
+    const int64_t n = 64 << 20, big = 256 << 20;
+    Stream c, t, slow;
+    Event held, chain;
+    CHECK_OK(rad_memcpy_list_async(nullptr, 0, 0, t.s));   /* the card's DMA queue, if it has one */
+    CHECK_OK(rad_link_hold(c.s, 1));
+    if (rad_link_hold(c.s, 1) == RAD_OK) return;   /* nothing to hold on this backend */
+    (void)rad_dev_last_error();
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> back(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> fat(big, RAD_MEM_DEVICE);
+    CHECK(src && dst && back && fat);
+    if (!src || !dst || !back || !fat) { (void)rad_link_hold(c.s, 0); return; }
+    fill(src, n, 0x6A7Eu);
+    for (int k = 0; k < 40; ++k) CHECK_OK(rad_memset_async(fat, k, big, slow.s));
+    CHECK_OK(rad_event_record(chain.e, slow.s));
+    CHECK_OK(rad_event_record(held.e, c.s));
+    CHECK_OK(rad_event_wait(c.s, chain.e));
+    CHECK_OK(rad_link_hold(c.s, 0));
+    CHECK_EQ(rad_link_hold(c.s, 0), RAD_E_STATE);   /* a release must follow a hold */
+    (void)rad_dev_last_error();
+
+    CHECK_OK(rad_event_wait(t.s, held.e));
+    const RadCopySeg seg{src, dst, n};
+    CHECK_OK(rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK_EQ(rad_event_query(chain.e), 1);
+    CHECK_OK(rad_memcpy_async(back, dst, n, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK(std::memcmp(back, src, (size_t)n) == 0);
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_OK(rad_stream_sync(slow.s));
+}
+
+/* A hold ended by the work it covered: a collective that knows when its peers' bytes have landed
+ * decrements the gate word (rad_link_gate) itself, and the stream records mode 2, so no barrier
+ * follows. The host plays the collective here: the word is odd while held and even once ended, a
+ * yielding list behind it runs, and a second end is refused since nothing is held. */
+TEST(link_gate_word_ends_a_hold_from_the_work_it_covers) {
+    const int64_t n = 4 << 20;
+    Stream c, t;
+    CHECK_OK(rad_memcpy_list_async(nullptr, 0, 0, t.s));   /* the card's DMA queue, if it has one */
+    volatile long long* g = (volatile long long*)rad_link_gate(c.s);
+    if (!g) return;                                  /* nothing to hold on this backend */
+    CHECK_OK(rad_link_hold(c.s, 1));
+    CHECK_OK(rad_stream_sync(c.s));
+    CHECK_EQ((int)(*g & 1), 1);
+    *g = *g - 1;                                     /* what the launch does once its bytes land */
+    CHECK_OK(rad_link_hold(c.s, 2));
+    CHECK_EQ((int)(*g & 1), 0);
+    CHECK_EQ(rad_link_hold(c.s, 2), RAD_E_STATE);
+    (void)rad_dev_last_error();
+
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> back(n, RAD_MEM_HOST_PINNED);
+    CHECK(src && dst && back);
+    if (!src || !dst || !back) return;
+    fill(src, n, 0x9A7Eu);
+    const RadCopySeg seg{src, dst, n};
+    CHECK_OK(rad_memcpy_list_async(&seg, 1, RAD_COPY_YIELD, t.s));
+    CHECK_OK(rad_memcpy_async(back, dst, n, t.s));
+    CHECK_OK(rad_stream_sync(t.s));
+    CHECK(std::memcmp(back, src, (size_t)n) == 0);
+}
+
+TEST(memset_async) {
+    const int64_t n = 1 << 20;
+    Stream st;
+    /* Pinned, not RAD_MEM_HOST: rad_memset_async needs a device-accessible destination, and
+     * hipMemsetAsync refuses pageable memory. The host backend cannot reproduce that refusal, so a
+     * pageable target here would pass code that fails on a card. See core/device/device.h. */
+    DevBuf<uint8_t> p(n, RAD_MEM_HOST_PINNED);
+    CHECK(p != nullptr);
+    if (!p) return;
+
+    std::memset(p, 0, (size_t)n);
+    CHECK_OK(rad_memset_async(p, 0x5A, n, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    bool all = true;
+    for (int64_t i = 0; i < n; ++i) if (p[i] != 0x5A) { all = false; break; }
+    CHECK(all);
+
+    /* Only the low byte of `value` is written, matching hipMemsetAsync and memset. */
+    CHECK_OK(rad_memset_async(p, 0x1FF, n, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ((int)p[0], 0xFF);
+    CHECK_EQ((int)p[n - 1], 0xFF);
+}
+
+TEST(memset_of_pageable_host_memory_is_refused_on_a_card) {
+    /* The one documented asymmetry between backends. On a card the destination must be
+     * device-accessible and RAD_MEM_HOST is not; on the host backend every kind is the same
+     * memory, so nothing is refused. */
+    Stream st;
+    DevBuf<uint8_t> p(4096, RAD_MEM_HOST);
+    CHECK(p != nullptr);
+    if (!p) return;
+    int s = rad_memset_async(p, 0, 4096, st.s);
+    if (rad::device_is_host()) {
+        CHECK_OK(s);
+        CHECK_OK(rad_stream_sync(st.s));
+    } else {
+        CHECK_EQ(s, RAD_E_UNSUPPORTED);
+        CHECK(std::strstr(rad_dev_last_error(), "device-accessible") != nullptr);
+    }
+}
+
+TEST(memcpy_2d_respects_the_pitch) {
+    /* A KV block's rows are strided by the pool's pitch, so the padding between rows belongs to
+     * someone else and must survive the copy. */
+    const int64_t W = 48, H = 7, DP = 64, SP = 55;
+    Stream st;
+    DevBuf<uint8_t> s(SP * H, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> d(DP * H, RAD_MEM_HOST_PINNED);
+    CHECK(s && d);
+    if (!s || !d) return;
+
+    fill(s, SP * H, 0xBEEF);
+    CHECK_OK(rad_memset_async(d, 0xCC, DP * H, st.s));
+    CHECK_OK(rad_memcpy_2d_async(d, DP, s, SP, W, H, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    bool rows_ok = true, pad_ok = true;
+    for (int64_t r = 0; r < H; ++r) {
+        if (std::memcmp(d + r * DP, s + r * SP, (size_t)W) != 0) rows_ok = false;
+        for (int64_t c = W; c < DP; ++c) if (d[r * DP + c] != 0xCC) pad_ok = false;
+    }
+    CHECK(rows_ok);
+    CHECK(pad_ok);
+
+    /* A pitch shorter than the row is a caller bug and is refused, not clamped. */
+    CHECK(rad_memcpy_2d_async(d, W - 1, s, SP, W, H, st.s) < 0);
+}
+
+/* Three laps of the kernel argument ring with no host wait. A backend that keeps kernel arguments
+ * in host-rewritten memory must make each slot's new contents visible to its kernel; a stale slot
+ * silently reruns the previous lap's arguments. Each copy moves a distinct 64-byte piece, so a
+ * stale argument misplaces a piece and the comparison finds it. */
+TEST(twelve_thousand_copies_each_land_where_their_own_arguments_say) {
+    const int64_t piece = 64, n = 12000, bytes = piece * n;
+    Stream st;
+    DevBuf<uint8_t> host(bytes, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> back(bytes, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> src(bytes, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> dst(bytes, RAD_MEM_DEVICE);
+    CHECK(host && back && src && dst);
+    if (!host || !back || !src || !dst) return;
+
+    fill(host, bytes, 0xA11CE);
+    CHECK_OK(rad_memcpy_async(src, host, bytes, st.s));
+    /* Piece i of dst comes from piece (i * 7919) mod n of src, a permutation since 7919 is prime
+     * and does not divide n, so no two copies share arguments. */
+    for (int64_t i = 0; i < n; ++i)
+        CHECK_OK(rad_memcpy_async(dst + i * piece, src + ((i * 7919) % n) * piece, piece, st.s));
+    CHECK_OK(rad_memcpy_async(back, dst, bytes, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    int64_t wrong = 0, first = -1;
+    for (int64_t i = 0; i < n; ++i)
+        if (std::memcmp(back + i * piece, host + ((i * 7919) % n) * piece, (size_t)piece) != 0) {
+            if (first < 0) first = i;
+            ++wrong;
+        }
+    CHECK_EQ(wrong, (int64_t)0);
+    if (wrong) std::fprintf(stderr, "    first misplaced piece: %lld\n", (long long)first);
+}
+
+/* ------------------------------------------------------------------ ordering */
+
+TEST(event_on_one_stream_orders_work_on_another) {
+    const int64_t n = 4 << 20;
+    const int     chain = 8;    /* copies stream A does before it records */
+    const int     rounds = 3;   /* the race, run more than once */
+
+    Stream a, b;
+    CHECK(a.s && b.s);
+
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
+    CHECK(src && mid && dst);
+    if (!src || !mid || !dst) return;
+
+    for (int round = 0; round < rounds; ++round) {
+        Event e_a, e_b;
+        CHECK(e_a.e && e_b.e);
+
+        fill(src, n, 0x51ED0000u + (uint32_t)round);
+
+        /* Poison the intermediate from a synchronised point, so a read that jumps the queue sees
+         * 0xEE rather than a stale copy of the right answer. */
+        CHECK_OK(rad_memset_async(mid, 0xEE, n, b.s));
+        CHECK_OK(rad_stream_sync(b.s));
+
+        /* Enough work on A that an unordered reader on B lands in the middle of it. */
+        CHECK_OK(rad_memset_async(mid, 0x00, n, a.s));
+        for (int i = 0; i < chain; ++i) CHECK_OK(rad_memcpy_async(mid, src, n, a.s));
+        CHECK_OK(rad_event_record(e_a.e, a.s));
+
+        /* B waits on the event, not the host (no rad_stream_sync(a)): spec §5.4 requires
+         * transfers without host synchronisation. */
+        CHECK_OK(rad_event_wait(b.s, e_a.e));
+        CHECK_OK(rad_memcpy_async(dst, mid, n, b.s));
+        CHECK_OK(rad_event_record(e_b.e, b.s));
+
+        CHECK_OK(rad_stream_sync(b.s));
+        CHECK_EQ(std::memcmp(dst, src, (size_t)n), 0);
+
+        /* Each timestamp is taken when its stream reaches the record, so B's precedes A's only if
+         * the wait did nothing. */
+        float ms = -1.0f;
+        CHECK_OK(rad_event_elapsed_ms(e_a.e, e_b.e, &ms));
+        CHECK(ms >= 0.0f);
+
+        CHECK_OK(rad_stream_sync(a.s));
+        CHECK_EQ(rad_event_query(e_a.e), 1);
+        CHECK_EQ(rad_event_query(e_b.e), 1);
+    }
+}
+
+/* Two streams joining each other hundreds of times, the host far ahead and one stream lagging, as
+ * a model's two compute lanes meet every layer. A backend that reuses an event's completion object
+ * before a wait on its previous record is reached turns that wait into one on a later record,
+ * behind a join the lagging stream has not reached: a deadlock (this test would hang). The bytes
+ * are checked too, since the joins also order the copies. */
+TEST(two_streams_joining_each_other_hundreds_of_times_neither_deadlock_nor_reorder) {
+    const int64_t big = 1 << 20, small = 4096;
+    const int     joins = 400;
+    Stream a, b;
+    Event ea, eb;
+    DevBuf<uint8_t> d0(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> d1(big, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> h(big, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> r(small, RAD_MEM_HOST_PINNED);
+    CHECK(d0 && d1 && h && r);
+    if (!d0 || !d1 || !h || !r) return;
+    fill(h, big, 0x5EED);
+    CHECK_OK(rad_memcpy_async(d0, h, big, a.s));
+    for (int i = 0; i < joins; ++i) {
+        /* b lags: 1 MiB per round against a's 4 KiB. */
+        CHECK_OK(rad_event_record(ea.e, a.s));
+        CHECK_OK(rad_event_wait(b.s, ea.e));
+        CHECK_OK(rad_memcpy_async(d1, d0, big, b.s));
+        CHECK_OK(rad_event_record(eb.e, b.s));
+        CHECK_OK(rad_event_wait(a.s, eb.e));
+        CHECK_OK(rad_memcpy_async(d0, d1, small, a.s));
+    }
+    CHECK_OK(rad_memcpy_async(r, d0, small, a.s));
+    CHECK_OK(rad_stream_sync(a.s));
+    CHECK_OK(rad_stream_sync(b.s));
+    CHECK_EQ(std::memcmp(r, h, (size_t)small), 0);
+}
+
+TEST(an_event_destroyed_while_queued_work_names_it_still_orders_that_work) {
+    /* Teardown (the mover's included) may destroy events whose record or wait has not run yet,
+     * as HIP allows. Queued work must behave as if the handle were alive: the wait waits, the copy
+     * behind it sees the bytes, and neither stream wedges. Events are churned between rounds so
+     * memory freed too early is reused and overwritten. */
+    const int64_t n = 4 << 20;
+    Stream a, b;
+    CHECK(a.s && b.s);
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> mid(n, RAD_MEM_DEVICE);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST);
+    CHECK(src && mid && dst);
+    if (!src || !mid || !dst) return;
+
+    for (int round = 0; round < 4; ++round) {
+        fill(src, n, 0xDE570000u + (uint32_t)round);
+        CHECK_OK(rad_memset_async(mid, 0xEE, n, b.s));
+        CHECK_OK(rad_stream_sync(b.s));
+
+        RadEvent ga = nullptr, eb = nullptr;
+        CHECK_OK(rad_event_create(&ga));
+        CHECK_OK(rad_event_create(&eb));
+        for (int i = 0; i < 8; ++i) CHECK_OK(rad_memcpy_async(mid, src, n, a.s));
+        CHECK_OK(rad_event_record(ga, a.s));
+        CHECK_OK(rad_event_wait(b.s, ga));
+        CHECK_OK(rad_memcpy_async(dst, mid, n, b.s));
+        CHECK_OK(rad_event_record(eb, b.s));
+        rad_event_destroy(eb);
+        rad_event_destroy(ga);
+        for (int k = 0; k < 4; ++k) {
+            Event churn;
+            CHECK_OK(rad_event_record(churn.e, b.s));
+        }
+
+        CHECK_OK(rad_stream_sync(b.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        CHECK_EQ(std::memcmp(dst, src, (size_t)n), 0);
+    }
+}
+
+TEST(waiting_on_an_unrecorded_event_is_a_no_op) {
+    /* The mover relies on this: a weight with no transfer in flight has an unrecorded event, and
+     * an error here would force a branch on the issue path. */
+    Stream st;
+    Event e;
+    CHECK_EQ(rad_event_query(e.e), 1);
+    CHECK_OK(rad_event_wait(st.s, e.e));
+    CHECK_OK(rad_stream_sync(st.s));
+}
+
+/* An advance runs at its place in stream order. The sampled token it accepts is the last thing a
+ * step copies into place, and the advance is issued behind that copy without a host wait. On the
+ * host backend each stream is a queue with a worker thread, so an advance run on the issuing
+ * thread would read the previous token. A long chain of copies precedes the token's, so an advance
+ * that jumps the queue reads the poison. */
+TEST(an_advance_reads_the_token_a_copy_issued_before_it_delivers) {
+    const int64_t big = 4 << 20;
+    const int     chain = 16;
+    Stream q;
+    const RadStream s = q.s;
+    REQUIRE(s != nullptr);
+    DevBuf<uint8_t> blob_src(big, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> blob_dst(big, RAD_MEM_DEVICE);
+    DevBuf<char> slab(4096, RAD_MEM_DEVICE);
+    DevBuf<int32_t> src(64, RAD_MEM_DEVICE);
+    DevBuf<rad::StepSlot> st((int64_t)sizeof(rad::StepSlot), RAD_MEM_DEVICE);
+    DevBuf<int32_t> stage(4096, RAD_MEM_HOST_PINNED);
+    REQUIRE(blob_src && blob_dst && slab && src && st && stage);
+    std::memset(blob_src, 0x5A, (size_t)big);
+
+    /* One device row that sampled row 0 with no drafts, at context 10, slot 0. */
+    rad::AdvanceArgs a;
+    a.mode = rad::ADV_ACCEPT;
+    a.n_seq = 1;
+    a.slab = slab;
+    a.row_off = 0;   a.row_pitch = 1;
+    a.tok_off = 16;  a.pos_off = 24; a.ctx_off = 32; a.acc_off = 40; a.out_off = 48;
+    a.sid_off = 56;  a.cu_off = 64;  a.q_off = 72;   a.grp_off = 80;
+    a.st = st;
+    a.src = src;
+    const int32_t layout[20] = { 1, 0, 0, 0,  0, 0,  0, 0,  10, 0,  0, 0,  0, 0,  0, 0,  0, 0,  1, 0 };
+    std::memcpy(stage, layout, sizeof(layout));
+    for (int round = 0; round < 3; ++round) {
+        stage[64] = 7;                       /* the poison: what src holds before the copy */
+        stage[65] = 4242 + round;            /* the token the copy delivers */
+        REQUIRE(rad_memcpy_async(slab, stage, sizeof(layout), s) >= 0);
+        REQUIRE(rad_memcpy_async(src, stage + 64, 4, s) >= 0);
+        REQUIRE(rad_memset_async(st, 0, (int64_t)sizeof(rad::StepSlot), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+
+        for (int i = 0; i < chain; ++i) REQUIRE(rad_memcpy_async(blob_dst, blob_src, big, s) >= 0);
+        REQUIRE(rad_memcpy_async(src, stage + 65, 4, s) >= 0);
+        CHECK_OK(rad::step_advance(a, s));
+        rad::StepSlot got{};
+        REQUIRE(rad_memcpy_async(stage + 128, st, (int64_t)sizeof(rad::StepSlot), s) >= 0);
+        REQUIRE(rad_stream_sync(s) >= 0);
+        std::memcpy(&got, stage + 128, sizeof(rad::StepSlot));
+        CHECK_EQ(got.tok[0], 4242 + round);
+        CHECK_EQ(got.ctx, 11);
+        CHECK_EQ(got.n_acc, 1);
+    }
+}
+
+TEST(the_null_stream_is_refused) {
+    /* HIP's stream 0 serialises against every other blocking stream in the process, defeating
+     * async transfers. Both backends refuse it, so the host backend cannot hide its use. */
+    uint8_t a[16] = {}, b[16] = {};
+    CHECK(rad_memcpy_async(a, b, sizeof a, nullptr) < 0);
+    CHECK(std::strlen(rad_dev_last_error()) > 0);
+    /* Drained by reading, per the header. */
+    CHECK_EQ(std::strlen(rad_dev_last_error()), 0u);
+
+    CHECK(rad_memset_async(a, 0, sizeof a, nullptr) < 0);
+    CHECK(rad_stream_sync(nullptr) < 0);
+}
+
+/* ------------------------------------------------------------------ the file tier */
+
+TEST(directfile_write_then_read_roundtrip) {
+    const std::string path = temp_path("dio");
+    const int64_t A = DirectFile::alignment();
+    const int64_t body = 3 * A, tail = 123;
+
+    DirectFile f;
+    CHECK_OK(f.open(path.c_str(), RAD_DIO_READ | RAD_DIO_WRITE | RAD_DIO_CREATE | RAD_DIO_TRUNC |
+                                  RAD_DIO_ALLOW_BUFFERED));
+    if (!f.is_open()) return;
+    if (!f.direct())
+        fprintf(stderr, "       (note: %s has no O_DIRECT; the buffered fallback is under test)\n",
+                path.c_str());
+    CHECK_EQ(f.size(), (int64_t)0);
+
+    /* The mover reads into pinned buffers, so the aligned path is tested with one: page-aligned
+     * address, offset and length give one pread with no intermediate copy. */
+    DevBuf<uint8_t> w(body, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> r(body, RAD_MEM_HOST_PINNED);
+    CHECK(w && r);
+    if (!w || !r) { f.close(); ::unlink(path.c_str()); return; }
+    fill(w, body, 0xD1EC7);
+
+    CHECK_OK(f.write_at(w, 0, body));
+    CHECK_EQ(f.size(), body);
+
+    /* The misaligned tail: an unaligned length from an unaligned stack buffer. This is the read
+     * path's only bounce, needed because O_DIRECT returns EINVAL otherwise. */
+    uint8_t t[tail];
+    fill(t, tail, 0x7A11);
+    CHECK_OK(f.write_at(t, body, tail));
+    CHECK_EQ(f.size(), body + tail);
+
+    std::memset(r, 0, (size_t)body);
+    CHECK_OK(f.read_at(r, 0, body));
+    CHECK_EQ(std::memcmp(r, w, (size_t)body), 0);
+
+    uint8_t t2[tail];
+    std::memset(t2, 0, sizeof t2);
+    CHECK_OK(f.read_at(t2, body, tail));
+    CHECK_EQ(std::memcmp(t2, t, sizeof t2), 0);
+
+    /* A slice that is aligned at neither end and straddles two blocks. */
+    uint8_t slice[2000];
+    CHECK_OK(f.read_at(slice, 1000, sizeof slice));
+    CHECK_EQ(std::memcmp(slice, w + 1000, sizeof slice), 0);
+
+    /* One byte past the end is RAD_E_IO, not a short read: read_at fills exactly what was asked
+     * or fails, so callers on the step path need not check a byte count. */
+    CHECK(f.read_at(t2, body, tail + 1) < 0);
+    CHECK(f.read_at(r, body + tail + A, A) < 0);
+
+    /* Reopen without O_TRUNC: the bytes are on disk, not in this handle. */
+    f.close();
+    CHECK_OK(f.open(path.c_str(), RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED));
+    CHECK_EQ(f.size(), body + tail);
+    std::memset(r, 0, (size_t)body);
+    CHECK_OK(f.read_at(r, 0, body));
+    CHECK_EQ(std::memcmp(r, w, (size_t)body), 0);
+    f.close();
+
+    CHECK(f.read_at(r, 0, A) < 0);          /* closed: RAD_E_STATE, not a crash */
+    CHECK_EQ(f.size(), (int64_t)-1);
+    ::unlink(path.c_str());
+}
+
+TEST(directfile_refuses_a_missing_file) {
+    DirectFile f;
+    CHECK(f.open("/nonexistent/rad/dio/path.bin", RAD_DIO_READ | RAD_DIO_ALLOW_BUFFERED) < 0);
+    CHECK(!f.is_open());
+    CHECK(f.open(nullptr, RAD_DIO_READ) < 0);
+}
+
+/* ------------------------------------------------------------------ elastic memory
+ *
+ * Elastic pools let two pools trade VRAM (the KV cache returns what no session holds and the
+ * expert slab takes it). The trade is safe only if an address never moves, a granule still in use
+ * is never unmapped, and a range reported as committed is actually backed. Each fails silently:
+ * a kernel reads another group's blocks, or a fault hits a previously valid address, or the first
+ * write past the old boundary faults under load.
+ *
+ * The risk is all interval arithmetic, so it is tested on the host backend, where a decommitted
+ * page can also be shown gone by reading it back as zero.
+ */
+
+TEST(elastic_memory_takes_address_space_and_no_pages) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    CHECK(g > 0);
+    CHECK_EQ(g % 4096, 0);              /* a granule is whole pages */
+
+    rad::VMem v;
+    CHECK_OK(v.reserve(8 * g));
+    CHECK(v.base() != nullptr);
+    CHECK_EQ(v.size(), 8 * g);
+    CHECK_EQ(v.committed(), 0);         /* reserved is not allocated */
+    CHECK_EQ((int64_t)((uintptr_t)v.base() % (uintptr_t)g), 0);
+
+    /* A size that is not a whole number of granules rounds up; otherwise the trailing partial
+     * granule could never be committed. */
+    rad::VMem odd;
+    CHECK_OK(odd.reserve(g + 1));
+    CHECK_EQ(odd.size(), 2 * g);
+
+    CHECK_EQ(v.reserve(0), RAD_E_INVAL);
+    CHECK_EQ(v.size(), 0);              /* a refused reserve releases what it held */
+}
+
+TEST(a_committed_range_is_backed_and_keeps_its_address) {
+    if (!need_vmem(/*host_visible=*/true)) return;
+    const int64_t g = rad::VMem::granularity();
+    rad::VMem v;
+    CHECK_OK(v.reserve(8 * g));
+    void* const addr = v.base();
+
+    CHECK_OK(v.commit(0, 2 * g));
+    CHECK_EQ(v.committed(), 2 * g);
+    CHECK(v.is_committed(0, 2 * g));
+    CHECK(!v.is_committed(0, 3 * g));
+
+    fill((uint8_t*)v.base(), 2 * g, 0x5eedu);
+    uint8_t expect[128];
+    fill(expect, sizeof expect, 0x5eedu);
+    CHECK_EQ(std::memcmp(v.base(), expect, sizeof expect), 0);
+
+    /* Growing at the far end keeps existing data and the base, from which every block index the
+     * pool handed out is an offset. */
+    CHECK_OK(v.commit(6 * g, 2 * g));
+    CHECK_EQ(v.committed(), 4 * g);
+    CHECK_EQ(v.base(), addr);
+    CHECK_EQ(std::memcmp(v.base(), expect, sizeof expect), 0);
+}
+
+TEST(commit_rounds_outward_and_decommit_rounds_inward) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    rad::VMem v;
+    CHECK_OK(v.reserve(4 * g));
+
+    /* Committing one byte commits its whole granule. */
+    CHECK_OK(v.commit(g / 2, 1));
+    CHECK_EQ(v.committed(), g);
+    CHECK(v.is_committed(0, g));
+
+    /* A decommit releases only whole granules; the rest of a partly covered granule is still
+     * owned. */
+    CHECK_OK(v.decommit(g / 2, 1));
+    CHECK_EQ(v.committed(), g);
+    CHECK_OK(v.decommit(0, g - 1));
+    CHECK_EQ(v.committed(), g);
+    CHECK_OK(v.decommit(0, g));
+    CHECK_EQ(v.committed(), 0);
+}
+
+TEST(the_commit_quantum_is_the_pool_alignment_on_every_backend) {
+    if (!need_vmem()) return;
+    /* Both backends use RAD_ALIGN_POOL (which every pool is aligned to) as the granule, not the
+     * driver's minimum (one reports a single host page), so the commit arithmetic checked without
+     * a card is what a card performs, and growth avoids a driver call per page. */
+    const int64_t g = rad::VMem::granularity();
+    CHECK(g >= (int64_t)RAD_ALIGN_POOL);
+    CHECK_EQ(g % (int64_t)RAD_ALIGN_POOL, 0);
+}
+
+TEST(committing_over_a_commit_maps_only_the_gap) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    rad::VMem v;
+    CHECK_OK(v.reserve(8 * g));
+
+    /* A growing pool commits [0,n) each time n changes. The driver refuses overlapping maps, so
+     * commit must map only the gap; a pool growing twice depends on it. */
+    CHECK_OK(v.commit(0, 2 * g));
+    CHECK_OK(v.commit(0, 5 * g));
+    CHECK_EQ(v.committed(), 5 * g);
+    CHECK_OK(v.commit(0, 5 * g));
+    CHECK_EQ(v.committed(), 5 * g);
+
+    /* Two islands and then the bridge between them. */
+    rad::VMem w;
+    CHECK_OK(w.reserve(8 * g));
+    CHECK_OK(w.commit(0, g));
+    CHECK_OK(w.commit(4 * g, g));
+    CHECK_EQ(w.committed(), 2 * g);
+    CHECK_OK(w.commit(0, 5 * g));
+    CHECK_EQ(w.committed(), 5 * g);
+    CHECK(w.is_committed(0, 5 * g));
+
+    /* Past the end clamps rather than failing: the reserved range is the maximum. */
+    CHECK_OK(w.commit(7 * g, 4 * g));
+    CHECK_EQ(w.committed(), 6 * g);
+}
+
+TEST(decommitting_the_middle_leaves_the_ends) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    rad::VMem v;
+    CHECK_OK(v.reserve(8 * g));
+    CHECK_OK(v.commit(0, 4 * g));
+    CHECK_OK(v.decommit(g, g));
+
+    CHECK_EQ(v.committed(), 3 * g);
+    CHECK(v.is_committed(0, g));
+    CHECK(!v.is_committed(g, g));
+    CHECK(v.is_committed(2 * g, 2 * g));
+    /* A span across the hole is not committed, which is what a caller checks before handing a
+     * range to a kernel. */
+    CHECK(!v.is_committed(0, 4 * g));
+
+    /* Refilling the hole merges the extents, so the extent list does not grow without bound. */
+    CHECK_OK(v.commit(g, g));
+    CHECK_EQ(v.committed(), 4 * g);
+    CHECK(v.is_committed(0, 4 * g));
+}
+
+TEST(a_recommitted_range_comes_back_zeroed) {
+    if (!need_vmem(/*host_visible=*/true)) return;
+    const int64_t g = rad::VMem::granularity();
+    rad::VMem v;
+    CHECK_OK(v.reserve(4 * g));
+    CHECK_OK(v.commit(0, 2 * g));
+
+    fill((uint8_t*)v.base(), 2 * g, 0xabcdu);
+    CHECK((( uint8_t*)v.base())[g] != 0);
+
+    /* Decommitted pages are actually released: recommitting returns zeroes, not the old bytes. A
+     * decommit that only forgot the range would pass every test above. */
+    CHECK_OK(v.decommit(0, 2 * g));
+    CHECK_EQ(v.committed(), 0);
+    CHECK_OK(v.commit(0, 2 * g));
+    const uint8_t* b = (const uint8_t*)v.base();
+    for (int64_t i = 0; i < 2 * g; i += 4093) CHECK_EQ((int)b[i], 0);
+}
+
+TEST(elastic_memory_is_accounted_and_released_whole) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    const int64_t before = rad::rad_dev_vmem_committed();
+    {
+        rad::VMem v;
+        CHECK_OK(v.reserve(8 * g));
+        CHECK_OK(v.commit(0, 3 * g));
+        CHECK_EQ(rad::rad_dev_vmem_committed() - before, 3 * g);
+        CHECK_OK(v.decommit(0, g));
+        CHECK_EQ(rad::rad_dev_vmem_committed() - before, 2 * g);
+        /* Destruction releases what is still committed. Freeing a range with pages in it leaks
+         * them and on some drivers fails the address free, so release() fixes the order. */
+    }
+    CHECK_EQ(rad::rad_dev_vmem_committed(), before);
+}
+
+/* ------------------------------------------------------------------ the ranged copy */
+
+/* Every step's staging upload and the block-table entries that changed go through one ranged copy
+ * per rank, so a wrong range offset is a wrong block id: another sequence's KV with fluent output.
+ * The copy is issued behind a chain that rewrites the source, so it must read the chain's result,
+ * and a range may overwrite part of the prefix after it is copied. The expected bytes are composed
+ * on the host from the source's final contents. */
+TEST(a_ranged_copy_lands_its_prefix_then_each_range_in_order) {
+    const int64_t n = 8192, chain_bytes = 1 << 20;
+    Stream st;
+    DevBuf<uint8_t> src(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> next(n, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> big_a(chain_bytes, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> big_b(chain_bytes, RAD_MEM_DEVICE);
+    DevBuf<RadCopyRange> list(8 * (int64_t)sizeof(RadCopyRange), RAD_MEM_HOST_PINNED);
+    REQUIRE(src && dst && next && big_a && big_b && list);
+    fill(src, n, 0x1234);
+    fill(next, n, 0x5678);
+    std::memset(big_a, 0x11, (size_t)chain_bytes);
+    CHECK_OK(rad_memset_async(dst, 0xEE, n, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    /* Five ranges: two adjacent at the destination, one written over the prefix, one from the
+     * start of the source and one into the last bytes. */
+    const RadCopyRange r[5] = {
+        { 1024, 512, 64 }, { 2048, 576, 128 }, { 3000, 128, 32 }, { 0, 4000, 256 }, { 4, 8184, 8 },
+    };
+    std::memcpy(list, r, sizeof r);
+    /* A chain ahead of the copy, ending with the source's final contents. */
+    for (int i = 0; i < 8; ++i) CHECK_OK(rad_memcpy_async(big_b, big_a, chain_bytes, st.s));
+    CHECK_OK(rad_memcpy_async(src, next, n, st.s));
+    CHECK_OK(rad_memcpy_ranges_async(dst, src, 256, list, 5, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+
+    std::vector<uint8_t> want((size_t)n, 0xEE);
+    std::memcpy(want.data(), next, 256);
+    for (const RadCopyRange& x : r)
+        std::memcpy(want.data() + x.dst, next + x.src, (size_t)x.bytes);
+    CHECK_EQ(std::memcmp(dst, want.data(), (size_t)n), 0);
+
+    /* Nothing to copy is not an error and moves nothing. */
+    CHECK_OK(rad_memcpy_ranges_async(dst, src, 0, nullptr, 0, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ(std::memcmp(dst, want.data(), (size_t)n), 0);
+    CHECK_EQ(rad_memcpy_ranges_async(dst, src, 0, nullptr, 2, st.s), RAD_E_INVAL);
+    CHECK_EQ(rad_memcpy_ranges_async(dst, src, -16, list, 1, st.s), RAD_E_INVAL);
+}
+
+/* The card's copy kernel moves 16-byte pieces: the prefix is a multiple of 16 and both bases are
+ * 16-byte aligned. Both backends refuse a call outside that, so a caller bug fails on the host
+ * suite and not first on a card. */
+TEST(a_ranged_copy_refuses_what_the_cards_kernel_cannot_copy) {
+    Stream st;
+    DevBuf<uint8_t> src(4096, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(4096, RAD_MEM_HOST_PINNED);
+    DevBuf<RadCopyRange> list((int64_t)sizeof(RadCopyRange), RAD_MEM_HOST_PINNED);
+    REQUIRE(src && dst && list);
+    *list.p = RadCopyRange{ 0, 0, 16 };
+    CHECK_EQ(rad_memcpy_ranges_async(dst, src, 24, list, 1, st.s), RAD_E_INVAL);
+    CHECK_EQ(rad_memcpy_ranges_async(dst + 4, src, 16, list, 1, st.s), RAD_E_UNSUPPORTED);
+    CHECK_EQ(rad_memcpy_ranges_async(dst, src + 8, 16, list, 1, st.s), RAD_E_UNSUPPORTED);
+    CHECK_OK(rad_memcpy_ranges_async(dst + 16, src + 32, 16, list, 1, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+}
+
+/* ------------------------------------------------------------------ stream contract extras */
+
+/* rad_stream_sync waits for the work submitted before the call, not for an empty queue: the step
+ * thread syncs while another thread keeps issuing to the same stream, and a sync that waited for
+ * the queue to drain would not return while the issuing continues. A pusher keeps the stream's
+ * ring full: each pair is a 64 KiB copy and a copy of the pair's number into `last`. Every sync
+ * must return while the pusher is still running, with every pair issued before it landed. */
+TEST(stream_sync_returns_while_another_thread_keeps_issuing) {
+    const int64_t piece = 64 << 10;
+    const int64_t slots = 4096;          /* more pairs than the ring holds, so a slot is retired
+                                          * before the pusher writes it again */
+    Stream st;
+    DevBuf<uint8_t> a(piece, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> b(piece, RAD_MEM_HOST_PINNED);
+    DevBuf<uint32_t> seq(slots * 4, RAD_MEM_HOST_PINNED);
+    DevBuf<uint32_t> last(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(a && b && seq && last);
+    std::memset(a, 1, (size_t)piece);
+    last[0] = 0;
+    std::atomic<bool> stop{ false }, running{ true };
+    std::atomic<int64_t> pushed{ 0 };
+    std::thread pusher([&] {
+        /* Bounded, so a sync that waits for an empty queue fails the checks below instead of
+         * hanging: the pusher gives up after 100k pairs. */
+        for (int64_t k = 1; !stop.load() && k <= 100000; ++k) {
+            seq[k % slots] = (uint32_t)k;
+            if (rad_memcpy_async(b, a, piece, st.s) < 0) break;
+            if (rad_memcpy_async(last, seq + k % slots, 4, st.s) < 0) break;
+            pushed.store(k);
+        }
+        running.store(false);
+    });
+    while (pushed.load() < 2048 && running.load()) std::this_thread::yield();
+    int while_running = 0, behind = 0;
+    for (int i = 0; i < 10; ++i) {
+        const int64_t before = pushed.load();
+        CHECK_OK(rad_stream_sync(st.s));
+        while_running += running.load();
+        behind += (int64_t)*(volatile uint32_t*)last.p < before;
+    }
+    stop.store(true);
+    pusher.join();
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ(while_running, 10);
+    CHECK_EQ(behind, 0);
+}
+
+/* Only an event made for host waits can be waited on by the host; a local or plain event raises
+ * no interrupt on a card, so a host sync on it is refused on both backends rather than spinning. */
+TEST(a_host_sync_on_an_event_not_made_for_it_is_refused) {
+    Stream st;
+    RadEvent local = nullptr, plain = nullptr, host = nullptr;
+    CHECK_OK(rad_event_create_local(&local));
+    CHECK_OK(rad_event_create_as(&plain, 0));
+    CHECK_OK(rad_event_create(&host));
+    for (RadEvent e : { local, plain, host }) CHECK_OK(rad_event_record(e, st.s));
+    CHECK_EQ(rad_event_sync(local), RAD_E_INVAL);
+    CHECK_EQ(rad_event_sync(plain), RAD_E_INVAL);
+    CHECK_OK(rad_event_sync(host));
+    CHECK_OK(rad_stream_sync(st.s));
+    /* Timing needs both events recorded. */
+    RadEvent never = nullptr;
+    CHECK_OK(rad_event_create(&never));
+    float ms = 0;
+    CHECK(rad_event_elapsed_ms(host, never, &ms) < 0);
+    CHECK(rad_event_elapsed_ms(never, host, &ms) < 0);
+    if (rad::device_is_host()) CHECK_EQ(rad_event_elapsed_ms(never, host, &ms), RAD_E_STATE);
+    for (RadEvent e : { local, plain, host, never }) rad_event_destroy(e);
+}
+
+/* ------------------------------------------------------------------ gates */
+
+/* Work queued behind a closed gate must not run until the host opens it, while work ahead of the
+ * gate runs as usual: rad-kbench queues a whole timed batch behind one so the device never waits
+ * for submission. The check behind the gate is bounded: a gate that does not hold would let a 2 KiB
+ * copy land well inside 20 ms. */
+TEST(nothing_behind_a_closed_gate_runs_until_it_opens) {
+    Stream st;
+    DevBuf<uint8_t> src(4096, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(4096, RAD_MEM_HOST_PINNED);
+    REQUIRE(src && dst);
+    fill(src, 4096, 7);
+    std::memset(dst, 0, 4096);
+    Event before, after;
+    CHECK_OK(rad_memcpy_async(dst, src, 2048, st.s));
+    CHECK_OK(rad_event_record(before.e, st.s));
+#if defined(_WIN32)
+    /* Brilliance: the native HIP backend has no gates (stream_gate null, which the contract allows:
+     * a gate needs a gate kernel on the queue, and only the kbench timer uses one). */
+    if (!rad::active_backend()->stream_gate) SKIP("no stream gates on this backend");
+#endif
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+    REQUIRE(gate != nullptr);
+    CHECK_OK(rad_memcpy_async(dst + 2048, src + 2048, 2048, st.s));
+    CHECK_OK(rad_event_record(after.e, st.s));
+    CHECK_OK(rad_event_sync(before.e));
+    CHECK_EQ(std::memcmp(dst, src, 2048), 0);
+    const auto t0 = std::chrono::steady_clock::now();
+    int ran = 0;
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(20))
+        ran |= rad_event_query(after.e) != 0;
+    CHECK_EQ(ran, 0);
+    int64_t untouched = 0;
+    for (int i = 2048; i < 4096; ++i) untouched += ((volatile uint8_t*)dst.p)[i] == 0;
+    CHECK_EQ(untouched, 2048ll);
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ(rad_event_query(after.e), 1);
+    CHECK_EQ(std::memcmp(dst, src, 4096), 0);
+}
+
+/* A ride a prefetch DMA list polls stays out of the signal pool until the engine has read it,
+ * however early the caller returns it. The pool reuses a signal at 0 that no queue packet names,
+ * and a DMA poll is none: a mark handed out again and set to 1 before the engine polls it would
+ * hold the list until the next use completes, which can sit behind a wait for this very list. The
+ * engine is held on an earlier list whose mark completes only once a gate opens, so the list
+ * under test has not polled its mark when the mark's dispatch has run and it is returned. */
+TEST(a_dma_lists_mark_stays_out_of_the_pool_until_the_engine_has_read_it) {
+    if (rad::device_is_host()) SKIP("a card only");
+    if (!rad_xp_supported(0)) SKIP("no prefetch DMA queue on this card");
+    Stream held, st;
+    DevBuf<uint8_t> a(256, RAD_MEM_DEVICE), b(256, RAD_MEM_DEVICE);
+    DevBuf<uint32_t> word(64, RAD_MEM_HOST_PINNED);
+    REQUIRE(a && b && word);
+    *(volatile uint32_t*)word.p = 0;
+
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(held.s, &gate), RAD_OK);
+    void* first = nullptr;
+    REQUIRE_EQ(rad_ride(held.s, &first), RAD_OK);
+    CHECK_OK(rad_memset_async(a, 1, 256, held.s));
+    REQUIRE_EQ(rad_xp_list(0, first, 0, nullptr, nullptr, nullptr, nullptr, 0, RAD_XP_NO_YIELD),
+               RAD_OK);
+
+    void* mark = nullptr;
+    REQUIRE_EQ(rad_ride(st.s, &mark), RAD_OK);
+    CHECK_OK(rad_memset_async(b, 2, 256, st.s));
+    REQUIRE_EQ(rad_xp_list(0, mark, 0, nullptr, nullptr, nullptr, word, 7, RAD_XP_NO_YIELD),
+               RAD_OK);
+    CHECK_OK(rad_stream_sync(st.s));                 /* the mark is 0 now */
+    rad_ride_release(mark, nullptr, 0);
+    CHECK(!rad::aql::ride_reusable(mark));
+    CHECK_EQ(*(volatile uint32_t*)word.p, 0u);
+
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(held.s));
+    const auto t0 = std::chrono::steady_clock::now();
+    while (*(volatile uint32_t*)word.p != 7u &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+        std::this_thread::yield();
+    CHECK_EQ(*(volatile uint32_t*)word.p, 7u);
+    bool back = false;
+    while (!back && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(6))
+        back = rad::aql::ride_reusable(mark);
+    CHECK(back);
+    rad_ride_release(first, nullptr, 0);
+}
+
+/* A host wait on a stream at a closed gate could only end when the waiting thread opened it, so it
+ * is refused with RAD_E_STATE instead of hanging, and works again once the gate is open. */
+TEST(a_host_wait_on_a_gated_stream_is_refused_not_a_deadlock) {
+#if defined(_WIN32)
+    /* Brilliance: the native HIP backend has no gates (stream_gate null, which the contract allows:
+     * a gate needs a gate kernel on the queue, and only the kbench timer uses one). */
+    if (!rad::active_backend()->stream_gate) SKIP("no stream gates on this backend");
+#endif
+    Stream st;
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+    CHECK_EQ(rad_stream_sync(st.s), RAD_E_STATE);
+    CHECK(std::strstr(rad_dev_last_error(), "closed gate") != nullptr);
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+}
+
+/* Behind a closed gate the queue only fills. Submissions up to the room succeed and the one after
+ * is refused rather than waiting for room that cannot appear; opening the gate runs every accepted
+ * submission in order. The ring holds 1024 tasks, the gate's own among them until the worker takes
+ * it, so 1023 or 1024 fit. */
+TEST(a_full_gated_queue_refuses_the_next_submission_instead_of_waiting) {
+    if (!need_host_backend()) return;
+    Stream st;
+    DevBuf<uint8_t> a(64, RAD_MEM_DEVICE);
+    REQUIRE(a);
+    void* gate = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+    CHECK(rad_gate_room(st.s) >= 1023);
+    int ok = 0, refused = 0;
+    for (int i = 0; i < 2048 && !refused; ++i) {
+        const int rc = rad_memset_async(a, (ok + 1) & 0xff, 64, st.s);
+        if (rc == RAD_OK) {
+            ++ok;
+        } else {
+            CHECK_EQ(rc, RAD_E_STATE);
+            ++refused;
+        }
+    }
+    CHECK_EQ(refused, 1);
+    CHECK(ok == 1023 || ok == 1024);
+    CHECK_EQ(rad_gate_room(st.s), 0ll);
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ((int)a[0], ok & 0xff);
+    CHECK_EQ((int)a[63], ok & 0xff);
+}
+
+/* The point of a gate: two events around work queued behind it time the work, not the host. The
+ * host stalls 20 ms between the two records; without a gate that stall is inside the interval,
+ * with one it is not. Timing is the behaviour here, and the margins are an order of magnitude. */
+TEST(events_behind_a_gate_leave_the_hosts_submission_time_out) {
+    Stream st;
+    DevBuf<uint8_t> a(4096, RAD_MEM_DEVICE);
+    REQUIRE(a);
+    Event e0, e1;
+#if defined(_WIN32)
+    /* Brilliance: the native HIP backend has no gates (stream_gate null, which the contract allows:
+     * a gate needs a gate kernel on the queue, and only the kbench timer uses one). */
+    if (!rad::active_backend()->stream_gate) SKIP("no stream gates on this backend");
+#endif
+    float open_ms = 0, gated_ms = 0;
+    for (const bool gated : { false, true }) {
+        void* gate = nullptr;
+        if (gated) REQUIRE_EQ(rad_stream_gate(st.s, &gate), RAD_OK);
+        CHECK_OK(rad_event_record(e0.e, st.s));
+        CHECK_OK(rad_memset_async(a, 1, 4096, st.s));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK_OK(rad_memset_async(a, 2, 4096, st.s));
+        CHECK_OK(rad_event_record(e1.e, st.s));
+        if (gated) CHECK_OK(rad_gate_open(gate));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_OK(rad_event_elapsed_ms(e0.e, e1.e, gated ? &gated_ms : &open_ms));
+    }
+    CHECK(open_ms >= 15.0f);
+    CHECK(gated_ms < 10.0f);
+}
+
+/* A pitched copy is ordered behind the copies before it like any other, and either pitch shorter
+ * than the row is refused, not clamped. */
+TEST(a_pitched_copy_reads_what_the_copies_before_it_wrote) {
+    const int64_t W = 40, H = 9, SP = 64, DP = 48, big = 1 << 20;
+    Stream st;
+    DevBuf<uint8_t> src(SP * H, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> next(SP * H, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> dst(DP * H, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> big_a(big, RAD_MEM_HOST_PINNED);
+    DevBuf<uint8_t> big_b(big, RAD_MEM_DEVICE);
+    REQUIRE(src && next && dst && big_a && big_b);
+    fill(src, SP * H, 1);
+    fill(next, SP * H, 2);
+    std::memset(big_a, 0, (size_t)big);
+    CHECK_OK(rad_memset_async(dst, 0xCC, DP * H, st.s));
+    for (int i = 0; i < 16; ++i) CHECK_OK(rad_memcpy_async(big_b, big_a, big, st.s));
+    CHECK_OK(rad_memcpy_async(src, next, SP * H, st.s));
+    CHECK_OK(rad_memcpy_2d_async(dst, DP, src, SP, W, H, st.s));
+    CHECK_OK(rad_stream_sync(st.s));
+    int64_t wrong = 0;
+    for (int64_t r = 0; r < H; ++r)
+        for (int64_t c = 0; c < DP; ++c)
+            wrong += dst[r * DP + c] != (c < W ? next[r * SP + c] : 0xCC);
+    CHECK_EQ(wrong, 0ll);
+    CHECK(rad_memcpy_2d_async(dst, DP, src, W - 1, W, H, st.s) < 0);
+    CHECK(rad_memcpy_2d_async(dst, W - 1, src, SP, W, H, st.s) < 0);
+    CHECK_OK(rad_memcpy_2d_async(dst, DP, src, SP, 0, H, st.s));     /* empty: nothing to do */
+}
+
+/* Freeing memory the device layer did not allocate would corrupt the heap; the host backend
+ * refuses it with a warning and keeps its accounting. */
+TEST(freeing_a_pointer_the_device_layer_did_not_allocate_is_ignored) {
+    if (!need_host_backend()) return;
+    int64_t used0 = 0, used1 = 0;
+    CHECK_OK(rad::dev_vram_used(0, &used0));
+    uint8_t on_stack[64];
+    const std::string err = stderr_of([&] { rad_dev_free(on_stack, RAD_MEM_DEVICE); });
+    CHECK(has(err, "not allocated by the device layer"));
+    CHECK_OK(rad::dev_vram_used(0, &used1));
+    CHECK_EQ(used1, used0);
+}
+
+/* ------------------------------------------------------------------ code objects */
+
+/* The AQL backend picks the card's code object out of a kernel library's fat binary and reads
+ * each kernel's argument layout from its metadata. This decides whether a library loads at all
+ * on a given card, and a misread argument offset faults every launch. The readers are host code,
+ * checked here against byte images built to the formats' specifications. */
+namespace {
+
+/* A clang offload bundle: magic, entry count, then per entry (offset, size, triple length,
+ * triple), then the payloads. */
+std::vector<unsigned char> offload_bundle(const std::vector<std::pair<std::string, std::string>>& e) {
+    std::vector<unsigned char> b;
+    auto u64 = [&b](uint64_t v) {
+        for (int k = 0; k < 8; ++k) b.push_back((unsigned char)(v >> (8 * k)));
+    };
+    const char magic[] = "__CLANG_OFFLOAD_BUNDLE__";
+    b.insert(b.end(), magic, magic + 24);
+    u64(e.size());
+    uint64_t off = 32;
+    for (const auto& x : e) off += 24 + x.first.size();
+    for (const auto& x : e) {
+        u64(off);
+        u64(x.second.size());
+        u64(x.first.size());
+        b.insert(b.end(), x.first.begin(), x.first.end());
+        off += x.second.size();
+    }
+    for (const auto& x : e) b.insert(b.end(), x.second.begin(), x.second.end());
+    return b;
+}
+
+/* The payload `bundle_code_object` picked, or "" when it refused. */
+std::string pick(const std::vector<unsigned char>& b, const std::vector<std::string>& isas,
+                 std::string* why = nullptr) {
+    const void* out = nullptr;
+    size_t size = 0;
+    std::string w;
+    const bool ok = rad::aql::bundle_code_object(b.data(), isas, &out, &size, &w);
+    if (why) *why = w;
+    if (!ok) return std::string();
+    return std::string((const char*)out, size);
+}
+
+/* A minimal msgpack writer: the forms code object metadata uses. */
+struct MsgPack {
+    std::vector<unsigned char> b;
+    void map(uint32_t n) { b.push_back((unsigned char)(0x80 | n)); }
+    void arr(uint32_t n) { b.push_back((unsigned char)(0x90 | n)); }
+    void str(const std::string& s) {
+        if (s.size() < 32) b.push_back((unsigned char)(0xa0 | s.size()));
+        else { b.push_back(0xd9); b.push_back((unsigned char)s.size()); }
+        b.insert(b.end(), s.begin(), s.end());
+    }
+    void uint(uint64_t v) {
+        if (v < 128) { b.push_back((unsigned char)v); return; }
+        const int nb = v < 0x10000 ? 2 : v < 0x100000000ull ? 4 : 8;
+        b.push_back(nb == 2 ? 0xcd : nb == 4 ? 0xce : 0xcf);
+        for (int k = nb - 1; k >= 0; --k) b.push_back((unsigned char)(v >> (8 * k)));
+    }
+    void boolean(bool v) { b.push_back(v ? 0xc3 : 0xc2); }
+};
+
+/* An ELF64 file with one PT_NOTE program header whose note is NT_AMDGPU_METADATA over `desc`.
+ * `cut` drops bytes from the end of the file. */
+std::vector<unsigned char> elf_with_note(const std::vector<unsigned char>& desc, size_t cut = 0) {
+    std::vector<unsigned char> f(64 + 56, 0);
+    f[0] = 0x7f; f[1] = 'E'; f[2] = 'L'; f[3] = 'F'; f[4] = 2; f[5] = 1;
+    auto put = [&f](size_t at, uint64_t v, int nb) {
+        for (int k = 0; k < nb; ++k) f[at + (size_t)k] = (unsigned char)(v >> (8 * k));
+    };
+    put(32, 64, 8);                                  /* e_phoff */
+    put(54, 56, 2);                                  /* e_phentsize */
+    put(56, 1, 2);                                   /* e_phnum */
+    const size_t note = f.size();
+    std::vector<unsigned char> n(12, 0);
+    const uint32_t namesz = 7, descsz = (uint32_t)desc.size(), type = 32;
+    std::memcpy(n.data(), &namesz, 4);
+    std::memcpy(n.data() + 4, &descsz, 4);
+    std::memcpy(n.data() + 8, &type, 4);
+    const char name[8] = "AMDGPU";
+    n.insert(n.end(), name, name + 8);
+    n.insert(n.end(), desc.begin(), desc.end());
+    while (n.size() % 4) n.push_back(0);
+    put(64, 4, 4);                                   /* p_type = PT_NOTE */
+    put(64 + 8, note, 8);                            /* p_offset */
+    put(64 + 32, n.size(), 8);                       /* p_filesz */
+    f.insert(f.end(), n.begin(), n.end());
+    f.resize(f.size() - cut);
+    return f;
+}
+
+/* Metadata for two kernels: one with an explicit scalar, a buffer, a hidden block count and the
+ * hostcall buffer this backend does not provide; one with no arguments and a long symbol. */
+std::vector<unsigned char> two_kernels() {
+    MsgPack m;
+    m.map(2);
+    m.str("amdhsa.version"); m.arr(2); m.uint(1); m.uint(2);
+    m.str("amdhsa.kernels"); m.arr(2);
+    m.map(6);
+    m.str(".symbol"); m.str("scale.kd");
+    m.str(".kernarg_segment_size"); m.uint(280);
+    m.str(".group_segment_fixed_size"); m.uint(70000);
+    m.str(".private_segment_fixed_size"); m.uint(16);
+    m.str(".uses_dynamic_stack"); m.boolean(false);
+    m.str(".args"); m.arr(4);
+    const struct { uint32_t off, size; const char* kind; } args[4] = {
+        { 0, 4, "by_value" }, { 8, 8, "global_buffer" }, { 16, 4, "hidden_block_count_x" },
+        { 24, 8, "hidden_hostcall_buffer" },
+    };
+    for (const auto& a : args) {
+        m.map(3);
+        m.str(".offset"); m.uint(a.off);
+        m.str(".size"); m.uint(a.size);
+        m.str(".value_kind"); m.str(a.kind);
+    }
+    m.map(3);
+    m.str(".symbol"); m.str("a_kernel_whose_symbol_is_longer_than_31.kd");
+    m.str(".uses_dynamic_stack"); m.boolean(true);
+    m.str(".kernarg_segment_size"); m.uint(0);
+    return m.b;
+}
+
+}  /* namespace */
+
+TEST(the_cards_exact_code_object_wins_and_its_family_build_is_the_fallback) {
+    const auto b = offload_bundle({
+        { "host-x86_64-unknown-linux-gnu-", "HOST" },
+        { "hipv4-amdgcn-amd-amdhsa--gfx1201", "EXACT" },
+        { "hipv4-amdgcn-amd-amdhsa--gfx12-generic", "FAMILY" },
+        { "hipv4-amdgcn-amd-amdhsa--gfx942:sramecc+:xnack-", "PINNED" },
+        { "hipv4-amdgcn-amd-amdhsa--gfx942", "ANYMODE" },
+        { "hipv4-amdgcn-amd-amdhsa--gfx1100", "" },          /* an empty entry is skipped */
+    });
+    const std::string pre = "amdgcn-amd-amdhsa--";
+    CHECK_EQ(pick(b, { pre + "gfx1201", pre + "gfx12-generic" }), std::string("EXACT"));
+    CHECK_EQ(pick(b, { pre + "gfx1200", pre + "gfx12-generic" }), std::string("FAMILY"));
+    /* A code object pinned to the card's mode beats one that runs in either mode, and one pinned
+     * to another mode never runs. */
+    CHECK_EQ(pick(b, { pre + "gfx942:sramecc+:xnack-" }), std::string("PINNED"));
+    CHECK_EQ(pick(b, { pre + "gfx942:sramecc-:xnack-" }), std::string("ANYMODE"));
+    CHECK_EQ(pick(b, { "gfx942:sramecc+:xnack-" }), std::string("PINNED"));   /* no prefix */
+    std::string why;
+    CHECK_EQ(pick(b, { pre + "gfx1100" }, &why), std::string());
+    CHECK(has(why, "gfx1201") && has(why, "gfx942:sramecc+:xnack-") && has(why, "this card runs [gfx1100]"));
+    /* A card without the mode a code object pins cannot run it. */
+    const auto pinned = offload_bundle({ { "hip-amdgcn-amd-amdhsa--gfx90a:xnack-", "X" } });
+    CHECK_EQ(pick(pinned, { pre + "gfx90a" }, &why), std::string());
+    CHECK_EQ(pick(pinned, { pre + "gfx90a:xnack-" }), std::string("X"));
+}
+
+TEST(a_bundle_that_is_not_one_is_refused_by_name) {
+    const std::string pre = "amdgcn-amd-amdhsa--";
+    std::string why;
+    std::vector<unsigned char> ccob(64, 0);
+    std::memcpy(ccob.data(), "CCOB", 4);
+    CHECK_EQ(pick(ccob, { pre + "gfx1201" }, &why), std::string());
+    CHECK(has(why, "compressed"));
+    std::vector<unsigned char> junk(64, 'x');
+    CHECK_EQ(pick(junk, { pre + "gfx1201" }, &why), std::string());
+    CHECK(has(why, "does not start with"));
+    auto none = offload_bundle({});
+    CHECK_EQ(pick(none, { pre + "gfx1201" }, &why), std::string());
+    CHECK(has(why, "entry count"));
+    auto many = offload_bundle({ { "hip-amdgcn-amd-amdhsa--gfx1201", "A" } });
+    const uint64_t n = 4097;
+    std::memcpy(many.data() + 24, &n, 8);
+    CHECK_EQ(pick(many, { pre + "gfx1201" }, &why), std::string());
+    CHECK(has(why, "entry count"));
+    auto triple = offload_bundle({ { "hip-amdgcn-amd-amdhsa--gfx1201", "A" } });
+    const uint64_t tl = 5000;
+    std::memcpy(triple.data() + 32 + 16, &tl, 8);
+    CHECK_EQ(pick(triple, { pre + "gfx1201" }, &why), std::string());
+    CHECK(has(why, "triple"));
+    const void* out = (const void*)1;
+    size_t size = 1;
+    CHECK(!rad::aql::bundle_code_object(nullptr, { pre + "gfx1201" }, &out, &size, &why));
+    CHECK(out == nullptr && size == 0);
+}
+
+TEST(kernel_argument_layouts_come_from_the_metadata_note) {
+    const auto elf = elf_with_note(two_kernels());
+    std::vector<rad::aql::KernelMeta> ks;
+    std::string why;
+    REQUIRE(rad::aql::code_object_kernels(elf.data(), elf.size(), &ks, &why));
+    REQUIRE_EQ(ks.size(), 2u);
+    const rad::aql::KernelMeta& k = ks[0];
+    CHECK_EQ(k.symbol, std::string("scale.kd"));
+    CHECK_EQ(k.kernarg_size, 280u);
+    CHECK_EQ(k.group_size, 70000u);
+    CHECK_EQ(k.private_size, 16u);
+    CHECK(!k.dynamic_stack);
+    REQUIRE_EQ(k.args.size(), 4u);
+    using H = rad::aql::Hidden;
+    const struct { uint32_t off, size; H h; } want[4] = {
+        { 0, 4, H::None }, { 8, 8, H::None }, { 16, 4, H::BlockCountX }, { 24, 8, H::Unsupported },
+    };
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK_EQ(k.args[i].offset, want[i].off);
+        CHECK_EQ(k.args[i].size, want[i].size);
+        CHECK(k.args[i].hidden == want[i].h);
+    }
+    CHECK_EQ(k.args[3].kind, std::string("hidden_hostcall_buffer"));
+    CHECK_EQ(ks[1].symbol, std::string("a_kernel_whose_symbol_is_longer_than_31.kd"));
+    CHECK(ks[1].dynamic_stack);
+    CHECK(ks[1].args.empty());
+}
+
+TEST(a_damaged_code_object_is_refused_not_misread) {
+    std::vector<rad::aql::KernelMeta> ks;
+    std::string why;
+    /* The note's descriptor cut short: the metadata is not there. */
+    auto cut = elf_with_note(two_kernels(), 40);
+    CHECK(!rad::aql::code_object_kernels(cut.data(), cut.size(), &ks, &why));
+    CHECK(has(why, "metadata"));
+    /* The note intact but its msgpack truncated inside a map. */
+    std::vector<unsigned char> half = two_kernels();
+    half.resize(half.size() / 2);
+    auto bad = elf_with_note(half);
+    CHECK(!rad::aql::code_object_kernels(bad.data(), bad.size(), &ks, &why));
+    CHECK(has(why, "malformed"));
+    /* Not ELF64, and program headers past the end. */
+    std::vector<unsigned char> elf = elf_with_note(two_kernels());
+    elf[4] = 1;
+    CHECK(!rad::aql::code_object_kernels(elf.data(), elf.size(), &ks, &why));
+    CHECK(has(why, "64-bit ELF"));
+    elf = elf_with_note(two_kernels());
+    elf[56] = 200;
+    CHECK(!rad::aql::code_object_kernels(elf.data(), elf.size(), &ks, &why));
+    CHECK(has(why, "past its end"));
+    /* Metadata without a kernel list. */
+    MsgPack m;
+    m.map(1);
+    m.str("amdhsa.version"); m.arr(0);
+    auto nolist = elf_with_note(m.b);
+    CHECK(!rad::aql::code_object_kernels(nolist.data(), nolist.size(), &ks, &why));
+    CHECK(has(why, "amdhsa.kernels"));
+}
+
+/* ------------------------------------------------------------------ parking (paging.cpp)
+ *
+ * An engine's large device allocations are mapped in chunks a park can take off the card and put
+ * back at the same address. Whatever route a chunk's bytes take while it is out (a host copy, the
+ * disk tier, a copy kept from an earlier park, the container it was loaded from), they must come
+ * back exact.
+ */
+namespace {
+
+/* The paging chunk (paging.cpp's kChunk). */
+constexpr int64_t kParkChunk = (int64_t)64 << 20;
+
+/* One pageable allocation under engine owner `owner`, and in `want` the pattern it should hold
+ * (upload() writes it). The owner's scope stays current for the object's life, so further
+ * allocations join the same owner. */
+struct Paged {
+    rad::EngineScope es;
+    int owner;
+    int64_t n;
+    void* d = nullptr;
+    std::vector<uint8_t> want;
+    RadStream s = nullptr;
+    Paged(int o, int64_t bytes, uint32_t seed)
+        : es(o, "paging-test"), owner(o), n(bytes), want((size_t)bytes) {
+        rad_dev_set(0);
+        fill(want.data(), n, seed);
+        d = rad_dev_alloc(n, RAD_MEM_DEVICE);
+        rad_stream_create(&s, 0);
+    }
+    ~Paged() {
+        if (d) rad_dev_free(d, RAD_MEM_DEVICE);
+        if (s) rad_stream_destroy(s);
+    }
+    /* Through pinned memory: an async copy reads its host side when it runs. */
+    int upload() {
+        void* h = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!h) return RAD_E_NOMEM;
+        std::memcpy(h, want.data(), (size_t)n);
+        int rc = rad_memcpy_async(d, h, n, s);
+        if (rc >= 0) rc = rad_stream_sync(s);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+        return rc;
+    }
+    /* Index of the first byte that differs from `want`, -1 when none does, -2 when the copy back
+     * fails. */
+    int64_t first_bad() {
+        std::vector<uint8_t> got((size_t)n);
+        void* h = rad_dev_alloc(n, RAD_MEM_HOST_PINNED);
+        if (!h) return -2;
+        const bool ok = rad_memcpy_async(h, d, n, s) >= 0 && rad_stream_sync(s) >= 0;
+        if (ok) std::memcpy(got.data(), h, (size_t)n);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+        if (!ok) return -2;
+        int64_t first = -1, count = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (got[(size_t)i] != want[(size_t)i]) {
+                if (first < 0) first = i;
+                ++count;
+            }
+        if (first >= 0) {
+            std::fprintf(stderr, "    %lld of %lld bytes differ, first at %lld (got %02x, want %02x); by chunk:",
+                         (long long)count, (long long)n, (long long)first, got[(size_t)first],
+                         want[(size_t)first]);
+            for (int64_t c0 = 0; c0 < n; c0 += kParkChunk) {
+                int64_t b = 0;
+                for (int64_t i = c0; i < std::min(n, c0 + kParkChunk); ++i) b += got[(size_t)i] != want[(size_t)i];
+                std::fprintf(stderr, " %lld", (long long)b);
+            }
+            std::fprintf(stderr, "\n");
+        }
+        return first;
+    }
+};
+
+/* A disk tier of the case's own, under the binary's temporary directory. */
+std::string park_dir() {
+    static int n = 0;
+    const std::string d = radtest::tmpdir() + "/park-" + std::to_string(++n);
+    return ::mkdir(d.c_str(), 0700) == 0 ? d : "";
+}
+
+}  // namespace
+
+/* Three and a bit chunks, so the last one is short. */
+constexpr int64_t kParkBytes = 3 * kParkChunk + (5 << 20);
+
+/* Chunks mapped again at their old addresses and written at once: until the cards' translation
+ * caches are flushed in full the writes land nowhere (Linux 7.1 with gfx1201), so the maps are
+ * followed by dev_settle_maps's flush before anything writes them. This is the page-in's order:
+ * every chunk released, then all mapped, then each written. */
+TEST(a_chunk_remapped_right_after_its_release_keeps_what_is_written) {
+    if (!need_vmem()) return;
+    const int64_t c = kParkChunk;
+    const int K = 4;
+    rad_dev_set(0);
+    const auto* be = rad::active_backend();
+    char* res = (char*)be->vmem_reserve(K * c, rad::VMem::granularity());
+    CHECK(res != nullptr);
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    std::vector<uint8_t> want((size_t)(K * c));
+    fill(want.data(), K * c, 99u);
+    uint8_t* h = (uint8_t*)rad_dev_alloc(K * c, RAD_MEM_HOST_PINNED);
+    CHECK(h != nullptr);
+    for (int round = 0; round < 3; ++round) {
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_commit(res + k * c, c));
+        for (int k = K - 1; k >= 0; --k) CHECK_OK(be->vmem_decommit(res + k * c, c));
+        std::memcpy(h, want.data(), (size_t)(K * c));
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_commit(res + k * c, c));
+        CHECK_OK(rad::dev_settle_maps());
+        for (int k = 0; k < K; ++k) CHECK_OK(rad_memcpy_async(res + k * c, h + k * c, c, s));
+        CHECK_OK(rad_stream_sync(s));
+        std::memset(h, 0, (size_t)(K * c));
+        CHECK_OK(rad_memcpy_async(h, res, K * c, s));
+        CHECK_OK(rad_stream_sync(s));
+        for (int k = 0; k < K; ++k)
+            CHECK_EQ(std::memcmp(h + k * c, want.data() + k * c, (size_t)c), 0);
+        for (int k = 0; k < K; ++k) CHECK_OK(be->vmem_decommit(res + k * c, c));
+    }
+    rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    be->vmem_release(res, K * c);
+    rad_stream_destroy(s);
+}
+
+TEST(a_parked_allocation_comes_back_exact_from_host_copies) {
+    if (!need_host_copies()) return;
+    Paged a(9101, kParkBytes, 11u);
+    CHECK(a.d != nullptr);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);   /* the round trip itself, before any park */
+    rad::PageOut req;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.disk, 0);
+    CHECK(res.host >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+TEST(a_parked_allocation_comes_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9102, kParkBytes, 12u);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK(res.disk >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* Sealed, the disk copy stays good for the next park, which writes nothing. */
+    rad::dev_page_seal(a.d);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.disk, 0);
+    CHECK(res.reused >= kParkBytes);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* More chunks than a page-out batch (16) and than the read-back's staging ring (16), so buffers
+ * are reused on both sides. */
+TEST(a_large_parked_allocation_comes_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    const int64_t n = 18 * kParkChunk + (3 << 20);
+    Paged a(9105, n, 15u);
+    CHECK(a.d != nullptr);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= n);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* An engine owns several pageable allocations, each with its own page file. */
+TEST(two_allocations_of_one_owner_come_back_exact_from_the_disk_tier) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    const int64_t n = 6 * kParkChunk + (3 << 20);
+    Paged a(9106, n, 21u);
+    void* d2 = rad_dev_alloc(n / 2, RAD_MEM_DEVICE);   /* same owner: a's scope is current */
+    CHECK(a.d != nullptr && d2 != nullptr);
+    std::vector<uint8_t> want2((size_t)(n / 2));
+    fill(want2.data(), n / 2, 22u);   /* not 20: the filler sets the seed's low bit, so 20 is 21 */
+    {
+        void* h = rad_dev_alloc(n / 2, RAD_MEM_HOST_PINNED);
+        std::memcpy(h, want2.data(), (size_t)(n / 2));
+        CHECK_OK(rad_memcpy_async(d2, h, n / 2, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    }
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= n + n / 2);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    {
+        void* h = rad_dev_alloc(n / 2, RAD_MEM_HOST_PINNED);
+        CHECK_OK(rad_memcpy_async(h, d2, n / 2, a.s));
+        CHECK_OK(rad_stream_sync(a.s));
+        CHECK_EQ(std::memcmp(h, want2.data(), (size_t)(n / 2)), 0);
+        rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    }
+    rad_dev_free(d2, RAD_MEM_DEVICE);
+}
+
+TEST(a_partial_park_takes_only_what_is_asked_and_comes_back_exact) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    Paged a(9103, kParkBytes, 13u);
+    CHECK_OK(a.upload());
+    const int dev = 0;   /* Paged allocates on card 0 */
+    rad::PageOut req;
+    req.want[dev] = (int64_t)100 << 20;
+    req.host_budget = kParkChunk;  /* what does not fit goes to disk */
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    /* Whole chunks, from the top: the short last one and two more, not all four. */
+    CHECK(res.freed[dev] >= ((int64_t)100 << 20));
+    CHECK(res.freed[dev] < kParkBytes);
+    CHECK_EQ(res.host + res.disk, res.freed[dev]);
+    CHECK(res.host <= kParkChunk);
+    CHECK(res.disk > 0);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+TEST(a_chunk_loaded_from_a_container_parks_against_it) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    Paged a(9104, kParkBytes, 14u);
+    /* The container holds the bytes at an offset that is not chunk-aligned, as weights are; the
+     * last 5 MiB of the allocation never came from it and are zero. */
+    const int64_t at = 3 * 4096 + 512, from = kParkBytes - (5 << 20);
+    std::memset(a.want.data() + from, 0, (size_t)(kParkBytes - from));
+    const std::string path = dir + "/container.bin";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        std::vector<uint8_t> pad((size_t)at, 0x7e);
+        std::fwrite(pad.data(), 1, pad.size(), f);
+        std::fwrite(a.want.data(), 1, (size_t)from, f);
+        std::fclose(f);
+    }
+    CHECK_OK(a.upload());
+    const int fid = rad::dev_page_file(path.c_str());
+    /* As the load's sweep records it (engine_bringup.cpp): a run as a single piece, and one as
+     * strided rows. */
+    rad::dev_page_source(a.d, fid, at, (int64_t)100 << 20, 1, 0);
+    const int64_t rows = (from - ((int64_t)100 << 20)) / 4096;
+    rad::dev_page_source((char*)a.d + ((int64_t)100 << 20), fid, at + ((int64_t)100 << 20), 4096, rows, 4096);
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.file >= 3 * kParkChunk);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* A write since the load: that chunk no longer matches, and goes to disk instead. */
+    a.want[70 << 20] ^= 0xff;
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (70 << 20), 1);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= kParkChunk);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* A write into a sealed chunk after a park leaves its copy exact but for the blocks written: the
+ * next park moves only those, into the host copy or onto the disk copy. */
+TEST(a_write_after_a_park_moves_only_its_blocks_back_out) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    const int64_t blk = (int64_t)64 << 10;
+    /* Two writes: one byte in chunk 1, and 20 bytes across a block boundary in chunk 2. */
+    auto scribble = [&](Paged& a, uint8_t x) {
+        a.want[(size_t)(70 << 20)] ^= x;
+        for (int k = 0; k < 20; ++k) a.want[(size_t)((130 << 20) - 10 + k)] ^= x;
+        CHECK_OK(a.upload());
+        rad::dev_page_invalidate((char*)a.d + (70 << 20), 1);
+        rad::dev_page_invalidate((char*)a.d + (130 << 20) - 10, 20);
+    };
+    /* The host copy's half only where parking keeps host copies (need_host_copies). */
+    const auto* be = rad::active_backend();
+    const int halves = be->vmem_commit_host && be->vmem_swap ? 2 : 1;
+    for (int host = 0; host < halves; ++host) {
+        Paged a(9107 + host, kParkBytes, 31u + 2 * host);
+        CHECK_OK(a.upload());
+        rad::dev_page_seal(a.d);
+        rad::PageOut req;
+        req.host_budget = host ? ((int64_t)1 << 30) : 0;
+        req.dir = dir;
+        rad::PageResult res;
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_OK(rad::dev_page_in(a.owner));
+        scribble(a, 0x5a);
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_EQ(host ? res.host : res.disk, 3 * blk);
+        CHECK_EQ(host ? res.disk : res.host, 0);
+        CHECK_EQ(res.reused, res.freed[0] - 3 * blk);   /* the span: kParkBytes rounded up */
+        CHECK_OK(rad::dev_page_in(a.owner));
+        CHECK_EQ(a.first_bad(), -1);
+    }
+}
+
+/* An allocation its owner refills (a weights pool and its container) leaves the card with nothing
+ * copied, whatever host room or disk tier there is; the page-in maps it back and hands it to the
+ * owner, which here writes it again; a page-in that would not hand it back refuses. */
+TEST(an_allocation_its_owner_refills_parks_with_no_copy_and_comes_back_to_be_filled) {
+    if (!need_vmem()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9111, kParkBytes, 53u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::dev_page_refilled(a.d);
+    CHECK_EQ(rad::dev_page_uncopied(a.owner), 0);
+    for (int round = 0; round < 2; ++round) {
+        rad::PageOut req;
+        req.host_budget = (int64_t)1 << 30;
+        req.dir = dir;
+        rad::PageResult res;
+        CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+        CHECK_EQ(res.host, 0);
+        CHECK_EQ(res.disk, 0);
+        CHECK_EQ(res.file, res.freed[0]);
+        CHECK(res.freed[0] >= kParkBytes);
+        CHECK_EQ(rad::dev_page_in(a.owner), RAD_E_STATE);   /* nobody to fill it */
+        std::vector<rad::PageSpan> spans;
+        CHECK_OK(rad::dev_page_in(a.owner, &spans));
+        REQUIRE_EQ(spans.size(), (size_t)1);                  /* adjacent chunks merged */
+        CHECK(spans[0].p == (char*)a.d);
+        CHECK(spans[0].bytes >= kParkBytes);
+        CHECK_EQ(spans[0].device, 0);
+        CHECK_OK(a.upload());
+        CHECK_EQ(a.first_bad(), -1);
+    }
+    /* A partial park takes chunks from the top (the short last one, then a whole one) and hands
+     * back only those. */
+    rad::PageOut part;
+    part.want[0] = kParkChunk;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, part, &res));
+    CHECK(res.file >= kParkChunk);
+    CHECK(res.file < res.freed[0] + 1 && res.file < kParkBytes);
+    std::vector<rad::PageSpan> spans;
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    REQUIRE_EQ(spans.size(), (size_t)1);
+    CHECK_EQ(spans[0].bytes, res.file);
+    CHECK(spans[0].p > (char*)a.d);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* A host fill of an allocation its owner refills: host memory mapped at its parked chunks, filled by
+ * the owner (here a copy from the card's side, as the refill's DMA writes it), comes back over the
+ * link with nothing handed back; the copy stays exact, so the next park leaves by the swap; once
+ * the host copies are dropped the chunks are the owner's to refill again. */
+TEST(a_refilled_allocation_fills_into_host_memory_and_keeps_that_copy) {
+    if (!need_host_copies()) return;
+    Paged a(9113, kParkBytes, 59u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::dev_page_refilled(a.d);
+    rad::PageOut req;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const std::vector<rad::PageSpan> pend = rad::dev_page_refill_chunks(a.owner);
+    CHECK_EQ(pend.size(), (size_t)4);
+    CHECK(rad::dev_page_fillable(a.owner) >= kParkBytes);
+    CHECK_OK(rad::dev_page_fill_begin(a.owner, pend));
+    CHECK_OK(a.upload());   /* into the host memory now mapped at the chunks */
+    rad::dev_page_fill_end(a.owner, pend, true);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), 0);
+    CHECK(rad::dev_page_refill_chunks(a.owner).empty());
+    std::vector<rad::PageSpan> spans;
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK(spans.empty());
+    CHECK_EQ(a.first_bad(), -1);
+    /* The kept copy is exact: the park swaps, copies nothing, and the restore copies it back. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.reused, res.freed[0]);
+    CHECK_EQ(res.file, 0);
+    CHECK_EQ(res.host, 0);
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK(spans.empty());
+    CHECK_EQ(a.first_bad(), -1);
+    /* Dropped while parked, the copies leave the chunks to the owner again. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(rad::dev_page_drop_host(a.owner) >= kParkBytes);
+    CHECK_EQ(rad::dev_page_refill_chunks(a.owner).size(), (size_t)4);
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    REQUIRE_EQ(spans.size(), (size_t)1);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+    /* A fill that fails gives its host memory back and leaves the chunks to be refilled. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const int64_t host0 = rad::dev_page_host_bytes();
+    const std::vector<rad::PageSpan> again = rad::dev_page_refill_chunks(a.owner);
+    CHECK_OK(rad::dev_page_fill_begin(a.owner, again));
+    CHECK(rad::dev_page_host_bytes() >= host0 + kParkBytes);
+    rad::dev_page_fill_end(a.owner, again, false);
+    CHECK_EQ(rad::dev_page_host_bytes(), host0);
+    CHECK_EQ(rad::dev_page_refill_chunks(a.owner).size(), (size_t)4);
+    spans.clear();
+    CHECK_OK(rad::dev_page_in(a.owner, &spans));
+    CHECK_EQ(spans.size(), (size_t)1);
+    CHECK_OK(a.upload());
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Parked to host memory, the allocation stays mapped at its address: the card reads it and writes
+ * it there, over the link, and a restore brings back what was written meanwhile. A second park
+ * of the sealed allocation, its host copy kept, leaves by a swap of mappings and copies nothing. */
+TEST(a_parked_chunk_is_read_and_written_in_place_from_host_memory) {
+    if (!need_host_copies()) return;
+    Paged a(9109, kParkBytes, 41u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = (int64_t)1 << 30;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.host >= kParkBytes);
+    CHECK(rad::dev_page_host_bytes() >= kParkBytes);
+    CHECK_EQ(a.first_bad(), -1);            /* read in place, out of host memory */
+    a.want[(size_t)(100 << 20)] ^= 0x3c;    /* written in place */
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (100 << 20), 1);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK_EQ(res.reused, res.freed[0]);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    /* The kept copies go; the host memory with them. */
+    const int64_t before = rad::dev_page_host_bytes();
+    CHECK(rad::dev_page_drop_copies(a.owner) >= kParkBytes);
+    CHECK(rad::dev_page_host_bytes() <= before - kParkBytes);
+}
+
+/* A live restore leaves a sealed allocation's chunks in host memory, read in place; promotion
+ * moves them onto the card in a quiet window. A write that lands between the promotion's copy and
+ * its swap (here, inside the quiet hook before the swap runs) is copied again, not lost. */
+TEST(a_live_restore_serves_from_host_memory_until_promoted) {
+    if (!need_host_copies()) return;
+    Paged a(9110, kParkBytes, 51u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = (int64_t)1 << 30;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    int64_t left = 0;
+    CHECK_OK(rad::dev_page_in_live(a.owner, &left));
+    CHECK_EQ(left, res.freed[0]);
+    CHECK_EQ(rad::dev_page_live_bytes(a.owner), left);
+    CHECK_EQ(a.first_bad(), -1);
+    bool wrote = false;
+    auto quiet = [&](const std::function<int()>& fn) -> int {
+        if (!wrote) {
+            wrote = true;
+            a.want[(size_t)(10 << 20)] ^= 0x77;
+            if (a.upload() < 0) return RAD_E_DEVICE;
+            rad::dev_page_invalidate((char*)a.d + (10 << 20), 1);
+        }
+        return fn();
+    };
+    /* One chunk at a time: the write lands in the first. */
+    int64_t moved = 0;
+    for (int k = 0; k < 8; ++k) {
+        const int64_t n = rad::dev_page_promote(a.owner, kParkChunk, quiet);
+        CHECK(n >= 0);
+        if (n <= 0) break;
+        moved += n;
+    }
+    CHECK_EQ(moved, left);
+    CHECK_EQ(rad::dev_page_live_bytes(a.owner), 0);
+    CHECK_EQ(a.first_bad(), -1);
+    /* Promoted with its host copy kept: the next park is a swap. */
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Parked to the disk tier alone, then read into host memory while it waits: the chunks are
+ * readable in place there, and the restore copies them over the link. */
+TEST(a_chunk_parked_on_the_drive_fills_into_host_memory_and_comes_back_exact) {
+    if (!need_host_copies()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9111, kParkBytes, 61u);
+    CHECK_OK(a.upload());
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK_EQ(res.host, 0);
+    const int64_t out = res.freed[0];
+    CHECK_EQ(rad::dev_page_fillable(a.owner), out);
+    const int64_t held = rad::dev_page_host_bytes();
+    /* One chunk, then the rest. */
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, 1), kParkChunk);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), out - kParkChunk);
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), out - kParkChunk);
+    CHECK_EQ(rad::dev_page_fillable(a.owner), 0);
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), 0);
+    CHECK_EQ(rad::dev_page_host_bytes() - held, out);
+    CHECK_EQ(a.first_bad(), -1);   /* read in place from host memory */
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+    CHECK_EQ(rad::dev_page_host_bytes(), held);
+}
+
+/* A chunk read in place from host memory and written there (a live restore after a fill from the
+ * drive) has its host copy as its only exact one: the drive's copy is stale. Promoted onto the
+ * card and its host copy then let go, the next park writes it again rather than unmapping it
+ * against the drive, and it comes back with the write. */
+TEST(a_chunk_written_in_place_does_not_go_out_against_its_stale_drive_copy) {
+    if (!need_host_copies()) return;
+    const std::string dir = park_dir();
+    CHECK(!dir.empty());
+    Paged a(9112, kParkBytes, 71u);
+    CHECK_OK(a.upload());
+    rad::dev_page_seal(a.d);
+    rad::PageOut req;
+    req.host_budget = 0;
+    req.dir = dir;
+    rad::PageResult res;
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    const int64_t out = res.freed[0];
+    CHECK_EQ(rad::dev_page_fill_host(a.owner, INT64_MAX), out);
+    int64_t left = 0;
+    CHECK_OK(rad::dev_page_in_live(a.owner, &left));
+    CHECK_EQ(left, out);
+    a.want[(size_t)(10 << 20)] ^= 0x5a;    /* written in place, in host memory */
+    CHECK_OK(a.upload());
+    rad::dev_page_invalidate((char*)a.d + (10 << 20), 1);
+    int64_t moved = 0;
+    for (int k = 0; k < 64; ++k) {
+        const int64_t n = rad::dev_page_promote(a.owner, INT64_MAX,
+                                                [](const std::function<int()>& fn) { return fn(); });
+        CHECK(n >= 0);
+        if (n <= 0) break;
+        moved += n;
+    }
+    CHECK_EQ(moved, left);
+    CHECK_EQ(a.first_bad(), -1);
+    (void)rad::dev_page_drop_copies(a.owner);
+    CHECK_OK(rad::dev_page_out(a.owner, req, &res));
+    CHECK(res.disk >= kParkChunk);          /* the written chunk, at least, went to the drive again */
+    CHECK_OK(rad::dev_page_in(a.owner));
+    CHECK_EQ(a.first_bad(), -1);
+}
+
+/* Granules mapped and unmapped at random, so the physical pages a freed granule held come back
+ * under other addresses and addresses come back on other pages: each live granule must hold only
+ * what was last written to it. On Linux 7.1 with gfx1201 an address mapped again kept its previous
+ * page until the cards' translations were flushed in full (dev_settle_maps, which VMem::commit
+ * runs): two live granules then shared a page and one's writes showed in the other. A process that
+ * opens the render node meanwhile (rocm-smi) made the alias far more frequent, so this is also run
+ * beside one. */
+TEST(granules_remapped_at_random_never_share_a_page) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    constexpr int kGranules = 128, kCycles = 1000;
+    /* Each granule's head and tail are written and read back: a page two granules share shows
+     * at both ends. */
+    constexpr int64_t kProbe = 4096;
+    rad_dev_set(0);
+    rad::VMem v;
+    CHECK_OK(v.reserve(kGranules * g));
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    uint32_t* stage = static_cast<uint32_t*>(rad_dev_alloc(kProbe, RAD_MEM_HOST_PINNED));
+    uint32_t* back = static_cast<uint32_t*>(rad_dev_alloc(kGranules * 2 * kProbe, RAD_MEM_HOST_PINNED));
+    CHECK(stage && back);
+    std::vector<uint32_t> tag(kGranules, 0);   /* the word a live granule holds; 0: unmapped */
+    uint32_t next = 1;
+    std::mt19937 rng(20261106u);
+    char* const base = static_cast<char*>(v.base());
+    auto map = [&](int i) -> int {
+        if (const int rc = v.commit(i * g, g); rc < 0) return rc;
+        tag[i] = next++;
+        std::fill(stage, stage + kProbe / 4, tag[i]);
+        if (const int rc = rad_memcpy_async(base + i * g, stage, kProbe, s); rc < 0) return rc;
+        if (const int rc = rad_memcpy_async(base + (i + 1) * g - kProbe, stage, kProbe, s); rc < 0) return rc;
+        return rad_stream_sync(s);
+    };
+    for (int i = 0; i < kGranules; i += 2) CHECK_OK(map(i));
+    int bad = 0, first_bad_cycle = -1, first_bad_granule = -1;
+    for (int c = 0; c < kCycles && bad == 0; ++c) {
+        std::vector<int> live, dead;
+        for (int i = 0; i < kGranules; ++i) (tag[i] ? live : dead).push_back(i);
+        if (!live.empty() && (dead.empty() || rng() % 2)) {
+            const int i = live[rng() % live.size()];
+            CHECK_OK(v.decommit(i * g, g));
+            tag[i] = 0;
+            continue;
+        }
+        CHECK_OK(map(dead[rng() % dead.size()]));
+        /* Every live granule's head and tail, in one batch. */
+        int k = 0;
+        for (int i = 0; i < kGranules; ++i) {
+            if (!tag[i]) continue;
+            char* dst = reinterpret_cast<char*>(back) + (int64_t)k * 2 * kProbe;
+            CHECK_OK(rad_memcpy_async(dst, base + i * g, kProbe, s));
+            CHECK_OK(rad_memcpy_async(dst + kProbe, base + (i + 1) * g - kProbe, kProbe, s));
+            ++k;
+        }
+        CHECK_OK(rad_stream_sync(s));
+        k = 0;
+        for (int i = 0; i < kGranules; ++i) {
+            if (!tag[i]) continue;
+            const uint32_t* w = back + (int64_t)k * 2 * kProbe / 4;
+            for (int64_t j = 0; j < 2 * kProbe / 4; ++j)
+                if (w[j] != tag[i]) {
+                    if (bad++ == 0) { first_bad_cycle = c; first_bad_granule = i; }
+                    break;
+                }
+            ++k;
+        }
+    }
+    if (bad) fprintf(stderr, "    %d granule(s) held another's bytes, first granule %d at cycle %d\n", bad,
+                     first_bad_granule, first_bad_cycle);
+    CHECK_EQ(bad, 0);
+    rad_dev_free(stage, RAD_MEM_HOST_PINNED);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    rad_stream_destroy(s);
+}
+
+/* Brilliance: the native HIP backend refuses a copy or fill whose range lies in elastic memory and
+ * is not backed to its end. The runtime does not: it takes an unmapped address for pageable host
+ * memory, and its staging copy faults in the process (win/device/hipnative.cpp, vm_backed). A
+ * refusal enqueues nothing. */
+TEST(a_copy_into_unbacked_elastic_memory_is_refused_on_the_native_hip_backend) {
+    if (!need_vmem()) return;
+    if (std::strcmp(rad::device_backend_name(), "hipnative") != 0) SKIP("the native HIP backend's check");
+    const int64_t g = rad::VMem::granularity();
+    rad_dev_set(0);
+    const auto* be = rad::active_backend();
+    char* res = (char*)be->vmem_reserve(4 * g, g);
+    CHECK(res != nullptr);
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    uint8_t* h = (uint8_t*)rad_dev_alloc(2 * g, RAD_MEM_HOST_PINNED);
+    uint8_t* back = (uint8_t*)rad_dev_alloc(2 * g, RAD_MEM_HOST_PINNED);
+    CHECK(h != nullptr && back != nullptr);
+    fill(h, 2 * g, 77u);
+    /* Nothing backed: refused both ways, and as a fill and a list. */
+    CHECK_EQ(rad_memcpy_async(res, h, g, s), RAD_E_INVAL);
+    CHECK_EQ(rad_memcpy_async(back, res, g, s), RAD_E_INVAL);
+    CHECK_EQ(rad_memset_async(res + g, 0, 4096, s), RAD_E_INVAL);
+    const RadCopySeg seg[2] = { { h, back, 4096 }, { h, res + 3 * g, 4096 } };
+    CHECK_EQ(rad_memcpy_list_async(seg, 2, 0, s), RAD_E_INVAL);
+    CHECK(std::strstr(rad_dev_last_error(), "not backed") != nullptr);
+    /* One granule backed: a copy inside it runs; one that runs out of it at either end does not. */
+    CHECK_OK(be->vmem_commit(res + g, g));
+    CHECK_OK(rad_memcpy_async(res + g, h, g, s));
+    CHECK_EQ(rad_memcpy_async(res + g, h, 2 * g, s), RAD_E_INVAL);
+    CHECK_EQ(rad_memcpy_async(res + g - 4096, h, 8192, s), RAD_E_INVAL);
+    CHECK_EQ(rad_memcpy_async(res + 2 * g - 4096, h, 8192, s), RAD_E_INVAL);
+    /* Two adjacent mappings are one backed run. */
+    CHECK_OK(be->vmem_commit(res + 2 * g, g));
+    CHECK_OK(rad_memcpy_async(res + g, h, 2 * g, s));
+    std::memset(back, 0, (size_t)(2 * g));
+    CHECK_OK(rad_memcpy_async(back, res + g, 2 * g, s));
+    CHECK_OK(rad_stream_sync(s));
+    CHECK_EQ(std::memcmp(back, h, (size_t)(2 * g)), 0);
+    /* Unbacked again, refused again. */
+    CHECK_OK(be->vmem_decommit(res + g, 2 * g));
+    CHECK_EQ(rad_memcpy_async(back, res + g, g, s), RAD_E_INVAL);
+    CHECK_OK(rad_stream_sync(s));
+    rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    be->vmem_release(res, 4 * g);
+    rad_stream_destroy(s);
+}
+
+/* Brilliance: a pitched copy over elastic memory, which is a mapping a granule: a rectangle longer
+ * than a mapping, and a short one that only crosses from one mapping into the next, both land
+ * whole and leave the bytes between their rows alone. A KV checkpoint copies layer rows a stride
+ * apart across many granules (kv.cpp). HIP's own pitched copy refuses a rectangle longer than the
+ * mapping it starts in, so the native backend copies such rows singly (hipnative.cpp,
+ * n_memcpy_2d_async). The fill before them is one fill across every mapping. */
+TEST(a_pitched_copy_across_mappings_lands_whole) {
+    if (!need_vmem()) return;
+    const int64_t g = rad::VMem::granularity();
+    const int64_t w = 48 << 10, pitch = 64 << 10;
+    const int rows = (int)(3 * g / pitch), few = 4;
+    if (rows < 2 * few || g % pitch) SKIP("a granule of %lld bytes", (long long)g);
+    rad_dev_set(0);
+    rad::VMem v;
+    CHECK_OK(v.reserve(8 * g));
+    CHECK_OK(v.commit(0, 8 * g));
+    char* const base = static_cast<char*>(v.base());
+    RadStream s = nullptr;
+    CHECK_OK(rad_stream_create(&s, 0));
+    const int64_t ext = (rows - 1) * pitch + w;   /* a long rectangle's extent: three granules */
+    uint8_t* h = (uint8_t*)rad_dev_alloc(rows * w, RAD_MEM_HOST_PINNED);
+    uint8_t* back = (uint8_t*)rad_dev_alloc(ext, RAD_MEM_HOST_PINNED);
+    uint8_t* packed = (uint8_t*)rad_dev_alloc(rows * w, RAD_MEM_HOST_PINNED);
+    CHECK(h && back && packed);
+    fill(h, rows * w, 83u);
+    /* Rows `n` of the pattern at `at`, a pitch apart, with the fill between them. */
+    auto holds = [&](const char* at, int n) -> int {
+        const int64_t e = (int64_t)(n - 1) * pitch + w;
+        std::memset(back, 0, (size_t)e);
+        if (rad_memcpy_async(back, at, e, s) < 0 || rad_stream_sync(s) < 0) return -1;
+        int bad = 0;
+        for (int r = 0; r < n; ++r) {
+            bad += std::memcmp(back + r * pitch, h + r * w, (size_t)w) != 0;
+            if (r + 1 < n)
+                for (int64_t i = w; i < pitch; ++i) bad += back[r * pitch + i] != 0xEE;
+        }
+        return bad;
+    };
+    CHECK_OK(rad_memset_async(base, 0xEE, 8 * g, s));
+    char* const a = base + g / 2;            /* granules 0 to 3 */
+    char* const b = base + 4 * g + g / 2;    /* granules 4 to 7 */
+    char* const c = base + 4 * g - 2 * pitch;   /* two rows each side of a mapping's end */
+    CHECK_OK(rad_memcpy_2d_async(c, pitch, h, w, w, few, s));        /* host to card, short */
+    CHECK_EQ(holds(c, few), 0);
+    CHECK_OK(rad_memcpy_2d_async(a, pitch, h, w, w, rows, s));       /* host to card, long */
+    CHECK_EQ(holds(a, rows), 0);
+    CHECK_OK(rad_memcpy_2d_async(b, pitch, a, pitch, w, rows, s));   /* card to card, long */
+    CHECK_EQ(holds(b, rows), 0);
+    std::memset(packed, 0, (size_t)(rows * w));
+    CHECK_OK(rad_memcpy_2d_async(packed, w, b, pitch, w, rows, s));  /* card to host, long */
+    CHECK_OK(rad_stream_sync(s));
+    CHECK_EQ(std::memcmp(packed, h, (size_t)(rows * w)), 0);
+    rad_dev_free(h, RAD_MEM_HOST_PINNED);
+    rad_dev_free(back, RAD_MEM_HOST_PINNED);
+    rad_dev_free(packed, RAD_MEM_HOST_PINNED);
+    rad_stream_destroy(s);
+}
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
+
+/* Brilliance: rad_dev_map_file on the native HIP backend, which --ngram-placement ram=DIR uses on a
+ * card engine (core/format/table_share.h). A range of a file past a 2 MiB header, mapped for the
+ * cards: the host sees the file's bytes, a card copies them out through the mapping, a card's copy
+ * into the mapping reaches the file, and freeing the mapping leaves the file whole. */
+TEST(a_mapped_file_range_is_the_files_bytes_for_the_card_and_back) {
+    if (rad::device_is_host()) SKIP("a card only");
+    if (!rad::active_backend()->map_file) SKIP("no map_file on this backend");
+    constexpr int64_t kHead = (int64_t)2 << 20, kLen = (int64_t)3 << 20, kOdd = 4096 * 3 + 100;
+    const std::string path = temp_path("map_file");
+    int fd = _open(path.c_str(), _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    REQUIRE(fd >= 0);
+    std::vector<uint8_t> file((size_t)(kHead + kLen));
+    fill(file.data(), (int64_t)file.size(), 41);
+    REQUIRE_EQ(_write(fd, file.data(), (unsigned)file.size()), (int)file.size());
+
+    uint8_t* m = (uint8_t*)rad_dev_map_file(fd, kHead, kLen);
+    if (!m) fprintf(stderr, "    rad_dev_map_file: %s\n", rad_dev_last_error());
+    REQUIRE(m != nullptr);
+    CHECK_EQ(std::memcmp(m, file.data() + kHead, (size_t)kLen), 0);
+
+    /* The address a kernel reads it at (on Windows not the host's: hipnative.cpp, map_file). */
+    uint8_t* on_card = (uint8_t*)rad_dev_device_ptr(m);
+    REQUIRE(on_card != nullptr);
+
+    Stream st;
+    DevBuf<uint8_t> card(kLen, RAD_MEM_DEVICE), mark(kOdd, RAD_MEM_DEVICE), back(kLen, RAD_MEM_HOST_PINNED);
+    REQUIRE(card && mark && back);
+    for (uint8_t* from : { m, on_card }) {                      /* the card reads the mapping */
+        std::memset(back, 0, (size_t)kLen);
+        CHECK_OK(rad_memset_async(card, 0, kLen, st.s));
+        CHECK_OK(rad_memcpy_async(card, from, kLen, st.s));
+        CHECK_OK(rad_memcpy_async(back, card, kLen, st.s));
+        CHECK_OK(rad_stream_sync(st.s));
+        CHECK_EQ(std::memcmp(back, file.data() + kHead, (size_t)kLen), 0);
+    }
+    CHECK_OK(rad_memset_async(mark, 0x5a, kOdd, st.s));
+    CHECK_OK(rad_memcpy_async(on_card + 4096, mark, kOdd, st.s));   /* and writes into it */
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ((int)m[4096], 0x5a);
+    CHECK_EQ((int)m[4096 + kOdd - 1], 0x5a);
+    rad_dev_free(m, RAD_MEM_HOST_MAPPED);
+
+    std::vector<uint8_t> now(file.size());
+    REQUIRE_EQ(_lseeki64(fd, 0, SEEK_SET), 0ll);
+    REQUIRE_EQ(_read(fd, now.data(), (unsigned)now.size()), (int)now.size());
+    _close(fd);
+    _unlink(path.c_str());
+    std::memset(file.data() + kHead + 4096, 0x5a, (size_t)kOdd);
+    CHECK_EQ(std::memcmp(now.data(), file.data(), file.size()), 0);
+}
+
+/* A range the file does not hold is refused, by name, with nothing left mapped. */
+TEST(a_file_range_past_the_end_is_refused) {
+    if (rad::device_is_host()) SKIP("a card only");
+    if (!rad::active_backend()->map_file) SKIP("no map_file on this backend");
+    const std::string path = temp_path("map_file_short");
+    int fd = _open(path.c_str(), _O_RDWR | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+    REQUIRE(fd >= 0);
+    std::vector<uint8_t> file((size_t)3 << 20);
+    REQUIRE_EQ(_write(fd, file.data(), (unsigned)file.size()), (int)file.size());
+    CHECK(rad_dev_map_file(fd, (int64_t)2 << 20, (int64_t)2 << 20) == nullptr);
+    CHECK(std::strstr(rad_dev_last_error(), "short of the range") != nullptr);
+    _close(fd);
+    _unlink(path.c_str());
+}
+#endif
+
+RAD_TEST_MAIN_HOST_KARGS()

@@ -1,0 +1,33 @@
+The FFmpeg libraries in bin\ (avcodec-62.dll, avformat-62.dll, avutil-60.dll, swresample-6.dll,
+swscale-9.dll) are FFmpeg 8.1.3, built for Brilliance with vcpkg from the recipe in the source
+tree's win\ffmpeg\, as this zip, an asset of the Brilliance 0.3.0-alpha.1 release:
+
+  brilliance-ffmpeg-8.1.3-win64-lgpl-20261118.zip
+  https://github.com/adamczhang/Brilliance/releases/download/v0.3.0-alpha.1/brilliance-ffmpeg-8.1.3-win64-lgpl-20261118.zip
+  SHA-256 1ebb1bdab0a56d1a47b342a5e4abbd9c7db21f507c7a7c711a11077e9e4a7f18
+
+They are used under the GNU Lesser General Public License, version 2.1 or later
+(ffmpeg.LICENSE.txt beside this file, FFmpeg's COPYING.LGPLv2.1). They were configured without
+--enable-gpl, --enable-nonfree or --enable-version3, and each reports "LGPL version 2.1 or later".
+
+Their source is FFmpeg's n8.1.3 tag archive,
+
+  https://github.com/ffmpeg/ffmpeg/archive/n8.1.3.tar.gz
+  SHA-256 09f990289327d3ebfedf4fc15cae3f884a65dab7a5aac7bbb5b01ff83900efd9
+
+and the same file, as an asset of the release,
+
+  https://github.com/adamczhang/Brilliance/releases/download/v0.3.0-alpha.1/ffmpeg-n8.1.3.tar.gz
+
+(the tag is also at https://git.ffmpeg.org/ffmpeg.git), with the patches of vcpkg's ffmpeg port
+(registry microsoft/vcpkg, tag 2026.07.29, commit 9e593bb18ea69cc5095e012465dcd675a822ed0d)
+applied in the order win\ffmpeg\ports\ffmpeg\portfile.cmake lists them. Those patches modify
+FFmpeg: its configure script and build files, a Windows include, nasm compatibility, WINVER for
+the Media Foundation code, and one added API the engine does not call; THIRD-PARTY.md lists each.
+The zip carries the whole recipe under source\, and win\ffmpeg\build-ffmpeg.ps1 rebuilds the DLLs
+from it; the full configure line is in the zip's BUILDINFO.txt and in each DLL
+(avcodec_configuration()). The libraries built into the DLLs (dav1d, libwebp, zlib and the AMD
+AMF headers) are listed in THIRD-PARTY.md with their licences and sources.
+
+radiance links them dynamically: replacing these DLLs with a build of the same FFmpeg major
+versions replaces FFmpeg in this program.

@@ -1,0 +1,14 @@
+# Brilliance profile: Qwen3.8-27B IQ4R-L-V4 on one R9700, 8K tokens, one request, plain decoding
+# (no speculation). The bring-up baseline: the simplest path, for comparing against.
+#
+#   bin\radiance.exe --config profiles\qwen27-8k-plain.yaml
+server:
+  host: 127.0.0.1
+  port: 8000
+models:
+  qwen3.8-27b:
+    model: D:/models/hf/StillDeadcode/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq4r-l-v4.rad
+    tp: 1
+    max-num-seqs: 1
+    max-model-len: 8192
+    num-speculative-tokens: 0

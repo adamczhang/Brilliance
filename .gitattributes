@@ -1,0 +1,5 @@
+# Brilliance: no line-ending conversion. The tree holds upstream's bytes (LF), shared with Linux.
+# Git for Windows' system default (core.autocrlf=true) would otherwise check text out as CRLF, and
+# those bytes reach the package and the vendor hashes; a clean clone then built a package whose every
+# text file differed from the repository's (found by a clean rebuild, 2026-11-17).
+* -text

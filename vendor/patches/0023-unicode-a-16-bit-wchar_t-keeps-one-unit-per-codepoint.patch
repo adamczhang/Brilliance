@@ -1,0 +1,38 @@
+diff --git a/src/unicode.cpp b/src/unicode.cpp
+index d362404..1462b9b 100644
+--- a/src/unicode.cpp
++++ b/src/unicode.cpp
+@@ -1384,6 +1384,33 @@ std::vector<std::string> unicode_regex_split(const std::string & text, const std
+                         wtext[i] = 0x0B;
+                     }
+                 }
++                // a 16-bit wchar_t (Windows) cannot hold a codepoint past U+FFFF, and the
++                // conversion above truncates it to an unrelated BMP character. These patterns use
++                // no unicode category, so all they can tell about such a codepoint is that it is
++                // not ASCII, not a space, not a digit and not a newline: a private-use character
++                // is all of those, and keeping one wchar_t per codepoint keeps the offsets right.
++                if (sizeof(wchar_t) < 4) {
++                    for (size_t i = 0; i < cpts.size(); ++i) {
++                        if (cpts[i] > 0xFFFF) {
++                            wtext[i] = (wchar_t) 0xE000;
++                        }
++                    }
++                }
++                // and \s must mean the same thing everywhere: Unicode whitespace was mapped to 0x0B
++                // above, so a non-ASCII character the regex's own traits ALSO call a space (the
++                // MSVC runtime's do for U+FEFF and others; glibc's "C" locale calls none a space)
++                // is not one, and gets the same neutral stand-in. Asked of the regex traits, not of
++                // iswspace, because that is the classification \s actually consults.
++                {
++                    static const std::regex_traits<wchar_t> traits;
++                    static const wchar_t s_name[] = { L's' };
++                    static const auto s_class = traits.lookup_classname(s_name, s_name + 1);
++                    for (size_t i = 0; i < wtext.size(); ++i) {
++                        if (wtext[i] > 0x7F && wtext[i] != 0x0B && traits.isctype(wtext[i], s_class)) {
++                            wtext[i] = (wchar_t) 0xE000;
++                        }
++                    }
++                }
+ 
+                 //printf("text: %s\n", text.c_str());
+                 //printf("regex_expr: %s\n", regex_expr.c_str());

@@ -1,0 +1,5 @@
+LTX-2.5 (Lightricks/LTX-2.5-Diffusers) is licensed by Lightricks Ltd. under the LTX-2.x Community License Agreement (LICENSE). Use of LTX-2.x and its Derivatives is subject to Section 4 and Attachment A of that agreement in their entirety, including all use restrictions and acceptable use policies.
+
+This copy has been modified: the text encoder's, the text connectors' and the diffusion transformer's linear weights were re-encoded from bfloat16 to int8 in a Hadamard-rotated domain (IQ8R: a u8 scale per row and 256 columns under a bfloat16 scale a row), the vocoders' weights were widened to float32, and the components were repackaged as one radiance .rad container. It is not an official Lightricks release and is not endorsed by Lightricks.
+
+Any entity with annual revenues of at least US$10,000,000 (a Commercial Entity under the agreement) must obtain a paid license from Lightricks (licensing@ltx.io) before any use of this Derivative other than a Non-Commercial Purpose.

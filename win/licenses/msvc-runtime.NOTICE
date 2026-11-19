@@ -1,0 +1,5 @@
+The Microsoft Visual C++ runtime libraries in bin\ (vcruntime140*.dll, msvcp140*.dll,
+concrt140.dll, vccorlib140.dll) are Microsoft's, copied app-locally from Visual Studio Build Tools
+18 (VC\Redist\MSVC\14.51.36231\x64\Microsoft.VC145.CRT). They are distributed as Distributable Code
+under the Visual Studio license terms; the list of distributable files is at
+https://aka.ms/vs/18/redistribution.

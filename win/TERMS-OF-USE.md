@@ -1,0 +1,224 @@
+# Terms of use
+
+These terms cover your use of this server and of the AI models it runs. The operator of this
+server, the person or organisation that runs it, sets them and is responsible for them.
+
+> **For the operator.** This page is a template that comes with Brilliance. It is not legal
+> advice, and the Brilliance and Radiance projects are not a party to it. Before you let other
+> people use your server, adopt it as your own: copy it, name yourself as the operator, remove the
+> models you do not serve, add your own terms, and set `terms-file:` under `server:` to your copy.
+> Then remove this note. Some model licences require whoever serves the model to other people to
+> pass the licence's use restrictions on to them as enforceable terms. The sections below carry
+> those restrictions for the models Brilliance 0.3.0 lists.
+
+## Using this service
+
+- By using this service you agree to these terms, including the section below for each model you
+  use.
+- You are responsible for what you send to the service, for what it makes for you, and for how you
+  use what it makes.
+- Follow the laws that apply to you and to your use of the service.
+- The operator may change these terms. The version on this page is the one that applies.
+
+## The models and their licences
+
+Each model keeps the licence its makers gave it. Where a licence restricts how the model and what
+it makes may be used, those restrictions are part of these terms whenever you use that model here.
+The full text of each licence is at `/terms/licenses` on this server.
+
+| Model | Licence | Use restrictions |
+|---|---|---|
+| LTX-2.5 distilled (video) | LTX-2.x Community License Agreement, Lightricks Ltd. | Yes, below |
+| SDXL base 1.0 (pictures) | CreativeML Open RAIL++-M | Yes, below |
+| EmbeddingGemma 2 (embeddings) | Apache 2.0 | The Gemma Prohibited Use Policy, below |
+| Qwen3.8-27B | Apache 2.0 | None |
+| Qwen3.8-Flash-Next | Qwen Community License 1.0 | None |
+| MiniCPM5-2B | Apache 2.0 | None |
+| Qwen3-ASR 1.7B (transcription) | Apache 2.0 | None |
+| Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | None |
+
+## LTX-2.5 (video)
+
+LTX-2.5 is licensed under the LTX-2.x Community License Agreement of Lightricks Ltd. (licence date
+August 11, 2026). LTX-2.5 and the videos it makes are subject to Section 4 and Attachment A of that
+licence in their entirety, including all use restrictions and acceptable use policies. By using
+LTX-2.5 here you agree to comply with them, and they are an enforceable part of these terms. They
+are quoted below as the licence states them. Words the licence defines, such as LTX-2.x, Outputs,
+Derivatives and Harm, have the meanings its section 1 gives them. The whole licence is at
+`/terms/licenses/ltx-2.x-community-license` on this server, and in the model's repository,
+https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-iq8r.
+
+Section 4 of the licence:
+
+```text
+   4. Use-based restrictions. The restrictions set forth in Attachment A
+      are considered Use-based restrictions. Therefore, you cannot use
+      LTX-2.x and the Derivatives of LTX-2.x in violation of the
+      specified restricted uses. You may use LTX-2.x subject to this
+      Agreement, only for lawful purposes and in accordance with the
+      Agreement. "Use" may include creating any content with,
+      fine-tuning, updating, running, training, evaluating and/or
+      re-parametrizing LTX-2.x. You shall require all of your users who
+      use LTX-2.x or a Derivative of LTX-2.x to comply with the terms of
+      this Section 4.
+```
+
+Attachment A of the licence, which includes Lightricks' Acceptable Use Policy by its address:
+
+```text
+                              Attachment A
+                            Use Restrictions
+
+   When using the Outputs, LTX-2.x and any Derivatives thereof, you
+   agree to comply with the Acceptable Use Policy
+   (https://static.lightricks.com/legal/ltx-acceptable-use-policy.pdf)
+   which is hereby incorporated into and made part of this Agreement by
+   reference. Licensor may update it from time to time, and the version
+   in effect at the time of your use governs; continued use after an
+   update constitutes acceptance. Licensor shall post each version of
+   the Acceptable Use Policy with its effective date, and no update
+   shall apply retroactively to use occurring before that effective
+   date. In addition, you agree not to use the Outputs, LTX-2.x or its
+   Derivatives in any of the following ways:
+
+      1) In any way that violates any applicable national, federal,
+         state, local or international law or regulation;
+
+      2) For the purpose of exploiting, Harming or attempting to exploit
+         or Harm minors in any way;
+
+      3) Knowingly generate or disseminate verifiably false information
+         and/or content with the intent to deceive, defraud, or
+         otherwise unlawfully Harm others;
+
+      4) To generate or disseminate personal identifiable information
+         that can be used to Harm an individual;
+
+      5) To generate or disseminate information and/or content (e.g.
+         images, code, posts, articles), and place the information
+         and/or content in any context (e.g. bot generating tweets)
+         without expressly and intelligibly disclaiming that the
+         information and/or content is machine generated;
+
+      6) To defame others, or to engage in the unlawful harassment of
+         others;
+
+      7) To impersonate or attempt to impersonate (e.g. deepfakes)
+         others without their consent;
+
+      8) For fully automated decision making that adversely impacts an
+         individual's legal rights or otherwise creates or modifies a
+         binding, enforceable obligation;
+
+      9) For any use intended to or which has the effect of
+         discriminating against or Harming individuals or groups based
+         on online or offline social behavior or known or predicted
+         personal or personality characteristics;
+
+      10) To exploit any of the vulnerabilities of a specific group of
+          persons based on their age, social, physical or mental
+          characteristics, in order to materially distort the behavior
+          of a person pertaining to that group in a manner that causes
+          or is likely to cause that person or another person physical
+          or psychological Harm;
+
+      11) For any use intended to or which has the effect of
+          discriminating against individuals or groups based on legally
+          protected characteristics or categories;
+
+      12) To provide medical advice and medical results interpretation;
+
+      13) To generate or disseminate information for the purpose to be
+          used for administration of justice, law enforcement,
+          immigration or asylum processes, such as predicting an
+          individual will commit fraud/crime commitment (e.g. by text
+          profiling, drawing causal relationships between assertions
+          made in documents, indiscriminate and arbitrarily-targeted
+          use);
+
+      14) To generate and/or disseminate malware (including - but not
+          limited to - ransomware) or any other content to be used for
+          the purpose of harming electronic systems;
+
+      15) To engage in, promote, incite, or facilitate discrimination or
+          other unlawful or harmful conduct in the provision of
+          employment, employment benefits, credit, housing, or other
+          essential goods and services;
+
+      16) To engage in, promote, incite, or facilitate the harassment,
+          abuse, threatening, or bullying of individuals or groups of
+          individuals;
+
+      17) For military, warfare, nuclear industries or applications,
+          weapons development, or any use in connection with activities
+          that may cause death, personal injury, or severe physical or
+          environmental damage;
+
+      18) For commercial use only: To train, improve, or fine-tune any
+          other machine learning model, artificial intelligence system,
+          or competing model, except for Derivatives of LTX-2.x as
+          expressly permitted under this Agreement;
+
+      19) To circumvent, disable, or interfere with any technical
+          limitations, safety features, content filters, watermarking,
+          content provenance or latent disclosure functionalities, or
+          use restrictions implemented in LTX-2.x by Licensor;
+
+      20) To use LTX-2.x or Derivatives of LTX-2.x in any product,
+          service, or application that directly competes with Licensor's
+          commercial products or services, or is designed to replace or
+          substitute Licensor's offerings in the market, without
+          obtaining a separate commercial license from Licensor.
+```
+
+**Videos are machine generated, and must say so.** Every video this service makes is marked as
+AI-generated in its file's metadata. Do not remove, disable or alter that marking, or any other
+disclosure, metadata, watermark or content-provenance feature of a video (section 6 of the
+licence). Wherever you publish a video or place it in any context, say plainly that it is machine
+generated (Attachment A, item 5).
+
+## SDXL base 1.0 (pictures)
+
+SDXL base 1.0 is licensed under the CreativeML Open RAIL++-M License of Stability AI (dated July
+26, 2023). SDXL base 1.0 is subject to paragraph 5 of that licence, its use-based restrictions,
+and to Attachment A. By using it here you agree to comply with them, and they are an enforceable
+part of these terms. They are quoted below as the licence states them; words the licence defines,
+such as Model, Derivatives of the Model and Output, have the meanings it gives them. The whole
+licence is at `/terms/licenses/creativeml-openrail-pp-m` on this server, and in the model's
+repository, https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0.
+
+Paragraph 5 of the licence:
+
+```text
+Use-based restrictions. The restrictions set forth in Attachment A are considered Use-based restrictions. Therefore You cannot use the Model and the Derivatives of the Model for the specified restricted uses. You may use the Model subject to this License, including only for lawful purposes and in accordance with the License. Use may include creating any content with, finetuning, updating, running, training, evaluating and/or reparametrizing the Model. You shall require all of Your users who use the Model or a Derivative of the Model to comply with the terms of this paragraph (paragraph 5).
+```
+
+Attachment A of the licence:
+
+```text
+Attachment A
+Use Restrictions
+You agree not to use the Model or Derivatives of the Model:
+In any way that violates any applicable national, federal, state, local or international law or regulation;
+For the purpose of exploiting, harming or attempting to exploit or harm minors in any way;
+To generate or disseminate verifiably false information and/or content with the purpose of harming others;
+To generate or disseminate personal identifiable information that can be used to harm an individual;
+To defame, disparage or otherwise harass others;
+For fully automated decision making that adversely impacts an individual’s legal rights or otherwise creates or modifies a binding, enforceable obligation;
+For any use intended to or which has the effect of discriminating against or harming individuals or groups based on online or offline social behavior or known or predicted personal or personality characteristics;
+To exploit any of the vulnerabilities of a specific group of persons based on their age, social, physical or mental characteristics, in order to materially distort the behavior of a person pertaining to that group in a manner that causes or is likely to cause that person or another person physical or psychological harm;
+For any use intended to or which has the effect of discriminating against individuals or groups based on legally protected characteristics or categories;
+To provide medical advice and medical results interpretation;
+To generate or disseminate information for the purpose to be used for administration of justice, law enforcement, immigration or asylum processes, such as predicting an individual will commit fraud/crime commitment (e.g. by text profiling, drawing causal relationships between assertions made in documents, indiscriminate and arbitrarily-targeted use).
+```
+
+## EmbeddingGemma 2 (embeddings)
+
+EmbeddingGemma 2 is licensed under Apache 2.0. Its model card says:
+
+```text
+Deployments must adhere to the [Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
+```
+
+By using EmbeddingGemma 2 here you agree to follow the Gemma Prohibited Use Policy:
+https://ai.google.dev/gemma/prohibited_use_policy
