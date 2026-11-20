@@ -12,7 +12,7 @@ include_guard(GLOBAL)
 
 # Brilliance's own release: what the package name carries. The project() version stays radiance's,
 # the release this tree was taken from.
-set(BRILLIANCE_VERSION "0.3.0-alpha.2" CACHE INTERNAL "Brilliance's release")
+set(BRILLIANCE_VERSION "0.3.0-alpha.3" CACHE INTERNAL "Brilliance's release")
 # The upstream revision the port is on, as `git describe --tags` names it, and its commit; an upstream
 # merge moves it. Since the merge of upstream's v2.2.0 tag (b6b8751c, 2026-11-19) it is that release.
 set(BRILLIANCE_UPSTREAM "v2.2.0 b6b8751cccb0e834a13ae9e5afca824ee9a487aa" CACHE INTERNAL

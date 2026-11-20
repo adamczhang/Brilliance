@@ -22,6 +22,7 @@
 #include "format/share.h"
 #include "format/table_copy.h"
 #include "format/table_share.h"
+#include "format/table_warm.h"
 #include "rad_plugin.h"
 #include "mem/vram_budget.h"
 #include "kvstream/bringup.h"
@@ -327,7 +328,10 @@ int64_t Engine::host_margin_bytes() const {
 
 /* See engine_hostmem.h. */
 bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
-                   std::string* why) {
+                   std::string* why, const std::vector<HostPart>* parts) {
+    /* Brilliance: what `still` is made of, when the caller says. */
+    const std::string made_of = parts ? host_parts_text(*parts) : std::string();
+    const std::string of = made_of.empty() ? std::string() : " (" + made_of + ")";
     long long locked_kb = 0;
     unsigned long long caps = 0;
     {
@@ -348,12 +352,13 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
         avail >= 0 && avail - still - margin < need) {
-        *why = fmt("%s of memory is available, %s more is still to be allocated (the pinned host "
-                   "pools, the prefix cache's host tier, the checkpoint slots and the host "
-                   "activation arenas), and this wants %s with %s to spare "
-                   "(--host-headroom-mib)",
-                   humanb(avail).c_str(), humanb(still).c_str(), humanb(need).c_str(),
-                   humanb(margin).c_str());
+        *why = fmt("%s of memory is available, %s more is still to be allocated %s, and this "
+                   "wants %s with %s to spare (--host-headroom-mib)",
+                   humanb(avail).c_str(), humanb(still).c_str(),
+                   made_of.empty() ? "(the pinned host pools, the prefix cache's host tier, the "
+                                     "checkpoint slots and the host activation arenas)"
+                                   : ("(" + made_of + ")").c_str(),
+                   humanb(need).c_str(), humanb(margin).c_str());
         return false;
     }
 #if defined(_WIN32)
@@ -372,9 +377,10 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
             if (pinned + mapped + still + need > cap) {
                 *why = fmt("Windows lets this process pin %s for its cards (the shared-memory budget "
                            "over the devices it sees, less a GiB kept for the load's staging "
-                           "windows); it holds %s, %s more is still to be pinned, and this wants %s",
+                           "windows); it holds %s, %s more is still to be pinned%s, and this "
+                           "wants %s",
                            humanb(cap).c_str(), humanb(pinned + mapped).c_str(),
-                           humanb(still).c_str(), humanb(need).c_str());
+                           humanb(still).c_str(), of.c_str(), humanb(need).c_str());
                 return false;
             }
         }
@@ -383,9 +389,9 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
     bool fits = true;
     memory_cgroups([&](const std::string& dir, int64_t room) {
         if (room - still - margin >= need) return true;
-        *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
+        *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated%s, "
                    "and this wants %s with %s to spare (--host-headroom-mib)", dir.c_str(),
-                   humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
+                   humanb(room).c_str(), humanb(still).c_str(), of.c_str(), humanb(need).c_str(),
                    humanb(margin).c_str());
         fits = false;
         return false;
@@ -546,6 +552,28 @@ bool Engine::ngram_gather_to_host() {
     return true;
 }
 
+/* Brilliance: the E line for a table `opt` ram pins in host memory (`table`, `noun` for short)
+ * when the host has no room for it. When what is still to be pinned does not fit even without
+ * the table (`rest_fits` false), the table only asked last: the setting that sized the largest
+ * part took the room, so the line leads with that setting and its fix. Otherwise it is the
+ * table's own line. Either way `why` lists the parts (lockable_room). */
+static void log_table_room_refusal(const char* opt, const std::string& table, const char* noun,
+                                   const std::string& why, const std::vector<HostPart>& parts,
+                                   bool rest_fits) {
+    const HostPart* big = rest_fits ? nullptr : host_parts_largest(parts);
+    if (!big) {
+        RAD_ERR("%s ram: %s cannot be held in host memory: %s. Use vram.", opt, table.c_str(),
+                why.c_str());
+        return;
+    }
+    RAD_ERR("%s%s%s (%s) is the largest part of what is still to be pinned, and with it host "
+            "memory has no room for %s that %s ram asks for: %s. Even without %s what is still "
+            "to be pinned does not fit, so %s vram alone would not be enough%s%s.",
+            big->setting.c_str(), big->setting.empty() ? "" : ": ", big->what.c_str(),
+            humanb(big->bytes).c_str(), table.c_str(), opt, why.c_str(), noun, opt,
+            big->fix.empty() ? "" : ": ", big->fix.c_str());
+}
+
 /* Resolve the lookup-table placements (--embedding-placement, --vision-tower-placement,
  * --ngram-placement) once for every rank before the card is split, into Config for the planner
  * and the load phase.
@@ -581,9 +609,33 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     const int64_t emb_pin = (int64_t)cfg_.tp * align_up(emb_max, (int64_t)MiB);
     const int64_t pools_still = (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB +
                                 cfg_.prefix_cache_mib * MiB + host_late;
+    /* Brilliance: what the pools still to be allocated are made of, for the refusals below; the
+     * tables placed so far join them as they are placed. */
+    auto still_parts = [&](bool with_emb, bool with_tower) {
+        std::vector<HostPart> p;
+        p.push_back({ "the prefix cache's host tier",
+                      fmt("--prefix-cache-mib %lld", (long long)cfg_.prefix_cache_mib),
+                      "lower --prefix-cache-mib", cfg_.prefix_cache_mib * MiB });
+        p.push_back({ "the pinned host pools",
+                      fmt("--host-pool-mib %lld a rank on %d rank(s)",
+                          (long long)cfg_.host_pool_mib, cfg_.tp),
+                      "lower --host-pool-mib", (int64_t)cfg_.tp * cfg_.host_pool_mib * MiB });
+        if (with_emb)
+            p.push_back({ "the token embedding", "--embedding-placement ram",
+                          "set --embedding-placement vram",
+                          (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB });
+        if (with_tower)
+            p.push_back({ "the encoder towers", "--vision-tower-placement ram",
+                          "set --vision-tower-placement vram",
+                          (int64_t)cfg_.tp * cfg_.tower_host_mib * MiB });
+        p.push_back({ "the checkpoint store and the host activation arenas", "", "", host_late });
+        return p;
+    };
+    const std::vector<HostPart> pools_parts = still_parts(false, false);
     std::string emb_room_why;
     auto emb_room = [&]() {
-        return lockable_room(emb_pin, pools_still, host_margin_bytes(), false, &emb_room_why);
+        return lockable_room(emb_pin, pools_still, host_margin_bytes(), false, &emb_room_why,
+                             &pools_parts);
     };
     if (emb_max == 0) {
         if (emb == TablePlacement::Ram && emb_asked) {
@@ -600,9 +652,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
             /* In a fleet the claim left it out already (Engine::plan): on the card it would come
              * out of the cache's floor. */
             if (emb_asked || broker_) {
-                RAD_ERR("--embedding-placement ram: the token embedding (%s a rank, pinned on "
-                        "every rank) cannot be held in host memory: %s. Use vram.",
-                        humanb(emb_max).c_str(), emb_room_why.c_str());
+                std::string rest_why;
+                log_table_room_refusal(
+                    "--embedding-placement",
+                    fmt("the token embedding (%s a rank, pinned on every rank)",
+                        humanb(emb_max).c_str()),
+                    "the embedding", emb_room_why, pools_parts,
+                    lockable_room(0, pools_still, host_margin_bytes(), false, &rest_why));
                 return RAD_E_NOMEM;
             }
             emb = TablePlacement::Vram;
@@ -640,11 +696,16 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         }
         std::string why;
         const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
-        if (!lockable_room(pin, pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB,
-                           host_margin_bytes(), false, &why)) {
-            RAD_ERR("--vision-tower-placement ram: the encoder towers (%s a rank, pinned on every "
-                    "rank) cannot be held in host memory: %s. Use vram.", humanb(tower_max).c_str(),
-                    why.c_str());
+        const int64_t tower_still = pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB;
+        const std::vector<HostPart> parts = still_parts(true, false);
+        if (!lockable_room(pin, tower_still, host_margin_bytes(), false, &why, &parts)) {
+            std::string rest_why;
+            log_table_room_refusal(
+                "--vision-tower-placement",
+                fmt("the encoder towers (%s a rank, pinned on every rank)",
+                    humanb(tower_max).c_str()),
+                "the towers", why, parts,
+                lockable_room(0, tower_still, host_margin_bytes(), false, &rest_why));
             return RAD_E_NOMEM;
         }
     }
@@ -760,8 +821,9 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     } else {
         std::string card_why, ram_why;
         const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
-        const bool room =
-            !card && lockable_room(need, still, host_margin_bytes(), !ngram_device, &ram_why);
+        const std::vector<HostPart> parts = still_parts(true, true);
+        const bool room = !card && lockable_room(need, still, host_margin_bytes(), !ngram_device,
+                                                 &ram_why, &parts);
         if (ng == TablePlacement::Ram) {
             if (!room) {
                 RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
@@ -3857,6 +3919,10 @@ int Engine::load_weights() {
     int64_t n_mapped = 0, mapped_bytes = 0;
     /* Of the container's own bytes, what the mapped tier reads: left in the page cache. */
     int64_t mapped_kept = 0;
+    /* Brilliance: --ngram-warm's input, the n-gram weights the disk tier reads from the
+     * container's mapping as (file offset, bytes), and whether disk=DIR put one in its own file. */
+    std::vector<std::pair<int64_t, int64_t>> ngram_warm;
+    bool ngram_own_file = false;
 
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
@@ -4042,6 +4108,15 @@ int Engine::load_weights() {
                     w.ptr = m;
                     w.host_ptr = m;
                 }
+                /* Brilliance: what --ngram-warm would read: the table's range of the container,
+                 * when the disk tier reads it through the container's own mapping. */
+                if (cfg_.ngram_resolved == TablePlacement::Disk &&
+                    is_ngram_table(r->program, (rad_weight)i)) {
+                    if (w.host_ptr == (void*)file_->data(p0))
+                        ngram_warm.emplace_back((int64_t)p0.offset, n);
+                    else
+                        ngram_own_file = true;
+                }
                 /* No readahead on a mapped weight: a host kernel gathers a few rows from a table
                  * too large to be resident, so the default 128 KiB readahead would read 32 pages
                  * for a row of a few hundred bytes. MADV_RANDOM is per range, so the rest of the
@@ -4183,7 +4258,57 @@ int Engine::load_weights() {
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "",
                  humanb(mapped_kept).c_str());
+    /* Brilliance: after the sweep, not beside it. Both read the same drive, which is the limit,
+     * so overlapping them saves little; and read last, the table's pages are the newest in the
+     * file cache, so the sweep's own reads are what memory pressure takes back first. */
+    warm_ngram_table(ngram_warm, ngram_own_file);
     return RAD_OK;
+}
+
+void Engine::warm_ngram_table(const std::vector<std::pair<int64_t, int64_t>>& ranges,
+                              bool own_file) {
+    const std::vector<std::pair<int64_t, int64_t>> rg = ngram_warm_ranges(ranges);
+    NgramWarmFacts f;
+    f.asked = cfg_.ngram_warm;
+    for (const auto& x : rg) f.table_bytes += x.second;
+    f.resolved = cfg_.ngram_resolved;
+    f.own_file = own_file;
+#if defined(__linux__)
+    f.direct_reads = true;   /* libavx's row cache reads the file with O_DIRECT */
+#endif
+    f.avail = meminfo_bytes("MemAvailable");
+    f.floor = std::max(kNgramWarmFloor, host_margin_bytes());
+    if (!has_ngram_ || !file_) {
+        if (f.asked) decide("--ngram-warm", "off", "this model has no n-gram table");
+        return;
+    }
+    const NgramWarmPlan p = ngram_warm_plan(f);
+    if (!p.warm) {
+        if (f.asked) {
+            RAD_INFO("placement: --ngram-warm skipped: %s", p.why.c_str());
+            decide("--ngram-warm", "skipped", p.why);
+        }
+        return;
+    }
+    RAD_INFO("placement: --ngram-warm: reading the n-gram table (%s) into the OS file cache before "
+             "serving: %s", humanb(f.table_bytes).c_str(), p.why.c_str());
+    int64_t bytes = 0;
+    double secs = 0;
+    std::string why;
+    const int rc = table_warm_read(*file_, rg, &bytes, &secs, &why);
+    if (rc != RAD_OK) {
+        RAD_WARN("--ngram-warm: reading the n-gram table into the file cache stopped after %s in "
+                 "%.1f s (%s); serving goes on, and rows not read are read from the drive when "
+                 "first used", humanb(bytes).c_str(), secs, why.c_str());
+        decide("--ngram-warm", "failed", fmt("%s of %s read: %s", humanb(bytes).c_str(),
+                                             humanb(f.table_bytes).c_str(), why.c_str()));
+        return;
+    }
+    RAD_INFO("placement: --ngram-warm: n-gram table read into the OS file cache, %s in %.1f s "
+             "(%.2f GB/s); not locked or pinned, so memory pressure can give it back to the drive",
+             humanb(bytes).c_str(), secs, (double)bytes / (secs > 0 ? secs : 1) / 1e9);
+    decide("--ngram-warm", "on", fmt("%s read in %.1f s: %s", humanb(bytes).c_str(), secs,
+                                     p.why.c_str()));
 }
 
 int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,

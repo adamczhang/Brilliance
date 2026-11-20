@@ -1,0 +1,35 @@
+# Brilliance profile: Qwen3.6-35B-A3B IQ8R (a mixture of experts, 256 routed) on two Radeon AI PRO
+# R9700s, tensor parallel (TP2).
+# 32K tokens of context, four requests at once, an int8 KV cache, MTP speculation from the container
+# at its own depth. About 17.5 GiB of weights a card: the model fits both cards whole, so no expert
+# is read from host memory. Upstream's two-card settings from the container's card (tp 2, int8 KV),
+# at a shorter context. The model thinks before it answers: a request's max_tokens counts the
+# reasoning too. Runs, not yet qualified: started, answered chat and stopped cleanly on two cards
+# (SUPPORT.md).
+#
+#   .\serve.ps1 qwen36-35b-2card -Bus 3,9
+#   bin\radiance.exe --config profiles\qwen36-35b-2card.yaml
+#
+# The model file: StillDeadcode/qwen3.6-35b-a3b-iq8r on Hugging Face, qwen3.6-35b-a3b-iq8r.rad,
+# 35.04 GiB (37,625,835,520 bytes), SHA-256
+# 3f3dffb91b4584227b958d244846b3f951df4e5b2ae80bc60a92494056cc112e. Point `model:` at where it is.
+# Apache 2.0, as Qwen's Qwen3.6-35B-A3B.
+#
+# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices); rank 0 is the first
+# named. Without -Bus the first two discrete cards HIP shows are used and the rest stay visible,
+# which lowers the pin limit (SUPPORT.md, known issue 3); name the two. Cards talk
+# through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is off with more
+# than one card visible, so the KV cache is sized whole at load.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 qwen36-35b-2card -Bus 3,9
+# -Listen 0.0.0.0 -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+models:
+  qwen3.6-35b-a3b:
+    model: D:/models/hf/StillDeadcode/qwen3.6-35b-a3b-iq8r/qwen3.6-35b-a3b-iq8r.rad
+    tp: 2
+    max-num-seqs: 4
+    max-model-len: 32768
+    kv-cache-dtype: i8

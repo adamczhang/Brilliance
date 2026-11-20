@@ -126,4 +126,32 @@ TEST(the_cgroup_walk_visits_every_limited_level_up_to_the_root) {
     CHECK_EQ(seen[0].first, t.root);
 }
 
+/* Brilliance: a refusal names what the memory still to be pinned is made of, largest first, so a
+ * large --prefix-cache-mib is not hidden behind the table that asked last (the encoder towers on
+ * four cards, 2026-11-20). Empty parts are left out. */
+TEST(the_parts_still_to_be_pinned_are_listed_largest_first) {
+    constexpr int64_t MiB = (int64_t)1 << 20;
+    const std::vector<HostPart> parts = {
+        { "the pinned host pools", "--host-pool-mib 256 a rank on 4 rank(s)", "lower --host-pool-mib",
+          1024 * MiB },
+        { "the token embedding", "--embedding-placement ram", "set --embedding-placement vram", 0 },
+        { "the prefix cache's host tier", "--prefix-cache-mib 20480", "lower --prefix-cache-mib",
+          20 * GiB },
+        { "the checkpoint store and the host activation arenas", "", "", 3 * MiB },
+    };
+    CHECK_EQ(host_parts_text(parts),
+             std::string("the prefix cache's host tier, --prefix-cache-mib 20480: 20.00 GiB; "
+                         "the pinned host pools, --host-pool-mib 256 a rank on 4 rank(s): "
+                         "1.00 GiB; the checkpoint store and the host activation arenas: "
+                         "3.00 MiB"));
+    const HostPart* big = host_parts_largest(parts);
+    REQUIRE(big != nullptr);
+    CHECK_EQ(big->fix, std::string("lower --prefix-cache-mib"));
+
+    const std::vector<HostPart> none = { { "the pinned host pools", "--host-pool-mib 0", "", 0 } };
+    CHECK_EQ(host_parts_text(none), std::string());
+    CHECK(host_parts_largest(none) == nullptr);
+    CHECK(host_parts_largest({}) == nullptr);
+}
+
 RAD_TEST_MAIN()

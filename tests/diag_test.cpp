@@ -364,6 +364,33 @@ TEST(environment_names_and_never_their_values) {
     CHECK(text.find("gemm:tile") == std::string::npos);
 }
 
+/* Brilliance: the FINDINGS line counts the W lines startup logged as warnings, and says how many
+ * they are, so a log with a warning in it (the pin cap's, 2026-11-20) never reads "0 warnings".
+ * With none logged the line is as it was. */
+TEST(the_findings_line_counts_the_w_lines_logged_above) {
+    diag::RunFacts run;
+    std::string text = diag::render({}, {}, diag::Facts{}, run, {});
+    CHECK(text.find("FINDINGS -- 0 warnings, 0 notes\n") != std::string::npos);
+    CHECK(text.find("  nothing found that costs speed or correctness\n") != std::string::npos);
+
+    run.logged_warnings = 4;
+    text = diag::render({}, {}, diag::Facts{}, run, {});
+    CHECK(text.find("FINDINGS -- 4 warnings (4 logged above as W lines, 0 listed below), 0 notes\n") !=
+          std::string::npos);
+    CHECK(text.find(" 0 warnings") == std::string::npos);
+    CHECK(text.find("the warnings are the W lines above") != std::string::npos);
+
+    run.logged_warnings = 1;
+    diag::Finding w;
+    w.level = diag::Finding::Warn;
+    w.id = "link-below-max";
+    diag::Finding n;
+    n.id = "a-note";
+    text = diag::render({}, {}, diag::Facts{}, run, { w, n });
+    CHECK(text.find("FINDINGS -- 2 warnings (1 logged above as W lines, 1 listed below), 1 note\n") !=
+          std::string::npos);
+}
+
 /* ------------------------------------------------------------------ checked */
 
 TEST(a_link_below_max_under_load_is_a_warning) {

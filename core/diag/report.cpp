@@ -200,10 +200,19 @@ std::string render(const std::vector<ConfigRow>& config, const std::vector<Decis
     int ni = 0, nw = 0, nn = 0;
     for (const Finding& x : findings)
         (x.level == Finding::Incompatible ? ni : x.level == Finding::Warn ? nw : nn)++;
-    o += fmt("FINDINGS -- %s%d warning%s, %d note%s\n",
+    /* Brilliance: the warnings count the W lines startup logged above as well as the warnings
+     * found here, and say how many of each, so a log with warnings never reads "0 warnings". */
+    const long long logged = std::max<int64_t>(r.logged_warnings, 0);
+    const long long warns = nw + logged;
+    o += fmt("FINDINGS -- %s%lld warning%s%s, %d note%s\n",
              ni ? fmt("%d incompatible%s, ", ni, r.unsupported ? " (started anyway)" : "").c_str() : "",
-             nw, nw == 1 ? "" : "s", nn, nn == 1 ? "" : "s");
-    if (findings.empty()) o += "  nothing found that costs speed or correctness\n";
+             warns, warns == 1 ? "" : "s",
+             logged ? fmt(" (%lld logged above as W lines, %d listed below)", logged, nw).c_str() : "",
+             nn, nn == 1 ? "" : "s");
+    if (findings.empty())
+        o += logged ? "  the checks here found nothing that costs speed or correctness; the warnings "
+                      "are the W lines above\n"
+                    : "  nothing found that costs speed or correctness\n";
     for (const Finding& x : findings) {
         o += fmt("  %s %s: %s\n", level_tag(x.level), x.id.c_str(), x.what.c_str());
         o += "       why: " + x.why + "\n";

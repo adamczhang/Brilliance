@@ -930,6 +930,11 @@ struct Config {
      * from the container at the first start, instead of from the container (a faster drive than
      * the model's). Empty: from the container. */
     std::string    ngram_disk_dir;
+    /* Brilliance: --ngram-warm: when the table resolves to the disk tier and the gather reads it
+     * through the container's mapping (off Linux), read it once at load into the OS file cache, so
+     * first-seen rows are not page faults served by the drive. Skipped, with the reason, without
+     * the table's size plus 24 GiB of host memory available (format/table_warm.h). Off by default. */
+    bool           ngram_warm = false;
     TablePlacement embedding_resolved  = TablePlacement::Vram;
     TablePlacement ngram_resolved      = TablePlacement::Disk;
     /* Set by the resolver: pinned host MiB per rank for the token embedding when it resolves to

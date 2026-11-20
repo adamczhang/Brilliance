@@ -143,7 +143,10 @@ void Engine::print_startup_report(int status) {
     std::vector<diag::Decision> derived;
     diag::merge(&rows, decisions_, &derived);
     const diag::Facts f = hardware_facts(false);
-    const diag::RunFacts r = run_facts(status < 0);
+    diag::RunFacts r = run_facts(status < 0);
+    /* Brilliance: the W lines logged so far, this engine's and those of no engine (the device
+     * layer's); the report's own W lines below come after. */
+    r.logged_warnings = (int64_t)(log_warn_lines(owner_) + (owner_ != 0 ? log_warn_lines(0) : 0));
     const std::vector<diag::Finding> found = diag::check(f, r);
     /* One log call per line: the logger formats into a fixed buffer, and every line keeps the
      * level tag. */

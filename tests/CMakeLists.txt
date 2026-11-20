@@ -1161,12 +1161,39 @@ if(WIN32 AND NOT RAD_FFMPEG_FOUND)
 endif()
 
 
-# Brilliance: three CPU budgets that hold alone but not beside a parallel ctest on this machine.
-# Measured 2026-11-16 on the 16-core, 32-thread host: gbnf_test_shard2 7.4 s alone (budget 10),
-# 12.7 s at -j 8; quant_ggml_test 24.0 s alone, 25.4 s at -j 8. 2026-11-19: gbnf_test_shard0
-# 5.2 s alone, 10.2 s at -j 32 (over its budget of 10). Threads sharing a core with other tests'
-# threads, at the all-core clock, are charged more CPU time for the same work. Run alone, the
-# budgets keep measuring the tests themselves.
+# Brilliance: the unit entries whose timing checks hold alone but not beside a parallel ctest on
+# this machine (16 cores, 32 threads) run alone, so the checks keep measuring the tests themselves
+# and stay as strict as they are. Threads sharing a core with other tests' threads, at the all-core
+# clock, are charged more CPU time and more cycles for the same work; a thread that yields in a loop
+# until another thread gets round to it is charged for the whole wait. Two kinds of check:
+#   - the CPU-time budget (RAD_TEST_CPU_BUDGET, rad_test.h), on every entry. Run alone here are the
+#     entries it has failed in a parallel run and those over 40% of their budget at -j 16, where
+#     -j 32 has been seen to double a binary's CPU time. Measured: gbnf_test_shard2 7.4 s alone
+#     (budget 10), 12.7 s at -j 8 (2026-11-16); quant_ggml_test 24.0 s alone, 25.4 s at -j 8
+#     (2026-11-16); gbnf_test_shard0 5.2 s alone, 10.2 s at -j 32 (2026-11-19); lora_test 10.34 s
+#     beside a HIP build (2026-11-19; 1.9 s at -j 16); server_test 13.59 s at -j 32 (2026-11-20;
+#     1.0 s at -j 16, 2.7 s wall alone): both have threads that yield in a loop while they wait.
+#     At -j 16 on 2026-11-20: gbnf_test_shard1 6.4 s, gbnf_test_shard3 4.5 s,
+#     bailing_hybrid_arch_test 5.2 s, shape_test 4.6 s, each against 10.
+#   - a ratio or bound of cycles or wall time inside a unit case (perf_ cases already run alone in
+#     <bin>_perf). On Windows radtest::work() counts the thread's cycles (work_counter.h), not
+#     instructions, so a neighbour on the core moves it: trigger_test (scanner work linear in the
+#     stream; a lazy grammar's waiting work, 1.44 against 1.25 at -j 24 on 2026-11-20, 1.00 alone),
+#     stream_test (a drain's work against long stop strings), tokenizer_perf_test (the encoder's
+#     work: linear, a fraction of the reference's, a resent turn's), gbnf_test's mask against a
+#     vocabulary pass and its 2 s compile bound (all four shards, with the budgets above),
+#     chatparse_test (re-read bytes in wall time), sched_test (1000 lookups against the index's
+#     build) and runtime_test (rad_issue's cost per call).
+# What they add to the suite's wall time is their own, about 30 s at -j 16's figures.
+# Left beside the others: transport_test's 4-9 s window is a deadline the server keeps, not a
+# cost; the tests that wait on a deadline (images_test, place_test, speech_stream_test) check what
+# happened, not how long it took.
 if(WIN32)
-  set_tests_properties(gbnf_test_shard0 gbnf_test_shard2 quant_ggml_test PROPERTIES RUN_SERIAL TRUE)
+  set_tests_properties(
+    # CPU-time budgets
+    gbnf_test_shard0 gbnf_test_shard1 gbnf_test_shard2 gbnf_test_shard3 quant_ggml_test
+    lora_test server_test bailing_hybrid_arch_test shape_test
+    # cycle and wall-time checks in unit cases
+    trigger_test stream_test tokenizer_perf_test chatparse_test sched_test runtime_test
+    PROPERTIES RUN_SERIAL TRUE)
 endif()

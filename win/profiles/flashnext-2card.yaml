@@ -17,6 +17,11 @@
 #   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
 #   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
 #                                 memory, their VRAM given to the KV cache.
+#   ngram-warm: true              the n-gram table (below) read once at load into the Windows file
+#                                 cache, so rows are not read from the drive mid-step (a cold
+#                                 row cost about 9% of one-stream decode, 2026-11-20). Not pinned;
+#                                 skipped, with the reason in the log, without the table's size
+#                                 plus 24 GiB of memory available. It adds 7 s or more to the load.
 # The n-gram table (47.68 GiB) is read from the file (ngram-placement left at auto): a pinned copy
 # exceeds what Windows lets this process pin (46.83 GiB with two cards visible). This build serves
 # no fp8 KV cache for this model; i8 is its 8-bit cache.
@@ -63,6 +68,15 @@ models:
     prefix-cache-mib: 4096
     checkpoint-slots: 8
     vision-tower-placement: ram
-    num-speculative-tokens: 3
+    # The drafting stack (alpha.3): up to 5 MTP drafts, coupled drafting, traversal verify, an
+    # adaptive depth that stops at 0.85 and backs off under load. Greedy output is unchanged; about 13%
+    # faster single-stream decode and 8% more eight-request throughput on two R9700s.
+    num-speculative-tokens: 5
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+    draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
+    ngram-warm: true

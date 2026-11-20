@@ -4,10 +4,10 @@ Brilliance is a fork of Radiance (https://codeberg.org/StillDeadcode/radiance), 
 Apache License 2.0 (LICENSE; NOTICE credits Radiance's authors). This tree is upstream's
 commit b6b8751cccb0e834a13ae9e5afca824ee9a487aa plus the Windows port.
 As section 4(b) of the licence asks, this file states which of upstream's files Brilliance
-has changed: the 309 listed under "Modified" carry changes made for Brilliance. Files under
+has changed: the 317 listed under "Modified" carry changes made for Brilliance. Files under
 "Added" are Brilliance's own. Every other file is upstream's, unchanged.
 
-Modified (309)
+Modified (317)
 
   .gitignore
   CMakeLists.txt
@@ -27,12 +27,16 @@ Modified (309)
   core/device/host.cpp
   core/device/paging.cpp
   core/diag/checks.cpp
+  core/diag/diag.h
   core/diag/report.cpp
   core/diag/sysinfo.cpp
   core/engine.cpp
   core/engine.h
   core/engine_bringup.cpp
+  core/engine_diag.cpp
   core/engine_diagnose.cpp
+  core/engine_hostmem.cpp
+  core/engine_hostmem.h
   core/fleet/config.cpp
   core/fleet/fleet.cpp
   core/format/radfile.cpp
@@ -52,6 +56,7 @@ Modified (309)
   core/place/xstats.cpp
   core/plugin/loader.cpp
   core/rad_core.h
+  core/rad_internal.h
   core/runtime/ctx.h
   core/runtime/issue.cpp
   core/runtime/wtab.hip
@@ -70,8 +75,10 @@ Modified (309)
   core/server/speech_stream.cpp
   core/server/videos.cpp
   core/util/json.h
+  core/util/rad_util.cpp
   core/util/stallwatch.cpp
   data/kernels_moe.rkb
+  docs/GUIDE.md
   libavx/avx_bench.cpp
   libavx/avx_check_rows.cpp
   libavx/avx_common.h
@@ -280,6 +287,7 @@ Modified (309)
   tests/harness_test.cpp
   tests/hf_model_test.cpp
   tests/host_kargs_main.h
+  tests/hostmem_test.cpp
   tests/kbench_mutant_test.cpp
   tests/kbench_test.cpp
   tests/mem_test.cpp
@@ -319,10 +327,12 @@ Modified (309)
   vendor/llama/common/json-partial.cpp
   vendor/llama/src/unicode.cpp
 
-Added (167)
+Added (175)
 
   .gitattributes
   RADIANCE-README.md
+  core/format/table_warm.cpp
+  core/format/table_warm.h
   core/server/terms.cpp
   docs/img/banner.png
   libr4d/r4d_ar_wide_host.h
@@ -330,6 +340,7 @@ Added (167)
   libr4d/r4d_ar_wide_rs.hip
   libr4d/r4d_ar_wide_ts.hip
   libr4d/r4d_ar_wide_x.h
+  tests/ngram_warm_test.cpp
   tests/terms_test.cpp
   vendor/patches/0023-unicode-a-16-bit-wchar_t-keeps-one-unit-per-codepoint.patch
   win/PREVIEW.md
@@ -435,6 +446,7 @@ Added (167)
   win/model-licenses/nemotron-3.5-rerank-notice.txt
   win/model-licenses/openmdw-1.1.txt
   win/model-licenses/qwen-community-1.0.txt
+  win/model-licenses/qwen-research.txt
   win/os/gpu_win32.cpp
   win/os/os.h
   win/os/os_gpu_test.cpp
@@ -444,10 +456,14 @@ Added (167)
   win/package.ps1
   win/profiles/flashnext-2card.yaml
   win/profiles/flashnext-4card.yaml
+  win/profiles/gemma4-12b-1card.yaml
+  win/profiles/gemma4-31b-1card.yaml
+  win/profiles/qwen-image-1card.yaml
   win/profiles/qwen27-8k-plain.yaml
   win/profiles/qwen27-iq8r-1card.yaml
   win/profiles/qwen27-iq8r-2card.yaml
   win/profiles/qwen27-preview.yaml
+  win/profiles/qwen36-35b-2card.yaml
   win/serve.ps1
   win/setup.ps1
   win/tests/CMakeLists.txt

@@ -36,6 +36,9 @@ The full text of each licence is at `/terms/licenses` on this server.
 | MiniCPM5-2B | Apache 2.0 | None |
 | Qwen3-ASR 1.7B (transcription) | Apache 2.0 | None |
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | None |
+| Gemma 4 31B and 12B | Apache 2.0 | None |
+| Qwen3.6-35B-A3B | Apache 2.0 | None |
+| Qwen-Image 2.1 (pictures) | Qwen RESEARCH LICENSE AGREEMENT | Yes, below: non-commercial use only |
 
 ## LTX-2.5 (video)
 
@@ -222,3 +225,22 @@ Deployments must adhere to the [Gemma Prohibited Use Policy](https://ai.google.d
 
 By using EmbeddingGemma 2 here you agree to follow the Gemma Prohibited Use Policy:
 https://ai.google.dev/gemma/prohibited_use_policy
+
+## Qwen-Image 2.1 (pictures)
+
+Qwen-Image 2.1 is licensed under the Qwen RESEARCH LICENSE AGREEMENT of Hangzhou Tongyi Laboratory
+Technology Co., Ltd. (release date September 20, 2026). It allows use for non-commercial purposes
+only, which it defines as research or evaluation. The whole licence is at
+`/terms/licenses/qwen-research` on this server, and in the model's repository. Qwen is licensed
+under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology
+Co., Ltd. All Rights Reserved.
+
+Section 2 of the licence:
+
+```text
+a. You are granted a non-exclusive, worldwide, non-transferable and royalty-free limited license under our intellectual property or other rights owned by us embodied in the Materials to use, reproduce, distribute, copy, create derivative works of, and make modifications to the Materials FOR NON-COMMERCIAL PURPOSES ONLY.
+b. You shall not use the Materials for any commercial purpose without obtaining a separate commercial license from us. If you wish to use the Materials commercially, you shall request a license from us at model-business@notice.qwencloud.com.
+```
+
+By using Qwen-Image 2.1 here you agree to use it for research or evaluation only, and to follow
+section 4 of the licence ("Rules of use"), at `/terms/licenses/qwen-research`.

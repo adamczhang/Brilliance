@@ -1,4 +1,4 @@
-# Brilliance 0.3.0-alpha.2 for Windows
+# Brilliance 0.3.0-alpha.3 for Windows
 
 A Windows build of [Radiance](https://codeberg.org/StillDeadcode/radiance) 2.2 on its native HIP
 backend, qualified on **one Radeon AI PRO R9700** with **Qwen3.8-27B IQ4R-L-V4**. This is an alpha
@@ -71,11 +71,22 @@ loading.
 | `qwen27-iq8r-1card.yaml` | Qwen3.8-27B IQ8R-V4 | 1 | Soak-clean | 16K | 4 | DFlash2 | int8 |
 | `qwen27-iq8r-2card.yaml` | Qwen3.8-27B IQ8R-V4 | 2 (TP2) | Soak-clean | 32K | 4 | DFlash2 | bf16 |
 | `flashnext-4card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | Supported: soaked at 32K on its earlier settings (2026-11-17); these tuned settings pass the injection, stop and serving checks; a soak on them has not run yet | 256K | 8 | MTP, depth 3 | bf16 |
-| `flashnext-2card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | Supported; upstream's two-card settings, tuned | 256K | 8 | MTP, depth 3 | int8 |
+| `flashnext-2card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | Supported; upstream's two-card settings, tuned | 256K | 8 | MTP, adaptive depth to 5 | int8 |
+| `gemma4-31b-1card.yaml` | Gemma 4 31B a4 | 1 | Runs, not yet qualified | 32K | 2 | MTP, depth 3 | bf16 |
+| `gemma4-12b-1card.yaml` | Gemma 4 12B i8g | 1 | Runs, not yet qualified | 32K | 4 | MTP, depth 3 | bf16 |
+| `qwen36-35b-2card.yaml` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | Runs, not yet qualified | 32K | 4 | MTP, depth 3 | int8 |
+| `qwen-image-1card.yaml` | Qwen-Image 2.1 IQ8R (pictures) | 1 | Runs, not yet qualified: generation only (`SUPPORT.md`, known issue 13) | 8,192 tokens a request | - | off | - |
 
 - The IQ8R-V4 file is `qwen3.8-27b-iq8r-v4.rad` in `StillDeadcode/qwen3.8-27b-iqr-v4` (27.58 GiB); the
   Flash-Next file is `qwen3.8-next-flash-iqr-v4.rad` in `StillDeadcode/qwen3.8-next-flash-iqr-v4`
   (113.32 GiB). Each profile's comment has the file's SHA-256; edit its `model:` to where the file is.
+- The four models that run, not yet qualified: `gemma4-31b-a4.rad` in `keptn/gemma4-31b-a4` (19.95 GiB),
+  `gemma4-12b-i8g.rad` in `keptn/gemma4-12b-i8g` (13.79 GiB), `qwen3.6-35b-a3b-iq8r.rad` in
+  `StillDeadcode/qwen3.6-35b-a3b-iq8r` (35.04 GiB, two cards: `-Bus 3,9`) and `qwen-image-2.1-iq8r.rad`
+  in `StillDeadcode/radiance-qwen-image-2.1-iq8r` (16.13 GiB). Qwen3.6 thinks before answering by
+  default, and a client's token limit counts the reasoning too. Qwen-Image serves
+  `/v1/images/generations` only: its edits come out with colour noise (`SUPPORT.md`, known issue 13),
+  and its licence allows non-commercial use only ("Model licences", below).
 - Name the cards with `-Bus`: `.\serve.ps1 qwen27-iq8r-1card -Bus 6`, `.\serve.ps1 qwen27-iq8r-2card -Bus 3,9`.
   Without it every discrete card is visible and the profile takes the first ones in HIP's order. On a
   machine with exactly four cards, `.\serve.ps1 flashnext-4card` needs no `-Bus`.
@@ -238,6 +249,24 @@ loading.
       which the licence names.
     - **The container** is a modified copy (re-encoded to IQ8R; its `NOTICE` says how), not an
       official Lightricks release, and not endorsed by Lightricks.
+  - **Gemma 4 31B a4 and 12B i8g** (`keptn/gemma4-31b-a4`, `keptn/gemma4-12b-i8g`): Apache 2.0, as
+    Google's Gemma 4; the repositories carry the licence text unchanged. No use restrictions to
+    pass on.
+  - **Qwen3.6-35B-A3B IQ8R** (`StillDeadcode/qwen3.6-35b-a3b-iq8r`): Apache 2.0, as Qwen's
+    Qwen3.6-35B-A3B. No use restrictions to pass on.
+  - **Qwen-Image 2.1 IQ8R** (`StillDeadcode/radiance-qwen-image-2.1-iq8r`, pictures): the **Qwen
+    RESEARCH LICENSE AGREEMENT** of Hangzhou Tongyi Laboratory Technology Co., Ltd.
+    (`/terms/licenses/qwen-research`).
+    - **Non-commercial use only.** It allows use for research or evaluation; any commercial use
+      needs a separate licence from Qwen (model-business@notice.qwencloud.com).
+    - **Rules of use** (section 4): export-control laws apply; a model made or improved with it or
+      its outputs and then made available must say "Built with Qwen" or "Improved using Qwen" in
+      its documentation; "Qwen" may not be the main name of a derivative product.
+    - **Passing it on.** A copy passed on carries the licence and the notice "Qwen is licensed
+      under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory
+      Technology Co., Ltd. All Rights Reserved." `TERMS-OF-USE.md` passes the non-commercial limit
+      on to the people you serve.
+    - **The container** is a modified copy: its linear weights are re-encoded as rotated int8.
 - **H.264** (`THIRD-PARTY.md`, "H.264", has the whole of it):
   - This package ships no H.264 encoder implementation (no OpenH264, no x264). Its FFmpeg,
     Brilliance's own built with vcpkg, keeps only two thin wrappers over encoders their makers

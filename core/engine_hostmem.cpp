@@ -1,5 +1,6 @@
 /* engine_hostmem.cpp -- see engine_hostmem.h. */
 #include "engine_hostmem.h"
+#include "rad_internal.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -83,6 +84,30 @@ int64_t cgroup_least_room() {
         return true;
     });
     return least;
+}
+
+/* Brilliance: see engine_hostmem.h. */
+std::string host_parts_text(const std::vector<HostPart>& parts) {
+    std::vector<const HostPart*> by;
+    for (const HostPart& p : parts)
+        if (p.bytes > 0) by.push_back(&p);
+    std::stable_sort(by.begin(), by.end(),
+                     [](const HostPart* a, const HostPart* b) { return a->bytes > b->bytes; });
+    std::string out;
+    for (const HostPart* p : by) {
+        if (!out.empty()) out += "; ";
+        out += p->what;
+        if (!p->setting.empty()) out += ", " + p->setting;
+        out += ": " + humanb(p->bytes);
+    }
+    return out;
+}
+
+const HostPart* host_parts_largest(const std::vector<HostPart>& parts) {
+    const HostPart* big = nullptr;
+    for (const HostPart& p : parts)
+        if (p.bytes > 0 && (!big || p.bytes > big->bytes)) big = &p;
+    return big;
 }
 
 }  /* namespace rad */

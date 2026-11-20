@@ -16,9 +16,9 @@ over them.
 - **Brilliance 0.2.2 is archived** at its original address,
   [codeberg.org/Dad_Vibes/Brilliance](https://codeberg.org/Dad_Vibes/Brilliance). Its `.rad` containers do
   not load in this version ([from 0.2.2](#from-brilliance-022)).
-- **Brilliance 0.3.0-alpha.2 is this fork's current release: the second alpha preview of 0.3.0**
-  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.2-<sha>-win64.zip`,
-  is on the [v0.3.0-alpha.2 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.2).
+- **Brilliance 0.3.0-alpha.3 is this fork's current release: the third alpha preview of 0.3.0**
+  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.3-<sha>-win64.zip`,
+  is on the [v0.3.0-alpha.3 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.3).
   Expect rough edges: what is qualified and what is not is listed below and in
   [win/SUPPORT.md](win/SUPPORT.md).
 
@@ -26,7 +26,7 @@ Upstream's own README is kept unchanged as [RADIANCE-README.md](RADIANCE-README.
 
 ## Status
 
-Alpha preview (0.3.0-alpha.2). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
+Alpha preview (0.3.0-alpha.3). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
 
 - **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean).
 - **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4).
@@ -76,8 +76,8 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
 
 ### 2. Get the package
 
-Download `Brilliance-0.3.0-alpha.2-<sha>-win64.zip` from the
-[v0.3.0-alpha.2 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.2), check it
+Download `Brilliance-0.3.0-alpha.3-<sha>-win64.zip` from the
+[v0.3.0-alpha.3 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.3), check it
 against the `.sha256` beside it (`Get-FileHash <zip>` in PowerShell), and unzip it anywhere; a path with spaces
 works. You can also [build it from source](#building-from-source). A CPU-only package
 (`Brilliance-<version>-<sha>-win64-cpu.zip`), which serves on the CPU kernels and needs no card, can be built
@@ -171,7 +171,11 @@ From the unzipped folder, in PowerShell:
 | `qwen27-iq8r-1card` | Qwen3.8-27B IQ8R-V4 | 1 | **Soak-clean** | 16K | 4 | DFlash2 | int8 |
 | `qwen27-iq8r-2card` | Qwen3.8-27B IQ8R-V4 | 2 (TP2) | **Soak-clean** | 32K | 4 | DFlash2 | bf16 |
 | `flashnext-4card` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | **Supported**: soaked at 32K on its earlier settings (2026-11-17); these tuned settings pass the injection, stop and serving checks; a soak on them has not run yet | 256K | 8 | MTP, depth 3 | bf16 |
-| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**: upstream's two-card settings, tuned | 256K | 8 | MTP, depth 3 | int8 |
+| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**: upstream's two-card settings, tuned | 256K | 8 | MTP, adaptive depth to 5 | int8 |
+| `gemma4-31b-1card` | Gemma 4 31B a4 | 1 | **Runs, not yet qualified** | 32K | 2 | MTP, depth 3 | bf16 |
+| `gemma4-12b-1card` | Gemma 4 12B i8g | 1 | **Runs, not yet qualified** | 32K | 4 | MTP, depth 3 | bf16 |
+| `qwen36-35b-2card` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | **Runs, not yet qualified** | 32K | 4 | MTP, depth 3 | int8 |
+| `qwen-image-1card` | Qwen-Image 2.1 IQ8R (pictures) | 1 | **Runs, not yet qualified**: generation only (known issue 13) | 8,192 tokens a request | - | off | - |
 
 - **Name the cards a profile needs** with `-Bus` (or `-Device`): `-Bus 6` for one card, `-Bus 3,9` for two.
   Without it every discrete card is visible and the profile takes the first one, two or four in HIP's order.
@@ -303,10 +307,15 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | Nemotron 3.5 Rerank 8B BF16 (`nvidia/Nemotron-3.5-Rerank-8B-BF16` as it ships, 16.78 GB) | **Qualified**: `/rerank` and `/v1/rerank`, text and picture documents, 32,768 tokens a pair | - | - |
 | SDXL base 1.0 bf16 (`stabilityai/stable-diffusion-xl-base-1.0`, the single-file checkpoint converted with `rad-convert`, 6.39 GiB) | **Qualified**: `/v1/images/generations`; PNG, JPEG and WebP; about 5.4 s at 1024x1024, 28 steps | - | - |
 | LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`) | **Runs, not yet qualified**: `/v1/videos`, text and image to video, MP4 | - | - |
+| Gemma 4 31B a4 ([`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4), 19.95 GiB) | **Runs, not yet qualified**: chat, 32K x 2, bf16 KV, MTP; pictures and video not yet checked | Not run | Not run |
+| Gemma 4 12B i8g ([`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g), 13.79 GiB) | **Runs, not yet qualified**: chat, 32K x 4, bf16 KV, MTP; pictures and audio not yet checked | - | - |
+| Qwen3.6-35B-A3B IQ8R ([`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r), 35.04 GiB) | - | **Runs, not yet qualified**: chat, 32K x 4, int8 KV, MTP; every expert on the cards | Not run |
+| Qwen-Image 2.1 IQ8R ([`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r), 16.13 GiB; non-commercial licence) | **Runs, not yet qualified**, generation only: `/v1/images/generations`; edits come out with colour noise ([known issue 13](win/SUPPORT.md#known-issues)) | Not run | - |
 | Every other upstream model | Source builds; not run on Windows | | |
 
-**The package's profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, and two
-that are **Supported** ([step 4](#4-start-a-server) has their settings):
+**The package's profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, two
+that are **Supported**, and four models that run, not yet qualified ([step 4](#4-start-a-server) has their
+settings):
 
 - Qwen3.8-27B IQ4R-L-V4, 1 card, **Qualified**: `qwen27-preview` (32K x 4) and `qwen27-8k-plain` (8K, one request).
 - Qwen3.8-27B IQ8R-V4, 1 card, **Soak-clean**: `qwen27-iq8r-1card`.
@@ -319,6 +328,13 @@ that are **Supported** ([step 4](#4-start-a-server) has their settings):
   beside a large build.
 - Qwen3.8-Flash-Next IQR-V4, 2 cards, **Supported**: `flashnext-2card`, upstream's two-card settings, tuned,
   on the exact wire; a lost write is re-sent. An 8-hour soak has not been run on it yet.
+- Gemma 4 31B a4, 1 card, **Runs, not yet qualified**: `gemma4-31b-1card` (32K x 2).
+- Gemma 4 12B i8g, 1 card, **Runs, not yet qualified**: `gemma4-12b-1card` (32K x 4).
+- Qwen3.6-35B-A3B IQ8R, 2 cards, **Runs, not yet qualified**: `qwen36-35b-2card` (32K x 4). It thinks
+  before answering by default, and a client's token limit counts the reasoning too.
+- Qwen-Image 2.1 IQ8R, 1 card, **Runs, not yet qualified**, generation only: `qwen-image-1card`. Its edits
+  come out with colour noise ([known issue 13](win/SUPPORT.md#known-issues)), and its licence allows
+  non-commercial use only ([Licence and credits](#licence-and-credits)).
 
 **Brilliance 0.2.2's containers do not load.** Radiance 2.2 does not read the 0.2.2-era formats: whole-model
 FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash MXFP4, DeepSeek-V4.1 and Gemma 4 FP8. Use the current

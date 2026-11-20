@@ -1005,6 +1005,25 @@ always complete); later starts check samples of it against the container and reu
 to it as `disk` reads the container, through the row cache with direct I/O, so `DIR`'s filesystem must
 support `O_DIRECT` (tmpfs since Linux 6.6 does, but a tmpfs is what `ram` is for).
 
+*On Windows* (Brilliance) `disk` has no row cache and no direct reads: the host gather reads the rows
+through the container's memory mapping, so a row the OS file cache does not hold is a page fault the
+drive serves while the card waits. On two R9700s with Qwen3.8-Flash-Next's 47.68 GiB table, a cold
+gather took 689 µs against 16 µs warm: about 9% of one-stream decode and 22% of eight-stream decode,
+and a cold 32K prompt took 22.4 s against 5.7 s. `ngram-warm: true` reads the table's bytes once at
+load, front to back in large buffered reads, so the file cache holds them before the first request.
+It runs after the weights are read and before serving starts (both reads share the drive, so
+overlapping them would save little), and adds about the table's size over the drive's read rate to
+the load: 7 s or more for Flash-Next on a PCIe 4.0 drive. Startup logs the bytes read and the time
+(`placement: --ngram-warm: n-gram table read into the OS file cache, ...`). Nothing is locked or
+pinned, so no pin limit or memory guard is touched: the cache stays reclaimable, and memory pressure
+can give rows back to the drive, which then serves them as before. The warm is skipped, with the
+reason in the log and the `ngram-warm` decision, unless the table resolved to `disk` and is read from
+the container (not `vram`, `ram` or `disk=DIR`), and unless the host has the table's size plus 24 GiB
+available (or plus `memory.host-headroom-mib`, if larger). A read that fails is a warning: the server
+starts, and rows not read come from the drive when first used. On Linux the row cache's direct reads
+bypass the file cache, so the warm is always skipped there. Off by default; both Flash-Next profiles
+turn it on.
+
 **`weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
 routed layer's first expert op, on every pass, the engine reads the layer's on-disk experts that its
@@ -2636,6 +2655,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `memory.host-headroom-mib: N` | 4096 | host RAM left free for the system when startup pins host memory, kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`checkpoint-slots`, §4.8) |
 | `embedding-placement: WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `host-pool-mib` and read in place, or on the card (§4.3) |
 | `ngram-placement: WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
+| `ngram-warm: true` | off | Brilliance: read an n-gram table on the `disk` tier once at load into the OS file cache, so rows are not read from the drive mid-step (Windows, where the gather reads the container's mapping; skipped on Linux). Not locked or pinned; skipped, with the reason, without the table's size plus 24 GiB available (§4.3) |
 | `vision-tower-placement: WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `host-pool-mib` and read in place once an image (§4.3) |
 | `weights-disk-tier: true` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -4704,7 +4724,9 @@ is the part of a log to paste into an issue. Its sections:
   with an on-board switch reports full speed whatever the slot does); its PCIe power levels; its power
   cap against default and maximum; any voltage offset; and its runtime power management.
 - **FINDINGS** lists warnings, then notes. Each says what was seen, what it costs, and the fix. Every
-  warning is also printed as a `W` line of its own.
+  warning is also printed as a `W` line of its own. The warning count on its first line also counts
+  the `W` lines startup logged before the report, and says how many those are:
+  `FINDINGS -- 4 warnings (4 logged above as W lines, 0 listed below), 2 notes`.
 
 ```
 I STARTUP REPORT -- radiance 2.2.0

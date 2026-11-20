@@ -4,8 +4,28 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace rad {
+
+/* Brilliance: one part of the host memory a process will still pin or allocate when a table asks
+ * for its own (lockable_room's `still`): what it is, the setting that sizes it ("" when no one
+ * setting does), the fix to name when it is what took the room ("" for none), and its bytes. A
+ * refusal lists the parts, so it can name the setting that used the room rather than only the
+ * table that asked last. */
+struct HostPart {
+    std::string what;     /* "the prefix cache's host tier" */
+    std::string setting;  /* "--prefix-cache-mib 20480" */
+    std::string fix;      /* "lower --prefix-cache-mib" */
+    int64_t     bytes = 0;
+};
+
+/* "what, setting: size; ..." for the parts with bytes, largest first ("what: size" without a
+ * setting); "" when none has any. */
+std::string host_parts_text(const std::vector<HostPart>& parts);
+
+/* The part with the most bytes (the first of equals), or nullptr when none has any. */
+const HostPart* host_parts_largest(const std::vector<HostPart>& parts);
 
 /* A cgroup's limit less the usage reclaim cannot give back: memory.current less file pages (v2)
  * or usage_in_bytes less cache (v1), since page cache yields to a locked allocation and anonymous
@@ -34,7 +54,9 @@ int64_t cgroup_least_room();
  * memory cgroup from the process's own up to the visible root (Docker's --memory, enforced by the
  * OOM killer); and, for an mlock()ed copy (`mlocks`), RLIMIT_MEMLOCK unless the process has
  * CAP_IPC_LOCK. Pinned memory a card reads is a driver userptr mapping, which RLIMIT_MEMLOCK does
- * not count. An unreadable limit is ignored, never guessed. */
-bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why);
+ * not count. An unreadable limit is ignored, never guessed. With `parts` (Brilliance), `why`
+ * says what `still` is made of (host_parts_text). */
+bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks, std::string* why,
+                   const std::vector<HostPart>* parts = nullptr);
 
 }  /* namespace rad */

@@ -18,6 +18,11 @@
 #   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
 #   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
 #                                 memory, their VRAM given to the KV cache.
+#   ngram-warm: true              the n-gram table (below) read once at load into the Windows file
+#                                 cache, so rows are not read from the drive mid-step (cold
+#                                 rows cost two cards about 9% of one-stream decode). Not pinned;
+#                                 skipped, with the reason in the log, without the table's size
+#                                 plus 24 GiB of memory available. It adds 7 s or more to the load.
 # No host prefix cache (prefix-cache-mib not set): a 14.25 GiB one beside the pinned encoders exceeds
 # what Windows lets this process pin with the integrated GPU visible too (16.93 GiB). The minute log
 # line's flag/ack re-store counts run about 6x higher than at 2,048-token steps; that is harmless
@@ -66,3 +71,4 @@ models:
     num-speculative-tokens: 3
     max-num-batched-tokens: 6144
     prefill-span: 3
+    ngram-warm: true

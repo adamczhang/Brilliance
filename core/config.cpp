@@ -132,6 +132,11 @@ static const Flag g_flags[] = {
     "                                    pinned copy a file in DIR (a tmpfs) mapped shared, so\n"
     "                                    two engines on separate cards hold one table: the\n"
     "                                    first fills it, the last to exit deletes it" },
+    { "--ngram-warm",         nullptr,  "read an n-gram table on the disk tier once at load into the\n"
+    "                                    OS file cache, so rows are not first read from the drive\n"
+    "                                    mid-step (Windows, where the gather reads the container's\n"
+    "                                    mapping). Not locked or pinned; skipped, with the reason,\n"
+    "                                    without the table's size and 24 GiB more available" },
     { "--weights-disk-tier",  nullptr,  "read weights that fit neither VRAM nor the host pool from the\n"
     "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
     "                                    Tier::SSD; a routed expert is read a layer at\n"
@@ -849,6 +854,7 @@ int config_parse(int argc, char** argv, Config* c) {
             }
             c->tower_placement = p;
         }
+        else if (S("--ngram-warm"))            { c->ngram_warm = true; }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
@@ -1800,6 +1806,7 @@ const ShowRow kShow[] = {
           const std::string& dir = c.ngram_share_dir.empty() ? c.ngram_disk_dir : c.ngram_share_dir;
           return dir.empty() ? v : v + "=" + dir; } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
+    { "--ngram-warm",         [](const Config& c) { return onoff(c.ngram_warm); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },

@@ -119,6 +119,32 @@ TEST(the_log_level_is_readable_and_settable) {
     CHECK((int)log_level() == (int)saved);
 }
 
+/* Brilliance: W lines are counted by the engine they were written for, and only when written:
+ * the startup report counts them into its warnings. */
+TEST(w_lines_are_counted_by_engine_and_only_when_written) {
+    const Log saved = log_level();
+    log_set_level(Log::Warn);
+    const int owner = 0x7e57;  /* no engine in this test has it */
+    const uint64_t before = log_warn_lines(owner);
+    const uint64_t none = log_warn_lines(0);
+    {
+        EngineScope es(owner, "counted");
+        RAD_WARN("util_test: a counted warning");
+        RAD_WARN("util_test: another");
+        RAD_ERR("util_test: an error is not a warning");
+        RAD_INFO("util_test: an info line the level suppresses");
+    }
+    CHECK_EQ(log_warn_lines(owner), before + 2);
+    CHECK_EQ(log_warn_lines(0), none);
+    log_set_level(Log::Error);
+    {
+        EngineScope es(owner, "counted");
+        RAD_WARN("util_test: a warning the level suppresses");
+    }
+    CHECK_EQ(log_warn_lines(owner), before + 2);
+    log_set_level(saved);
+}
+
 /* ================================================================== Geometry */
 
 TEST(geometry_stores_by_kind_and_a_reader_of_the_wrong_kind_misses) {

@@ -12,6 +12,8 @@
 #include <cinttypes>
 #include <ctime>
 #include <iterator>
+#include <mutex>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace rad {
@@ -86,6 +88,19 @@ EngineScope::~EngineScope() {
 static std::atomic<uint64_t> g_last_line_ns{0};
 uint64_t log_last_line_ns() { return g_last_line_ns.load(std::memory_order_relaxed); }
 
+/* Brilliance: W lines by engine owner (log_warn_lines). Warnings are few, so a lock is cheap; the
+ * map is never destroyed, since a thread may log during static destruction. */
+static std::mutex& warn_mu() { static std::mutex* m = new std::mutex; return *m; }
+static std::unordered_map<int, uint64_t>& warn_lines() {
+    static auto* m = new std::unordered_map<int, uint64_t>;
+    return *m;
+}
+uint64_t log_warn_lines(int owner) {
+    std::lock_guard<std::mutex> lk(warn_mu());
+    const auto it = warn_lines().find(owner);
+    return it == warn_lines().end() ? 0 : it->second;
+}
+
 std::string log_sanitize(const std::string& s) {
     std::string out = s;
     for (char& c : out) {
@@ -147,6 +162,10 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...) {
     else
         fprintf(stderr, "%s%s%s%s %s\n", col, level_tag(l), rank, rst, msg);
     g_last_line_ns.store(rad_mono_ns(), std::memory_order_relaxed);
+    if (l == Log::Warn) {
+        std::lock_guard<std::mutex> lk(warn_mu());
+        ++warn_lines()[g_owner];
+    }
 }
 
 void fatal(const char* fmt, ...) {

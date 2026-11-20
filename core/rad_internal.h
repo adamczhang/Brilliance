@@ -29,6 +29,10 @@ void log_emit(Log l, const char* file, int line, const char* fmt, ...)
 /* rad_mono_ns of the last line written at any level; StallWatch reads it as progress. 0 before
  * the first. */
 uint64_t log_last_line_ns();
+/* Brilliance: the W lines written so far by threads working for engine `owner` (EngineScope);
+ * owner 0 counts those written for no engine, such as the device layer's. A line the log level
+ * suppresses is not written and not counted. The startup report counts them into its warnings. */
+uint64_t log_warn_lines(int owner);
 
 /* A copy safe to interpolate into a log line: every byte below 0x20 but '\t', and DEL, becomes
  * '?'. Client-controlled text reaches the log -- session labels, echoed request fields -- and an

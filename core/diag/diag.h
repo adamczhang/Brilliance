@@ -186,6 +186,10 @@ struct RunFacts {
     /* Names of the RADIANCE_* variables set (env_names): settings outside the option table,
      * such as the log level, a pinned tuning or an instrument left on. */
     std::vector<std::string> environment;
+    /* Brilliance: the W lines startup logged before the report, outside its own checks (the
+     * engine's and the process's, log_warn_lines). The FINDINGS line counts them into its
+     * warnings and says how many they are, so "0 warnings" means none was logged. */
+    int64_t logged_warnings = 0;
 };
 
 /* ------------------------------------------------------------------ findings */

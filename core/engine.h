@@ -385,6 +385,11 @@ private:
     std::vector<TableCopy> table_files_;
     std::vector<const void*> table_file_src_;   /* the container address each of table_files_ replaces */
     int table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** out, std::string* why);
+    /* Brilliance: --ngram-warm, at the end of load_weights: the container's byte ranges the ranks
+     * published for the n-gram table on the disk tier, read once into the OS file cache when
+     * ngram_warm_plan (format/table_warm.h) says so. Logs what it read and how long it took, or why
+     * it skipped; a failed read is a warning and the load goes on. */
+    void warm_ngram_table(const std::vector<std::pair<int64_t, int64_t>>& ranges, bool own_file);
     /* --expert-profile: the decode ranking loaded once, before any rank plans, and handed to every
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
