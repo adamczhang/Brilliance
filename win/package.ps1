@@ -68,7 +68,7 @@ $version = 'dev'
 $m = Select-String -Path $cache -Pattern '^BRILLIANCE_VERSION:INTERNAL=(.+)$' | Select-Object -First 1
 if ($m) { $version = $m.Matches[0].Groups[1].Value }
 # The upstream pin, as the binaries report it (win/cmake/RadWindows.cmake, BRILLIANCE_UPSTREAM).
-$upstreamPin = 'v2.1.0-108-g3deabdae 3deabdaeca17b58bad90d332f4b204cf7bb8a10e'
+$upstreamPin = 'v2.2.0 b6b8751cccb0e834a13ae9e5afca824ee9a487aa'
 $m = Select-String -Path $cache -Pattern '^BRILLIANCE_UPSTREAM:INTERNAL=(.+)$' | Select-Object -First 1
 if ($m) { $upstreamPin = $m.Matches[0].Groups[1].Value }
 $sha = (& git -C $repo rev-parse HEAD).Trim()

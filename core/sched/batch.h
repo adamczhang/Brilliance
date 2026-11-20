@@ -370,6 +370,10 @@ private:
     bool                   ckpt_cut_on_ = false;   /* set_ckpt_cut */
     /* The engine serves runtime LoRA adapters (Config::lora): the batch carries each row's slot. */
     bool                   lora_on_ = false;
+    /* The trunk's window group (RAD_KV_WINDOW, not a drafter's), -1 for none: a run read both ways
+     * is attended on sliding layers, over this group's block table, so RadBatch::bidi_used counts
+     * from that table's first position (build()). */
+    int32_t                bidi_grp_ = -1;
     /* Program::plugin_words: the words a sequence may carry, 0 for none. */
     int64_t                pw_cap_ = 0;
     int64_t                n_embd_ = 0;

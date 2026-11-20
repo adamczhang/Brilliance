@@ -62,7 +62,7 @@
  *   - the lanes are reduced inside each group of RAD_MTP_BLOCK_WAVE by the butterfly
  *     a[l] = a[l] + a[l ^ d], d = 16, 8, 4, 2, 1 (every lane of a group ends with the same bits),
  *     and the LANES / WAVE group sums are added as ((g0 + g1) + (g2 + g3)).
- * The exp() of a slot is the same libm / device function on both sides, as before. */
+ * The exp() of a slot is the same libm / device function on both sides. */
 #define RAD_MTP_BLOCK_LANES 128
 #define RAD_MTP_BLOCK_WAVE  32
 

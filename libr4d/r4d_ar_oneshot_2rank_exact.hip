@@ -1024,39 +1024,24 @@ __global__ void r4d_ar_hc_write_coded_staged_kernel(
 }
 
 /* Parts a block of the staged coded form takes, 0 for the single-phase coded kernel. A coded launch
- * takes the rule (r4d_ar_coded_stages_pin overrides it in tests and benchmarks): the write
- * R4D_AR_CODED_STAGES parts (default 8) from R4D_AR_CODED_STAGES_MIN_KB (default 4096 KiB), the gather form R4D_AR_CODED_STAGES_G
- * (default 6) from R4D_AR_CODED_STAGES_G_MIN_KB (default 6144 KiB); 0 or 1 parts is the
- * single-phase kernel. Both ranks decide from the same launch, message and grid. On 2x R9700, rows
+ * takes the rule (r4d_ar_coded_stages_pin overrides it in tests and benchmarks): the write 8 parts
+ * from 4096 KiB, the gather form 6 parts from 6144 KiB; 0 or 1 parts is the single-phase kernel.
+ * Both ranks decide from the same launch, message and grid. On 2x R9700, rows
  * of 2560, 48 blocks of 1024, coded -> staged, us: write 1024 rows 203 -> 190, 2048 433 -> 378,
  * 4096 1023 -> 821, 8192 2015 -> 1639; gather 1536 rows 336 -> 326 (S4), 2048 482 -> 445,
  * 4096 1077 -> ~1005, 8192 2235 -> 2015. A gather below ~1.5K rows is slower staged. */
 static int g_ar_stages_pin = -1;
 extern "C" void r4d_ar_coded_stages_pin(int stages) { g_ar_stages_pin = stages; }
 static int ar_coded_stages(int n16, int nb, unsigned nbw, bool gather = false) {
-  static int s_env = -1, s_env_g = -1;
-  static long long min16 = 0, min16_g = 0;
-  if (s_env < 0) {
-    auto parts = [](const char* key, int dflt) {
-      const char* e = std::getenv(key);
-      int s = e && *e ? std::atoi(e) : dflt;
-      if (s < 0) s = 0;
-      return s > R4D_ARC_STAGES_MAX ? R4D_ARC_STAGES_MAX : s;
-    };
-    auto floor16 = [](const char* key, long long dflt_kb) {
-      const char* m = std::getenv(key);
-      return (m && *m ? std::atol(m) : dflt_kb) * 1024LL / 16LL;
-    };
-    min16   = floor16("R4D_AR_CODED_STAGES_MIN_KB", 4096LL);
-    min16_g = floor16("R4D_AR_CODED_STAGES_G_MIN_KB", 6144LL);
-    s_env_g = parts("R4D_AR_CODED_STAGES_G", 6);
-    s_env   = parts("R4D_AR_CODED_STAGES", 8);
-  }
+  constexpr int  kStages = 8, kStagesG = 6;
+  constexpr long long kMin16 = 4096LL * 1024LL / 16LL, kMin16G = 6144LL * 1024LL / 16LL;
+  static_assert(kStages <= R4D_ARC_STAGES_MAX && kStagesG <= R4D_ARC_STAGES_MAX,
+                "the staged form's parts fit its flag layout");
   int s;
   if (g_ar_stages_pin >= 0) s = g_ar_stages_pin > R4D_ARC_STAGES_MAX ? R4D_ARC_STAGES_MAX
                                                                            : g_ar_stages_pin;
-  else if (gather) s = n16 >= min16_g ? s_env_g : 0;
-  else s = n16 >= min16 ? s_env : 0;
+  else if (gather) s = n16 >= kMin16G ? kStagesG : 0;
+  else s = n16 >= kMin16 ? kStages : 0;
   int S = s;
   while (S > 1 && (long long)nb * S > (long long)nbw) --S;
   return S >= 2 ? S : 0;

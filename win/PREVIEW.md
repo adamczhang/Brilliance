@@ -1,6 +1,6 @@
-# Brilliance 0.3.0-alpha.1 for Windows
+# Brilliance 0.3.0-alpha.2 for Windows
 
-A Windows build of [Radiance](https://codeberg.org/StillDeadcode/radiance) 2.1 on its native HIP
+A Windows build of [Radiance](https://codeberg.org/StillDeadcode/radiance) 2.2 on its native HIP
 backend, qualified on **one Radeon AI PRO R9700** with **Qwen3.8-27B IQ4R-L-V4**. This is an alpha
 preview of Brilliance 0.3.0: one qualified card count and model, more that run soak-clean or
 supported (`SUPPORT.md`), and the limits below. Expect rough edges.
@@ -70,8 +70,8 @@ loading.
 | `qwen27-8k-plain.yaml` | Qwen3.8-27B IQ4R-L-V4 | 1 | Qualified | 8K | 1 | off | bf16 |
 | `qwen27-iq8r-1card.yaml` | Qwen3.8-27B IQ8R-V4 | 1 | Soak-clean | 16K | 4 | DFlash2 | int8 |
 | `qwen27-iq8r-2card.yaml` | Qwen3.8-27B IQ8R-V4 | 2 (TP2) | Soak-clean | 32K | 4 | DFlash2 | bf16 |
-| `flashnext-4card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | Soak-clean, before the four-card re-send; with it, injection and serving checks pass | 32K | 8 | MTP, depth 3 | int8 |
-| `flashnext-2card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | Supported; upstream's two-card settings | 200K | 8 | MTP, depth 3 | int8 |
+| `flashnext-4card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | Supported: soaked at 32K on its earlier settings (2026-11-17); these tuned settings pass the injection, stop and serving checks; a soak on them has not run yet | 256K | 8 | MTP, depth 3 | bf16 |
+| `flashnext-2card.yaml` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | Supported; upstream's two-card settings, tuned | 256K | 8 | MTP, depth 3 | int8 |
 
 - The IQ8R-V4 file is `qwen3.8-27b-iq8r-v4.rad` in `StillDeadcode/qwen3.8-27b-iqr-v4` (27.58 GiB); the
   Flash-Next file is `qwen3.8-next-flash-iqr-v4.rad` in `StillDeadcode/qwen3.8-next-flash-iqr-v4`
@@ -79,12 +79,19 @@ loading.
 - Name the cards with `-Bus`: `.\serve.ps1 qwen27-iq8r-1card -Bus 6`, `.\serve.ps1 qwen27-iq8r-2card -Bus 3,9`.
   Without it every discrete card is visible and the profile takes the first ones in HIP's order. On a
   machine with exactly four cards, `.\serve.ps1 flashnext-4card` needs no `-Bus`.
-- `flashnext-4card` has a known issue: Flash-Next's output changes when requests share a step, so
+- `flashnext-4card` has two known issues. Flash-Next's output can change when requests share a step, so
   sampling over requests sent together is looser than the temperature asked (`SUPPORT.md`, known
-  issue 8). One request at a time behaves normally.
+  issue 8). This is rounding, not wrong data; one request at a time is repeatable. And it hard-locked
+  the test machine once, when stopped during a long prefill beside a large build: let a prefill finish
+  before stopping, or keep the CPU light (`SUPPORT.md`, known issue 12).
 - `flashnext-2card` (`.\serve.ps1 flashnext-2card -Bus 3,9`) carries upstream's two-card settings on
   the exact wire and sets no runtime variable. The server re-sends a lost write (`SUPPORT.md`,
   known issue 1).
+- Both Flash-Next profiles are tuned: the model's full 256K context, prefill steps of up to 6,144
+  tokens for a prompt alone in its step (`max-num-batched-tokens: 6144`, `prefill-span: 3`), eight
+  linear-state snapshots and the picture and audio encoders in host memory. The two-card KV cache
+  holds about 262K tokens across all requests, the four-card one about 917K. Each profile's comment
+  explains its settings.
 - A profile's `# brilliance-env: NAME=VALUE` lines, and `serve.ps1 -Env NAME=VALUE[,...]`, set
   `GPU_*`, `HIP_*`, `AMD_*`, `BRILLIANCE_*` and `RADIANCE_*` variables for the server only, and for
   `-Install` in the service's environment. `.\serve.ps1 <profile> -WhatIf` prints what a start would
@@ -109,14 +116,16 @@ loading.
 ## Known limits
 
 - **One card is qualified.** Qwen3.8-Flash-Next IQR-V4 runs on two cards and passes the same API
-  checks, but with its production settings (8 sequences, 200K context, speculation, prefix cache)
+  checks, but with its production settings (experts in host memory, 8 sequences, speculation, prefix cache)
   a write to host memory is lost now and then (`SUPPORT.md`, known issue 1). The server re-sends
-  it, at about 4% of single-stream decode, so Flash-Next on two cards is Supported; the 8-hour soak
-  is still to run. A block that cannot be recovered stops the server, which exits with status 70.
+  it, at about 4% of single-stream decode, so Flash-Next on two cards is Supported; an 8-hour soak
+  has not been run on it yet. A block that cannot be recovered stops the server, which exits with status 70.
   A server that stops making progress for any reason can be read with `bin\brl-stacks.exe`
-  (`tools\STACKS.md`). On four cards, with every expert on the cards, it was soak-clean, as was
-  Qwen3.8-27B IQ8R-V4 on one and on two. Four cards now carry the same re-send and stop: Flash-Next
-  was soaked there before they were added, and with them it passes the injection and serving checks.
+  (`tools\STACKS.md`). Qwen3.8-27B IQ8R-V4 is soak-clean on one card and on two. On four cards,
+  with every expert on the cards, Flash-Next is Supported: it was soaked at 32K on its earlier
+  settings (2026-11-17), before four cards carried the same re-send and stop; with them its
+  profile's tuned 256K settings pass the injection, stop and serving checks, and a soak on them has
+  not run yet.
   `SUPPORT.md` has the table of models and card counts.
 - **Cards:** the build carries GPU code for gfx1201 (R9700, RX 9070 family) only.
 - **Generation endpoints:**

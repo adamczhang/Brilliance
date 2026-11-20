@@ -745,13 +745,13 @@ long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far);
 // Test hook: pins the gated residual read's decode kernels. 0 is the launcher's rule (kernels A and
 // B as one grid at one to seven rows where the per-stream counters exist, the tiled up-mix's K
 // passes pipelined from eight rows), 1 the two-grid form (A, then the up-mix in a second launch;
-// the tiled up-mix's passes unpipelined). Bit-identical; r4d_selftest compares their bytes
-// and --perfhc times both.
+// the tiled up-mix's passes unpipelined), 2 the rule with the 64-row tile from 33 rows, 3 the
+// rule with the 48-row tile at kTNT columns a workgroup. Bit-identical; r4d_selftest compares
+// their bytes and --perfhc times them.
 void r4d_hc_read_pin_decode(int form);
 // Test hooks: the sparse attention launch's prefill form at twelve queries a KV head
-// (r4d_attn_usel.h). `form` 0 is the rule of a process started with R4D_ATTN_USEL=1 (tiles of rows
-// from 256 launch rows of q_len 1), 1 the decode kernel a row at every row count (what a process
-// starts with), 2 the tiled form at every row count; `lim` the
+// (r4d_attn_usel.h). `form` 0 the tiled form from 256 launch rows of q_len 1, 1 the decode kernel
+// a row at every row count (what a process serves), 2 the tiled form at every row count; `lim` the
 // union past which a tile is handed back to the decode kernel (0: the launcher's; 2^20 or more:
 // never, nor for sharing too little). Bits 8 and up of `form` leave launches out, for timing.
 // r4d_attn_usel_gqa12_geom picks one of the tiled kernel's built geometries and returns its rows a

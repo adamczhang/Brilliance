@@ -41,6 +41,15 @@ bool decoder_available();
  * without libavformat decodes them through Windows' own codecs (WIC) and so answers yes where
  * decoder_available() says no; video, audio and encoding still need decoder_available(). */
 bool image_decoder_available();
+
+/* Brilliance: JPEG XL is refused by name. Brilliance's LGPL FFmpeg has no libjxl (win/SUPPORT.md),
+ * so a JPEG XL picture would otherwise fail as an unreadable file. is_jpeg_xl reads the bytes'
+ * signature (the bare codestream's FF 0A, or the ISO-BMFF container's "JXL " box), and every
+ * decode above refuses those bytes with kJpegXlRefusal; is_jpeg_xl_type reads a data: URL's media
+ * type (image/jxl), which the server refuses with the same reason. */
+extern const char* const kJpegXlRefusal;
+bool is_jpeg_xl(const uint8_t* data, size_t n);
+bool is_jpeg_xl_type(const std::string& media_type);
 #endif
 
 /* "libavformat <version>" when the decoder is built in, "absent (built without libav*)" when it

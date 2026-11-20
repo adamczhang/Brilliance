@@ -3429,9 +3429,8 @@ enum { R4D_AR_WHT6_FUSED_THREADS = 512 };
  * Qwen3.8-Flash-Next's prefill sends 0.8% (the mixers) and 0.02% (the experts) of its words raw,
  * 12.16 and 12.13 bits a value.
  *
- * R4D_AR_CODED_MIN_KB moves the floor for both ranks (they are threads of one process): a size in
- * KiB, 0 for every message that fits the form, `off` for none. `coded` (0 or 1), a launch
- * parameter no declaration carries, pins one launch: r4d_selftest's arms. */
+ * `coded` (0 or 1), a launch parameter no declaration carries, pins one launch: r4d_selftest's
+ * arms. */
 enum { R4D_AR_CODED_MIN_BYTES = 512 * 1024 };
 
 /* The coded form's grid. Its blocks code and decode in waves of 32 words, so it runs 1024 threads
@@ -3442,17 +3441,7 @@ enum { R4D_AR_CODED_MIN_BYTES = 512 * 1024 };
  * plain gather at 192 rows takes 59 us at 24 blocks and 49 at 48, where coding alone gives 0.87. */
 enum { R4D_AR_CODED_NB_CAP = 48, R4D_AR_CODED_THREADS = 1024 };
 
-static long long ar_coded_min_bytes() {
-    static const long long v = [] {
-        const char* e = std::getenv("R4D_AR_CODED_MIN_KB");
-        if (!e || !*e) return (long long)R4D_AR_CODED_MIN_BYTES;
-        char* end = nullptr;
-        const long long kb = std::strtoll(e, &end, 10);
-        if (end == e || *end || kb < 0) return (long long)INT64_MAX;   /* `off`: never */
-        return kb > INT64_MAX / 1024 ? (long long)INT64_MAX : kb * 1024;
-    }();
-    return v;
-}
+static long long ar_coded_min_bytes() { return (long long)R4D_AR_CODED_MIN_BYTES; }
 
 /* Whether a fused write of `words16` 16-byte words takes the coded push: asked for (the floor, or
  * the launch's `coded`) and fitting the form (r4d_ar_coded2_ok; the gather's launcher adds its

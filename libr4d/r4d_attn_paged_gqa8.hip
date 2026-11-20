@@ -148,21 +148,12 @@ extern "C" long long GQ_SYM(r4d_attn_decode_gqa, _scratch_bytes)(const R4DArgs* 
  * or more tiles every tile. */
 constexpr int kG8UselMinRows = 256;
 constexpr int kG8UselLim     = kUselCap;
-/* A process starts at form 1, every sparse launch on the decode kernel: the tiled form agrees
- * with it to rounding and not bit for bit, and a served model's greedy text can part from the
- * decode launch's where two candidates are a few tenths of a nat apart (docs/QSA.md, "The sparse
- * launch at a prefill chunk"). R4D_ATTN_USEL=1 in the environment starts it at form 0. */
-static int g_usel_form = [] {
-    const char* e = std::getenv("R4D_ATTN_USEL");
-    return (e && e[0] == '1' && !e[1]) ? 0 : 1;
-}();
-/* R4D_ATTN_USEL_LIM=n in the environment starts a process with that limit: 1 hands every tile
- * back, so the builder and the hand-back run and the decode kernel computes every row. */
-static int g_usel_lim  = [] {
-    const char* e = std::getenv("R4D_ATTN_USEL_LIM");
-    const long long v = (e && *e) ? std::strtol(e, nullptr, 10) : 0;
-    return v > 0 ? (int)v : kG8UselLim;
-}();
+/* A process serves every sparse launch on the decode kernel (form 1): the tiled form agrees with
+ * it to rounding and not bit for bit, and on Qwen3.8-Flash-Next at two ranks it measured no faster
+ * (cold prefill of 2000- and 6000-word prompts within 0.5%). It stays reachable through the pin
+ * for r4d_selftest's checks and timings (docs/QSA.md, "The sparse launch at a prefill chunk"). */
+static int g_usel_form = 1;
+static int g_usel_lim  = kG8UselLim;
 /* `g_usel_skip` (timing only, r4d_selftest --perfusel): launches left out of the tiled form, a
  * bit each -- 1 the builder (the tables of the launch before stay in the scratch), 2 the tiled
  * attention, 4 the hand-back, 8 the merge. */
@@ -187,14 +178,9 @@ static const G8UselGeom kG8UselGeoms[] = {
     G8_USEL_GEOMS(G8_X)
 #undef G8_X
 };
-/* R4D_ATTN_USEL_GEOM=i in the environment starts a process on geometry i: another tiling of the
- * same rows, so another order of each row's keys and another rounding of the same sums. Against
- * the first it measures what a served model makes of a reordering alone. */
-static int g_usel_geom = [] {
-    const char* e = std::getenv("R4D_ATTN_USEL_GEOM");
-    const long long v = (e && *e) ? std::strtol(e, nullptr, 10) : 0;
-    return v > 0 && v < (long long)(sizeof(kG8UselGeoms) / sizeof(kG8UselGeoms[0])) ? (int)v : 0;
-}();
+/* The geometry in force: the first (the launcher's); r4d_selftest sets another through the hook
+ * below to time it. */
+static int g_usel_geom = 0;
 static int g8_usel_g() {
     const G8UselGeom& gm = kG8UselGeoms[g_usel_geom];
     return gm.nw - gm.ns;

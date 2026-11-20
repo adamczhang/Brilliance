@@ -471,7 +471,7 @@ TEST(a_prefill_span_below_one_interval_is_refused) {
 }
 
 /* --prefill-span-pass piece|step and --prefill-span-min auto|N shape a span: piece and auto are
- * the defaults (the span as it was), and either is refused without a span to shape. */
+ * the defaults (a pass a piece, the automatic minimum), and either is refused without a span to shape. */
 TEST(the_span_pass_and_the_span_minimum_need_a_span) {
     LogGuard lg;
     Config d;
@@ -612,6 +612,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
+        { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
         { "--max-model-len", { "4096" } }, { "--rope-scaling", { "yarn:4" } },

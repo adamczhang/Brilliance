@@ -1411,6 +1411,13 @@ int decode_media_url(const std::string& url, const std::string& field,
         *err = err_bad(field, "data: URL must be base64 encoded");
         return RAD_E_INVAL;
     }
+#if defined(_WIN32)
+    /* Brilliance: a JPEG XL picture is refused by its stated type too (mm/media.h). */
+    if (mm::is_jpeg_xl_type(meta)) {
+        *err = err_bad(field, mm::kJpegXlRefusal);
+        return RAD_E_INVAL;
+    }
+#endif
     if (!base64_decode(url.substr(comma + 1), out)) {
         *err = err_bad(field, "invalid base64");
         return RAD_E_INVAL;

@@ -223,7 +223,7 @@ are consecutive queries over one history and their lists overlap: neighbours sha
 of their pages, and eight consecutive rows name 1000 to 1750 distinct pages where their lists sum
 to 4104.
 
-With `R4D_ATTN_USEL=1` in the engine's environment, libr4d therefore runs the same op from 256
+Pinned to it (`r4d_attn_usel_gqa12_pin`, r4d_selftest), libr4d runs the same op from 256
 launch rows of `q_len` 1 (lists no wider than 520 pages, the bf16 cache, twelve queries a KV
 head: the model at two ranks), `attn_paged`, `attn_paged_gate_quant` or
 `attn_paged_gate_had_quant` with the same operands, as **tiles of eight rows over the union of
@@ -251,7 +251,7 @@ bit for bit, and a served model shows it ("What a served model makes of it", bel
    of unrelated sequences, which a workgroup would walk one row at a time). A tile is served by
    one kernel or the other, never both.
 4. The decode launch's merge, unchanged, with one segment a row: the output row, the gate and the
-   quantiser are computed from the partial exactly as before.
+   quantiser are computed from the partial as the decode launch computes them.
 
 On a R9700, 2048 rows of a real chunk (`r4d_selftest --perfusel`, the gated merge included):
 
@@ -310,12 +310,12 @@ own tiles.
 
 What a served model makes of it (Qwen3.8-Flash-Next at two ranks, six fixed prompts of 4.5 K to
 42 K tokens, greedy, the first eight tokens' logprobs): with every tile handed back
-(`R4D_ATTN_USEL_LIM=1`) text and logprobs are the decode launch's bit for bit. Tiled, the logprob
+(the pin's limit of 1) text and logprobs are the decode launch's bit for bit. Tiled, the logprob
 of a picked token moved by at most 0.15 nats. At the one position of these continuations where
 three candidates share the probability (" to", " respond", " answer", 0.13 to 0.49 each) a
 candidate's logprob moved by up to 0.43 nats, and the greedy pick changed in two of the six
 prompts (the decode launch's two best were 0.24 and 0.41 nats apart there). Tiles of sixteen
-rows (`R4D_ATTN_USEL_GEOM=1`), a second reordering of the same sums, lie as far from tiles of
+rows (the second geometry), a second reordering of the same sums, lie as far from tiles of
 eight as either lies from the decode kernel, and change the pick in two prompts too, one of them
 another prompt. So the moves are what this model, with an int8 quantiser behind every sparse
 attention, makes of a last-bit change in 4 % of those codes, and not an error of one order; but
@@ -334,12 +334,11 @@ inf and NaN in the slots behind its end (no output moves with them and none is n
 whether the launch starts on a page or inside one). Every launch of the case finds its scratch
 full of ones, as an engine's is full of another launch's bytes.
 
-Without `R4D_ATTN_USEL=1` every sparse launch runs on the decode kernel, as before. With it,
-`R4D_ATTN_USEL_LIM=1` keeps the builder and hands every tile back, which is the decode kernel's
-bytes by another road (a check of the hand-back in a served model), and
-`R4D_ATTN_USEL_GEOM=1` tiles sixteen rows instead of eight (slower: more of a larger union is
-read by nobody), which reorders every row's keys again and so shows what a served model makes of
-a reordering alone. `r4d_selftest --perfusel T CTX` times the forms on its own lists, on a real chunk's
+A served engine runs every sparse launch on the decode kernel: on Qwen3.8-Flash-Next at two ranks
+the tiled form measured no faster (cold prefill of 2000- and 6000-word prompts within 0.5%, the
+same text on those prompts). The test pin's limit of 1 keeps the builder and hands every tile
+back, which is the decode kernel's bytes by another road, and the second built geometry tiles
+sixteen rows instead of eight (slower: more of a larger union is read by nobody). `r4d_selftest --perfusel T CTX` times the forms on its own lists, on a real chunk's
 (`R4D_USEL_SEL`, `R4D_USEL_SEQU`: dumps written with `RADIANCE_DUMP_BUF=qsa_sel:2048,qsa_sequ:2048`
 and `RADIANCE_DUMP_DIR`), or on rows of unrelated sequences (`R4D_USEL_KIND=2`). The four-rank
 unit (six queries a KV head) keeps the decode kernel: the form has not been run at that ratio.

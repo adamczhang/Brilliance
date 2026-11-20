@@ -169,6 +169,7 @@ struct Fixture {
         cfg.max_ctx = max_ctx;
         cfg.checkpoint_interval = 256;
         cfg.prefix_cache = true;
+        cfg.prefill_room_gate = false;
         /* The fixture runs --prefix-resume nearest (a tail snapshot at the last quantum
          * boundary, a hit at any snapshot or block); the exact-resume tests set prefix_exact
          * (--prefix-resume exact, the engine's default) themselves. */
@@ -718,12 +719,13 @@ TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
     /* No tail snapshot: the last boundary crossed, 768, inside [512, 830). */
     CHECK_EQ(f.sch.plan_chunk(512, 830, 512, &ck), 318);
     CHECK_EQ(ck, 768);
-    /* Mid-prompt chunks and a prompt ending on its tail are as before. */
+    /* Mid-prompt chunks and a prompt ending on its tail plan as without the cut. */
     CHECK_EQ(f.sch.plan_chunk(256, 2000, 512, &ck), 512);
     CHECK_EQ(ck, 768);
     CHECK_EQ(f.sch.plan_chunk(768, 960, 512, &ck), 192);
     CHECK_EQ(ck, 960);
-    /* Every position matches the cut schedule's. */
+    /* Every position matches the cut schedule's (at this interval a quarter interval is one
+     * quantum, so the cut's tail floor takes the same positions; see the next case). */
     Fixture g;
     g.build();
     g.cfg.prefill_span = 2;
@@ -757,6 +759,74 @@ TEST(a_lone_spanned_prefill_takes_its_tail_snapshot_inside_its_last_chunk) {
     o.sch.set_ckpt_inside(true);
     CHECK_EQ(o.sch.plan_chunk(512, 1000, 512, &ck), 488);
     CHECK_EQ(ck, -1);
+}
+
+/* The quarter-interval floor of nearest's tail snapshot (tail_checkpoint) is for a cut, which costs
+ * the last tokens a step of their own. A snapshot taken inside the last chunk cuts nothing: it is at
+ * the prompt's last quantum boundary however few rows that is past the interval below it, so the
+ * next turn resumes there and not at the interval. */
+TEST(a_tail_snapshot_inside_the_last_chunk_has_no_quarter_interval_floor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048);
+    f.cfg.checkpoint_interval = 1024;     /* quantum 64; a quarter interval is 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    f.sch.set_ckpt_inside(true);
+    int64_t ck = -1;
+    /* 2176 is 128 past the boundary at 2048: the cut schedule keeps 2048 and runs [2048, 2200) as
+     * a step of its own; inside, one chunk to the end with the snapshot at 2176. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2200, 2048, &ck), 1176);
+    CHECK_EQ(ck, 2176);
+    /* A last chunk that crosses no boundary, 3136 (64 past 3072), as well. */
+    CHECK_EQ(f.sch.plan_chunk(3072, 3150, 2048, &ck), 78);
+    CHECK_EQ(ck, 3136);
+    /* A tail on the boundary itself is that boundary's snapshot; so is one past a quarter
+     * interval. */
+    CHECK_EQ(f.sch.plan_chunk(1024, 2090, 2048, &ck), 1066);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(f.sch.plan_chunk(1024, 2400, 2048, &ck), 1376);
+    CHECK_EQ(ck, 2368);
+    /* The first interval keeps none (a shorter prompt is cheap to redo). */
+    CHECK_EQ(f.sch.plan_chunk(0, 1000, 2048, &ck), 1000);
+    CHECK_EQ(ck, -1);
+
+    /* The step sequence: the first interval, then the rest of the prompt in one spanned step with
+     * the snapshot inside it, 128 rows past the interval. */
+    const uint64_t a = f.submit(2200, 2);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].seq, a);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1024);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 1023);
+    f.commit_plain();
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().e[0].n_tokens, 1176);
+    CHECK_EQ(f.sch.plan().e[0].ckpt_tok, 2176 - 1024 - 1);
+    CHECK(f.sch.plan().e[0].produces_token);
+    f.commit_plain();
+
+    /* Where the snapshot cuts the chunk, the floor stays: 2048 and the rest a step of its own. */
+    Fixture g;
+    g.build(4096, 64, 2048);
+    g.cfg.checkpoint_interval = 1024;
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    CHECK_EQ(g.sch.plan_chunk(1024, 2200, 2048, &ck), 1024);
+    CHECK_EQ(ck, 2048);
+    CHECK_EQ(g.sch.plan_chunk(2048, 2200, 2048, &ck), 152);
+    CHECK_EQ(ck, -1);
+    /* And so it does inside a shared step, which a span does not hold. */
+    g.sch.set_ckpt_inside(true);
+    const uint64_t b = g.submit(2200, 2);
+    const uint64_t c = g.submit(100, 40);
+    (void)c;
+    int64_t b_ck = -1;
+    for (int k = 0; k < 30; ++k) {
+        if (!g.sch.step()) break;
+        for (const StepEntry& e : g.sch.plan().e)
+            if (e.seq == b && e.is_prefill && e.ckpt_tok >= 0) b_ck = e.ctx_len + e.ckpt_tok + 1;
+        g.commit_plain();
+    }
+    CHECK_EQ(b_ck, 2048);
 }
 
 /* A span moves no checkpoint and no piece, from a prompt's start or from any checkpoint a turn
@@ -887,9 +957,10 @@ TEST(a_span_min_keeps_a_short_prompt_at_one_interval) {
     CHECK(last_pf > 0);
 }
 
-/* A shared step under a span is planned as a deployment without one plans it: with two requests
- * from the start, every step they share is the same, entry for entry, at budget 512 with a span of
- * two as at budget 256 with none, --busy-prefill-chunk's shares included. */
+/* A shared step under a span is planned as a deployment without one plans it: with one request
+ * decoding (b, its prompt a step of its own) and a long prompt beside it, every step they share is
+ * the same, entry for entry, at budget 512 with a span of two as at budget 256 with none,
+ * --busy-prefill-chunk's shares included. */
 TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     std::vector<std::vector<std::pair<uint64_t, int32_t>>> plans[2];
     for (int m = 0; m < 2; ++m) {
@@ -897,8 +968,12 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
         f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/m == 0 ? 512 : 256);
         if (m == 0) f.cfg.prefill_span = 2;
         CHECK_OK(f.start());
+        const uint64_t b = f.submit(100, 12);
+        CHECK(f.sch.step() != nullptr);
+        CHECK_EQ((int64_t)f.sch.plan().e.size(), 1ll);
+        CHECK_EQ(f.sch.plan().e[0].n_tokens, 100);
+        f.commit_plain();
         const uint64_t a = f.submit(3000, 4);
-        const uint64_t b = f.submit(300, 6);
         (void)a;
         for (int k = 0; k < 40; ++k) {
             if (!f.sch.step()) break;
@@ -915,6 +990,110 @@ TEST(a_shared_step_under_a_span_is_planned_as_without_one) {
     }
     CHECK(plans[0].size() >= 4);
     CHECK(plans[0] == plans[1]);
+}
+
+/* Prompts prefilling side by side with nothing decoding and no one to admit: each step is spanned
+ * and holds one of them, the one with the fewest prompt tokens left, and the others wait for it
+ * (they take no share of it). As soon as one decodes, the steps are shared again. */
+TEST(concurrent_prefills_with_nothing_decoding_span_one_at_a_time_shortest_first) {
+    Fixture f;
+    f.build();                            /* interval 256, budget 512, shared 256 */
+    f.cfg.prefill_span = 2;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(3000, 3);
+    const uint64_t b = f.submit(1300, 3);
+    /* Both admitted in the first step, at the shared budget. */
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ((int64_t)f.sch.plan().e.size(), 2ll);
+    CHECK(f.sch.plan().n_tok <= 256);
+    f.commit_plain();
+    /* Then b, the shorter, alone in spanned steps up to its first token; a takes nothing. */
+    std::vector<int32_t> b_chunks;
+    int b_first = -1;
+    for (int k = 0; k < 20 && b_first < 0; ++k) {
+        CHECK(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        CHECK_EQ((int64_t)p.e.size(), 1ll);
+        CHECK_EQ(p.e[0].seq, b);
+        CHECK(p.e[0].is_prefill);
+        b_chunks.push_back(p.e[0].n_tokens);
+        if (p.e[0].produces_token) b_first = k;
+        f.commit_plain();
+    }
+    CHECK(b_first >= 0);
+    int wide = 0;
+    for (int32_t n : b_chunks) wide += n > 256;
+    CHECK(wide >= 1);
+    /* With b decoding, every step is shared: no entry and no step past 256 tokens, a's chunk beside
+     * b's row. */
+    int shared = 0, a_beside_b = 0;
+    for (int k = 0; k < 6; ++k) {
+        if (!f.sch.step()) break;
+        const StepPlan& p = f.sch.plan();
+        bool has_a = false, has_b = false;
+        for (const StepEntry& e : p.e) {
+            has_a = has_a || e.seq == a;
+            has_b = has_b || (e.seq == b && !e.is_prefill);
+        }
+        if (!has_b) break;
+        ++shared;
+        CHECK(p.n_tok <= 256);
+        a_beside_b += has_a;
+        f.commit_plain();
+    }
+    CHECK(shared >= 2);
+    CHECK_EQ(a_beside_b, shared);
+
+    /* A step wider than the shared budget never holds more than one sequence, over a run of three
+     * prompts arriving together (RadBuildCtx::max_mixed_tok). */
+    Fixture g;
+    g.build();
+    g.cfg.prefill_span = 2;
+    CHECK_OK(g.start());
+    g.submit(2500, 2);
+    g.submit(900, 2);
+    g.submit(1700, 2);
+    int bad = 0, spans = 0, done = 0;
+    for (int k = 0; k < 200; ++k) {
+        if (!g.sch.step()) break;
+        const StepPlan& p = g.sch.plan();
+        if (p.n_tok > 256) { ++spans; bad += p.e.size() != 1; }
+        g.commit_plain();
+        ++done;
+    }
+    CHECK(done < 200);
+    CHECK(spans >= 3);
+    CHECK_EQ(bad, 0);
+
+    /* The step after a request finishes beside a prefill is shared: a follow-up turn its client
+     * sends at once waits for that step, not for a span. Then the prefill spans again. */
+    Fixture h;
+    h.build();
+    h.cfg.prefill_span = 2;
+    CHECK_OK(h.start());
+    const uint64_t d = h.submit(100, 3);
+    CHECK(h.sch.step() != nullptr);
+    h.commit_plain();
+    const uint64_t p = h.submit(3000, 2);
+    std::vector<int64_t> after;           /* p's chunks from the step after d finished */
+    bool d_gone = false;
+    for (int k = 0; k < 40 && after.size() < 3; ++k) {
+        if (!h.sch.step()) break;
+        bool has_d = false;
+        int64_t p_tok = 0;
+        for (const StepEntry& e : h.sch.plan().e) {
+            has_d = has_d || e.seq == d;
+            if (e.seq == p) p_tok = e.n_tokens;
+        }
+        if (!has_d) { d_gone = true; after.push_back(p_tok); }
+        h.commit_plain();
+    }
+    CHECK(d_gone);
+    CHECK_EQ((int64_t)after.size(), 3ll);
+    if (after.size() == 3) {
+        CHECK(after[0] > 0 && after[0] <= 256);
+        CHECK(after[1] > 256 || after[2] > 256);
+    }
 }
 
 /* Window snapshots do not support spans, and a model without checkpoints has no interval.
@@ -2046,6 +2225,46 @@ TEST(an_idle_overdue_prefill_is_admitted_when_its_kv_sequence_is_gone) {
     CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Running);
     CHECK(f.kv.has_sequence(b));
     f.commit_plain();
+}
+
+/* A waiter the idle engine cannot start must not park the queue. The room gate used to return
+ * kAdmitWait when the pool could ever hold the prompt but can_grow could not, and with nothing
+ * running the next step never freed a block. step() then returned null forever. */
+TEST(an_idle_engine_fails_a_waiter_it_cannot_start) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/4);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    for (auto& fl : f.kv.freelist) fl.clear();
+
+    const uint64_t id = f.submit(64, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(id)->state, (int)ReqState::Failed);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ(f.sch.metrics().queue_depth, 0);
+}
+
+/* The room gate counts the prompts this step already admitted, and a prompt it holds back holds
+ * the queue behind it. 40 blocks of 16 tokens: A's 350-token prompt takes 22, so B's needs 22 more
+ * than are left beside A (and the one past A), and C, a short prompt behind B, waits with B
+ * rather than taking the room B waits for. */
+TEST(the_room_gate_counts_this_steps_admissions_and_holds_the_queue_behind_a_long_prompt) {
+    Fixture f;
+    f.build(/*blocks=*/40, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(350, 8);
+    const uint64_t b = f.submit(350, 8);
+    const uint64_t c = f.submit(20, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
+    CHECK(f.sch.find(a)->n_computed > 0);
+    CHECK_EQ(f.sch.find(b)->n_computed, (int64_t)0);
+    CHECK_EQ(f.sch.find(c)->n_computed, (int64_t)0);
+    CHECK_EQ((int)f.sch.find(b)->state, (int)ReqState::Waiting);
+    CHECK_EQ((int)f.sch.find(c)->state, (int)ReqState::Waiting);
 }
 
 /* Two prefills that cannot both stay up. Resetting the higher-priority one so the lower one can
@@ -6168,6 +6387,36 @@ TEST(a_refused_lookahead_still_runs_the_history_pass) {
     f.sch.serial_end(0);
 }
 
+TEST(calibration_history_keeps_every_row_without_reserving_a_proposal) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64);
+    f.prog.drafter.kind = RAD_DRAFT_HISTORY;
+    f.cfg.n_spec = 0;
+    f.cfg.prefix_cache = false;
+    CHECK_OK(f.start());
+
+    REQUIRE(f.submit(160, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    REQUIRE(f.submit(32, /*max_tokens=*/1, /*priority=*/0, /*ignore_eos=*/true));
+    const RadBatch* trunk = f.sch.step();
+    REQUIRE(trunk != nullptr);
+    const int64_t tokens = trunk->n_tok;
+    CHECK_EQ(tokens, 192);
+
+    // Like the engine, plan history after issuance but before either request commits.
+    int rounds = 1;
+    Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);
+    const RadBatch* history = f.sch.serial_batch(0, 1);
+    REQUIRE(history != nullptr);
+    CHECK_EQ(history->draft_pass, -1);
+    CHECK_EQ(history->n_tok, tokens);
+    CHECK_EQ(history->n_out, tokens);
+    CHECK_EQ(history->n_draft_out, 0);
+    CHECK(f.sch.serial_batch(2, 1) == nullptr);
+    f.commit_plain();
+    f.sch.serial_end(0);
+}
+
 /* Draft round 1 rides the history pass. A drafting verifier owes the head's history at all
  * 1 + n_spec verified positions, and the card repeats the last committed one past it, so the
  * run's last row is round 1's input: the pass names that row, and round 1 has no pass of its own. */
@@ -7859,8 +8108,9 @@ std::unique_ptr<Request> with_run(Fixture& f, int n_prompt, int tok, int n, mm::
     return req;
 }
 
-void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi) {
-    f.build(/*blocks=*/4096, /*states=*/64, max_tok);
+void media_fixture(Fixture& f, int64_t max_tok, int32_t bidi, bool windowed = false) {
+    f.build(/*blocks=*/4096, /*states=*/64, max_tok, /*max_ctx=*/4096, windowed,
+            /*linear=*/!windowed);
     f.prog.encoder.modalities = RAD_MM_IMAGE;
     f.prog.encoder.n_embd = 4;
     f.prog.encoder.patch_dim = 4;
@@ -7932,6 +8182,36 @@ TEST(a_run_longer_than_a_step_is_cut_and_reads_up_to_the_cut) {
     CHECK_EQ(b->bidi_row[0], 8);
     CHECK_EQ(b->bidi_n[0], 56);
     CHECK_EQ(b->bidi_used[0], 256);
+}
+
+/* A run read both ways is attended on sliding layers, over the window group's block table, which
+ * starts at first_block_pos once the window has recycled the blocks below it. bidi_used counts from
+ * there, as that group's seqused does; the absolute end would point the run's rows past the keys
+ * the pass wrote, and a picture after the first chunk was read as nothing. Gemma 4's layout: a
+ * full group and a 64-token window group, no linear group. */
+TEST(a_run_in_a_later_chunk_counts_its_keys_from_the_recycled_window) {
+    Fixture f;
+    media_fixture(f, 256, 1, /*windowed=*/true);
+    CHECK_OK(f.start());
+    f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_bidi, (int64_t)0);
+    const int64_t c0 = b->n_tok;                      /* the chunk ends before the run */
+    f.commit_plain();
+    f.kv.first_pos[1] = 128;                          /* trim_window: the window slid past 0..127 */
+    b = f.sch.step();
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->n_bidi, (int64_t)1);
+    CHECK_EQ(b->bidi_row[0], (int32_t)(200 - c0));
+    CHECK_EQ(b->bidi_n[0], 100);
+    CHECK_EQ(b->bidi_used[0], 300 - 128);
+    /* The same count as the window group's own: its seqused less the rows past the run. */
+    const RadKVGroupBatch* win = nullptr;
+    for (int g = 0; g < b->n_kv_groups; ++g)
+        if (b->kv[g].group == 1) win = &b->kv[g];
+    REQUIRE(win != nullptr && win->seqused_h != nullptr);
+    CHECK_EQ(b->bidi_used[0], win->seqused_h[0] - (int32_t)(c0 + b->n_tok - 300));
 }
 
 TEST(runs_are_cut_anywhere_without_the_flag_and_for_audio) {

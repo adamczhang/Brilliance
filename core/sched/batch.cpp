@@ -491,6 +491,10 @@ int BatchBuilder::layout(Program& prog, const Config& cfg) {
 
     mm_on_ = prog.encoder.modalities != 0 || prog.audio_encoder.modalities != 0;
     bidi_on_ = prog.encoder.modalities != 0 && prog.encoder.bidirectional != 0;
+    bidi_grp_ = -1;
+    for (size_t i = 0; bidi_on_ && bidi_grp_ < 0 && i < prog.kv_groups.size(); ++i)
+        if (prog.kv_groups[i].decl.kind == RAD_KV_WINDOW && !prog.kv_groups[i].drafter)
+            bidi_grp_ = (int32_t)i;
     lora_on_ = cfg.lora.enabled();
     pw_cap_ = prog.plugin_words;
     return RAD_OK;
@@ -1074,11 +1078,20 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
          * chunk's where a run longer than any step was cut (Scheduler::bidi_fit). */
         if (bidi_on_ && plan.draft_pass == 0 && shift == 0 && e.req && e.req->media) {
             const mm::PromptMedia& pm = *e.req->media;
+            /* The run's rows are attended again on sliding layers, over the window group's block
+             * table. That table starts at first_block_pos once the window has recycled the blocks
+             * below it (trim_window after each chunk), and the group's seqused counts from there
+             * (build_groups). bidi_used counts the same way, after the loop: the absolute end would
+             * point the rows past the keys this pass wrote, so a picture after the first chunk was
+             * read as nothing. A full group starts at 0, so without a window group the end stays
+             * absolute. */
+            const int64_t w0 = bidi_grp_ >= 0 ? kv.first_block_pos(e.seq, bidi_grp_) : 0;
+            const int64_t n0 = n_bidi;
             const int64_t c0 = e.ctx_len, c1 = c0 + e.n_tokens, T = max_tok_;
             /* RopeLayout::runs is documented ascending and pairwise disjoint, and the slice
              * bound (h_bidi is 4*max_tok_ wide, one slot per token this step can carry) leans
-             * on exactly that: overlapping runs would count one token twice. The layout is now
-             * fed from request-side placement, so the promise is checked here rather than
+             * on exactly that: overlapping runs would count one token twice. The layout comes
+             * from request-side placement, so the promise is checked here rather than
              * trusted -- an overlapping run drops its media rows' bidirectionality, which the
              * acceptance path treats as an ordinary miss, where a slot overrun is a fault. */
             int64_t prev_b = c0;
@@ -1110,6 +1123,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 s.h_bidi[3 * T + n_bidi] = (int32_t)i;
                 ++n_bidi;
             }
+            for (int64_t q = n0; q < n_bidi; ++q) s.h_bidi[q] -= (int32_t)w0;
         }
         if (e.ckpt_tok >= 0 && e.ckpt_slot >= 0 && e.ckpt_tok + 1 < e.n_tokens &&
             plan.draft_pass == 0) {

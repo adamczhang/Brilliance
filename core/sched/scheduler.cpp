@@ -781,6 +781,7 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
     if (s.req->finish_reason.empty() && reason) s.req->finish_reason = reason;
     queue_erase(running_, s.slot);
     queue_erase(waiting_, s.slot);
+    if (st == ReqState::Finished && !s.req->embed && !running_.empty()) finished_beside_ = true;
     s.n_draft = 0;
 
     /* Terminal. The sink keeps the first finish, so a cancel racing a natural stop yields one
@@ -1210,14 +1211,15 @@ int64_t Scheduler::plan_chunk(int64_t n_computed, int64_t n_target, int64_t budg
              * leaves, so the final chunk splits at the last quantum boundary and the remainder
              * (under a quantum) runs as the next step's chunk (tail_checkpoint decides when that
              * is worth it). A window's tail snapshot is taken above, inside its chunk. */
-            const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target);
             /* A prefill alone in its spanned step whose plugin snapshots inside the step
              * (set_ckpt_inside) takes either snapshot below inside its last chunk, at the same
              * position, and runs to the prompt's end: the rows past it would otherwise be a step
              * of their own, which on a routed model reads nearly every expert for a few dozen
-             * rows. */
+             * rows. Its tail snapshot splits nothing, so it is taken however few rows it lies
+             * past the interval boundary below it (tail_checkpoint's in_step). */
             const bool inside = ckpt_inside_ && cfg_.prefill_tail_snapshot && geo_.span > 1 &&
                                 span_now_ && cfg_.prefill_span > 1 && !geo_.window_ckpt;
+            const int64_t tail = geo_.window_ckpt ? -1 : tail_checkpoint(n_target, inside);
             if (inside && tail > n_computed) {
                 if (checkpoint_pos) *checkpoint_pos = tail;
             } else if (inside && n_computed + want > next) {
@@ -1312,8 +1314,9 @@ int64_t Scheduler::bidi_fit(const Request& r, int64_t n_computed, int64_t n_targ
  * last chunk starts (below). Under nearest, its last quantum boundary, only past the first
  * interval (a shorter prompt is cheap to redo) and only where it gains at least a quarter
  * interval over the interval checkpoint below it, which pays for the extra step; a window
- * snapshot follows its own rule (below). */
-int64_t Scheduler::tail_checkpoint(int64_t target) const {
+ * snapshot follows its own rule (below). A snapshot taken inside the last chunk (`in_step`)
+ * costs no step, only its copy, and is taken wherever it lies past the interval below it. */
+int64_t Scheduler::tail_checkpoint(int64_t target, bool in_step) const {
     const int64_t I = geo_.checkpoint_interval, Q = geo_.quantum;
     if (I <= 0 || Q <= 0) return -1;
     if (geo_.exact) {
@@ -1340,6 +1343,7 @@ int64_t Scheduler::tail_checkpoint(int64_t target) const {
         const int64_t t = (target - std::max<int64_t>(Q, 16)) / Q * Q;
         return t >= std::min<int64_t>(I, kWindowSnapshotMin) ? t : -1;
     }
+    if (in_step) return tail > I && tail % I != 0 ? tail : -1;
     return tail > I && tail - tail / I * I >= std::max<int64_t>(Q, I / 4) ? tail : -1;
 }
 
@@ -1522,6 +1526,8 @@ bool Scheduler::preempt_back() {
  * blocks to run would be preempted on its first step, a full recompute for nothing. */
 int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
                          int64_t mixed_target_shares) {
+    idle_refuse_ = false;
+    room_wait_ = false;
     Request& r = *s.req;
 
     /* A REQUEST THAT WAS PREEMPTED WAITS FOR ROOM FOR THE WHOLE RECOMPUTE, plus one block of
@@ -1731,6 +1737,38 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
         s.hit_attn = h.n_attn_tokens;
     }
 
+    /* A fresh prefill is admitted only when its WHOLE prompt plus one decode position fits
+     * beside the whole prompt of every runner and their next-token headroom. The generic
+     * admission below only reserves this chunk; without this gate a long prompt can reach 100%
+     * and then be preempted at the first decode step, wasting the entire prefill. */
+    if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && (int64_t)r.n_computed < (int64_t)r.prompt.size()) {
+        int rounds = 0;
+        while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
+               cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
+            ++rounds;
+        if (!fresh_prefill_can_fit(s)) {
+            /* A prompt the empty pool cannot hold must not starve the queue: it fails below
+             * (spec §17) like the preempted path, rather than waiting forever. */
+            if (!kv_->can_ever_fit(s.seq_len() + 1))
+                ;   /* fall through: ensure_from() reports the shortfall */
+            else if (running_.empty() && took_.empty()) {
+                /* Nothing is running, so the next step will not free a block or a slot. A hit
+                 * kept from the previous bounce (n_computed > 0) can be what can_grow refuses;
+                 * drop it once. Still short: refuse, and the step loop fails this request
+                 * instead of parking every waiter behind kAdmitWait. */
+                if (r.n_computed > 0) undo_hit(s);
+                (void)kv_->release_idle_states();
+                if (!fresh_prefill_can_fit(s)) {
+                    idle_refuse_ = true;
+                    return RAD_E_NOMEM;
+                }
+            } else {
+                room_wait_ = true;
+                return kAdmitWait;
+            }
+        }
+    }
+
     int64_t target = s.seq_len();
     int64_t ckpt = -1;
     int64_t want;
@@ -1901,6 +1939,53 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     return true;
 }
 
+/* Whether a FRESH prefill may start: the whole prompt plus one decode position has to fit in
+ * every FULL paged group, beside the whole prompt (or the next position) of every running
+ * sequence and of every request this step's admission has already taken, with one block past
+ * that for each. Admitting on the first chunk alone lets the pool reach 100% mid-prompt, and
+ * preempt_back() then hands back the whole prefill's KV, so the request starts again at zero.
+ * WINDOW/RING groups recycle; counting the whole prompt against them livelocks a long chat in
+ * Waiting. */
+bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
+
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        auto beside = [&](int32_t slot) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req || &rs == &s) return;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;                       /* one block past that for the sequence */
+        };
+        for (int32_t slot : running_) beside(slot);
+        for (size_t i : took_) beside(waiting_[i]);
+        if (need > kv_->available_blocks((int32_t)g)) return false;
+    }
+
+    /* Stateful groups: the fresh prefill needs a state slot, and every running sequence must keep
+     * the slot it already holds. Asked at the next position, not the prompt's end: the FULL
+     * groups were counted above, and a window or ring group recycles its blocks, so counting the
+     * whole prompt there refuses a prompt longer than its window that the model serves (an idle
+     * engine then fails it). */
+    if (kv_->has_sequence(r.id) && !kv_->can_grow(r.id, (int64_t)r.n_computed + 1)) return false;
+    for (int32_t slot : running_) {
+        const SchedReq& rs = *reqs_[(size_t)slot];
+        if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
+    }
+    return true;
+}
+
 bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
     if (!s.req || s.req->state != ReqState::Preempted) return false;
     /* 0 means fall back on the next step; a timed request must have been preempted before. */
@@ -2036,13 +2121,21 @@ const RadBatch* Scheduler::step() {
 
     /* A span is for a prefill alone in its step (ChunkGeometry::span). A spanned step takes as
      * long as the intervals it carries, so a decode row riding along would wait that long for its
-     * token. The span is taken only when the step can hold nothing but the one prefill (a single
-     * running request with prompt left and no admission possible, or a single request in an empty
-     * engine); every other step is planned at ChunkGeometry::shared_tok as a deployment without a
-     * span plans it, --busy-prefill-chunk included. Both kinds of chunk end on the same interval
+     * token. The span is taken only when the step can hold nothing but one prefill: a single
+     * request in an empty engine, or running requests that all have prompt left with no admission
+     * possible. Of several, the one with the fewest prompt tokens left takes the step alone and the
+     * others wait for it (shortest remaining first): a step of shared_tok split between them runs
+     * well under a spanned step's rate, and the first token of the shortest comes first. Every
+     * other step -- one with a decode row, or a request to admit -- is planned at
+     * ChunkGeometry::shared_tok as a deployment without a span plans it, --busy-prefill-chunk
+     * included. So is the one step after a request finished beside them (finished_beside_): a
+     * follow-up turn its client sends at once arrives while that step runs, and waits for it
+     * rather than for a span several times as long. Both kinds of chunk end on the same interval
      * grid, so a prompt may switch between them at any step. */
     span_now_ = true;
     struct SpanReset { bool& f; ~SpanReset() { f = true; } } span_reset{span_now_};
+    /* The running request a spanned step holds, or -1: every other running request sits it out. */
+    int32_t span_slot = -1;
     /* Keyed on the flag, not on whether this model has intervals to span: the engine told the
      * plugin that a step wider than shared_tok is one sequence (RadBuildCtx::max_mixed_tok),
      * whatever the geometry turned out to be. */
@@ -2050,14 +2143,28 @@ const RadBatch* Scheduler::step() {
         bool lone = false;
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
-        if (running_.size() == 1 && !admit_possible) {
-            const SchedReq& s0 = *reqs_[(size_t)running_[0]];
-            lone = s0.req->n_computed < (int64_t)s0.req->prompt.size() ||
-                   s0.req->n_computed + 1 < s0.seq_len();
+        const bool after_finish = finished_beside_;
+        finished_beside_ = false;
+        if (!running_.empty() && !admit_possible && !after_finish) {
+            int64_t fewest = INT64_MAX;
+            for (int32_t slot : running_) {
+                const SchedReq& sr = *reqs_[(size_t)slot];
+                const Request& rr = *sr.req;
+                const int64_t tg = sr.seq_len();
+                if (rr.n_computed >= (int64_t)rr.prompt.size() && rr.n_computed + 1 >= tg) {
+                    span_slot = -1;           /* a decode row: a shared step */
+                    break;
+                }
+                if (tg - rr.n_computed < fewest) { fewest = tg - rr.n_computed; span_slot = slot; }
+            }
+            lone = span_slot >= 0;
             /* By the whole prefill, not what is left of it, so a prompt keeps spanning through
              * its last intervals (set_span_min). */
-            if (lone && span_min_ > 0)
+            if (lone && span_min_ > 0) {
+                const SchedReq& s0 = *reqs_[(size_t)span_slot];
                 lone = std::max<int64_t>((int64_t)s0.req->prompt.size(), s0.seq_len()) >= span_min_;
+            }
+            if (!lone) span_slot = -1;
         } else if (running_.empty() && waiting_.size() == 1) {
             const SchedReq& w = *reqs_[(size_t)waiting_[0]];
             lone = span_min_ == 0 || (w.req && (int64_t)w.req->prompt.size() >= span_min_);
@@ -2085,6 +2192,8 @@ const RadBatch* Scheduler::step() {
     int64_t behind_dec = 0, behind_pf = 0;
     if (share_step) {
         for (int32_t slot : running_) {
+            /* Those a spanned step leaves out take no share of it. */
+            if (span_slot >= 0 && slot != span_slot) continue;
             const Request& rr = *reqs_[(size_t)slot]->req;
             const int64_t tg = reqs_[(size_t)slot]->seq_len();
             const bool pf = (rr.n_computed < (int64_t)rr.prompt.size()) || (rr.n_computed + 1 < tg);
@@ -2120,6 +2229,9 @@ const RadBatch* Scheduler::step() {
      * admitted, so new work never preempts work half done. */
     for (size_t i = 0; i < running_.size(); ) {
         if ((int64_t)plan_.e.size() >= cfg_.max_seqs || budget <= 0) break;
+        /* A spanned step holds one sequence (RadBuildCtx::max_mixed_tok): the one chosen above. */
+        if (cfg_.prefill_span > 1 && span_now_ && !plan_.e.empty()) break;
+        if (span_slot >= 0 && running_[i] != span_slot) { ++i; continue; }
 
         int32_t slot = running_[i];
         SchedReq& s = *reqs_[(size_t)slot];
@@ -2371,6 +2483,22 @@ const RadBatch* Scheduler::step() {
                 : 0;
             const int as = admit_one(s, budget, areserve,
                                      std::max<int64_t>(0, mixed_target_shares));
+            /* An idle engine that cannot start this request will not be able to on the next
+             * step either: nothing is running to free a block or a slot. Fail it and ask the
+             * next, instead of returning an empty plan forever (every waiter stays Waiting,
+             * the GPU idles). A refusal that is only a wait for a deferred restore
+             * (admit_next_step_) still waits. */
+            if (idle_refuse_ && as < 0 && running_.empty() && took_.empty() && plan_.e.empty() &&
+                !admit_next_step_ && s.req) {
+                idle_refuse_ = false;
+                RAD_WARN("request %llu failed: its prompt of %zu tokens does not fit the KV "
+                         "cache with nothing running (%s); a larger cache (gpu memory, "
+                         "kv-cache-dtype) or a shorter prompt serves it",
+                         (unsigned long long)s.req->id, s.req->prompt.size(), rad_strerror(as));
+                close_request(s, ReqState::Failed, "idle_admission", false, true, as,
+                              "the prompt does not fit the KV cache with nothing running");
+                continue;
+            }
             /* A preempted request waiting for its whole-recompute gate lets the next one be asked;
              * an overdue one does not. The room the overdue path made this step is for it, and a
              * request queued behind it would take that room back: a victim just forced off for it,
@@ -2379,6 +2507,10 @@ const RadBatch* Scheduler::step() {
              * waited. */
             if (as == kAdmitWait) {
                 if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                /* A fresh prompt waiting for room holds the queue behind it: shorter requests
+                 * admitted past it would keep taking the room it waits for, and nothing ages a
+                 * waiting fresh request the way an overdue preempted one is aged. */
+                if (room_wait_) break;
                 ++at;
                 continue;
             }

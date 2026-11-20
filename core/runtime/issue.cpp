@@ -1361,7 +1361,12 @@ void Ctx::haz_note(const OpPlan& p, const IssuePlan& ip, const RadTensor* t, int
     o.rec1 = rec1;
     o.op = (uint32_t)(&p - plans_.data());
     const RadOpSchema* sc = p.info ? p.info->schema : nullptr;
-    o.opaque = p.collective || !sc || sc->n_operands != n_opd || !ip.row || !ip.row->concurrent;
+    /* The operand counts issue_body accepts: trailing optional operands may be left out, and an
+     * absent one is a null tensor that reaches nothing (skipped below). Requiring the full schema
+     * count here made every issue that omits one opaque, which orders it behind its neighbours in
+     * a recorded pass (the routed MoE GEMMs without their prefill-only `split`, for example). */
+    const bool count_ok = sc && n_opd <= sc->n_operands && n_opd >= p.n_opd_required;
+    o.opaque = p.collective || !count_ok || !ip.row || !ip.row->concurrent;
     std::pair<uintptr_t, uintptr_t> rd[MAX_OPERANDS + 1], wr[MAX_OPERANDS + 1];
     int n_rd = 0, n_wr = 0;
     for (int i = 0; i < n_opd && !o.opaque; ++i) {

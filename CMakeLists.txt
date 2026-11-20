@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 # VERSION is the server release that /version reports. The plugin ABI version is separate and is
 # read from abi/rad_abi.h below.
-project(radiance VERSION 2.1.0 LANGUAGES C CXX)
+project(radiance VERSION 2.2.0 LANGUAGES C CXX)
 # Brilliance: everything the Windows build does differently lives in win/.
 if(WIN32)
   include(${CMAKE_CURRENT_SOURCE_DIR}/win/cmake/RadWindows.cmake)

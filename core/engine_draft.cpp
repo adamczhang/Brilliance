@@ -20,10 +20,6 @@
 #include <string>
 #include <vector>
 
-#include <sys/stat.h>
-#if defined(_WIN32)
-#include "os/os.h"   // Brilliance: os::file_size_mtime
-#endif
 
 namespace rad {
 
@@ -118,7 +114,7 @@ int Engine::step_state_init() {
             RAD_INFO("DFlash coupled LIVE: %d position(s), x~Q along the candidate walk, maximal "
                      "coupling at the verify; fixed-seed tokens are NOT preserved", drafter_.depth);
         else
-            RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the final reranked top8, "
+            RAD_INFO("MTP coupled LIVE: %d linear round(s), x~Q from the draft shortlist, "
                      "maximal coupling at the verify; fixed-seed tokens are NOT preserved",
                      drafter_.depth);
     }
@@ -183,7 +179,7 @@ int Engine::step_state_init() {
             depth_online_on_ = cfg_.draft_depth_load_online;
             draft_depth_online_begin(depth_cfg_, &depth_online_);
             depth_pend_.assign((size_t)n_slot, DepthPend{});
-            if (const char* e = std::getenv("RADIANCE_CONC_LOG"); e && *e) {
+            if (const char* e = std::getenv("RADIANCE_DEBUG_CONC_LOG"); e && *e) {
                 depth_log_ = std::fopen(e, "w");
                 if (depth_log_) std::setvbuf(depth_log_, nullptr, _IOFBF, 1 << 20);
             }
@@ -196,7 +192,6 @@ int Engine::step_state_init() {
             RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
         depth_row_.assign((size_t)n_slot, DraftDepthRow{});
         depth_of_.assign((size_t)n_slot, 0);
-        if (const char* e = std::getenv("RADIANCE_DEPTH_SPIN_US")) depth_spin_us_ = std::atoll(e);
         RAD_INFO("draft depth adaptive: 1..%d draft(s) a step, the chain goes on while the product of "
                  "the head's %s probabilities is >= %.3f (decided %d round(s) behind, %d round(s) "
                  "always run); a row with no law drafts %d",
@@ -409,7 +404,7 @@ int Engine::depth_observe_upto(int round, int n, const StepOut& so) {
                     if (q != 0) break;
                     if ((spin & 255u) == 255u &&
                         std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t1)
-                                .count() > (double)depth_spin_us_) {
+                                .count() > (double)kDepthSpinUs) {
                         blocked = true;
                         break;
                     }
@@ -488,47 +483,6 @@ void Engine::depth_log_stats(const char* when) {
     if (depth_load_on_) depth_load_log(when);
 }
 
-/* RADIANCE_DEPTH_CTL=<file>, diagnostics: `load=0|1` the load-aware rule (and with it the late
- * choice), `late=0|1` the late choice alone. The file is looked at every 16 steps and
- * read again when its mtime has moved; a word switches only what --draft-depth-load on set up.
- * Between steps, like every table the rule reads. */
-void Engine::depth_ctl_poll(int step) {
-    static const char* path = std::getenv("RADIANCE_DEPTH_CTL");
-    if (!path || !*path || (step & 15) != 0) return;
-#if defined(_WIN32)
-    /* Brilliance: the UCRT's stat has no st_mtim; os::file_size_mtime gives the last-write time
-     * at 100 ns, the same seconds-and-nanoseconds the Linux line reads. */
-    int64_t fsz = 0, fsec = 0, fnsec = 0;
-    if (!os::file_size_mtime(path, &fsz, &fsec, &fnsec)) return;
-    const int64_t mt = fsec * 1000000000ll + fnsec;
-#else
-    struct stat sb;
-    if (::stat(path, &sb) != 0) return;
-    const int64_t mt = (int64_t)sb.st_mtim.tv_sec * 1000000000ll + (int64_t)sb.st_mtim.tv_nsec;
-#endif
-    if (mt == depth_ctl_mtime_) return;
-    depth_ctl_mtime_ = mt;
-    std::FILE* f = std::fopen(path, "r");
-    if (!f) return;
-    char buf[256];
-    const size_t got = std::fread(buf, 1, sizeof buf - 1, f);
-    std::fclose(f);
-    buf[got] = 0;
-    for (char* t = std::strtok(buf, " \t\r\n"); t; t = std::strtok(nullptr, " \t\r\n")) {
-        char* eq = std::strchr(t, '=');
-        if (!eq) continue;
-        const bool v = std::atoi(eq + 1) != 0;
-        *eq = 0;
-        if      (!std::strcmp(t, "load")) depth_cfg_.load = v && depth_load_on_;
-        else if (!std::strcmp(t, "late")) depth_cfg_.late = v && depth_load_on_ && cfg_.draft_depth_load_late;
-    }
-    RAD_INFO("draft depth control (step %d): load-aware rule %s, late choice %s", step,
-             depth_cfg_.load ? "on" : "off", depth_cfg_.load && depth_cfg_.late ? "on" : "off");
-    if (depth_log_)
-        std::fprintf(depth_log_, "C %d %d %d\n", step, (int)depth_cfg_.load,
-                     (int)(depth_cfg_.load && depth_cfg_.late));
-}
-
 /* --draft-depth-load, once a step, after its draft passes ended and its verify was committed:
  * the step's milliseconds (since the step before it ended, when both were pure decode steps of the
  * same drafting rows), its verify rows, rounds and tokens for the rule's rate and prices; every 64
@@ -599,7 +553,7 @@ void Engine::depth_load_log(const char* when) const {
              depth_cfg_.cal_x[0], depth_cfg_.cal_x[draft_depth_knots(depth_cfg_) - 1], c.c_str());
 }
 
-/* RADIANCE_CONC_LOG: the step just finished, one line.
+/* RADIANCE_DEBUG_CONC_LOG: the step just finished, one line.
  *   S step ns phase n_seq n_tok rounds drafting_rows load_step | entry;... | chain;...
  * An entry is a sequence of the step's verify: seq,is_prefill,n_tokens,drafts verified,drafts
  * accepted (-1: no token row),ctx_len. A chain is what a drafting row made behind the step, for
@@ -641,9 +595,9 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
-    if (depth_cfg_.on) depth_ctl_poll(step);
+    const bool history_only = drafter_.kind == RAD_DRAFT_HISTORY;
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
-    if (!serial_drafting()) {
+    if (!serial_drafting() && !history_only) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
         return RAD_OK;
     }
@@ -651,7 +605,9 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     RAD_TRY(collect_issue(so, /*fence=*/true));
 
-    int rounds = drafter_.depth;
+    /* serial_begin needs a pass budget even for history alone. The scheduler's speculative
+     * depth is still zero there, so it stages history rows but never reserves a proposal row. */
+    int rounds = history_only ? 1 : drafter_.depth;
     /* --draft-depth-max below the head's declared depth: no round past it is ever asked for. */
     if (depth_cfg_.on && rounds > depth_cfg_.max) rounds = depth_cfg_.max;
     serial_row_.resize((size_t)cfg_.max_seqs);
@@ -707,12 +663,23 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         const auto tA = std::chrono::steady_clock::now();
         const RadBatch* db = sched_.serial_batch(rd, step);
-        if (!db) { if (rd == 0) continue; break; }
+        if (!db) {
+            if (history_only) {
+                RAD_ERR("'%s' calibration: missing history batch for step %d", drafter_.name, step);
+                return RAD_E_STATE;
+            }
+            if (rd == 0) continue;
+            break;
+        }
         /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
          * also draft round 1 for drafting rows, whose inputs are the last row of their history run
          * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
          * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
         const int drafted = rd == 0 ? (int)db->n_draft_out : n;
+        if (history_only && (n != 0 || drafted != 0 || rd != 0)) {
+            RAD_ERR("'%s' history-only calibration cannot reserve draft proposals", drafter_.name);
+            return RAD_E_STATE;
+        }
         RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
         const auto tB = std::chrono::steady_clock::now();
 
@@ -816,7 +783,12 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
  * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
  * so a disagreement is a defect and the step is refused. */
 int Engine::finish_serial_drafter(const StepOut& so) {
-    if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    if (serial_rounds_ <= 0) return RAD_OK;
+    if (drafter_.kind == RAD_DRAFT_HISTORY) {
+        sched_.serial_end(0);  /* advance the history watermark, not the draft chain */
+        return RAD_OK;
+    }
+    if (!serial_drafting()) return RAD_OK;
     const StepPlan& plan = sched_.plan();
     if (serial_done_ > 0 && serial_rows_ > 0) {
         for (size_t i = 0; i < plan.e.size(); ++i) {

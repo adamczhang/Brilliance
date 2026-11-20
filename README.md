@@ -7,8 +7,8 @@ LLM inference engine, for AMD Radeon AI PRO R9700 cards (RDNA4, `gfx1201`): no W
 It speaks Radiance's HTTP API (OpenAI's Chat Completions and Responses, Anthropic's Messages), so existing
 clients work unchanged.
 
-**This is a new fork, based on Radiance 2.1:** upstream's `v2.1.0` tag and its main branch up to `3deabdae`
-(2026-11-18), with the Windows port on top. It is not a continuation of Brilliance 0.2.2's code. Upstream's source layout,
+**This is a new fork, based on Radiance 2.2:** upstream's `v2.2.0` tag (`b6b8751c`, 2026-11-19), with the
+Windows port on top. It is not a continuation of Brilliance 0.2.2's code. Upstream's source layout,
 YAML configuration, model implementations and plugin ABI are kept; the Windows work is a reviewable layer
 over them.
 
@@ -16,9 +16,9 @@ over them.
 - **Brilliance 0.2.2 is archived** at its original address,
   [codeberg.org/Dad_Vibes/Brilliance](https://codeberg.org/Dad_Vibes/Brilliance). Its `.rad` containers do
   not load in this version ([from 0.2.2](#from-brilliance-022)).
-- **Brilliance 0.3.0-alpha.1 is this fork's first public release: an alpha preview of 0.3.0.** Its
-  package, `Brilliance-0.3.0-alpha.1-<sha>-win64.zip`, is on the
-  [v0.3.0-alpha.1 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.1).
+- **Brilliance 0.3.0-alpha.2 is this fork's current release: the second alpha preview of 0.3.0**
+  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.2-<sha>-win64.zip`,
+  is on the [v0.3.0-alpha.2 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.2).
   Expect rough edges: what is qualified and what is not is listed below and in
   [win/SUPPORT.md](win/SUPPORT.md).
 
@@ -26,12 +26,13 @@ Upstream's own README is kept unchanged as [RADIANCE-README.md](RADIANCE-README.
 
 ## Status
 
-Alpha preview (0.3.0-alpha.1). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
+Alpha preview (0.3.0-alpha.2). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
 
 - **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean).
 - **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4).
-- **Four cards:** Qwen3.8-Flash-Next IQR-V4, soak-clean with every expert on the cards (soaked before the
-  four-card re-send and stop were added; with them it passes the injection and serving checks).
+- **Four cards:** Qwen3.8-Flash-Next IQR-V4, supported with every expert on the cards (soaked at 32K on
+  its earlier settings, 2026-11-17; its profile's tuned 256K settings pass the injection, stop and
+  serving checks; a soak on them has not run yet).
 - **Model switching on one card** by parking, with HIP virtual memory.
 - **Embeddings** (`/v1/embeddings`) with EmbeddingGemma 2.
 - **Transcription and realtime** (`/v1/audio/transcriptions`, `/v1/realtime`) with Qwen3-ASR 1.7B, and
@@ -44,9 +45,10 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
 - **Flash-Next on two cards loses a write now and then** with its production settings, where experts are
   read from host memory. A lost block is re-sent and the step completes, at about 4% of single-stream
   decode; one that cannot be recovered stops the server, which exits with status 70. Flash-Next on two
-  cards is Supported; the 8-hour soak is still to run. Profile: `flashnext-2card`.
-- **Flash-Next's output changes when requests share a step:** identical requests sent together get
-  different next-token distributions. Under investigation.
+  cards is Supported; an 8-hour soak has not been run on it yet. Profile: `flashnext-2card`.
+- **Flash-Next's output can change when requests share a step:** identical requests sent together can get
+  different next-token distributions. This is rounding, not wrong data, as upstream documents for batched
+  requests; one request at a time is repeatable.
 - **Video generation works on one card and is not yet qualified** (LTX-2.5 distilled IQ8R). It writes H.264
   only through AMD's or Windows' licensed encoders, on Brilliance's own FFmpeg ([H.264](#h264)).
 - **Speech synthesis (TTS) is not supported** in 0.3.0, and **music generation is not served**:
@@ -74,8 +76,8 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
 
 ### 2. Get the package
 
-Download `Brilliance-0.3.0-alpha.1-<sha>-win64.zip` from the
-[v0.3.0-alpha.1 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.1), check it
+Download `Brilliance-0.3.0-alpha.2-<sha>-win64.zip` from the
+[v0.3.0-alpha.2 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.2), check it
 against the `.sha256` beside it (`Get-FileHash <zip>` in PowerShell), and unzip it anywhere; a path with spaces
 works. You can also [build it from source](#building-from-source). A CPU-only package
 (`Brilliance-<version>-<sha>-win64-cpu.zip`), which serves on the CPU kernels and needs no card, can be built
@@ -168,22 +170,29 @@ From the unzipped folder, in PowerShell:
 | `qwen27-8k-plain` | Qwen3.8-27B IQ4R-L-V4 | 1 | **Qualified** | 8K | 1 | off | bf16 |
 | `qwen27-iq8r-1card` | Qwen3.8-27B IQ8R-V4 | 1 | **Soak-clean** | 16K | 4 | DFlash2 | int8 |
 | `qwen27-iq8r-2card` | Qwen3.8-27B IQ8R-V4 | 2 (TP2) | **Soak-clean** | 32K | 4 | DFlash2 | bf16 |
-| `flashnext-4card` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | **Soak-clean**, before the four-card re-send; with it, injection and serving checks pass | 32K | 8 | MTP, depth 3 | int8 |
-| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**: upstream's two-card settings | 200K | 8 | MTP, depth 3 | int8 |
+| `flashnext-4card` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | **Supported**: soaked at 32K on its earlier settings (2026-11-17); these tuned settings pass the injection, stop and serving checks; a soak on them has not run yet | 256K | 8 | MTP, depth 3 | bf16 |
+| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**: upstream's two-card settings, tuned | 256K | 8 | MTP, depth 3 | int8 |
 
 - **Name the cards a profile needs** with `-Bus` (or `-Device`): `-Bus 6` for one card, `-Bus 3,9` for two.
   Without it every discrete card is visible and the profile takes the first one, two or four in HIP's order.
   A card left visible but unused still costs: HIP virtual memory is on only with exactly one card visible,
   and the pin limit is divided by every card the process sees. On a machine with exactly four cards,
   `.\serve.ps1 flashnext-4card` needs no `-Bus`.
-- **`flashnext-4card` has a known issue:** Flash-Next's output changes when requests share a step. Identical
-  requests sent together get different next-token distributions, and sampling over them is looser than the
-  temperature asked; one request at a time behaves normally. Under investigation
-  ([known issue 8](win/SUPPORT.md#known-issues)).
+- **`flashnext-4card` has two known issues.** Flash-Next's output can change when requests share a step.
+  Identical requests sent together can get different next-token distributions, and sampling over them is
+  looser than the temperature asked; one request at a time is repeatable. This is rounding, not wrong data
+  ([known issue 8](win/SUPPORT.md#known-issues)). And it hard-locked the test machine once, when stopped
+  during a long prefill beside a large build: let a prefill finish before stopping, or keep the CPU
+  light ([known issue 12](win/SUPPORT.md#known-issues)).
 - **`flashnext-2card`** carries upstream's two-card settings on the exact wire (`tp-wire` left at its
   default), and with them a 64-byte write to host memory is lost now and then
   ([known issue 1](win/SUPPORT.md#known-issues)). The server re-sends the block, at about 4% of
   single-stream decode. It sets no runtime variable.
+- **Both Flash-Next profiles are tuned:** the model's full 256K context, prefill steps of up to 6,144
+  tokens for a prompt alone in its step (`max-num-batched-tokens: 6144`, `prefill-span: 3`), eight
+  linear-state snapshots and the picture and audio encoders in host memory. The two-card KV cache holds
+  about 262K tokens across all requests, the four-card one about 917K. Each profile's comment explains
+  its settings.
 - `kv-cache-dtype: i8` halves the cache (5.3 GiB instead of 9.4 GiB at 32K x 4).
 
 ### 5. Stop it
@@ -287,7 +296,7 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 |---|---|---|---|
 | Qwen3.8-27B IQ4R-L-V4 ([`StillDeadcode/qwen3.8-27b-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4)) | **Qualified**: 8K and 32K x 4, DFlash2 or plain, bf16 or i8 KV; text, tools, pictures, video | Not run | Not run |
 | Qwen3.8-27B IQ8R-V4 (same repository, `qwen3.8-27b-iq8r-v4.rad`, 27.58 GiB) | **Soak-clean**: 16K x 4, int8 KV, DFlash2 | **Soak-clean**: 32K x 4, DFlash2 | Not run |
-| Qwen3.8-Flash-Next IQR-V4 ([`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4), 113 GiB) | Not run (upstream lists a one-card layout with experts in host memory) | **Supported**: with production settings a lost write is re-sent, at about 4% of single-stream decode. The 8-hour soak is still to run. Profile: `flashnext-2card` | **Soak-clean**: every expert on the cards (`placement: all_vram`), 32K x 8, int8 KV, MTP; soaked before the four-card re-send and stop were added; with them it passes the injection and serving checks |
+| Qwen3.8-Flash-Next IQR-V4 ([`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4), 113 GiB) | Not run (upstream lists a one-card layout with experts in host memory) | **Supported**: with production settings a lost write is re-sent, at about 4% of single-stream decode. An 8-hour soak has not been run on it yet. Profile: `flashnext-2card` | **Supported**: every expert on the cards (`placement: all_vram`); soaked at 32K x 8, int8 KV, MTP on its earlier settings (2026-11-17), before the four-card re-send and stop were added; with them the profile's tuned 256K x 8, bf16 KV settings pass the injection, stop and serving checks; a soak on them has not run yet. Profile: `flashnext-4card` |
 | MiniCPM5-2B IQ8R ([`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r)) | Runs (the bring-up model); also on the CPU package, without its drafter: set `num-speculative-tokens: 0` | - | - |
 | EmbeddingGemma 2 bf16 (`google/embeddinggemma-2`, converted with `rad-convert`, 1.40 GiB) | **Qualified**: `/v1/embeddings` for text, pictures, video and audio; also on the CPU kernels | - | - |
 | Qwen3-ASR 1.7B bf16 (`Qwen/Qwen3-ASR-1.7B-hf` as it ships, 4.09 GB) | **Qualified**: `/v1/audio/transcriptions` (5 formats, 4 response forms) and `/v1/realtime`, 16 sequences | - | - |
@@ -296,32 +305,34 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`) | **Runs, not yet qualified**: `/v1/videos`, text and image to video, MP4 | - | - |
 | Every other upstream model | Source builds; not run on Windows | | |
 
-**The package's profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, and one
-that is **Supported** ([step 4](#4-start-a-server) has their settings):
+**The package's profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, and two
+that are **Supported** ([step 4](#4-start-a-server) has their settings):
 
 - Qwen3.8-27B IQ4R-L-V4, 1 card, **Qualified**: `qwen27-preview` (32K x 4) and `qwen27-8k-plain` (8K, one request).
 - Qwen3.8-27B IQ8R-V4, 1 card, **Soak-clean**: `qwen27-iq8r-1card`.
 - Qwen3.8-27B IQ8R-V4, 2 cards, **Soak-clean**: `qwen27-iq8r-2card`.
-- Qwen3.8-Flash-Next IQR-V4, 4 cards, **Soak-clean**: `flashnext-4card`, soaked before the four-card re-send
-  and stop were added; with them it passes the injection and serving checks.
-  Its known issue: the output changes when requests share a step, so sampling is looser than asked (under
-  investigation).
-- Qwen3.8-Flash-Next IQR-V4, 2 cards, **Supported**: `flashnext-2card`, upstream's two-card settings on the
-  exact wire; a lost write is re-sent. The 8-hour soak is still to run.
+- Qwen3.8-Flash-Next IQR-V4, 4 cards, **Supported**: `flashnext-4card`, soaked at 32K on its earlier settings
+  (2026-11-17), before the four-card re-send and stop were added; with them its tuned 256K settings pass the
+  injection, stop and serving checks. A soak on them has not run yet.
+  Its known issues: the output can change when requests share a step, so sampling is looser than asked
+  (rounding, not wrong data); and one hard lock, seen once, when it was stopped during a long prefill
+  beside a large build.
+- Qwen3.8-Flash-Next IQR-V4, 2 cards, **Supported**: `flashnext-2card`, upstream's two-card settings, tuned,
+  on the exact wire; a lost write is re-sent. An 8-hour soak has not been run on it yet.
 
-**Brilliance 0.2.2's containers do not load.** Radiance 2.1 does not read the 0.2.2-era formats: whole-model
+**Brilliance 0.2.2's containers do not load.** Radiance 2.2 does not read the 0.2.2-era formats: whole-model
 FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash MXFP4, DeepSeek-V4.1 and Gemma 4 FP8. Use the current
 containers above.
 
 ## Feature parity
 
-Radiance 2.1's features, and where each stands on Windows, from [win/SUPPORT.md](win/SUPPORT.md).
+Radiance 2.2's features, and where each stands on Windows, from [win/SUPPORT.md](win/SUPPORT.md).
 
-| Radiance 2.1 feature | On Windows | Note |
+| Radiance 2.2 feature | On Windows | Note |
 |---|---|---|
 | Chat Completions, Responses, Messages; streaming | **Yes** | Qualified on Qwen3.8-27B |
 | Tools, reasoning | **Yes** | Qualified on Qwen3.8-27B; Open WebUI and OpenCode tool round trips pass |
-| Grammars and structured output (`response_format`) | **Unverified** | Built; the host grammar tests pass; not checked against a served model |
+| Grammars and structured output (`response_format`); `/v1/completions`, `/completion`, `/infill` | **Yes** | Checked on Qwen3.8-27B IQ4R-L-V4, one card (2026-11-19), not qualified: json_object, json_schema, GBNF on the completion routes, strict tool schemas. GBNF on chat is refused on Qwen3.8 (use `response_format`); no regex constraint (upstream has none); `/infill` needs fill-in-the-middle tokens, and its text can end in `<\|file_sep\|>` |
 | Pictures and video in requests (`image_url`, `video_url`) | **Yes** | Through the bundled FFmpeg 8.1; checked on Qwen3.8-27B. H.264 input is decoded by FFmpeg's built-in decoder, with no H.264 patent licence supplied ([H.264](#h264)) |
 | Audio in requests | **Yes** | In an embeddings request (EmbeddingGemma 2) and for transcription (Qwen3-ASR 1.7B, one card) |
 | Embeddings (`/v1/embeddings`) | **Yes** | EmbeddingGemma 2, on one card and on the CPU kernels; batches, `dimensions`, base64 |
@@ -332,12 +343,14 @@ Radiance 2.1's features, and where each stands on Windows, from [win/SUPPORT.md]
 | Video generation | **Works, not yet qualified** | LTX-2.5 distilled (IQ8R) on one card, the model for 0.3.0. MP4s through AMD's (`h264_amf`), else Windows' (`h264_mf`) licensed H.264 encoders, each marked AI-generated in its metadata ([H.264](#h264)) |
 | Music generation | **Not yet** | Built; host tests pass; no model on hand. Writes WAV or raw PCM itself. Its endpoint, `/v1/audio/speech`, is refused (speech, above) |
 | Multi-model fleet, routing, reload | **Yes** | Reload by `POST /admin/reload` or `tools\reload-server.ps1` (Windows' SIGHUP) |
-| Model switching | **Yes** | One card visible: by parking. Several cards visible: by unloading and reloading; since 2026-11-18 a reload keeps its VRAM (PAL's resource cache off); switching repeats at TP2 not run |
+| Model switching | **Yes** | One card visible: by parking. Several cards visible: by unloading and reloading; since 2026-11-18 a reload keeps its VRAM (PAL's resource cache off). Repeated switching at TP2 checked 2026-11-19 (Qwen3.8-Flash-Next and Qwen3.8-27B IQ8R, 40 alternating requests, no memory drift; queued requests and a pinned model's refusal as documented), not qualified. A fleet of several models on more than one card needs `gpu-memory-mib` on each model ([SUPPORT](win/SUPPORT.md), known issue 2) |
 | Parking (HIP virtual memory) | **Partial** | On with exactly one device visible: an elastic KV cache, and parking with no host copies. Off with more than one (rocm-systems#13232) |
 | Prefix cache, checkpoint snapshots, agent replay | **Yes** | |
 | Speculation: DFlash2, MTP | **Yes** | |
-| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory (a lost write is re-sent; the 8-hour soak still to run), on the exact wire; `tp-wire: wht6` runs with the same protection, not qualified |
-| Tensor parallel, 4 cards | **Partial** | Flash-Next soak-clean with every expert on the cards, before the four-card re-send; with it, a lost write is re-sent as on two cards and the injection and serving checks pass; 3 and 8 cards not run |
+| Drafting options (`draft-coupling`, `draft-verify`, `draft-depth: adaptive`, `draft-suffix`) | **Yes** | Checked on Qwen3.8-Flash-Next, two cards (2026-11-19), not qualified: greedy text identical to the uncoupled base. Coupling and the traversal verify also on Qwen3.8-27B's DFlash2. A model that cannot take an option is refused at start, naming why |
+| Control vectors | **Yes** | Checked on Qwen3.8-Flash-Next with the shipped vector, two cards (2026-11-19), not qualified: the per-request field, the `MODEL:NAME` variant, `/admin/control-vector`. Only Flash-Next's architecture applies them |
+| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory (a lost write is re-sent; no 8-hour soak run yet), on the exact wire; `tp-wire: wht6` runs with the same protection, not qualified |
+| Tensor parallel, 4 cards | **Partial** | Flash-Next supported with every expert on the cards: soaked at 32K on its earlier settings, before the four-card re-send and stop; with them, a lost write is re-sent as on two cards, and its tuned settings pass the injection, stop and serving checks (a soak on them has not run yet); 3 and 8 cards not run |
 | Peer-to-peer between cards | **Not on Windows** | Collectives go through pinned host memory |
 | Dashboard | **Partial** | Per card it shows temperature, not load or power |
 | Diagnose mode | **Yes** | The busy-host warning reads the CPUs' load over a quarter second |

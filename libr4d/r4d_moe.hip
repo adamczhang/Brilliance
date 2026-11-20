@@ -687,17 +687,20 @@ struct MoeCls {
     uint32_t w_s0, s_s0;   /* bytes an entry of a stacked plane; 0 marks a pointer table */
     uint32_t n, k, w_ld, s_ld;
 };
-/* W4: the code table (r4d_args.h's kW4IntPerm, kW4nlPerm or kW5nlMagPerm), shared by all classes. */
+/* W4: the code table (r4d_args.h's kW4IntPerm, kW4nlPerm, kW5nlMagPerm or the first half of
+ * kW6nlMagPerm), shared by all classes. */
 struct MoeTab { uint32_t v[4]; };
 
 /* W4 is the weight's form: 0 block E4M3; 1 four-bit with one bf16 scale per (row, 128 of K); 2 the
  * same codes with one E4M3 scale per (row, 64 of K) times the fixed kW4G64Scale (w4nl64a8h); 3 the
  * same per (row, 32 of K) (w4nl32a8h); 4 five-bit codes, form 2's magnitudes and scales plus a sign
- * bit per code from the plane after a row's nibbles (w5nl64a8h). At 2-4 a staged 128-wide tile holds
- * two or four scale groups, each in its own accumulator; a tile's E4M3 scales are one 16- or 32-bit
- * load.
+ * bit per code from the plane after a row's nibbles (w5nl64a8h); 5 six-bit codes, form 2's scales,
+ * a row's nibbles followed by a plane of each code's high magnitude bit, which selects between two
+ * sets of sixteen magnitudes, and then its sign plane (w6nl64a8h). At 2-5 a staged 128-wide tile
+ * holds two or four scale groups, each in its own accumulator; a tile's E4M3 scales are one 16- or
+ * 32-bit load.
  *
- * FK is the K staged per pass: kFK (one 128-wide scale block) or, at W4 2-4 only, two blocks, which
+ * FK is the K staged per pass: kFK (one 128-wide scale block) or, at W4 2-5 only, two blocks, which
  * doubles the bytes in flight per barrier pair and halves the passes. Each scale group keeps its
  * own accumulator and the fold runs the two blocks in K order, so FK 256 is bit-identical to 128.
  *
@@ -744,10 +747,10 @@ __device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
      * one bf16 scale per (row, 128 of K), the four-bit forms' scale grid, and at W4 1 to 3 the
      * levels as int8 (moe_w4_bytes). kRowS: the weight's scale varies per row. */
     constexpr bool kRowS = W4 != 0 || I8;
-    static_assert(!I8 || W4 <= 3, "the five-bit levels have no int8 form");
+    static_assert(!I8 || W4 <= 3, "the five- and six-bit levels have no int8 form");
     static_assert(kRowS || kBlock % FN == 0,
                   "a block's N rows must sit in one 128-row weight scale row");
-    /* Scale groups per 128-wide block: one, or the 64- or 32-column groups at W4 2-4. */
+    /* Scale groups per 128-wide block: one, or the 64- or 32-column groups at W4 2-5. */
     constexpr uint32_t kSub = W4 == 3 ? 4u : (W4 == 2 || W4 == 4 || W4 == 5) ? 2u : 1u;
     /* What multiplies a subgroup's E4M3 scale: the format's fixed second level, and at I8 the
      * levels' unit. */
@@ -1108,7 +1111,7 @@ __device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
          * scale fold. */
         const bool wlive = !SK || (r0 + wgm * WM * 16 < re);
         f8v raw[WM][WN], out[WM][WN];
-        /* The other scale groups' accumulators at W4 2-4 (`raw` is the first's), for every block of
+        /* The other scale groups' accumulators at W4 2-5 (`raw` is the first's), for every block of
          * the pass; one unused element otherwise. Each starts fresh at its group's first WMMA, so
          * none is zeroed. */
         f8v rx[kSubT > 1 ? kSubT - 1 : 1][kSubT > 1 ? WM : 1][kSubT > 1 ? WN : 1];
@@ -1262,7 +1265,8 @@ __device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
                 const bool ok = (j0 + r) < fc;
                 /* W4: half the bytes of the row, expanded on the way in; `w_ld` is already the
                  * packed byte pitch. At W4 4 the row's sign plane (one bit per element) follows its
-                 * K/2 bytes of nibbles. Under kUL a dead row reads the tile's first row and the
+                 * K/2 bytes of nibbles; at W4 5 the high magnitude bits' plane does, and the sign
+                 * plane follows that. Under kUL a dead row reads the tile's first row and the
                  * store selects its zero (see bok). */
                 const uint8_t* wr = Wp + (size_t)(kUL && !ok ? wn0 : wn0 + r) * w_ld;
                 if constexpr (kUL) bok[p] = ok;
@@ -1375,7 +1379,7 @@ __device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
                         acc[i][j] = mma8<I8>(af[i], bf[j], fresh ? acc_zero() : acc[i][j]);
                 }
             };
-            /* At W4 2-4 each scale group of the tile has its own accumulator, so no group's WMMA
+            /* At W4 2-5 each scale group of the tile has its own accumulator, so no group's WMMA
              * waits on the previous group's fold; all fold once at the end of the tile, and each
              * group's first step starts its accumulator. At FK 256 group g of the pass is group
              * g % kSub of block g / kSub, in K order. */
@@ -1400,7 +1404,7 @@ __device__ __forceinline__ void moe_gemm_q_body(R4D_MOEGQ_PARAMS) {
                  * w4:   one bf16 per (row, 128 of K); a 128x128 block scale would spend all sixteen
                  *       levels on its largest row. A fragment's lanes hold sixteen consecutive
                  *       output columns, so the scale is a per-lane constant per N tile.
-                 * W4 2-4: groups of 64 or 32 K, two or four per tile, each sum under its scale.
+                 * W4 2-5: groups of 64 or 32 K, two or four per tile, each sum under its scale.
                  *
                  * The fp8 form is written out separately because a * (b * c) and (a * b) * c differ
                  * in the last bit, and its output is byte-checked. */
@@ -1557,7 +1561,7 @@ __device__ __forceinline__ void moe_down_dec_body(R4D_MOEDD_PARAMS) {
     /* moe_gemm_q_kernel's I8, with its per-row scale and its subgroup unit. */
     constexpr bool kRowS = W4 != 0 || I8;
     constexpr float kSubScale = I8 ? kW4G64Scale * kW4nlI8Unit : kW4G64Scale;
-    static_assert(!I8 || W4 <= 3, "the five-bit levels have no int8 form");
+    static_assert(!I8 || W4 <= 3, "the five- and six-bit levels have no int8 form");
     constexpr uint32_t NPT = kMaxExpert / NTHR;
     static_assert(kMaxExpert % NTHR == 0, "the offsets divide over the block's threads");
     static_assert(FK % (kSub * r4d_fp8::kK) == 0, "a scale group is whole WMMA K steps");
@@ -2656,7 +2660,7 @@ static inline bool r4d_moe_decode_band(long long T, long long n_expert) {
 }
 /* Row limit, per weight format, for staging two 128-wide K blocks per pass (FK 256) in the decode
  * form of the token-operand projection (gate_up). Only formats that already fold scale groups
- * (W4 2-4) with every class's K a multiple of 256 qualify. Bit-identical either way; a constant, so
+ * (W4 2-5) with every class's K a multiple of 256 qualify. Bit-identical either way; a constant, so
  * recorded and live passes take the same kernel.
  *
  * Measured (gate_up, us, one block / two): the 4-bit formats gain at 10-20 rows but not at 40-160
@@ -2818,16 +2822,11 @@ static int g_moe_down_tile_pin = 0;
  * over thirty-two waves, or of four M tiles a wave, slower (1390-2170).
  *
  * The rule takes 64 rows from a mean of 32 routed rows an expert (kMoeDownMtRowsPerExpert: 16384
- * rows at 512 experts). Pinnable for tests: -1 the rule (RADIANCE_MOE_DOWN_MT gives the pin its
- * first value), 2 or 4 the M tiles a block. r4d_selftest compares them byte for byte. */
+ * rows at 512 experts). Pinnable for tests: -1 the rule, 2 or 4 the M tiles a block.
+ * r4d_selftest compares them byte for byte. */
 constexpr long long kMoeDownMtRowsPerExpert = 32;
-static int g_moe_down_mt_pin = -2;
+static int g_moe_down_mt_pin = -1;
 static inline int r4d_moe_down_mt(long long T, long long n_expert) {
-    if (g_moe_down_mt_pin == -2) {
-        const char* e = std::getenv("RADIANCE_MOE_DOWN_MT");
-        const int v = e ? std::atoi(e) : -1;
-        g_moe_down_mt_pin = (v == 2 || v == 4) ? v : -1;
-    }
     if (g_moe_down_mt_pin > 0) return g_moe_down_mt_pin;
     return T >= kMoeDownMtRowsPerExpert * n_expert ? 4 : 2;
 }
@@ -2914,7 +2913,7 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (M < (a_sorted ? T : (T + top_k - 1) / top_k)) return R4D_NO(RAD_E_SHAPE);
 
     /* The code table, from the dtype the layout hook accepted: w4nla8h's levels, w5nl64a8h's
-     * magnitudes, or two's complement for w4a8 and w4a8h. */
+     * magnitudes, w6nl64a8h's lower sixteen magnitudes, or two's complement for w4a8 and w4a8h. */
     const char* wdt = r4d_gets(a, "dtype");
     const uint32_t* tab = I8 ? kW4IntPermI8
                         : W4 == 5 ? kW6nlMagPerm
@@ -2924,8 +2923,8 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                                          !std::strcmp(wdt, "w4nl32a8h"))) ? kW4nlPerm : kW4IntPerm;
 
     /* One class's tables. The kernel wants the weight pitch in bytes: half the element count for a
-     * 4-bit plane, five eighths for the 5-bit one. `wtab_of` reports the declared element stride,
-     * so the scaling happens here. */
+     * 4-bit plane, five eighths for the 5-bit one, three quarters for the 6-bit one. `wtab_of`
+     * reports the declared element stride, so the scaling happens here. */
     auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
                       long long k, MoeCls* c) -> int {
         long long w_ld = 0, ws_ld = 0;
@@ -2946,7 +2945,8 @@ static int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                          &s_s0, &ws_ld);
             if (rc != RAD_OK) return rc;
             /* A 5-bit row is its nibbles then its sign bits; the kernel finds the signs K/2 bytes
-             * in. */
+             * in. A 6-bit row is its nibbles, its high magnitude bits and then its sign bits; the
+             * kernel finds them K/2 and 5K/8 bytes in. */
             if (W4 == 5 ? (w_ld % 4 || k % 32) : W4 == 4 ? (w_ld % 8 || k % 32) : (w_ld % 2))
                 return R4D_NO(RAD_E_STRIDE);
             w_ld = W4 == 5 ? w_ld / 4 * 3 : W4 == 4 ? w_ld / 8 * 5 : w_ld / 2;
@@ -3224,7 +3224,7 @@ extern "C" void r4d_moe_gemm_pin_down_dec(int pin) {
 }
 
 /* The four-bit forms (an E4M3 scale per 64 or 32 of K for w4nl64a8h / w4nl32a8h, else a bf16
- * scale per 128) and the five-bit w5nl64a8h. */
+ * scale per 128), the five-bit w5nl64a8h and the six-bit w6nl64a8h. */
 extern "C" int r4d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream stream) {
     const char* wdt = r4d_gets(a, "dtype");
     if (wdt && !std::strcmp(wdt, "w4nl64a8h")) return moe_gemm_launch<2>(a, stream);

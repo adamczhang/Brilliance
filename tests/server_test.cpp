@@ -5669,6 +5669,39 @@ TEST(a_media_part_that_cannot_be_served_is_refused_by_name) {
     }
 }
 
+#if defined(_WIN32)
+/* Brilliance: a data: URL that states JPEG XL is refused by name before its bytes are read, with
+ * the decoder's own reason (mm/media.h): this build has no JPEG XL decoder. PNG and JPEG still
+ * reach the encoder. */
+TEST(a_jpeg_xl_data_url_is_refused_by_name) {
+    Fixture f;
+    FakeMultimodal mm;
+    OaiLimits lim = f.limits();
+    lim.allow_image = true;
+    OaiDeps d = f.odeps();
+    d.mm = &mm;
+    auto parse = [&](const std::string& url, ApiError* e) {
+        const json parts = json::array({ json{ { "type", "image_url" }, { "image_url", { { "url", url } } } } });
+        const json body = { { "messages", json::array({ json{ { "role", "user" }, { "content", parts } } }) } };
+        OaiRequest r;
+        return parse_chat_request(body.dump(), d, lim, &r, e);
+    };
+    for (const char* url : { "data:image/jxl;base64,/wo=", "data:IMAGE/JXL;base64,AAAADEpYTCANCocK" }) {
+        ApiError e;
+        CHECK_EQ(parse(url, &e), RAD_E_INVAL);
+        CHECK_EQ(e.status, 400);
+        CHECK_EQ(e.param, std::string("messages[].content[].image_url.url"));
+        CHECK(has(e.message, "JPEG XL images are not supported by this build; send PNG, JPEG or WebP"));
+    }
+    CHECK(mm.got.empty());
+    for (const char* url : { "data:image/png;base64,AAAA", "data:image/jpeg;base64,AAAA" }) {
+        ApiError e;
+        CHECK_EQ(parse(url, &e), RAD_OK);
+    }
+    CHECK_EQ(mm.got.size(), (size_t)2);
+}
+#endif
+
 /* The media marker is the server's own placeholder, so text that spells it is refused in a
  * request carrying media, as the embeddings endpoint refuses it: otherwise it counts as a picture's
  * place, and with a template that drops a part the picture's tokens land where the user typed it.

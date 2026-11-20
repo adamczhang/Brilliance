@@ -118,7 +118,13 @@ int main(int argc, char** argv) {
  * starts; it runs radiance_main on the service's thread and turns a service stop into the drain
  * Ctrl-Break starts (win/SERVICE.md). Every other command line is radiance_main's, unchanged. */
 int main(int argc, char** argv) {
+    /* A service runs process_init itself, once its --env-from-file values are set: its
+     * BRILLIANCE_PRIORITY and BRILLIANCE_CPUS count, and what they did goes to its log. */
     if (rad::os::service_wanted(argc, argv)) return rad::os::service_main(argc, argv, radiance_main);
+    /* Above Normal priority, power throttling off, a 1 ms timer (os.h), before anything starts:
+     * the HIP runtime's own submit threads inherit the class, and a build or test run beside the
+     * server at Normal then cannot starve them. */
+    rad::os::process_init();
     return radiance_main(argc, argv);
 }
 #endif

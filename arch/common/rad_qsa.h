@@ -383,11 +383,11 @@ inline void QsaIndexer::step(RadCtx* c_, const ActFP8& in, const RadBatch* batch
      * key is not 0 -- every block with a page and a score that is a number, whatever the number --
      * and what it writes (the pages in block order, the partial page, their count, seqused) is a
      * function of the positions and the block table: the same bytes from every layer's scores. So
-     * the pass's first full-attention layer issues the selection exactly as it always did, and
+     * the pass's first full-attention layer issues the selection in full, and
      * every later layer reads that one and issues none of its own: no query, no score. */
     if (use == kQsaOnce) use = first ? kQsaSelect : kQsaUnread;
     if (use != kQsaUnread) use = kQsaSelect;
-    /* RADIANCE_DEBUG_QSA_EAGER: the issue sequence as it was, every layer its own. */
+    /* RADIANCE_DEBUG_QSA_EAGER: every layer issues its own query, score and select. */
     if (qsa_eager()) use = kQsaSelect;
 
     /* The projection always: its raw-key head is the block keys' and the tail's. */

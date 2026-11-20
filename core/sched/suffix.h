@@ -1,11 +1,10 @@
-/* suffix.h -- SuffixDecoding's proposal for a hybrid step selector (--draft-suffix, DESIGN-suffix.md).
+/* suffix.h -- SuffixDecoding's proposal for a hybrid step selector (--draft-suffix, docs/GUIDE.md).
  *
  * SuffixDecoding (Oliaro et al., arXiv 2411.04975) drafts from a suffix tree of earlier text: for
  * the longest suffix of the current context that occurred before, it expands the tokens that
  * followed, each node scored by the product of its followers' frequencies (D, the expected number of
- * accepted tokens along its path). Here the tree is the per-request one (prompt ++ output of THIS
- * request; an offline study found a cross-request tree adds nothing on this workload), reduced to what
- * a chain needs:
+ * accepted tokens along its path). Here the tree is the per-request one (prompt ++ output of this
+ * request; no tree over other requests), reduced to what a chain needs:
  *
  *   - the earlier occurrence comes from the existing NgramIndex (the --spec-ngram matcher): the
  *     latest earlier occurrence of the longest recurring suffix of `min_match..min_match+3` tokens;

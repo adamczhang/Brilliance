@@ -292,11 +292,8 @@ RAD_TEST_MAIN()
  * on every chained packet of an engine that loads it, so a row added with a wait of its own shows
  * up here rather than as a slower step. */
 TEST(libr4ds_rows_that_chain_acquire_for_themselves) {
-#if !(defined(RAD_HAVE_HIP) && RAD_HAVE_HIP)
-    /* Brilliance: libr4d is built only with HIP (CMakeLists.txt, RAD_HIP_FOUND), so a build
-     * without it has no libr4d to ask, and under RAD_TEST_STRICT the missing artifact would fail.
-     * Windows' host flavor (win/build.ps1 -Flavor host) is such a build. */
-    SKIP("libr4d is built only with HIP, and this build has none");
+#ifndef RAD_TEST_HAS_LIBR4D
+    SKIP("this build makes no libr4d");
 #endif
     Registry r;
     const int st = r.load_dir(dir_of("kernels"), { "libr4d", "libref" });

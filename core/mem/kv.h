@@ -638,8 +638,9 @@ public:
      * slot in one copy (checkpoint_stage_out, Engine::save_checkpoints).
      *
      * Planned (plan_groups) where the engine snapshots linear state into a prefix cache and the
-     * slot has no window section; 0 bytes and a null stage otherwise. RADIANCE_CKPT_STAGE=0 plans
-     * none, which keeps every checkpoint at a chunk's end. */
+     * slot has no window section, under Config::ckpt_stage (the plugin cuts its step at a tail
+     * snapshot and --prefix-resume is nearest); 0 bytes and a null stage otherwise, which keeps
+     * every checkpoint at a chunk's end. */
     int64_t ckpt_stage_bytes() const { return stage_bytes_; }
     void*   ckpt_stage() const { return stage_; }
     /* Per group (by index): the group's offset in the stage and its bytes a layer, -1 / 0 for a

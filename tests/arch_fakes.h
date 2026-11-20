@@ -154,6 +154,7 @@ struct RadBuilder {
     /* What rad_weight_encoding answers: the first entry whose key the source name contains. Empty
      * means no model, so every weight is plain in its declared dtype. */
     std::vector<std::pair<std::string, RadEncoding>> encs;
+    std::map<std::string, std::vector<int64_t>> shapes;  /* optional unsharded shapes by exact name */
 
     const RecOp* op_of(rad_op h) const { return h ? &ops[h - 1] : nullptr; }
 };
@@ -197,10 +198,24 @@ extern "C" rad_weight rad_decl_weight(RadBuilder* b, const char* name, const Rad
     return (rad_weight)b->weights.size();
 }
 
-extern "C" int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t*,
-                                   uint32_t*) {
-    for (const auto& [key, e] : b->encs)
-        if (source && std::strstr(source, key.c_str())) { *out = e; return RAD_OK; }
+extern "C" int rad_weight_encoding(RadBuilder* b, const char* source, RadEncoding* out, int64_t* shape,
+                                   uint32_t* rank) {
+    for (const auto& [key, e] : b->encs) {
+        if (!source || !std::strstr(source, key.c_str())) continue;
+        *out = e;
+        if (shape || rank) {
+            const auto it = b->shapes.find(source);
+            if (it != b->shapes.end()) {
+                if (it->second.size() > RAD_MAX_RANK) return RAD_E_SHAPE;
+                if (shape) {
+                    std::fill_n(shape, RAD_MAX_RANK, 0);
+                    std::copy(it->second.begin(), it->second.end(), shape);
+                }
+                if (rank) *rank = (uint32_t)it->second.size();
+            }
+        }
+        return RAD_OK;
+    }
     return RAD_E_NOTFOUND;
 }
 extern "C" rad_buf rad_decl_buffer(RadBuilder* b, const char* name, const RadBufDecl* d) {

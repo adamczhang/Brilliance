@@ -419,6 +419,7 @@ int run(const service::Args& a) {
         }
         log_line(var + " set from " + file + " (its value is not shown)");
     }
+    process_init();   // os.h: priority class, power throttling, timer -- after the service's environment
     // Relative paths in the YAML mean the config's folder, not System32 where the SCM starts us.
     const size_t slash = a.config.find_last_of("/\\");
     if (slash != std::string::npos) {

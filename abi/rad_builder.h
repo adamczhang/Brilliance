@@ -739,16 +739,19 @@ int rad_declare_plugin_words(RadBuilder* b, int64_t max_words);
  * The kind is a drive shape, not a model. SERIAL runs `depth` dependent passes, each embedding the
  * last one's proposal, so tokens arrive one at a time and a pass that declines ends the chain
  * (MTP, EAGLE, Medusa-serial). BLOCK runs a context pass, then one pass that fills every drafted
- * position at once (DFlash2 and other block-diffusion drafters).
+ * position at once (DFlash2 and other block-diffusion drafters). HISTORY runs just the serial
+ * history pass (draft_pass < 0, every hidden row, n_draft_out = 0) to collect calibration
+ * inputs. It is for --calib-corpus with max_spec = 0; it declares and produces no proposals.
  *
  * `proposal` is the buffer a pass writes its token ids into; 0 means the sampler's token buffer,
  * which suits a head whose logits go through the ordinary sampler chain.
  *
  * Declaring no drafter is the normal case; the scheduler's prompt-lookup drafter still runs. */
 typedef enum {
-    RAD_DRAFT_NONE   = 0,
-    RAD_DRAFT_SERIAL = 1,   /* `depth` dependent passes, one proposal each */
-    RAD_DRAFT_BLOCK  = 2,   /* a context pass, then one pass that fills the whole block */
+    RAD_DRAFT_NONE    = 0,
+    RAD_DRAFT_SERIAL  = 1,   /* `depth` dependent passes, one proposal each */
+    RAD_DRAFT_BLOCK   = 2,   /* a context pass, then one pass that fills the whole block */
+    RAD_DRAFT_HISTORY = 3,   /* calibration-only serial history pass, depth zero */
 } RadDraftKind;
 
 typedef struct RadDrafterDecl {

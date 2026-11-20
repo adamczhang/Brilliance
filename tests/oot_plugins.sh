@@ -75,7 +75,11 @@ dirs="libref libquant"
 [ -d "$S/libavx" ] && [ -f "$B/radiance_home/kernels/libavx.$SO" ] && dirs="$dirs libavx"
 small=""
 for d in "$S"/arch/*/ "$S"/plugin/*/; do
-  [ -f "$d/CMakeLists.txt" ] && small="$small $(basename "$(dirname "$d")")/$(basename "$d")"
+  [ -f "$d/CMakeLists.txt" ] || continue
+  # A plugin under plugin/ that the tree's build does not make (a source drop, built by hand) is
+  # not compared: the tree's home has no copy of it.
+  case "$d" in "$S"/plugin/*) [ -f "$B/radiance_home/kernels/$(basename "$d").$SO" ] || continue ;; esac
+  small="$small $(basename "$(dirname "$d")")/$(basename "$d")"
 done
 # The device libraries: built out of tree only with the tree's HIP compiler, and left out of every
 # comparison below without it. Each declares the family it serves, so a tree built for one family

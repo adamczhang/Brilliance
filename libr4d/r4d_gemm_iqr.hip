@@ -32,6 +32,9 @@
 #include <algorithm>
 #include <cstdio>
 
+/* Brilliance: BRILLIANCE_EXACT_VERIFY, off by default (r4d_rows.cpp). */
+extern "C" int r4d_exact_verify_on(void);
+
 /* The i8a8 narrow tile's grid and split rules and its finisher counters (r4d_gemm_fp8a8.hip): a
  * split here sums each output as the int8 tile's does. */
 uint32_t r4d_8a8_narrow_mw(uint32_t n, uint32_t m);
@@ -151,6 +154,12 @@ __device__ __forceinline__ void gated_tail(const GatedOut& go, uint32_t M, uint3
  *
  * The fold order differs from the WMMA tile's (per lane, then across lanes and waves), so the
  * output is the product within f32 rounding rather than the int8 tile's bytes. */
+/* Brilliance: the forms upstream 1d94e416's row grid covers, the U5 row-f32 computed trellis. Only
+ * their single-token GEMV carries the grid.y row offset, so every other form's GEMV is upstream
+ * v2.2.0's code; the row grid itself runs only under BRILLIANCE_EXACT_VERIFY (r4d_exact_verify_on). */
+template <class F>
+constexpr bool kRowGridForm = F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u && F::SC == kRowF32;
+
 template <class F, uint32_t MT, uint32_t KW, bool GATED, class CH>
 __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
@@ -158,8 +167,9 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
                      GatedOut go) {
     if (CH::on) r4d_chain_wait();
     /* A non-gated single-token GEMV may put independent token rows on grid.y. Every block then
-     * executes exactly the M=1 arithmetic over its own row, including the chained launch. */
-    if constexpr (!GATED && MT == 1) {
+     * executes exactly the M=1 arithmetic over its own row, including the chained launch. Off
+     * (the default) the grid has one row, so blockIdx.y is 0. */
+    if constexpr (!GATED && MT == 1 && kRowGridForm<F>) {
         X  += (size_t)blockIdx.y * x_ld;
         XS += (size_t)blockIdx.y * xs_ld;
         Y  += (size_t)blockIdx.y * N;
@@ -963,9 +973,10 @@ int gemv_launch(const Operands& g, RadStream stream, const GatedOut* go = nullpt
     const uint32_t kw = N >= 4096u ? 4u : 8u;
     /* U5 row-f32's GEMV has the single-token fold order through MT=4. At MT>4 it uses a different
      * fold, so put independent single-row blocks on grid.y instead. Gated GEMMs keep their
-     * existing dispatch and counter layout. */
-    const bool row_grid = !go && F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u &&
-                          F::SC == kRowF32 && M > 4u && M <= kGemvMaxM;
+     * existing dispatch and counter layout. Only under BRILLIANCE_EXACT_VERIFY; off, the default,
+     * every M takes upstream v2.2.0's switch below. */
+    const bool row_grid = kRowGridForm<F> && !go && M > 4u && M <= kGemvMaxM &&
+                          r4d_exact_verify_on();
     const GatedOut gz = go ? *go : GatedOut{};
     uint16_t* const y = go ? nullptr : (uint16_t*)g.y->data;
     int rc = RAD_E_SHAPE;
@@ -1069,8 +1080,8 @@ template <class F>
 int m64_launch(const Operands& g, void* scratch, long long scratch_bytes, int split_n,
                RadStream stream) {
     const uint32_t N = (uint32_t)g.N, K = (uint32_t)g.K, M = (uint32_t)g.M;
-    const bool row_grid = F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u && F::SC == kRowF32;
-    if (M <= gemv_max<F>() || (row_grid && M <= kGemvMaxM)) return gemv_launch<F>(g, stream);
+    if (M <= gemv_max<F>() || (kRowGridForm<F> && M <= kGemvMaxM && r4d_exact_verify_on()))
+        return gemv_launch<F>(g, stream);
     if (M <= (tiles_form<F>() ? 64u : 16u) && ((uintptr_t)g.y->data & 15u) == 0u)
         return m16_launch<F>(g, stream);
     /* At most eight waves a block: each has its own transpose tile in LDS. The wave count changes

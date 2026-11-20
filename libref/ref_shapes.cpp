@@ -2101,11 +2101,11 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts
  * (fp8a8) carry the checkpoint's one scale per 128x128 tile (`group` = 128). The 4-bit formats
  * (docs/MOE-W4.md) carry one per row per K group: all of `group` for w4a8, w4a8h and w4nla8h, half
- * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. The `a8i8` names are the four-bit formats
- * against an int8 activation and `i8a8` / `i8a8h` int8 experts against one, a scale per row per
- * `group`. These are the served format names (arch/common/rad_block_moe_fp8.h, kServed and
- * kServed8). Any other dtype returns { 0, 0 } and the description
- * declines rather than guess a grid.
+ * for w4nl64a8h, w5nl64a8h and w6nl64a8h, a quarter for w4nl32a8h. The `a8i8` names are the
+ * four-bit formats against an int8 activation and `i8a8` / `i8a8h` int8 experts against one, a
+ * scale per row per `group`. These are the served format names (arch/common/rad_block_moe_fp8.h,
+ * kServed and kServed8). Any other dtype returns { 0, 0 } and the description declines rather than
+ * guess a grid.
  *
  * The grid matters beyond extents: re-laid weights are inverted into the tensor described here
  * before the oracle reads them (core/runtime/oracle.cpp), so the wrong grid leaves the scales

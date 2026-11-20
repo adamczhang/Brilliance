@@ -39,6 +39,7 @@
 #include "lora/adapter.h"
 #include "lora/slots.h"
 #include "fleet/broker.h"
+#include "place/expert_restore.h"
 
 #include <atomic>
 #include <chrono>
@@ -427,15 +428,9 @@ private:
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
      * which references `vocab_` and must not outlive it. */
     std::shared_ptr<const Vocab> vocab_;
-    /* End-of-generation ids the chat format also writes as a call delimiter: a call boundary is
-     * not a turn's, so the decoder does not stop on them (run_server demotes them). */
-    std::vector<int32_t> eog_demoted_;
-    /* End-of-generation as the decoder sees it: the vocabulary's set, minus the demoted ids. */
-    bool is_eog(int32_t id) const {
-        if (!vocab_ || !vocab_->is_eog(id)) return false;
-        for (int32_t d : eog_demoted_) if (d == id) return false;
-        return true;
-    }
+    /* `vocab_` itself, writable: bring-up takes call delimiters out of its end-of-generation set
+     * (demote_call_delimiters) before anything is built from the set. Not written after that. */
+    std::shared_ptr<Vocab> vocab_own_;
     std::unique_ptr<VocabView>   vocab_view_;
     /* The container's second vocabulary (rad-convert --tokenizer2), which an image generator that
      * declares `aux_tokens` reads its prompt through; null without one. */
@@ -505,10 +500,12 @@ private:
     void                          flex_room_tick(uint64_t now_ns);
     /* Expert flex (§6.7). Each rank's slab borrows from its own reserved range (Rank::xflex), the
      * top `xflex_bytes_` of it backed; the ceiling is the loan that covers every slot carved there.
-     * xflex_tick grows it on the step loop while the engine is busy, a GiB at a time once the
+     * xflex_tick grows it while busy, or restores surrendered backing while idle, a GiB
+     * at a time once the
      * slab has filled what it holds; xflex_give recalls and unbacks it, between steps. */
     std::atomic<int64_t>          xflex_bytes_{0};
     std::atomic<int64_t>          xflex_want_{0};
+    ExpertFlexRestore             xflex_restore_;  /* step-loop state, reset on park */
     int64_t                       xflex_cap_ = 0;
     int64_t                       xflex_claimed_ = 0;       /* the claim's expert bytes a card */
     uint64_t                      xflex_ns_ = 0, xflex_busy_ns_ = 0, xflex_retry_ns_ = 0;
@@ -558,6 +555,8 @@ private:
     bool state_slots_of(uint64_t seq, std::vector<int32_t>* out) const;
 
     int  load_vocab();
+    int  build_vocab_view();
+    int  demote_call_delimiters();
     int  declare_sampler(int rank, RadBuilder* b, int64_t logits_width, bool sizing = false);
     /* The build context for every declare of rank `rank` at `max_tok`; the real declare and the
      * arena's sizing declares differ only in max_tok. */
@@ -700,7 +699,7 @@ private:
     std::vector<DraftDepthRow> depth_row_;
     std::vector<int32_t>       depth_of_;
     int           depth_seen_ = 0;                      /* rounds observed this step */
-    int64_t       depth_spin_us_ = 3000;                /* RADIANCE_DEPTH_SPIN_US: poll this long, then block */
+    static constexpr int64_t kDepthSpinUs = 3000;      /* poll this long for a round, then block */
     struct DepthStats {
         uint64_t steps = 0, rows = 0, rounds = 0, drafts = 0, lawless = 0, waits = 0, blocked = 0;
         uint64_t hist[RAD_MTP_COUPLE_MAX_ROUNDS + 1] = {};
@@ -724,11 +723,6 @@ private:
     int           depth_other_rows_ = 0;                 /* the next verify's token rows that draft nothing */
     bool          depth_load_step_ = false;              /* this step's chains were decided by the load-aware rule */
     bool          depth_load_on_ = false;                /* --draft-depth-load on: the tables exist */
-    /* Diagnostics. RADIANCE_DEPTH_CTL=<file>: the words `load=0|1 late=0|1`, read again when the
-     * file changes (looked at every 16 steps), so one server compares the rules on interleaved
-     * load; it switches only what the configuration set up. */
-    int64_t       depth_ctl_mtime_ = -1;
-    void          depth_ctl_poll(int step);
     /* A chain between the step that drafted it and the verify that settles it, by card slot: what
      * the online calibration counts once the accepted count is known. */
     struct DepthPend {
@@ -744,7 +738,7 @@ private:
     uint64_t      depth_note_n_ = 0;
     void          depth_step_note(const RadBatch* b, const StepOut& so);
     void          depth_load_log(const char* when) const;
-    /* RADIANCE_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,
+    /* RADIANCE_DEBUG_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,
      * rounds, each chain's depth and statistics, what the verify accepted) and one a refresh of
      * the tables. */
     std::FILE*    depth_log_ = nullptr;
@@ -798,7 +792,7 @@ private:
      *
      * ckpt_snap_ok_: the plugin snapshots inside a step (RadArchProbe::ckpt_snap_ok); with a
      * stage on every rank the scheduler then takes a prompt's tail snapshot inside its last chunk
-     * (Scheduler::set_ckpt_inside; RADIANCE_CKPT_INSIDE=0 keeps the chunk's own step). Such a
+     * (Scheduler::set_ckpt_inside). Such a
      * snapshot is the stage's one contiguous copy to the host slot rather than a pitched copy a
      * group. */
     bool ckpt_snap_ok_ = false;

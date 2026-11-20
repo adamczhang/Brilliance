@@ -1111,8 +1111,8 @@ int Engine::declare() {
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     /* --calib-corpus: every token of the corpus through prefill exactly once, so no prefix hit
-     * skips any and no drafter adds rows; the corpus is loaded here, before the plugins declare,
-     * because they are told its size. */
+     * skips any and no drafter adds rows. Load it before declaration so a plugin knows its size
+     * and can opt into a separate, proposal-free history pass (RAD_DRAFT_HISTORY). */
     if (cfg_.calib()) {
         if (cfg_.n_spec > 0) {
             RAD_ERR("--num-speculative-tokens %d: a calibration run drafts nothing; leave it at "
@@ -1122,7 +1122,7 @@ int Engine::declare() {
         cfg_.n_spec = 0;
         cfg_.prefix_cache = false;
         if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
-        decide("--num-speculative-tokens", "0", "a calibration run records the trunk's rows only");
+        decide("--num-speculative-tokens", "0", "a calibration run does not propose draft tokens");
         prefix_off_why_ = "a calibration run: a prefix hit would skip tokens the statistics must count";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
         calib_ = std::make_unique<Kld>();
@@ -1351,11 +1351,10 @@ int Engine::declare() {
          * none, drafts nothing either (n_spec is 0 there by now), so this never runs under it. */
         draft_tree_ = cfg_.n_spec > 0 && pb.tree_pays != 0;
         ckpt_snap_ok_ = pb.ckpt_snap_ok != 0;
-        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made. */
-        {
-            const char* e = std::getenv("RADIANCE_CKPT_STAGE");
-            cfg_.ckpt_stage = !(e && e[0] == '0');
-        }
+        /* The checkpoint stage (KVManager::ckpt_stage), planned before any KV plan is made, where
+         * a tail snapshot can be taken inside the last chunk: the plugin cuts its step for it and
+         * a hit resumes at the nearest snapshot (the exact grid snapshots where a chunk starts). */
+        cfg_.ckpt_stage = ckpt_snap_ok_ && !cfg_.prefix_exact;
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
@@ -1652,7 +1651,13 @@ int Engine::declare() {
     drafter_       = p0.drafter;
     drafter_name_  = p0.drafter_name;
     drafter_.name  = drafter_name_.c_str();
-    if (cfg_.n_spec <= 0) drafter_ = RadDrafterDecl{};
+    const bool calib_history = drafter_.kind == RAD_DRAFT_HISTORY;
+    if (calib_history && !cfg_.calib()) {
+        RAD_ERR("'%s' history calibration requires --calib-corpus; it cannot run with "
+                "--kld-record", drafter_.name);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (cfg_.n_spec <= 0 && !calib_history) drafter_ = RadDrafterDecl{};
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
@@ -1693,7 +1698,9 @@ int Engine::declare() {
                 "for the sequences the head declines", drafter_.name);
         return RAD_E_INVAL;
     }
-    if (drafter_.kind != RAD_DRAFT_NONE) {
+    if (calib_history) {
+        RAD_INFO("calib: '%s' history only; no draft proposals", drafter_.name);
+    } else if (drafter_.kind != RAD_DRAFT_NONE) {
         /* A zero proposal handle means the sampler's token buffer: the head's logits go through
          * the ordinary sampler chain. */
         RAD_INFO("speculation: %s",
@@ -4875,6 +4882,7 @@ int Engine::start() {
     if (vocab_ex) std::rethrow_exception(vocab_ex);
     if (vocab_st < 0) return vocab_st;
     if (plugins_st < 0) return plugins_st;
+    RAD_TRY(demote_call_delimiters());
     {
         /* The loaded libraries in selection order: as --kernels named them, or every library in
          * the home. */
@@ -5538,6 +5546,7 @@ int Engine::load_vocab() {
     auto v = std::make_shared<Vocab>();
     RAD_TRY(v->load(std::move(vb)));
     vocab_ = v;
+    vocab_own_ = v;
     if (file_ && file_->aux_vocab()) {
         VocabBuild ab;
         RAD_TRY(vocab_deserialize(file_->base(), (uint64_t)file_->size(), file_->aux_vocab().h, ab));
@@ -5547,12 +5556,17 @@ int Engine::load_vocab() {
         RAD_INFO("vocab: a second vocabulary of %d tokens", aux_vocab_->n_tokens());
     }
 
+    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
+             vocab_->chat_template().empty() ? ", no chat template" : "");
+    return build_vocab_view();
+}
+
+/* The sampler's view of the vocabulary and the grammar engine's index over it. The index sorts
+ * end-of-generation ids apart from text, so both are built again when that set changes. */
+int Engine::build_vocab_view() {
     auto view = std::make_unique<TokenView>();
     RAD_TRY(view->init(vocab_));
     vocab_view_ = std::move(view);
-
-    RAD_INFO("vocab: %d tokens, bos=%d eos=%d%s", vocab_->n_tokens(), vocab_->bos(), vocab_->eos(),
-             vocab_->chat_template().empty() ? ", no chat template" : "");
 
     /* Build the grammar engine's vocabulary index now rather than on the first grammar request
      * (nearly every tool-calling request has one), so admission pays only for its own grammar. */

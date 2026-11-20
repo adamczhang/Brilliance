@@ -59,6 +59,8 @@ int r4d_moe_blockmap_emit(RadStream s, const int32_t* off, uint32_t n_expert, ui
                           uint32_t fm, uint32_t cap, uint32_t* map);
 /* Whether T sorted rows over n_expert experts are served by the decode grid. */
 bool r4d_moe_in_decode_band(long long T, long long n_expert);
+/* Brilliance: BRILLIANCE_EXACT_VERIFY, off by default (r4d_rows.cpp). */
+extern "C" int r4d_exact_verify_on(void);
 
 namespace {
 
@@ -716,19 +718,11 @@ constexpr uint32_t kPackTiles = 8;
  * (16384 rows at 512 experts, a pass of 1639 tokens at top 10). A constant, so recorded and live
  * passes take the same kernels. */
 constexpr long long kPackMinRowsPerExpert = 32;
-/* The map's token tiles, pinnable for tests: 0 the rule (RADIANCE_MOE_IQR_MAP_TILES gives the pin
- * its first value), 4 the run map, 8 the packed map wherever the form has it. r4d_selftest compares
- * them byte for byte. */
-static std::atomic<int> g_moe_iqr_map_tiles{-1};
+/* The map's token tiles, pinnable for tests: 0 the rule, 4 the run map, 8 the packed map wherever
+ * the form has it. r4d_selftest compares them byte for byte. */
+static std::atomic<int> g_moe_iqr_map_tiles{0};
 static uint32_t map_tiles_pin() {
-    int v = g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
-    if (v < 0) {
-        const char* e = std::getenv("RADIANCE_MOE_IQR_MAP_TILES");
-        v = e ? std::atoi(e) : 0;
-        if (v != (int)kMapTiles && v != (int)kPackTiles) v = 0;
-        g_moe_iqr_map_tiles.store(v, std::memory_order_relaxed);
-    }
-    return (uint32_t)v;
+    return (uint32_t)g_moe_iqr_map_tiles.load(std::memory_order_relaxed);
 }
 /* The routed rows between which a narrow-K wave takes two weight tiles. Flash-Next's down
  * projection (2560 x 384:256, 512 experts, top 10), us a launch at one tile -> two: 10 rows 11.1 ->
@@ -906,10 +900,11 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
     g.nkb = (uint32_t)(K / kBlock);
     /* The common short verification shape uses the same wide-K dot reduction as a one-token
      * gate/up. Limit this to geometries whose one-token step takes that decode path; larger batches
-     * retain the throughput-oriented run/map kernels. */
+     * retain the throughput-oriented run/map kernels. Only under BRILLIANCE_EXACT_VERIFY; off, the
+     * default, mode bit 4 is never set and every batch takes upstream v2.2.0's grid. */
     const bool parity_rows = !a_sorted && top_k < (long long)kOneWaveMinRows &&
                              T > top_k && T <= 8 * top_k && g.nkb >= 8u &&
-                             r4d_moe_in_decode_band(top_k, n_expert);
+                             r4d_moe_in_decode_band(top_k, n_expert) && r4d_exact_verify_on();
     const bool band = parity_rows || r4d_moe_in_decode_band(T, n_expert);
     /* a narrow-K projection and the run map's grid take four weight tiles a block */
     if (((!band || g.nkb < 8u) && (N / 16) % 4) || (N / parts) % 16) return R4D_NO(RAD_E_SHAPE);

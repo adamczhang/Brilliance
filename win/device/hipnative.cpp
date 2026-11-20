@@ -417,7 +417,8 @@ constexpr int64_t kPinMargin = (int64_t)2 << 30;
 struct PinLimit {
     int     devices = 0;
     int64_t budget = -1;     /* the smallest visible device's shared budget, or Microsoft's formula */
-    int64_t limit = -1;      /* budget / devices - margin, or BRILLIANCE_PIN_LIMIT_GIB; -1 unknown */
+    int64_t limit = -1;      /* budget / devices - margin, or a lower BRILLIANCE_PIN_LIMIT_GIB; -1 unknown */
+    bool    from_env = false; /* the limit is BRILLIANCE_PIN_LIMIT_GIB's */
     bool    read = false;
 };
 std::mutex g_pin_mu;
@@ -444,14 +445,23 @@ const PinLimit& pin_limit_locked() {
     }
     g_pin.budget = b;
     const char* e = std::getenv("BRILLIANCE_PIN_LIMIT_GIB");
-    if (e && *e && std::atoll(e) > 0)
-        g_pin.limit = (int64_t)std::atoll(e) << 30;
-    else if (b > 0 && n > 0)
-        g_pin.limit = std::max<int64_t>(b / n - kPinMargin, 0);
+    const PinLimitChoice c = choose_pin_limit(b, n, kPinMargin, e);
+    g_pin.limit = c.limit;
+    g_pin.from_env = c.from_env;
+    if (c.invalid)
+        RAD_WARN("device: BRILLIANCE_PIN_LIMIT_GIB=%s is not a whole number of GiB above 0; it is "
+                 "ignored", e);
+    if (c.clamped)
+        RAD_WARN("device: BRILLIANCE_PIN_LIMIT_GIB=%s asks for more than Windows lets this process "
+                 "pin: %s, the %s shared-memory budget / %d device(s) - %s. Past that budget a pin "
+                 "does not fail; the next GPU operation hangs. Using %s: the variable can only "
+                 "lower the limit",
+                 e, humanb(c.computed).c_str(), humanb(b).c_str(), n, humanb(kPinMargin).c_str(),
+                 humanb(c.computed).c_str());
     RAD_INFO("device: this process may pin %s of host memory: %s%s shared-memory budget / %d "
              "device(s) - %s for HIP's and the kernel libraries' own pins",
              g_pin.limit >= 0 ? humanb(g_pin.limit).c_str() : "an unknown amount",
-             e && *e ? "BRILLIANCE_PIN_LIMIT_GIB; otherwise the " : "the ",
+             c.from_env ? "BRILLIANCE_PIN_LIMIT_GIB; otherwise the " : "the ",
              humanb(b).c_str(), n, humanb(kPinMargin).c_str());
     return g_pin;
 }
@@ -471,8 +481,7 @@ bool pin_reserve(int64_t bytes) {
                      "devices this process does not use (HIP_VISIBLE_DEVICES)",
                      humanb(bytes).c_str(), humanb(before).c_str(), humanb(l.limit).c_str(),
                      humanb(l.budget).c_str(), l.devices, humanb(kPinMargin).c_str(),
-                     std::getenv("BRILLIANCE_PIN_LIMIT_GIB") ? "; BRILLIANCE_PIN_LIMIT_GIB sets it here"
-                                                             : "");
+                     l.from_env ? "; BRILLIANCE_PIN_LIMIT_GIB sets it here" : "");
     return false;
 }
 

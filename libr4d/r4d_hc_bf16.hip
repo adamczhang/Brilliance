@@ -3142,13 +3142,6 @@ constexpr int kWideRT = 128, kWideNT = 112, kWideCH = 16;
  * (hc_pf2_launch; refused likewise, and below kPf2MinRows, where `u` is not sized for its weight
  * planes), 4 the PF2 form as the rule runs it, its up product hc_up_mix_pf3_kernel. */
 static int g_hc_prefill_form = 0;
-/* R4D_HC_PF3=0 in the environment keeps the wide kernel as the PF2 form's up product wherever the
- * rule runs PF2: the read as it was before hc_up_mix_pf3_kernel, for a comparison in a running
- * engine. A pin of 3 or 4 names the up product itself. */
-static const bool g_hc_pf3 = [] {
-    const char* e = std::getenv("R4D_HC_PF3");
-    return !(e && e[0] == '0' && !e[1]);
-}();
 
 /* ==================================================== d = silu(W_down @ N / hc) at the PREFILL tile
  *
@@ -4529,7 +4522,9 @@ constexpr int kPf3AP = kPf3KT + 4;               // LDS row pitch in shorts: six
 /* v_rcp_f32 is within one unit in the last place of the quotient below this d. */
 constexpr float kRcpTop = 0x1p120f;
 /* Whether the bf16 of `r`, a reciprocal within one unit in the last place of the quotient, may
- * differ from the quotient's: as a distance, (low16 - 0x7fff) mod 2^16 < 2. */
+ * differ from the quotient's: as a distance, (low16 - 0x7fff) mod 2^16 < 3. The low halves at which
+ * one unit can move the rounding are 0x7fff and 0x8000 (the halfway point) and 0x8001: a quotient
+ * exactly at the tie (0x8000) rounds to even, and a reciprocal one unit above it rounds up. */
 __device__ __forceinline__ unsigned rcp_tie_dist(float r) {
     return (__float_as_uint(r) - 0x7fffu) & 0xffffu;
 }
@@ -4663,7 +4658,7 @@ void hc_up_mix_pf3_kernel(const unsigned short* __restrict__ up,
             /* One step from a rounding tie, or a d whose reciprocal is not within a unit of the
              * quotient (2^120 and up, a NaN; every d is at least 1, so the sum of the four catches
              * each): the quotient itself. */
-            if (__builtin_amdgcn_ballot_w32(tie < 2u || !(dsum < kRcpTop))) {
+            if (__builtin_amdgcn_ballot_w32(tie < 3u || !(dsum < kRcpTop))) {
 #pragma unroll
                 for (int c = 0; c < HC; ++c) q[c] = 1.0f / d[c];
             }
@@ -4692,7 +4687,7 @@ void hc_rcp_check_kernel(unsigned lo, unsigned hi, unsigned* bad) {
          i += step) {
         const float d = __uint_as_float(lo + (unsigned)i);
         const float r = __builtin_amdgcn_rcpf(d), qe = 1.0f / d;
-        const bool div = rcp_tie_dist(r) < 2u || !(d < kRcpTop);
+        const bool div = rcp_tie_dist(r) < 3u || !(d < kRcpTop);
         const float t = div ? qe : r;
         miss += f2bf(t) != f2bf(qe);
         const unsigned rb = __float_as_uint(r), qb = __float_as_uint(qe);
@@ -5948,7 +5943,7 @@ extern "C" int r4d_rad_hc_read(const RadArgs* a, RadStream s) {
                 rq ? (unsigned char*)rq->data : nullptr, rq ? (float*)rqs->data : nullptr,
                 (long long)rows, (long long)n, (int)hc, (long long)lr, ncol, (long long)hrow, (long long)irow, (long long)xrow,
                 (long long)qrow, (long long)srow, (long long)rqrow, (long long)rsrow, kc, ks, eps, wadd, s,
-                g_hc_prefill_form == 4 || (g_hc_prefill_form != 3 && g_hc_pf3));
+                g_hc_prefill_form != 3);
             return prc == RAD_OK ? RAD_OK : R4D_NO(prc);
         }
 
@@ -6255,6 +6250,5 @@ extern "C" long long r4d_hc_rcp_check(unsigned lo, unsigned hi, long long* far) 
 
 extern "C" void r4d_hc_read_pin_prefill(int form) { g_hc_prefill_form = form; }
 /* 0 the launcher's rule; 1 the two-grid form (and the 64-row tile from 33 rows); 2 the rule with the
- * 64-row tile from 33 rows, as it was before the 48-row tile; 3 the rule with the 48-row tile at
- * kTNT columns a workgroup. */
+ * 64-row tile from 33 rows; 3 the rule with the 48-row tile at kTNT columns a workgroup. */
 extern "C" void r4d_hc_read_pin_decode(int form) { g_hc_decode_form = form; }

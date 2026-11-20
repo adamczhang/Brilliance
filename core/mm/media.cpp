@@ -12,6 +12,7 @@
 /* Brilliance: the H.264 encoders the round trip may use, the video writer's (mm/mp4.h). */
 #include "mm/mp4.h"
 
+#include <cctype>
 #include <string>
 #include <vector>
 #endif
@@ -36,6 +37,29 @@ extern "C" {
 
 namespace rad {
 namespace mm {
+
+#if defined(_WIN32)
+/* Brilliance: JPEG XL, refused by name on both picture paths (media.h). */
+const char* const kJpegXlRefusal =
+    "JPEG XL images are not supported by this build; send PNG, JPEG or WebP";
+
+bool is_jpeg_xl(const uint8_t* data, size_t n) {
+    static const uint8_t kBox[12] = { 0x00, 0x00, 0x00, 0x0c, 'J', 'X', 'L', ' ',
+                                      0x0d, 0x0a, 0x87, 0x0a };
+    if (!data) return false;
+    if (n >= 2 && data[0] == 0xff && data[1] == 0x0a) return true;
+    return n >= sizeof kBox && std::memcmp(data, kBox, sizeof kBox) == 0;
+}
+
+bool is_jpeg_xl_type(const std::string& media_type) {
+    /* The type alone: up to the first ';' (parameters, base64), spaces trimmed, any case. */
+    std::string t = media_type.substr(0, media_type.find(';'));
+    const size_t a = t.find_first_not_of(" \t"), b = t.find_last_not_of(" \t");
+    t = a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+    for (char& c : t) c = (char)std::tolower((unsigned char)c);
+    return t == "image/jxl" || t == "image/x-jxl";
+}
+#endif
 
 #ifndef RAD_HAVE_FFMPEG
 
@@ -89,6 +113,7 @@ int wic_decode(const uint8_t* data, size_t n, int64_t max_pixels, int32_t* w, in
                std::vector<uint8_t>* rgba, std::string* why) {
     if (!data || n == 0) { *why = "empty"; return RAD_E_INVAL; }
     if (n > 0x7fffffffu) { *why = "the image file is larger than 2 GiB"; return RAD_E_INVAL; }
+    if (is_jpeg_xl(data, n)) { *why = kJpegXlRefusal; return RAD_E_UNSUPPORTED; }
     ComScope com;
     if (!com.ok()) { *why = "Windows' picture codecs could not be started on this thread"; return RAD_E_STATE; }
     Com<IWICImagingFactory> fac;
@@ -323,6 +348,10 @@ struct Input {
     /* `max_pixels` > 0 makes the decoder refuse a larger picture itself. */
     int open(const uint8_t* data, size_t n, bool want_decoder, std::string* why,
              int64_t max_pixels = 0) {
+#if defined(_WIN32)
+        /* Brilliance: no JPEG XL decoder in this FFmpeg (media.h). */
+        if (is_jpeg_xl(data, n)) { *why = kJpegXlRefusal; return RAD_E_UNSUPPORTED; }
+#endif
         io.p = data; io.n = n; io.at = 0;
         constexpr int kBuf = 64 * 1024;
         uint8_t* buf = static_cast<uint8_t*>(av_malloc(kBuf));

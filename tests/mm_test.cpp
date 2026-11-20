@@ -2627,6 +2627,74 @@ TEST(a_png_decodes_through_windows_codecs_without_libavformat) {
     CHECK(why.find("pixel limit") != std::string::npos);
     CHECK_EQ(rad::mm::decode_image(png, 20, 1000, &small, &why), RAD_E_INVAL);   /* truncated */
 }
+
+/* Brilliance: this build has no JPEG XL decoder (no libjxl in its LGPL FFmpeg), so a JPEG XL
+ * picture is refused by name, from its signature, on every decode path: the bare codestream
+ * (FF 0A) and the ISO-BMFF container (its "JXL " signature box). PNG and JPEG still decode, and a
+ * JPEG's FF D8 is not taken for a codestream. The media type a data: URL states is read too. */
+TEST(a_jpeg_xl_picture_is_refused_by_name) {
+    static const uint8_t codestream[] = { 0xff, 0x0a, 0xfa, 0x7f, 0x01, 0x90, 0x08, 0x06, 0x01,
+                                          0x00, 0x48, 0x01, 0x00, 0x4b, 0x12, 0x0c, 0x08, 0x0f };
+    static const uint8_t container[] = { 0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a,
+                                         0x87, 0x0a, 0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70,
+                                         0x6a, 0x78, 0x6c, 0x20, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x78,
+                                         0x6c, 0x20 };
+    CHECK(rad::mm::is_jpeg_xl(codestream, sizeof codestream));
+    CHECK(rad::mm::is_jpeg_xl(codestream, 2));
+    CHECK(rad::mm::is_jpeg_xl(container, sizeof container));
+    CHECK(rad::mm::is_jpeg_xl(container, 12));
+    CHECK(!rad::mm::is_jpeg_xl(container, 11));                 /* cut inside the box */
+    CHECK(!rad::mm::is_jpeg_xl(codestream, 1));
+    CHECK(!rad::mm::is_jpeg_xl(nullptr, 0));
+    uint8_t other[sizeof container];
+    std::memcpy(other, container, sizeof other);
+    other[11] = 0x0b;                                             /* one byte off the signature */
+    CHECK(!rad::mm::is_jpeg_xl(other, sizeof other));
+    const std::vector<uint8_t> png = media_file("red.png"), jpg = media_file("red.jpg");
+    REQUIRE(!png.empty() && !jpg.empty());
+    CHECK(!rad::mm::is_jpeg_xl(png.data(), png.size()));
+    CHECK(!rad::mm::is_jpeg_xl(jpg.data(), jpg.size()));
+
+    CHECK(rad::mm::is_jpeg_xl_type("image/jxl"));
+    CHECK(rad::mm::is_jpeg_xl_type("image/jxl;base64"));
+    CHECK(rad::mm::is_jpeg_xl_type(" Image/JXL ;base64"));
+    CHECK(rad::mm::is_jpeg_xl_type("image/x-jxl;base64"));
+    CHECK(!rad::mm::is_jpeg_xl_type("image/png;base64"));
+    CHECK(!rad::mm::is_jpeg_xl_type("image/jpeg;base64"));
+    CHECK(!rad::mm::is_jpeg_xl_type("image/webp"));
+    CHECK(!rad::mm::is_jpeg_xl_type("image/jxlx"));
+    CHECK(!rad::mm::is_jpeg_xl_type(""));
+
+    if (!rad::mm::image_decoder_available()) SKIP("no picture decoder in this build");
+    const std::string want = rad::mm::kJpegXlRefusal;
+    CHECK(has(want, "JPEG XL"));
+    for (const auto& b : { std::vector<uint8_t>(codestream, codestream + sizeof codestream),
+                           std::vector<uint8_t>(container, container + sizeof container) }) {
+        rad::mm::Frame f;
+        rad::mm::FrameRGBA fa;
+        std::string why;
+        CHECK_EQ(rad::mm::decode_image(b.data(), b.size(), int64_t(1) << 24, &f, &why),
+                 RAD_E_UNSUPPORTED);
+        CHECK_EQ(why, want);
+        why.clear();
+        CHECK_EQ(rad::mm::decode_image_rgba(b.data(), b.size(), int64_t(1) << 24, &fa, &why),
+                 RAD_E_UNSUPPORTED);
+        CHECK_EQ(why, want);
+        if (rad::mm::decoder_available()) {
+            rad::mm::Video v;
+            why.clear();
+            CHECK_EQ(rad::mm::decode_video(b.data(), b.size(), first_and_last, nullptr,
+                                           int64_t(1) << 24, &v, &why), RAD_E_UNSUPPORTED);
+            CHECK_EQ(why, want);
+        }
+    }
+    for (const std::vector<uint8_t>* b : { &png, &jpg }) {
+        rad::mm::Frame f;
+        std::string why;
+        CHECK_EQ(rad::mm::decode_image(b->data(), b->size(), int64_t(1) << 24, &f, &why), RAD_OK);
+        CHECK(is_red(f));
+    }
+}
 #endif
 
 RAD_TEST_MAIN()

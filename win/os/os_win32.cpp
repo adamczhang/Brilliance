@@ -1411,12 +1411,20 @@ void process_init() {
     using TBP = UINT(WINAPI*)(UINT);
     if (HMODULE wm = LoadLibraryW(L"winmm.dll"))
         if (auto tbp = (TBP)(void*)GetProcAddress(wm, "timeBeginPeriod")) tbp(1);
+    // Never realtime: anything but "high" or "normal" is above-normal, with a warning.
     DWORD cls = ABOVE_NORMAL_PRIORITY_CLASS;
-    if (const char* p = std::getenv("BRILLIANCE_PRIORITY")) {
-        if (_stricmp(p, "high") == 0) cls = HIGH_PRIORITY_CLASS;
-        else if (_stricmp(p, "normal") == 0) cls = NORMAL_PRIORITY_CLASS;
+    const char* name = "above-normal";
+    if (const char* p = std::getenv("BRILLIANCE_PRIORITY"); p && *p) {
+        if (_stricmp(p, "high") == 0) { cls = HIGH_PRIORITY_CLASS; name = "high"; }
+        else if (_stricmp(p, "normal") == 0) { cls = NORMAL_PRIORITY_CLASS; name = "normal"; }
+        else if (_stricmp(p, "above") != 0)
+            std::fprintf(stderr, "W process: BRILLIANCE_PRIORITY=%s is not high, above or normal; using above\n", p);
     }
-    SetPriorityClass(GetCurrentProcess(), cls);
+    if (SetPriorityClass(GetCurrentProcess(), cls))
+        std::fprintf(stderr, "I process: priority class %s (BRILLIANCE_PRIORITY), power throttling off, 1 ms timer\n",
+                     name);
+    else
+        std::fprintf(stderr, "W process: cannot set priority class %s: %s\n", name, win32_message().c_str());
 }
 
 void sleep_us(int64_t us) {

@@ -30,3 +30,17 @@ add_test(NAME serve_service_test
          COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
                  -File "${CMAKE_CURRENT_SOURCE_DIR}/serve_service_test.ps1" -Exe "$<TARGET_FILE:radiance>")
 set_tests_properties(serve_service_test PROPERTIES LABELS unit TIMEOUT 120)
+
+# The process's pinned-memory limit (win/device/pin_ledger.h): BRILLIANCE_PIN_LIMIT_GIB lowers it
+# and is clamped to the shared-memory budget's figure, never raises it. Pure arithmetic on a budget
+# the test hands in; no card, no HIP.
+add_executable(pin_limit_test pin_limit_test.cpp)
+target_include_directories(pin_limit_test PRIVATE "${CMAKE_SOURCE_DIR}/tests" "${CMAKE_SOURCE_DIR}/win/device")
+target_compile_features(pin_limit_test PRIVATE cxx_std_20)
+set_target_properties(pin_limit_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME pin_limit_test COMMAND pin_limit_test)
+set_tests_properties(pin_limit_test PROPERTIES
+  LABELS unit
+  SKIP_RETURN_CODE 77
+  TIMEOUT 60
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=-1;RAD_TEST_STRICT=1;RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")

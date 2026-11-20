@@ -33,7 +33,7 @@
 //                           them, this kernel serves exactly those and the tiled one the rest.
 //
 // The merge is the decode launch's, unchanged (splits 1), so the output row, the gate and the
-// quantiser are computed from the partial exactly as before.
+// quantiser are computed from the partial as the decode launch computes them.
 //
 // What a row attends is exactly what the decode form attends: the keys of its own list, each once.
 // A score is the decode kernel's bit for bit, and p = 2^(s - m_ref), the rescale rule, the partial
@@ -58,9 +58,9 @@
 // nobody's whole one), and those slots are staged as zeros, K and V. Every other slot is one the
 // decode form reads for one of the tile's own rows.
 //
-// The launcher (r4d_attn_paged_gqa8.hip) takes this form only in a process started with
-// R4D_ATTN_USEL=1: not bit for bit is enough to move a served model's greedy text now and then
-// (docs/QSA.md gives the measurement), and that is the deployment's choice to make.
+// The launcher (r4d_attn_paged_gqa8.hip) takes this form only where a test pins it: it agrees
+// with the decode form to rounding, not bit for bit, and measured no faster in a served model
+// (docs/QSA.md).
 #pragma once
 
 #include "r4d.h"

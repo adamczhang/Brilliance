@@ -876,8 +876,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     /* A read's rotated copy takes its plain codes' dtype, so beside int8 codes the routed arm is
      * int8 too: the experts read had_quant_act_i8g's codes through the grouped GEMM's int8 rows
      * (MoeFP8::a8), which the rotated four-bit plane, the codebook at E4M3 scales a 64 or 32 of K
-     * and rotated int8 experts have. The codebook at a bf16 scale a 128 and the five-bit one do
-     * not: under them the connections keep E4M3 codes, as for unrotated experts. */
+     * and rotated int8 experts have. The codebook at a bf16 scale a 128 and the five- and six-bit
+     * ones do not: under them the connections keep E4M3 codes, as for unrotated experts. */
     const bool exp8 = m.moecfg.expert_rot && !m.moecfg.expert_w5 && !m.moecfg.expert_w6 &&
                       (!m.moecfg.expert_nl || m.moecfg.expert_g64);
     m.hccfg.codes_i8 = (m.trunk_i8 && (exp8 || m.moecfg.expert_bf16)) ? 1 : 0;
@@ -1014,8 +1014,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     if (m.arm8) {
         /* The int8 routed arm's two pairs, rotated at a scale a 128 and written by their
          * producers: the gated product's by gated_had_quant_i8g, the input's by the read. */
-        /* A trellis gate_up may be paired with W5NL down. Keep its E4M3 pair as well so that
-         * the gated intermediate can use the down projection's own activation format. */
+        /* A trellis gate_up may be paired with a codebook (W5NL, W6NL) down. Keep its E4M3 pair
+         * as well so that the gated intermediate can use the down projection's own activation
+         * format. */
         RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER, true,
                                         m.moecfg.expert_iqr != 0, RAD_FP8_BLOCK));
         m.a_eff.q8_fed = m.a_eff.q8_rot = true;
@@ -1325,8 +1326,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         MoeFP8::Src ms{};
         ms.cfg              = m.moecfg;
-        /* The legacy expert tap can be limited to selected layers, including the MTP
-         * layer below. Keep the whole-expert placement selected by m.moecfg.calib. */
+        /* The expert tap can be limited to selected layers (RADIANCE_CALIB_LAYERS), the MTP
+         * layer below among them. The whole-expert placement m.moecfg.calib selects stays. */
         ms.cfg.calib        = m.moecfg.calib && calib_layer_on((int)l);
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",

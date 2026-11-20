@@ -170,6 +170,7 @@ struct Plugin {
     void (*pin_ar_stages)(int) = nullptr;
     void (*pin_ar_form)(int) = nullptr;
     int (*record)(const void**, int) = nullptr;
+    void (*pin_exact)(int) = nullptr;   /* r4d_exact_verify_pin: BRILLIANCE_EXACT_VERIFY */
     void (*ar8_settings)(const R4DAr8Settings*) = nullptr;
 };
 
@@ -247,6 +248,7 @@ static bool load(Plugin* pl, const char* path) {
     okall &= sym(pl->h, "r4d_ar_coded_stages_pin", &pl->pin_ar_stages);
     okall &= sym(pl->h, "r4d_ar_form_pin", &pl->pin_ar_form);
     okall &= sym(pl->h, "r4d_record_dispatches", &pl->record);
+    okall &= sym(pl->h, "r4d_exact_verify_pin", &pl->pin_exact);
     okall &= sym(pl->h, "r4d_ar8_test_settings", &pl->ar8_settings);
     ScopedAr8::apply = pl->ar8_settings;
     return okall;
@@ -7536,9 +7538,17 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
 
     /* A verify issues several rows where a plain decode issues one. Same weight and activation
      * must give the same bytes at every position, not merely agree with an oracle to tolerance. */
+    /* Brilliance: the exact form is upstream 1d94e416 behind BRILLIANCE_EXACT_VERIFY (off by
+     * default). On, the rows must match; off is upstream v2.2.0's form, whose differences are
+     * reported, not failed. Each width must dispatch another kernel off than on, so a pin that is
+     * ignored cannot pass. */
     if (row_invariance) {
         std::vector<uint16_t> batch((size_t)(M * N)), single((size_t)N);
-        for (int64_t width = 2; width <= M; ++width) {
+        std::vector<const void*> kfn[2] = { std::vector<const void*>((size_t)M + 1, nullptr),
+                                            std::vector<const void*>((size_t)M + 1, nullptr) };
+        for (int exact : { 1, 0 }) {
+          pl.pin_exact(exact);
+          for (int64_t width = 2; width <= M; ++width) {
             auto q = tq;
             q[0] = T(d_a, RAD_I8, { width, K });
             q[1] = T(d_as, RAD_F32, { width, nkb });
@@ -7546,7 +7556,11 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
             std::vector<RadParam> p = { PI("M", width), PI("N", N), PI("K", K),
                                         PI("group", 128), PS("dtype", dt) };
             st_memset(d_y, 0x7f, (size_t)(M * N) * 2);
+            const void* fns[8] = {};
+            pl.record(fns, 8);
             int rc = launch(r, q, p);
+            const int nd = pl.record(nullptr, 0);
+            kfn[exact][(size_t)width] = nd >= 1 && nd <= 8 ? fns[nd - 1] : nullptr;
             if (rc == RAD_OK)
                 st_memcpy(batch.data(), d_y, (size_t)(M * N) * 2, hipMemcpyDeviceToHost);
             int64_t different = 0, first = -1, tail_touched = 0;
@@ -7572,10 +7586,24 @@ static void iqr_gemm_case(const Plugin& pl, const IqrCase& f, int64_t M, int64_t
             const std::string label = "U5 IQR verify M=" + std::to_string(width) +
                                       " equals independent decodes N=" + std::to_string(N) +
                                       " K=" + std::to_string(K);
-            ok(label.c_str(), rc == RAD_OK && different == 0 && tail_touched == 0,
-               "rc=" + std::to_string(rc) + ", differing BF16=" + std::to_string(different) +
-               ", first=" + std::to_string(first) + ", untouched-tail violations=" +
-               std::to_string(tail_touched));
+            const std::string detail =
+                "rc=" + std::to_string(rc) + ", differing BF16=" + std::to_string(different) +
+                ", first=" + std::to_string(first) + ", untouched-tail violations=" +
+                std::to_string(tail_touched);
+            if (exact)
+                ok((label + " (BRILLIANCE_EXACT_VERIFY on)").c_str(),
+                   rc == RAD_OK && different == 0 && tail_touched == 0, detail);
+            else
+                std::printf("  info  %s (off, upstream v2.2.0's form): %s\n", label.c_str(),
+                            detail.c_str());
+          }
+        }
+        pl.pin_exact(-1);
+        for (int64_t width = 2; width <= M; ++width) {
+            const std::string label = "U5 IQR verify M=" + std::to_string(width) + " N=" +
+                                      std::to_string(N) + ": off dispatches another form than on";
+            ok(label.c_str(), kfn[0][(size_t)width] && kfn[1][(size_t)width] &&
+                                  kfn[0][(size_t)width] != kfn[1][(size_t)width]);
         }
     }
 
@@ -7802,6 +7830,17 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
         void* d_of1 = dalloc((size_t)(E + 1) * 4);
         void* d_y1 = dalloc((size_t)(top_k * N) * 2);
         if (!d_so1 || !d_of1 || !d_y1) { ok(nm, false, "regression allocation failed"); dfree_all(); return; }
+        /* Brilliance: on (BRILLIANCE_EXACT_VERIFY) the batch must match; off, upstream v2.2.0's
+         * grid, the differences are reported, not failed. The batch is launched again per state. */
+        for (int exact : { 1, 0 }) {
+        pl.pin_exact(exact);
+        {
+            std::vector<uint16_t> poison((size_t)(Tr * N), h_to_bf16(123.0f));
+            st_memcpy(d_y, poison.data(), poison.size() * 2, hipMemcpyHostToDevice);
+        }
+        const int rb = launch(r, ts, ps);
+        if (rb != RAD_OK) { pl.pin_exact(-1); ok(nm, false, "batch rc " + std::to_string(rb)); dfree_all(); return; }
+        st_memcpy(y.data(), d_y, y.size() * 2, hipMemcpyDeviceToHost);
         int64_t bad = 0, total = 0;
         for (int64_t tok = 0; tok < sh.Mtok; ++tok) {
             std::vector<int32_t> so1, of1((size_t)E + 1), original;
@@ -7816,7 +7855,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
                 }
             }
             of1[(size_t)E] = (int32_t)so1.size();
-            if ((int64_t)so1.size() != top_k) { ok(nm, false, "routing remap failed"); dfree_all(); return; }
+            if ((int64_t)so1.size() != top_k) { pl.pin_exact(-1); ok(nm, false, "routing remap failed"); dfree_all(); return; }
             st_memcpy(d_so1, so1.data(), so1.size() * 4, hipMemcpyHostToDevice);
             st_memcpy(d_of1, of1.data(), of1.size() * 4, hipMemcpyHostToDevice);
             auto t1 = ts;
@@ -7827,7 +7866,7 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
             t1[8] = T(d_y1, RAD_BF16, { top_k, N });
             auto p1 = ps; p1[0] = PI("M", 1);
             const int r1 = launch(r, t1, p1);
-            if (r1 != RAD_OK) { ok(nm, false, "decode reference rc " + std::to_string(r1)); dfree_all(); return; }
+            if (r1 != RAD_OK) { pl.pin_exact(-1); ok(nm, false, "decode reference rc " + std::to_string(r1)); dfree_all(); return; }
             std::vector<uint16_t> one((size_t)(top_k * N));
             st_memcpy(one.data(), d_y1, one.size() * 2, hipMemcpyDeviceToHost);
             for (int64_t i = 0; i < top_k; ++i)
@@ -7836,8 +7875,14 @@ static void moe_iqr_case(const Plugin& pl, const MoeIqrShape& sh) {
                     if (one[(size_t)(i * N + col)] != y[(size_t)(original[(size_t)i] * N + col)]) ++bad;
                 }
         }
-        ok(nm, bad == 0, std::to_string(bad) + " of " + std::to_string(total) +
-                            " BF16 outputs differ from independent decode");
+        const std::string detail = std::to_string(bad) + " of " + std::to_string(total) +
+                                   " BF16 outputs differ from independent decode";
+        if (exact)
+            ok((std::string(nm) + " (BRILLIANCE_EXACT_VERIFY on)").c_str(), bad == 0, detail);
+        else
+            std::printf("  info  %s (off, upstream v2.2.0's grid): %s\n", nm, detail.c_str());
+        }
+        pl.pin_exact(-1);
         dfree_all();
         return;
     }
@@ -18705,8 +18750,9 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
             d_ws[c] = dalloc(wsc.size() * 2);
             st_memcpy(d_ws[c], wsc.data(), wsc.size() * 2, hipMemcpyHostToDevice);
         }
-        /* A separate six-bit allocation: do not overread the five-bit experts. Its independent
-         * deterministic generator also leaves the pre-existing benchmark's RNG stream alone. */
+        /* The six-bit experts' own planes: the shared ones hold five bits a weight, short of a
+         * six-bit row. Their bytes come from a generator of their own, not `rnd`, so the other
+         * operands' bytes do not depend on whether the six-bit forms run. */
         void* d_w6[2] = { nullptr, nullptr };
         if (w6_only) for (int c = 0; c < 2; ++c) {
             const size_t bytes = (size_t)(nec[c] * Nc[c] * Kc[c] / 8 * 6);
@@ -18767,7 +18813,8 @@ static void moe_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E = 512,
          * w5nl64a8h (`sub` 5), which adds the sign plane's loads and merge. Not over pooled
          * experts, whose blocks are sized for four bits. */
         /* And each against an int8 activation (moe_gemm_w4a8i8, `a8`): the same planes and
-         * activation bytes, the int8 levels and the iu8 WMMA. The five-bit form has no such row. */
+         * activation bytes, the int8 levels and the iu8 WMMA. The five- and six-bit forms have no
+         * such row. */
         const RadKernelInfo* r8 = find(pl, "moe_gemm_w4a8i8");
         for (int a8 = 0; a8 < (r8 ? 2 : 1); ++a8)
         for (const int sub : { 1, 2, 4, 5, 6 }) {
@@ -36426,11 +36473,10 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 moe_w4_gemm(pl, t, sh, 2, true);
         }
-        moe_w6_cases(pl);
     }
 
-    /* Also expose the W6 tests alone while retaining them in the normal W4 row's test. */
-    if (sel("moe_gemm_w6nl")) moe_w6_cases(pl);
+    /* The six-bit cases, once: with the W4 row's cases or under their own name. */
+    if (sel("moe_gemm_w4a8") || sel("moe_gemm_w6nl")) moe_w6_cases(pl);
 
     /* The grouped GEMM against an int8 activation: the same shapes through each row's forms. */
     {
@@ -36476,12 +36522,6 @@ static void device_phase(const Plugin& pl) {
             moe_iqr_pack_case(pl, 4096, false);
             moe_iqr_pack_case(pl, 8192, false);
             moe_iqr_pack_case(pl, 3277, true);
-        }
-        if (g_case && sel("moe_iqr_row_invariance")) {
-            for (int B : { 4, 5 })
-                for (int64_t m : { (int64_t)2, (int64_t)3, (int64_t)4, (int64_t)7 })
-                    moe_iqr_case(pl, { "row-invariance gate/up", B, 16, 128, 16, 10, m,
-                                       768, 512, 2560, 2560, 2, false, 0 });
         }
         if (g_case && sel("moe_iqr_row_invariance")) {
             for (int B : { 4, 5 })
@@ -36866,7 +36906,7 @@ static void device_phase(const Plugin& pl) {
          * form S at 9, 12 and 16 rows, and the tiled up-mix at both of its row tiles. */
         for (int64_t m : { 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 32, 33, 64 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8);
-        /* The 48-row tile (33 to 48 rows) against the 64-row tile it replaced. */
+        /* The 48-row tile (33 to 48 rows) against the 64-row tile at the same rows. */
         for (int64_t m : { 33, 40, 47, 48 })
             for (bool i8 : { false, true }) hc_decode_forms(pl, m, i8, 2);
     }

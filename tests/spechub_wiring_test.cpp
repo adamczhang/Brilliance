@@ -107,10 +107,7 @@ TEST(spechub_wiring_the_device_rows_are_production_and_the_oracle_rows_are_refer
 #ifdef RAD_SPECHUB_WITH_DEVICE
     CHECK_EQ(refonly.size(), (size_t)0);
 #else
-    /* No card: every op is oracle-only, and the gate must still see them as such.
-     * Brilliance: four, as the host count above -- upstream's d0fd4aa1 added mtp_trav_verify and
-     * raised the host counts, not this one (its builds have HIP, so they never compile this
-     * branch). */
+    /* No card: every op is oracle-only, and the gate must still see them as such. */
     CHECK_EQ(refonly.size(), (size_t)4);
 #endif
 }

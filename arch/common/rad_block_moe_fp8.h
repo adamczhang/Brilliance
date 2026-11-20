@@ -512,8 +512,8 @@ struct MoeFP8 {
     /* The format `e` names: 0 block fp8, 1 four-bit, 2 four-bit rotated, 3 plain bf16, 4 the
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
      * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 rotated int8, 11 the rotated
-     * computed trellis under one f32 scale a row (an IQR weight an expert); RAD_E_DTYPE
-     * otherwise. */
+     * computed trellis under one f32 scale a row (an IQR weight an expert), 12 the codebook's
+     * six-bit form per 64; RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings against an E4M3 activation, and
      * against an int8 one (null: the format has no such row). Int8 experts read int8 only. */
@@ -566,7 +566,7 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     if (!rad_enc_is(&e, "affine")) return RAD_E_DTYPE;
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     /* The codebook at E4M3 scales per 64 or 32 of K under one fixed f32 (w4nl64a8h, w4nl32a8h),
-     * and its five-bit form per 64 (w5nl64a8h). */
+     * and its five- and six-bit forms per 64 (w5nl64a8h, w6nl64a8h). */
     if (e.n_planes == 4 && sc && sc->dtype == RAD_F8E4M3) {
         const RadEncPlane* s2 = rad_enc_plane(&e, "scale.1");
         const RadEncPlane* t  = rad_enc_plane(&e, "table");
@@ -824,7 +824,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             if (fe[0] == 3 && fe[1] == 3) continue;
             for (int i = 0; i < 2; ++i) {
                 /* A trellis gate_up reads rotated int8, but the down projection can use the
-                 * W5NL E4M3 kernel: its gated intermediate is quantised independently below. */
+                 * W5NL or W6NL E4M3 kernel: its gated intermediate is quantised independently
+                 * below. */
                 const bool mixed_codebook_down = a8f && want == 11 && i == 1 &&
                                                      (fe[i] == 7 || fe[i] == 12);
                 if (family(want) && (family(fe[i]) || mixed_codebook_down)) fmt[i] = fe[i];
@@ -1053,9 +1054,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     struct EFmt { uint32_t cdt; const char* cplanes; uint32_t sdt; int64_t sgk; const char* splanes; };
     auto efmt_of = [](int f, const RadEncoding& fe) -> EFmt {
         switch (f) {
+        case 12: return { RAD_U6, "codes,table", RAD_F8E4M3, 1, "scale,scale.1" };
         /* An IQR weight: the codes at their stored width with the code's planes, and the row and
          * block scales as one view at the weight's extents (LinearFP8's views of the same form). */
-        case 12: return { RAD_U6, "codes,table", RAD_F8E4M3, 1, "scale,scale.1" };
         case 11: return { fe.plane[0].dtype, "codes,trellis,trellis.mad", RAD_F32, 1,
                           "scale,scale.col" };
         case 10: return { RAD_I8, "codes", RAD_BF16, RAD_FP8_BLOCK, "scale" };
@@ -1103,9 +1104,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const bool pair = w.eff.q8 && w.eff.s8 && w.eff.q8_rot && w.eff.g8 == RAD_FP8_BLOCK;
         const bool down_supported = down_codebook_fp8 ? (w.eff.q && w.eff.s && kServed[fmt[1]])
                                                 : kServed8[fmt[1]] != nullptr;
-        /* A clamped layer is served too: GateQuantFP8 clamps into the bf16 plane, then
-         * quantises it into the rotated codes. Not before a codebook (W5NL, W6NL) down
-         * projection, which reads rotated E4M3: no clamp writes those codes. */
+        /* A clamped layer: GateQuantFP8 clamps into the bf16 plane, then quantises it into the
+         * rotated codes. A codebook (W5NL, W6NL) down projection reads rotated E4M3, which no
+         * clamp writes, so it is served unclamped only. */
         const bool clamp_codebook = down_codebook_fp8 && c.swiglu_limit > 0;
         if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
             clamp_codebook) {
@@ -1330,8 +1331,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while W5NL down
-     * reads rotated E4M3: select the latter pair only for the gated intermediate. */
+    /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
+     * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
     ActFP8 down_eff = w.eff;
     if (down_codebook_fp8) down_eff.q8_fed = down_eff.q8_rot = false;
     RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, down_eff, c.n_ff_exp, gact, c.rows * c.top_k,
@@ -1933,7 +1934,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
     else if (ncls == 4) {
-        /* `split` only where set: every other step's list is the one it always was. */
+        /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
             brow_slice(gin_q, r0, rows, g.n_embd),
             brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
@@ -1945,7 +1946,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             brows(w.egu, rows * k), sp };
         rad_issue(c_, op_gu, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
     } else {
-        /* `split` only where set: every other step's list is the one it always was. */
+        /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
             brow_slice(gin_q, r0, rows, g.n_embd),
             brow_slice(gin_s, r0, rows, g.n_embd / gin_g),
@@ -1977,7 +1978,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
     else if (ncls == 4) {
-        /* `split` only where set: every other step's list is the one it always was. */
+        /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
             brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
             RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),
@@ -1988,7 +1989,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             brows(w.edn, rows * k), sp };
         rad_issue(c_, op_dn, o_, (int)(sizeof o_ / sizeof *o_) - (split_on ? 0 : 1), rows);
     } else {
-        /* `split` only where set: every other step's list is the one it always was. */
+        /* `split` only where set, so every other step's operand list carries none. */
         const RadOperand o_[] = {
             brows(gq_exp.a.cq(), rows * k), brows(gq_exp.a.cs(), rows * k),
             RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),

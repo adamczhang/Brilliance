@@ -499,8 +499,10 @@ public:
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
 
-    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition). */
-    int64_t tail_checkpoint(int64_t target) const;
+    /* plan_chunk's tail-checkpoint rule for each --prefix-resume mode (see the definition).
+     * `in_step`: the snapshot is taken inside the last chunk (set_ckpt_inside), which it does not
+     * split, so nearest's quarter-interval floor does not apply. */
+    int64_t tail_checkpoint(int64_t target, bool in_step = false) const;
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
@@ -581,10 +583,16 @@ private:
     /* Set by admit_one when it held the admitted chunk back: what it would have taken. */
     int64_t       admit_full_ = 0;
     bool          admit_next_step_ = false;   /* admit_one's refusal is a wait for the next step */
+    bool          idle_refuse_ = false;       /* idle engine: this refusal will not clear by waiting */
+    bool          room_wait_ = false;         /* the refusal is the fresh prefill's room gate */
     /* Whether this step's prefill may span (ChunkGeometry::span): set by step() for the step it
      * plans, true only for a prefill alone in its step, and read by plan_chunk. True outside a
      * step, so plan_chunk called directly answers for a span. */
     bool          span_now_ = true;
+    /* A request finished while others still run: the next step is planned at the shared budget,
+     * not a span (step()), so that the finished conversation's next turn, which a client sends at
+     * once, waits for a shared step rather than a spanned one. Consumed by that step. */
+    bool          finished_beside_ = false;
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     std::function<void(uint64_t, int, int, int64_t, bool)> kv_rollback_test_hook_;
@@ -922,6 +930,9 @@ private:
      * preempted request: after --preempt-wait-ms the scheduler reclaims cache blocks and preempts
      * a decoding runner until one of them can prefill. A runner still prefilling is not a victim. */
     bool preempted_can_prefill(const SchedReq& s) const;
+    /* A fresh prefill: the whole prompt plus one decode position fits in every FULL paged group,
+     * with one block past that for every running sequence. WINDOW/RING recycle. */
+    bool fresh_prefill_can_fit(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();

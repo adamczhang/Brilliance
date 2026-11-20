@@ -344,7 +344,8 @@ typedef struct RadBatch {
      * (RadEncoderDecl::bidirectional): a picture's or a video frame's placeholders inside one
      * sequence's chunk. The pass attends them causally like every other row; the plugin attends a
      * run's rows again without the causal bound, over the keys before `bidi_used` (the position
-     * after the run's last token), in place of that result. The scheduler ends no chunk inside such
+     * after the run's last token, counted as the window group's seqused is: from the first
+     * position of its table), in place of that result. The scheduler ends no chunk inside such
      * a run, so its keys are this pass's or, after a prefix hit, the cache's; a run longer than any
      * step is cut where its chunk ends, and that chunk's rows see the run up to the cut.
      *

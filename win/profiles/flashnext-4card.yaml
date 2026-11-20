@@ -1,14 +1,33 @@
 # Brilliance profile: Qwen3.8-Flash-Next IQR-V4 on four Radeon AI PRO R9700s, tensor parallel (TP4),
 # every expert on the cards (placement: all_vram, about 17 GiB of weights a card).
-# 32K tokens of context, eight requests at once, an int8 KV cache, MTP speculation 3 deep, 2,048
-# batched tokens. With no expert read from host memory, the two-card lost write (SUPPORT.md, known
-# issue 1) has not been seen. Soak-clean (2026-11-17), before the four-card re-send and stop were
-# added; with them it passes the injection and serving checks (SUPPORT.md).
+# 256K tokens of context (262,144), eight requests at once, a bf16 KV cache, MTP speculation 3 deep,
+# prefill steps of up to 6,144 tokens. With no expert read from host memory, the two-card lost write
+# (SUPPORT.md, known issue 1) has not been seen. Supported: soaked at 32K on its earlier settings
+# (2026-11-17: 2,048-token steps and an int8 KV cache), before the four-card re-send and stop
+# (SUPPORT.md, known issue 1). With them, these tuned settings pass the injection, stop and serving
+# checks (2026-11-19); a soak on them has not run yet.
 #
-# KNOWN ISSUE (SUPPORT.md, known issue 8): Flash-Next's output changes when requests share a
-# step. Identical requests sent together get different next-token distributions, and sampling over
-# them is looser than the temperature asked. One request at a time behaves normally. Clients send
-# side requests beside a chat (titles, tags), so it can show up in normal use. Under investigation.
+# What the tuned settings do:
+#   max-model-len: 262144         the model's full context. On the test machine the KV cache holds
+#                                 about 917,000 tokens across all requests (12.5 GiB a card), about three
+#                                 and a half full-length conversations.
+#   kv-cache-dtype: bf16          the cache unquantized; i8 halves it.
+#   max-num-batched-tokens: 6144  with prefill-span: 3, a prompt alone in its step is prefilled up
+#   prefill-span: 3               to 6,144 tokens a step, three 2,048-token checkpoint intervals.
+#                                 Every other step is planned at 2,048 tokens.
+#   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
+#   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
+#                                 memory, their VRAM given to the KV cache.
+# No host prefix cache (prefix-cache-mib not set): a 14.25 GiB one beside the pinned encoders exceeds
+# what Windows lets this process pin with the integrated GPU visible too (16.93 GiB). The minute log
+# line's flag/ack re-store counts run about 6x higher than at 2,048-token steps; that is harmless
+# (SUPPORT.md, known issue 1).
+#
+# KNOWN ISSUE (SUPPORT.md, known issue 8): Flash-Next's output can change when requests share a
+# step. Identical requests sent together can get different next-token distributions, and sampling
+# over them is looser than the temperature asked. One request at a time is repeatable. Clients send
+# side requests beside a chat (titles, tags), so it can show up in normal use. It is rounding, not
+# wrong data.
 #
 #   .\serve.ps1 flashnext-4card
 #   .\serve.ps1 flashnext-4card -Bus 6,3,9,32
@@ -40,7 +59,10 @@ models:
     tp: 4
     placement: all_vram
     max-num-seqs: 8
-    max-model-len: 32768
-    kv-cache-dtype: i8
+    max-model-len: 262144
+    kv-cache-dtype: bf16
+    checkpoint-slots: 8
+    vision-tower-placement: ram
     num-speculative-tokens: 3
-    max-num-batched-tokens: 2048
+    max-num-batched-tokens: 6144
+    prefill-span: 3

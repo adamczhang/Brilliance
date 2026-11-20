@@ -42,8 +42,8 @@ here is such a choice.
   an activation format share one key: `bf16`, `f16`/`fp16`, `f32`/`fp32`, `u8`, `fp8_e4m3`,
   `fp8a8`, `fp8a8f32`, `fp8a16`, `i8a8`, `i8a8h`, `w4`, `w4a8`, `w4a8_asym`, `w4a8h`, `w8a8`,
   `w4a16`, `w8a16`, `w2a8`, `mxfp4a8`, `m2xfp4`, `w5a16`, `w4a16_asym`, `w5a8i8`, `w4a8i8_asym`,
-  and the codebook expert forms `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`
-  (`docs/MOE-W4.md`).
+  and the codebook expert forms `w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`
+  (`docs/MOE-W4.md`, `docs/MOE-W6.md`).
   - `w4a8h` is `w4a8` with a `group`-wide Walsh–Hadamard along K baked into the stored weight
     (`docs/MOE-W4.md`).
   - `i8a8` is an i8 weight with a bf16 scale per (row, 128 of K) against an int8 activation on
@@ -2361,8 +2361,9 @@ divides a table op's weights over its table operands by count alone, so the oper
 class count. Everything else (`parts`, the zero fill, `a_order`) is `moe_gemm_q`'s, and the weight
 list is class 0's codes and scales, then class 1's, 2's and 3's.
 
-**The codebook forms** (`w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`; `docs/MOE-W4.md`) hold
-u4 or u5 codes into an f32 table of 16 or 32 levels, declared as one view over the planes
+**The codebook forms** (`w4nla8h`, `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h`, `w6nl64a8h`;
+`docs/MOE-W4.md`, `docs/MOE-W6.md`) hold u4, u5 or u6 codes into an f32 table of 16, 32 or 64
+levels, declared as one view over the planes
 `codes,table`, and a scale per (row, group of K): bf16 per 128, or E4M3 per 64 or 32 declared with
 its fixed f32 level as `scale,scale.1`. Element (n, k) of an expert is `table[code] * scale`, times
 `scale.1` where there is one. The encoding's `fwht128` is in the stored weight and in the
@@ -2370,7 +2371,8 @@ activation its producer writes rotated (`hc_read`'s `rq`, or `had_quant_act_i8g`
 `a8i8h` names), so the GEMM applies none. On the host, a view of several
 planes is stored in the joined form of `abi/rad_planes.h`; libref's and libavx's hooks accept
 exactly the planes `dtype` names (code width and table length, scale dtype and group, `fwht128`)
-and refuse any other selection at declare with `RAD_E_DTYPE`. libref computes the form as
+and refuse any other selection at declare with `RAD_E_DTYPE`; libavx has no `w6nl64a8h` form.
+libref computes the form as
 `gemm_nt_q` does: per weight group the sub-sum of table values times activation codes, then
 `(sub * sa) * sb` with `sb` the scale times its level. The logical form the oracle and rad-kbench
 pass (table entries for codes, scale products for scales) goes through the same chain, bit for
@@ -2654,11 +2656,10 @@ exact form rather than omitting it: a row that serves one wire says so with a co
 and a constraint on an absent key does not hold. The two-rank exact row (and `ar_gather_hc_write`'s)
 over P2P carries a message of 512 KiB or more with its push coded at about 12.1 bits a value,
 losslessly: the peer decodes the bf16 words the plain push would have carried, so `y` and `h` are
-the same bytes (docs/GUIDE.md §4.7; `R4D_AR_CODED_MIN_KB` moves the floor). The form needs a message
+the same bytes (docs/GUIDE.md §4.7). The form needs a message
 of whole 256-value waves and leaves the others, and the host-mailbox twins, plain. From 4 MiB (the
 gather form from 6 MiB) the coded push runs staged: each block's range in parts with their own
-handshake, the fold of one part beside the push of the next, the same bytes
-(`R4D_AR_CODED_STAGES`, `R4D_AR_CODED_STAGES_G`).
+handshake, the fold of one part beside the push of the next, the same bytes.
 
 `ar_gather_hc_write` is `moe_gather` followed by `ar_hc_write`: the gather's output is the message,
 so the gather half writes `y` before it is reduced in place, and the five gather operands and `act`

@@ -83,6 +83,9 @@ static const Flag g_flags[] = {
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
                                         "completed mixed steps; 0 (default) is off" },
+    { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
+                                        "decode position fits beside every runner; off (the default)\n"
+                                        "admits a prompt when its first chunk fits" },
     { "--preempt-wait-ms",    "N",      "how long a preempted prefill may wait for the whole-\n"
                                         "recompute gate before reclaiming cache blocks and\n"
                                         "preempting the lowest-priority running request; 0\n"
@@ -178,7 +181,9 @@ static const Flag g_flags[] = {
     { "--checkpoint-interval","N",      "linear-attention state checkpoint interval, in tokens" },
     { "--prefill-span",       "N",      "checkpoint intervals one step may carry of a prefill alone\n"
     "                                    in its step, from the prompt's second interval on (default\n"
-    "                                    1); needs --max-num-batched-tokens of N intervals. Every\n"
+    "                                    1); needs --max-num-batched-tokens of N intervals. Prompts\n"
+    "                                    prefilling side by side with nothing decoding take such\n"
+    "                                    steps one at a time, the fewest tokens left first. Every\n"
     "                                    other step is planned at the budget less the extra\n"
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },
@@ -252,8 +257,9 @@ static const Flag g_flags[] = {
     "                                    the step once the product of the head's probabilities along it falls\n"
     "                                    below --draft-depth-stop, and the next verify carries only the drafts\n"
     "                                    made (1 .. --draft-depth-max). Same output law (the rule reads the\n"
-    "                                    draft's own laws only); needs --draft-coupling on and --draft-window\n"
-    "                                    fixed (both choose the depth, so they are not served together)" },
+    "                                    draft's own laws only); switches --draft-coupling on (an explicit\n"
+    "                                    off is refused) and needs --draft-window fixed (both choose the\n"
+    "                                    depth, so they are not served together)" },
     { "--draft-depth-max",    "N",      "--draft-depth adaptive: the deepest chain (default 0 =\n"
                                         "num-speculative-tokens)" },
     { "--draft-depth-min",    "N",      "--draft-depth adaptive: rounds that always run (default 1)" },
@@ -732,6 +738,12 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
         else if (S("--mixed-step-target-ms"))  { if (!num(0, 60000, &c->mixed_step_target_ms)) return RAD_E_INVAL; }
+        else if (S("--prefill-room-gate")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
+            else if (!std::strcmp(v, "off"))  c->prefill_room_gate = false;
+            else { RAD_ERR("--prefill-room-gate takes on or off -- got '%s'", v); return RAD_E_INVAL; }
+        }
         else if (S("--preempt-wait-ms"))       { if (!num(0, INT64_MAX, &c->preempt_wait_ms)) return RAD_E_INVAL; }
         else if (S("--max-num-seqs"))          { if (!num(1, INT64_MAX, &c->max_seqs)) return RAD_E_INVAL; }
         else if (S("--max-model-len"))         { if (!num(0, INT64_MAX, &c->max_ctx)) return RAD_E_INVAL; }
@@ -1766,6 +1778,8 @@ const ShowRow kShow[] = {
                                           : std::string("off"); } },
     { "--mixed-step-target-ms", [](const Config& c) {
           return c.mixed_step_target_ms > 0 ? num(c.mixed_step_target_ms) : std::string("off"); } },
+    { "--prefill-room-gate", [](const Config& c) {
+          return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
     { "--max-num-seqs",       [](const Config& c) { return num(c.max_seqs); } },
     { "--max-model-len",      [](const Config& c) {

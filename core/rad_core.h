@@ -859,6 +859,10 @@ struct Config {
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
      * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
     int64_t mixed_step_target_ms = 0;
+    /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
+     * position fits beside every runner. Off (the default) admits the first chunk alone, which
+     * can fill the pool and be preempted back to zero at the first decode step. */
+    bool prefill_room_gate = false;
     /* --preempt-wait-ms: how long a preempted prefill may wait for the whole-recompute gate
      * before the scheduler evicts cache blocks and preempts a lower-priority running request to
      * make room for it. 0 = fall back on the next step; default 5000 ms. */
@@ -971,7 +975,7 @@ struct Config {
      * expert's weight is read -- and a trellis expert decoded -- once for all its rows. The expert
      * planes are then a step tall (on Qwen3.8-Flash-Next at a 4096 budget 165 MiB more arena a
      * rank), and the output differs from piece passes at tie level, as a spanned step's at one or
-     * two ranks already does. Off (piece) is the span as it was, launch for launch. */
+     * two ranks already does. Off (piece): a routed pass a piece. */
     bool    prefill_span_step = false;
     /* --prefill-span-min auto|N: the shortest prompt, in tokens, a lone prefill spans for
      * (Scheduler::set_span_min). -1 is auto, which Engine::serve resolves: eight intervals where
@@ -986,8 +990,9 @@ struct Config {
      * or a quarter interval) a step of their own, which on a routed model reads most of the
      * experts once more (some 60 ms a prompt on Flash-Next at two ranks). Off ends the last chunk
      * at the prompt's end: the next turn resumes from the deepest snapshot a chunk end left (the
-     * last interval or span boundary) and recomputes up to an interval more. On (the default) is
-     * the schedule as it was. Output of a cold prompt differs only as another chunking does. */
+     * last interval or span boundary) and recomputes up to an interval more. On (the default):
+     * the tail snapshot at its own boundary. Output of a cold prompt differs only as another
+     * chunking does. */
     bool    prefill_tail_snapshot = true;
     /* --prefill-span-first on|off: whether a span may start at a prompt's first token (off, the
      * default: from its second interval on, Scheduler::plan_chunk). On, the first interval is no
@@ -1003,8 +1008,8 @@ struct Config {
     int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
     /* Engine-internal, not a flag: plan a checkpoint stage on the card (KVManager::ckpt_stage).
-     * The engine sets it at startup unless RADIANCE_CKPT_STAGE=0; a KVManager planned without it
-     * (a test, a tool) carves none. */
+     * The engine sets it at startup where the plugin can cut a step at a tail snapshot and
+     * --prefix-resume is nearest; a KVManager planned without it (a test, a tool) carves none. */
     bool    ckpt_stage = false;
     /* --prefix-resume exact|nearest.
      * - exact (the default): a prefix hit resumes only on the grid an idle server's cold prefill
@@ -1091,9 +1096,9 @@ struct Config {
      * many rows. The chain goes on while the product of the rounds' statistic (stat 0: the largest
      * mass of each round's law, 1: the mass of the token it drew) stays >= draft_depth_stop; the
      * decision trails the chain by draft_depth_lag rounds (0 or 1; 1 hides the host's readback
-     * behind a running round), draft_depth_min rounds always run. Needs --draft-coupling on, a
-     * serial head's chain and --draft-window fixed. Lossless: the rule reads draft-side quantities
-     * only. Off by default, which is the fixed chain bit for bit. */
+     * behind a running round), draft_depth_min rounds always run. Switches --draft-coupling on
+     * and needs a serial head's chain and --draft-window fixed. Lossless: the rule reads draft-side
+     * quantities only. Off by default: the fixed chain. */
     bool        draft_depth_adaptive = false;
     int         draft_depth_max = 0;
     int         draft_depth_min = 1;
@@ -1127,7 +1132,7 @@ struct Config {
      * delta-net fold's register window serves 8 query rows, so a Flash-Next verify window past 7
      * drafts leaves its kernels unsupported), cut where the path score falls under
      * `draft_suffix_min_score`) in place of the head's draft. Lossless: the proposal's rows are never
-     * coupled. Off (default) is the engine as it was, bit for bit. */
+     * coupled. Off by default: every step is the head's. */
     bool        draft_suffix = false;
     int         draft_suffix_min_match = 6;
     int         draft_suffix_max = 7;

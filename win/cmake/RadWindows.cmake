@@ -12,10 +12,10 @@ include_guard(GLOBAL)
 
 # Brilliance's own release: what the package name carries. The project() version stays radiance's,
 # the release this tree was taken from.
-set(BRILLIANCE_VERSION "0.3.0-alpha.1" CACHE INTERNAL "Brilliance's release")
+set(BRILLIANCE_VERSION "0.3.0-alpha.2" CACHE INTERNAL "Brilliance's release")
 # The upstream revision the port is on, as `git describe --tags` names it, and its commit; an upstream
-# merge moves it. Since the merge of upstream's main at 3deabdae (2026-11-18) it is past v2.1.0.
-set(BRILLIANCE_UPSTREAM "v2.1.0-108-g3deabdae 3deabdaeca17b58bad90d332f4b204cf7bb8a10e" CACHE INTERNAL
+# merge moves it. Since the merge of upstream's v2.2.0 tag (b6b8751c, 2026-11-19) it is that release.
+set(BRILLIANCE_UPSTREAM "v2.2.0 b6b8751cccb0e834a13ae9e5afca824ee9a487aa" CACHE INTERNAL
     "the upstream tag and commit Brilliance is pinned to")
 
 # An install goes to Program Files\Brilliance unless the configure named a prefix; CMake's own

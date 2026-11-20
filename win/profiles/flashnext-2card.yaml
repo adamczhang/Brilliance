@@ -1,14 +1,30 @@
 # Brilliance profile: Qwen3.8-Flash-Next IQR-V4 on two Radeon AI PRO R9700s, tensor parallel (TP2),
 # experts tiered between the cards and host memory (placement: expert_tiered, a 16 GiB host pool).
-# 200K tokens of context, eight requests at once, an int8 KV cache, a 4 GiB prefix cache, MTP
-# speculation 3 deep, 2,048 batched tokens: upstream's two-card settings
-# (deploy/compose/tp2.radiance.yaml), on the exact wire, the default (upstream's file sets
-# tp-wire: wht6, which runs on Windows with the same protection but is not qualified). Supported
-# (SUPPORT.md, known issue 1).
+# 256K tokens of context (262,144), eight requests at once, an int8 KV cache, a 4 GiB prefix cache,
+# MTP speculation 3 deep, prefill steps of up to 6,144 tokens, on the exact wire, the default.
+# Upstream's two-card settings (deploy/compose/tp2.radiance.yaml: 200K, 2,048 batched tokens,
+# tp-wire: wht6, which runs on Windows with the same protection but is not qualified), tuned for
+# Windows. Supported (SUPPORT.md, known issue 1).
+#
+# What the tuned settings do:
+#   max-model-len: 262144         the model's full context. On the test machine the KV cache holds
+#                                 about 262,100 tokens across all requests (the experts take the rest of
+#                                 the cards), so a prompt longer than that is refused (400).
+#   max-num-batched-tokens: 6144  with prefill-span: 3, a prompt alone in its step is prefilled up
+#   prefill-span: 3               to 6,144 tokens a step, three 2,048-token checkpoint intervals;
+#                                 with experts in host memory this starts at 16,384-token prompts.
+#                                 Every other step is planned at 2,048 tokens.
+#   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
+#   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
+#                                 memory, their VRAM given to the KV cache.
+# The n-gram table (47.68 GiB) is read from the file (ngram-placement left at auto): a pinned copy
+# exceeds what Windows lets this process pin (46.83 GiB with two cards visible). This build serves
+# no fp8 KV cache for this model; i8 is its 8-bit cache.
 #
 # Now and then a 64-byte write from one GPU to host memory in an all-reduce is lost or misdirected;
 # the server re-sends the block and the step completes, at about 4% of single-stream decode. A block
-# that cannot be recovered stops the server (exit status 70). No runtime variable is set.
+# that cannot be recovered stops the server (exit status 70). The re-send and the stop were checked
+# at 6,144-token steps (2026-11-19). No runtime variable is set.
 #
 #   .\serve.ps1 flashnext-2card -Bus 3,9
 #   .\serve.ps1 flashnext-2card -Bus 3,9 -WhatIf     what it would set and run
@@ -42,8 +58,11 @@ models:
     placement: expert_tiered
     host-pool-mib: 16384
     max-num-seqs: 8
-    max-model-len: 200000
+    max-model-len: 262144
     kv-cache-dtype: i8
     prefix-cache-mib: 4096
+    checkpoint-slots: 8
+    vision-tower-placement: ram
     num-speculative-tokens: 3
-    max-num-batched-tokens: 2048
+    max-num-batched-tokens: 6144
+    prefill-span: 3
