@@ -203,6 +203,13 @@ def check_tick(root, doc, n, tok, rep):
         return
     if t.startswith("share/radiance/") and not t.startswith("share/radiance/recipes"):
         return
+    if t.startswith("share/radiance/recipes/"):
+        # The build installs data/recipes as share/radiance/recipes (win/cmake/RadWindows.cmake),
+        # so a recipe a document names must be one in data/recipes.
+        name = t[len("share/radiance/recipes/"):]
+        if name and not os.path.exists(os.path.join(root, "data/recipes", name)):
+            rep.err(where, "`%s`: no such recipe in data/recipes" % tok)
+        return
     if first in ("profiles", "tools", "libexec", "share") or t in PACKAGE_FILES:
         key = t.rstrip("/")
         if key in PACKAGE_FILES:

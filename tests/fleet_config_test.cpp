@@ -475,6 +475,144 @@ TEST(durations) {
     CHECK(!fleet::parse_duration_ms("5d", &ms));
 }
 
+/* ------------------------------------------------------------------ the launcher's overrides */
+
+/* Brilliance: win\serve.ps1's -Listen, -Port and -ApiKey reach the engine as BRILLIANCE_SERVER_*,
+ * which this reader applies over the file's server: block whatever its layout. These are the
+ * layouts the launcher's old line rewrite misread (a flow mapping, a commented key line, an anchor,
+ * a block at the end of the file without a final newline, no block at all). */
+namespace {
+
+struct ServerEnv {
+    ServerEnv(const char* host, const char* port, const char* key) {
+        put("BRILLIANCE_SERVER_HOST", host);
+        put("BRILLIANCE_SERVER_PORT", port);
+        put("BRILLIANCE_SERVER_API_KEY", key);
+    }
+    ~ServerEnv() {
+        unsetenv("BRILLIANCE_SERVER_HOST");
+        unsetenv("BRILLIANCE_SERVER_PORT");
+        unsetenv("BRILLIANCE_SERVER_API_KEY");
+    }
+    static void put(const char* n, const char* v) {
+        if (v) setenv(n, v, 1);
+        else   unsetenv(n);
+    }
+};
+
+const char* const kLayouts[] = {
+    /* block, comments beside and between the keys */
+    "# a profile\nserver:\n  host: 127.0.0.1   # loopback\n  # port: 1\n  port: 8001\n  api-key: file-key\n"
+    "models:\n  a:\n    model: /m/a.rad\n",
+    /* a flow mapping on the server: line, with a comment after it */
+    "server: {host: 127.0.0.1, port: 8001, api-key: file-key}  # inline\nmodels:\n  a:\n    model: /m/a.rad\n",
+    /* `server:` with a trailing comment */
+    "server:   # the listener\n  host: 127.0.0.1\n  port: 8001\n  api-key: file-key\nmodels:\n  a:\n    model: /m/a.rad\n",
+    /* an anchor and a merge key */
+    "x-net: &net\n  host: 127.0.0.1\n  port: 8001\nserver:\n  <<: *net\n  api-key: file-key\n"
+    "models:\n  a:\n    model: /m/a.rad\n",
+    /* the server block last, no newline at the end */
+    "models:\n  a:\n    model: /m/a.rad\nserver:\n  host: 127.0.0.1\n  port: 8001\n  api-key: file-key",
+};
+
+}  // namespace
+
+TEST(the_file_is_read_whatever_its_layout) {
+    ServerEnv none(nullptr, nullptr, nullptr);
+    for (const char* text : kLayouts) {
+        fleet::FleetConfig fc;
+        CHECK_EQ(yload(text, &fc), RAD_OK);
+        if (fc.models.empty()) continue;
+        const Config& c = fc.models[0].cfg;
+        CHECK_EQ(c.host, "127.0.0.1");
+        CHECK_EQ(c.port, 8001);
+        CHECK_EQ(c.api_key, "file-key");
+    }
+}
+
+TEST(the_launcher_overrides_replace_the_file_s_server_keys) {
+    setenv("RAD_FLEET_TEST_KEY", "env-key", 1);
+    {
+        ServerEnv over("0.0.0.0", "8004", "env:RAD_FLEET_TEST_KEY");
+        for (const char* text : kLayouts) {
+            fleet::FleetConfig fc;
+            CHECK_EQ(yload(text, &fc), RAD_OK);
+            if (fc.models.empty()) continue;
+            const Config& c = fc.models[0].cfg;
+            CHECK_EQ(c.host, "0.0.0.0");
+            CHECK_EQ(c.port, 8004);
+            CHECK_EQ(c.api_key, "env-key");
+            CHECK_EQ(c.api_key_env, "RAD_FLEET_TEST_KEY");
+            CHECK_EQ(c.given.at("--host"), "environment (BRILLIANCE_SERVER_HOST)");
+            CHECK_EQ(c.given.at("--port"), "environment (BRILLIANCE_SERVER_PORT)");
+            CHECK_EQ(c.given.at("--api-key-env"), "environment (BRILLIANCE_SERVER_API_KEY)");
+            CHECK(!c.given.count("--api-key"));
+        }
+    }
+    {
+        /* off: no key at all, whichever spelling the file used */
+        ServerEnv off(nullptr, nullptr, "off");
+        for (const char* text : kLayouts) {
+            fleet::FleetConfig fc;
+            CHECK_EQ(yload(text, &fc), RAD_OK);
+            if (fc.models.empty()) continue;
+            CHECK(fc.models[0].cfg.api_key.empty());
+            CHECK_EQ(fc.models[0].cfg.port, 8001);   /* what is not overridden stays the file's */
+            CHECK_EQ(fc.models[0].cfg.given.at("--port"), "server.port");
+        }
+        fleet::FleetConfig fc;
+        CHECK_EQ(yload("server:\n  api-key-env: RAD_FLEET_TEST_UNSET_VAR\nmodels:\n  a:\n    model: /m/a.rad\n", &fc), RAD_OK);
+        CHECK(fc.models[0].cfg.api_key.empty());
+    }
+    unsetenv("RAD_FLEET_TEST_KEY");
+}
+
+TEST(the_launcher_overrides_need_no_server_block) {
+    ServerEnv over("0.0.0.0", "8004", nullptr);
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("models:\n  a:\n    model: /m/a.rad\n  b:\n    model: /m/b.rad\n", &fc), RAD_OK);
+    for (const fleet::ModelEntry& m : fc.models) {
+        CHECK_EQ(m.cfg.host, "0.0.0.0");
+        CHECK_EQ(m.cfg.port, 8004);
+    }
+}
+
+/* A reload rereads the file with the same variables, so an unchanged listener compares equal and a
+ * model-level edit applies (Fleet::reload refuses only server: and cards: changes). */
+TEST(a_reload_sees_the_same_overrides) {
+    ServerEnv over("0.0.0.0", "8004", "off");
+    fleet::FleetConfig a, b;
+    CHECK_EQ(yload("server:\n  port: 8000\nmodels:\n  a:\n    model: /m/a.rad\n    max-num-seqs: 4\n", &a), RAD_OK);
+    CHECK_EQ(yload("server:\n  port: 8000\nmodels:\n  a:\n    model: /m/a.rad\n    max-num-seqs: 8\n", &b), RAD_OK);
+    CHECK_EQ(a.models[0].cfg.host, b.models[0].cfg.host);
+    CHECK_EQ(a.models[0].cfg.port, b.models[0].cfg.port);
+    CHECK_EQ(a.models[0].cfg.api_key, b.models[0].cfg.api_key);
+    CHECK_EQ(b.models[0].cfg.max_seqs, 8);
+    CHECK(a.models[0].args != b.models[0].args);
+}
+
+TEST(the_launcher_overrides_refuse_a_key_itself) {
+    {
+        ServerEnv bad(nullptr, nullptr, "sk-a-real-key");
+        CHECK(refused("models:\n  a:\n    model: /m/a.rad\n"));
+    }
+    {
+        ServerEnv bad(nullptr, nullptr, "env:");
+        CHECK(refused("models:\n  a:\n    model: /m/a.rad\n"));
+    }
+    {
+        ServerEnv bad(nullptr, "eighty", nullptr);
+        CHECK(refused("models:\n  a:\n    model: /m/a.rad\n"));
+    }
+    {
+        /* empty is unset */
+        ServerEnv empty("", "", "");
+        fleet::FleetConfig fc;
+        CHECK_EQ(yload("server:\n  port: 8001\nmodels:\n  a:\n    model: /m/a.rad\n", &fc), RAD_OK);
+        CHECK_EQ(fc.models[0].cfg.port, 8001);
+    }
+}
+
 /* Every key the loader places at the server and memory levels is an option in the table, so a
  * renamed flag cannot leave a level key that nothing accepts. */
 TEST(level_keys_are_options) {

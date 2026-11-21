@@ -12,7 +12,10 @@
 #include <string>
 
 #if defined(_WIN32)
+#include "device/device.h"   /* Brilliance: dev_host_only, for BRILLIANCE_DEVICE=host */
 #include "os/os.h"
+
+#include <cstdlib>
 #endif
 
 namespace {
@@ -52,6 +55,22 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+#if defined(_WIN32)
+    /* Brilliance: BRILLIANCE_DEVICE=host (win\serve.ps1 -Cpu): this process uses no GPU. As
+     * rad-convert does, before anything can start HIP: every device is hidden from the HIP runtime
+     * and backend selection takes the host backend without asking HIP for a single device, so no
+     * card is touched. It is asked for, never a fallback: serve.ps1 sets it only for -Cpu. */
+    const char* host_only = std::getenv("BRILLIANCE_DEVICE");
+    if (host_only && *host_only) {
+        if (std::strcmp(host_only, "host") != 0) {
+            RAD_ERR("BRILLIANCE_DEVICE takes host (serve on the CPU, no GPU touched), not '%s'", host_only);
+            return 2;
+        }
+        _putenv_s("HIP_VISIBLE_DEVICES", "-1");
+        rad::dev_host_only();
+    }
+#endif
+
     rad::fleet::FleetConfig fleet;
     if (rad::fleet::load(path, &fleet) != RAD_OK) return 2;
     if (fleet.log_set) rad::log_set_level(fleet.log);
@@ -68,6 +87,39 @@ int main(int argc, char** argv) {
         for (const rad::fleet::ModelEntry& m : fleet.models)
             RAD_INFO("%s: model %s = %s, tp %d", path.c_str(), m.name.c_str(), m.cfg.model.c_str(),
                      m.cfg.tp);
+        /* Brilliance: the listener and key as this parser read them -- the file's, or the
+         * launcher's BRILLIANCE_SERVER_* over it (fleet/config.cpp) -- each with its source, so
+         * win\serve.ps1 shows what a start would apply. A key itself is never printed. */
+        const rad::Config& c = fleet.models.front().cfg;
+        auto src = [&c](const char* flag) {
+            const auto g = c.given.find(flag);
+            return g != c.given.end() ? g->second : std::string("default");
+        };
+        const std::string key = c.api_key.empty()       ? std::string("none")
+                              : !c.api_key_env.empty()  ? "env " + c.api_key_env + " (" + src("--api-key-env") + ")"
+                                                        : "in the file (" + src("--api-key") + ")";
+        RAD_INFO("%s: server host %s (%s), port %d (%s), api key %s", path.c_str(), c.host.c_str(),
+                 src("--host").c_str(), c.port, src("--port").c_str(), key.c_str());
+        /* Brilliance: what serve.ps1 -Cpu and -Model apply over the file (BRILLIANCE_SERVER_KERNELS,
+         * BRILLIANCE_MODEL_SPECULATION, BRILLIANCE_MODEL_PATH), with the source of each. */
+        std::string kernels;
+        for (const std::string& k : c.kernel_hierarchy) kernels += (kernels.empty() ? "" : ",") + k;
+#if defined(_WIN32)
+        if (host_only && *host_only)
+            RAD_INFO("%s: device host: the CPU only, HIP not asked (environment (BRILLIANCE_DEVICE))", path.c_str());
+#endif
+        RAD_INFO("%s: kernels %s (%s)", path.c_str(), kernels.empty() ? "every library found" : kernels.c_str(),
+                 src("--kernels").c_str());
+        for (const rad::fleet::ModelEntry& m : fleet.models) {
+            auto msrc = [&m](const char* flag) {
+                const auto g = m.cfg.given.find(flag);
+                return g != m.cfg.given.end() ? g->second : std::string("default");
+            };
+            RAD_INFO("%s: model %s: model from %s, num-speculative-tokens %s (%s)", path.c_str(),
+                     m.name.c_str(), msrc("--model").c_str(),
+                     m.cfg.n_spec < 0 ? "auto" : std::to_string(m.cfg.n_spec).c_str(),
+                     msrc("--num-speculative-tokens").c_str());
+        }
         return 0;
     }
 
@@ -118,6 +170,8 @@ int main(int argc, char** argv) {
  * starts; it runs radiance_main on the service's thread and turns a service stop into the drain
  * Ctrl-Break starts (win/SERVICE.md). Every other command line is radiance_main's, unchanged. */
 int main(int argc, char** argv) {
+    /* process_init's W lines through the logger, so the startup report's FINDINGS counts them. */
+    rad::os::set_log_sink(&rad::log_line_at);
     /* A service runs process_init itself, once its --env-from-file values are set: its
      * BRILLIANCE_PRIORITY and BRILLIANCE_CPUS count, and what they did goes to its log. */
     if (rad::os::service_wanted(argc, argv)) return rad::os::service_main(argc, argv, radiance_main);

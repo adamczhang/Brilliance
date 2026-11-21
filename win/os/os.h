@@ -354,6 +354,16 @@ double      busy_cpus(int window_ms);
  * a 9950X3D CCD), "vcache" (the domain with the largest L3) or a list like "0-7,16-23". */
 void        process_init();
 
+/* Where this layer's own log lines go (process_init's "W process: ..." and "I process: ..."):
+ * `level` numbered as the core's rad::Log (0 E, 1 W, 2 I, 3 D, 4 T), `line` without its level tag.
+ * Unset, a line is printed to stderr as "<tag> <line>", as before. radiance sets it to the core's
+ * logger (rad::log_line_at) before process_init, so these W lines are counted into the startup
+ * report's FINDINGS like every other (log_warn_lines). Set once, before process_init. */
+using LogSink = void (*)(int level, const char* line);
+void        set_log_sink(LogSink sink);
+/* One line through the sink, or to stderr: process_init's lines, and a test's. */
+void        log_os_line(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+
 /* Wait about `us` microseconds without the 15.6 ms (or, after process_init, ~1-2 ms) granularity
  * of a sleep: up to half a millisecond is spent yielding the core, longer is a high-resolution
  * waitable timer. For backoff loops whose first steps are microseconds. */

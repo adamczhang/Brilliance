@@ -24,10 +24,12 @@
 
 #include "r4d_plugin.h"
 #include "rad_abi_layout.h"
+#include "r4d_log.h"   /* Brilliance */
 
 #include <dirent.h>
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
@@ -10839,6 +10841,38 @@ extern "C" int r4d_record_dispatches(const void** fns, int cap) {
     return n;
 }
 
+/* Brilliance: the host's logger (rad_plugin_set_log, rad_abi.h), handed over before rad_plugin_open,
+ * so this library's W lines are counted into the startup report's FINDINGS. Never handed one (a
+ * tool that dlopens the library itself), a line goes to stderr as it always did. */
+static std::atomic<RadLogFn> g_host_log{ nullptr };
+extern "C" void rad_plugin_set_log(RadLogFn log) { g_host_log.store(log); }
+
+/* Declared in r4d_log.h, for the collectives' units too. A line longer than the stack buffer (the
+ * bad-block comparison, the stall capture's report) is formatted again in full. */
+void r4d_log(int level, const char* fmt, ...) {
+    char buf[1024];
+    std::string big;
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    const int n = std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) buf[0] = '\0';
+    if (n >= (int)sizeof buf) {
+        big.resize((size_t)n + 1);
+        std::vsnprintf(&big[0], big.size(), fmt, ap2);
+        big.resize((size_t)n);
+    }
+    va_end(ap2);
+    const char* line = big.empty() ? buf : big.c_str();
+    if (const RadLogFn log = g_host_log.load()) {
+        log(level, line);
+        return;
+    }
+    std::fprintf(stderr, "%c %s\n", level >= 0 && level <= 4 ? "EWIDT"[level] : '?', line);
+    std::fflush(stderr);
+}
+
 /* Brilliance (alpha.2, the owner's choice of 2026-11-19): BRILLIANCE_EXACT_VERIFY switches on the
  * re-applied upstream 1d94e416, "keep short IQR verification on the decode path", which upstream's
  * v2.2.0 dropped. On, the U5 row-f32 trellis GEMV takes speculative verify rows 5-8 as independent
@@ -10865,13 +10899,12 @@ extern "C" int r4d_exact_verify_on(void) {
     int want = -1;
     if (g_exact_verify.compare_exchange_strong(want, v)) {
         if (bad)
-            std::fprintf(stderr, "W r4d: BRILLIANCE_EXACT_VERIFY=%s is not 1/on or 0/off; it stays off "
-                         "(upstream v2.2.0's verify forms)\n", e);
+            r4d_log(1, "r4d: BRILLIANCE_EXACT_VERIFY=%s is not 1/on or 0/off; it stays off "
+                    "(upstream v2.2.0's verify forms)", e);
         else if (v)
-            std::fprintf(stderr, "I r4d: BRILLIANCE_EXACT_VERIFY=%s: exact short verification on (upstream "
-                         "1d94e416): U5 row-f32 IQR GEMMs and short MoE gate/up batches verify on the "
-                         "single-row decode path, bit for bit as decode; slower speculative decoding\n", e);
-        if (bad || v) std::fflush(stderr);
+            r4d_log(2, "r4d: BRILLIANCE_EXACT_VERIFY=%s: exact short verification on (upstream "
+                    "1d94e416): U5 row-f32 IQR GEMMs and short MoE gate/up batches verify on the "
+                    "single-row decode path, bit for bit as decode; slower speculative decoding", e);
     }
     return g_exact_verify.load(std::memory_order_relaxed);
 }
@@ -10899,6 +10932,7 @@ extern "C" const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
  * with no card. It declines only where KFD lists a card and none is gfx12. */
 extern "C" int rad_plugin_open(void) {
     (void)r4d_exact_verify_on();   /* read and logged once, at start */
+    r4d_ar_env_read();             /* Brilliance: the collectives' switches too (r4d_log.h) */
     const char* root = "/sys/class/kfd/kfd/topology/nodes";
     DIR* d = opendir(root);
     if (!d) return RAD_OK;

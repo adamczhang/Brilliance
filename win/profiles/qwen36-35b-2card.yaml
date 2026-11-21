@@ -4,7 +4,7 @@
 # at its own depth. About 17.5 GiB of weights a card: the model fits both cards whole, so no expert
 # is read from host memory. Upstream's two-card settings from the container's card (tp 2, int8 KV),
 # at a shorter context. The model thinks before it answers: a request's max_tokens counts the
-# reasoning too. Runs, not yet qualified: started, answered chat and stopped cleanly on two cards
+# reasoning too. Qualified: chat, Responses and Messages, tools, pictures and video on two cards
 # (SUPPORT.md).
 #
 #   .\serve.ps1 qwen36-35b-2card -Bus 3,9

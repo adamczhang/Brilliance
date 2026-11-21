@@ -77,6 +77,8 @@
 extern char** environ;
 
 #if defined(_WIN32)
+#include <brl_path.h>
+
 /* Brilliance: sincosf is a glibc extension the UCRT does not have. The host references here want
  * the sine and cosine of one angle, which is what it computes. */
 static inline void sincosf(float x, float* s, float* c) {
@@ -15985,6 +15987,81 @@ void dense_case(const Plugin& pl, std::vector<int32_t> cu, int64_t nh, int causa
     check(nm + ": against the bf16 P.V form", out, down_bf16(dout2, (size_t)(R * W)), 5e-2);
 }
 
+/* attn_prefix_self WITH a paged prefix, as an image edit's denoising pass runs it: one sequence
+ * whose first `P` keys sit in the paged cache ([blocks, kv_heads, 16, 2 * 128], K then V a slot,
+ * the block table in reverse order) and whose `R` own rows are dense beside the queries, at bf16
+ * and int8 scores, every `stride`th row against the port over all P + R keys. */
+void prefix_case(const Plugin& pl, int64_t P, int64_t R, int64_t nh, bool i8, int64_t stride) {
+    const char* name = "attn_prefix_self_h128_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t W = nh * kHd, ld = 3 * W + 64, BS = 16;
+    /* Prefix rows then own rows, one fused row each (the prefix rows' q unused), bf16-rounded. */
+    std::vector<float> comb = randv((size_t)((P + R) * ld), 1.5f);
+    for (float& x : comb) x = bfr(x);
+    std::vector<float> own(comb.begin() + P * ld, comb.end());
+    void* d = up_bf16(own);
+    auto col = [&](int64_t which) {
+        RadTensor t = T((uint16_t*)d + which * W, RAD_BF16, { R, W });
+        t.stride[0] = ld;
+        return t;
+    };
+    const int64_t nb = (P + BS - 1) / BS, NB = nb + 3;
+    std::vector<int32_t> bt((size_t)nb);
+    for (int64_t b = 0; b < nb; ++b) bt[(size_t)b] = (int32_t)(NB - 1 - b);
+    std::vector<float> cache((size_t)(NB * nh * BS * 2 * kHd), 0.0f);
+    for (int64_t p = 0; p < P; ++p)
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t e = 0; e < kHd; ++e) {
+                const size_t s = (size_t)(((bt[(size_t)(p / BS)] * nh + h) * BS + p % BS) * 2 * kHd);
+                cache[s + (size_t)e] = comb[(size_t)(p * ld + W + h * kHd + e)];
+                cache[s + (size_t)(kHd + e)] = comb[(size_t)(p * ld + 2 * W + h * kHd + e)];
+            }
+    void* dc = up_bf16(cache);
+    void* dout = dalloc((size_t)(R * W) * 2);
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    std::vector<RadTensor> ts = { col(0), col(1), col(2),
+                                  T(dc, RAD_BF16, { NB, nh, BS, 2 * kHd }),
+                                  T(up_i32(bt), RAD_I32, { 1, nb }),
+                                  T(up_i32({ (int32_t)P }), RAD_I32, { 1 }),
+                                  T(up_i32({ 0, (int32_t)R }), RAD_I32, { 2 }), none, none, none,
+                                  none, T(dout, RAD_BF16, { R, W }) };
+    std::vector<RadParam> ps = { PI("q_len", R), PI("head_dim", kHd), PI("gqa", 1),
+                                 PI("block_size", BS), PI("causal", 0), PS("q_dtype", "bf16"),
+                                 PS("kv_dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                                 PI("max_ctx", 8192), PI("n_head", nh), PI("max_seqs", 4) };
+    KQ8 kq_own, kq_all;
+    if (i8) {
+        kq_own = make_kq8(Opd{ &own, W, ld }, R, nh);
+        kq_all = make_kq8(Opd{ &comb, W, ld }, P + R, nh);
+        RadTensor tk8 = T(kq_own.dcode, RAD_I8, { R, W });
+        tk8.stride[0] = kq_own.ld;
+        ts[9] = tk8;
+        ts[10] = T(kq_own.dscale, RAD_F32, { R, nh });
+        ps.push_back(PS("qk", "i8"));
+    }
+    const std::string nm = fmt("%s a %lld-key paged prefix and %lld own rows, %lld heads, qk %s",
+                               name, (long long)P, (long long)R, (long long)nh, i8 ? "i8" : "bf16");
+    const int rc = run(r, ts, ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> out = down_bf16(dout, (size_t)(R * W));
+    std::vector<int> keys((size_t)(P + R));
+    for (int64_t j = 0; j < P + R; ++j) keys[(size_t)j] = (int)j;
+    const Opd qo{ &comb, 0, ld }, ko{ &comb, W, ld }, vo{ &comb, 2 * W, ld };
+    std::vector<float> got, want, row((size_t)kHd);
+    for (int64_t x = 0; x < R; x += stride)
+        for (int64_t h = 0; h < nh; ++h) {
+            attn_ref(qo, ko, vo, keys, P + x, h, 1.0 / std::sqrt(128.0), row.data(),
+                     i8 ? &kq_all : nullptr);
+            for (int64_t e = 0; e < kHd; ++e) {
+                want.push_back(row[(size_t)e]);
+                got.push_back(out[(size_t)(x * W + h * kHd + e)]);
+            }
+        }
+    check(nm + fmt(": %zu values", got.size()), got, want, 2e-2);
+}
+
 /* The dense fp8 P.V form's refusals: with a paged prefix, and `pv` "fp8" without v_scale. */
 void dense_pv8_refusals(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "attn_prefix_self_h128_bf16");
@@ -16018,6 +16095,11 @@ void dense_pv8_refusals(const Plugin& pl) {
 }
 
 void dense_cases(const Plugin& pl) {
+    for (const bool i8 : { false, true }) {
+        prefix_case(pl, 96, 4096, 2, i8, 61);
+        prefix_case(pl, 4160, 3136, 2, i8, 61);
+        prefix_case(pl, 4160, 4096, 2, i8, 61);
+    }
     for (const bool i8 : { false, true })
         for (const bool pv8 : { false, true }) {
             dense_case(pl, { 0, 1000, 2333 }, 2, 0, 3, i8, pv8);
@@ -38170,6 +38252,13 @@ int main(int argc, char** argv) {
         }
     }
     if (!path) path = "libr4d.so";
+#if defined(_WIN32)
+    /* Brilliance: libref.so is found beside the plugin by cutting its path at the last '/', which
+     * a backslash path does not have (win/compat/include/brl_path.h). The children get this
+     * spelling too. */
+    static const std::string slashed = brl_forward_slashes(path);
+    path = slashed.c_str();
+#endif
 
     Plugin pl;
 

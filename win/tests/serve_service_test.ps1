@@ -61,14 +61,15 @@ try {
   Check (Has $o "[BrlSvc]::SetFailureActions('Brl-SvcTest', 86400, @(1, 120000, 0, 0))") 'restart once after 2 minutes, then nothing'
   Check (Has $o "[BrlSvc]::SetFailureActionsOnNonCrashFailures('Brl-SvcTest', `$true)") 'non-crash failures count'
   Check (Has $o "[BrlSvc]::SetPreshutdownTimeout('Brl-SvcTest', 180000)") 'a 180 s preshutdown wait'
-  Check (Has $o "-Name Environment -Type MultiString -Value @('HIP_VISIBLE_DEVICES=2', 'BRILLIANCE_HF_CACHE=X:\test-hf')") 'the card and the model store in the service environment'
+  Check (Has $o "-Name Environment -Type MultiString -Value @('HIP_VISIBLE_DEVICES=2', 'BRILLIANCE_HF_CACHE=X:\test-hf', 'BRILLIANCE_SERVER_HOST=0.0.0.0', 'BRILLIANCE_SERVER_PORT=18365', 'BRILLIANCE_SERVER_API_KEY=env:BRL_SVC_TEST_KEY')") "the card, the model store and the listener in the service environment:`n$o"
   Check (Has $o "$icacls $(Split-Path $keyFile) /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F`n") 'the key folder: SYSTEM and Administrators only'
   Check (Has $o "$icacls $data /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX") 'the data folder: users read'
   Check (Has $o "[IO.File]::WriteAllText('$keyFile', `$env:BRL_SVC_TEST_KEY <not shown>)") 'the key written to its file, not shown'
-  foreach ($l in '| server:', '|   host: 0.0.0.0', '|   port: 18365', '|   api-key-env: BRL_SVC_TEST_KEY', '|     model: C:/nonexistent/a.rad') {
-    Check (Has $o $l) "the derived YAML has '$l':`n$o"
+  # the service's YAML is the profile as it is; -Listen, -Port and -ApiKey are in its environment
+  foreach ($l in '| server:', '|   host: 127.0.0.1', '|   port: 18364', '|     model: C:/nonexistent/a.rad') {
+    Check (Has $o $l) "the service's YAML has '$l':`n$o"
   }
-  Check (-not (Has $o '127.0.0.1')) 'the profile''s host is replaced'
+  Check (Has $o 'the service will listen on 0.0.0.0 port 18365 (host from environment (BRILLIANCE_SERVER_HOST), port from environment (BRILLIANCE_SERVER_PORT)), API key from BRL_SVC_TEST_KEY') "radiance's reader says what the service will listen on:`n$o"
   Check (Has $o "--config $yaml --check") 'the YAML checked by radiance'
   # the steps come in the order they must run
   $order = @("WriteAllText('$yaml'", "WriteAllText('$keyFile'", '--check', "$sc create", 'SetFailureActions(', 'Set-ItemProperty', "$sc qfailure")
@@ -77,7 +78,8 @@ try {
   Check $inOrder 'the steps are in order'
 
   # ---- defaults: the profile's name, no key, manual start, no restart, a longer stop timeout
-  $r = Serve @($profile, '-Install', '-WhatIf', '-Exe', $Exe, '-Manual', '-NoRestart', '-StopTimeoutS', '600') @{ HIP_VISIBLE_DEVICES = $null; BRILLIANCE_HF_CACHE = $null }
+  # (one card and no integrated GPU: no mask to set)
+  $r = Serve @($profile, '-Install', '-WhatIf', '-Exe', $Exe, '-Manual', '-NoRestart', '-StopTimeoutS', '600') @{ HIP_VISIBLE_DEVICES = $null; BRILLIANCE_HF_CACHE = $null; BRILLIANCE_SERVE_TEST_DEVICES = '0:3:0' }
   $o = $r.Out
   Check ($r.Rc -eq 0) "defaults: exit 0 (got $($r.Rc)):`n$o"
   # the profile's name made a service name: 'svc test' -> Brilliance-svc-test; the display name keeps it

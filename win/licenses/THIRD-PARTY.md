@@ -30,10 +30,11 @@ them, with the licence each is used under and the file that carries its text.
 | `vcruntime140*.dll`, `msvcp140*.dll`, `concrt140.dll`, `vccorlib140.dll` | Microsoft's Visual C++ runtime | Visual Studio Build Tools 18 (`Microsoft.VC145.CRT`) | Visual Studio licence terms, Distributable Code | `msvc-runtime.NOTICE` |
 
 The FFmpeg DLLs link no GCC, MinGW or winpthreads runtime. They import Windows system DLLs, the
-Universal CRT and the VC++ runtime (`msvc-runtime.NOTICE`). They load three DLLs at run time,
-only when an H.264 encoder opens, and the package ships none of them: Media Foundation's
-`mfplat.dll` and `d3d11.dll`, which come with Windows, and AMD's AMF runtime, `amfrt64.dll`, from
-the AMD driver.
+Universal CRT and the VC++ runtime (`msvc-runtime.NOTICE`). Three more DLLs are loaded at run
+time, and the package ships none of them: Media Foundation's `mfplat.dll` and `d3d11.dll`, which
+come with Windows, and AMD's AMF runtime, `amfrt64.dll`, from the AMD driver. FFmpeg loads them
+for the media paths built to use them: the two H.264 encoders and the AMF and D3D11 device
+contexts those encoders open. Hardware decoding is configured out (`--disable-hwaccels`).
 
 ## H.264
 
@@ -47,8 +48,9 @@ What ships and what does not:
     not with this package.
   - `h264_mf`: Windows' Media Foundation encoder. Windows "N" editions lack it unless Microsoft's
     Media Feature Pack is installed.
-  - H.264 output goes only through these two, AMD's first (`core/mm/mp4.h`); the engine takes no
-    other H.264 encoder, even from a different FFmpeg.
+  - H.264 output goes only through these two, AMD's first by default (`core/mm/mp4.h`).
+    `BRILLIANCE_H264_ENCODER` can restrict the choice to one of them or change their order, and
+    refuses any other name; the engine takes no other H.264 encoder, even from a different FFmpeg.
 - **What produces H.264.** Video generation (`/v1/videos`) writes its MP4s through them, and an
   image-to-video model's first frame goes through an H.264 round trip with the same two. Video
   generation works on one card and is not yet qualified. Speech synthesis (TTS) is not supported
@@ -173,8 +175,11 @@ text accompany the binaries, which the files beside this one do.
 
 ## Where the source is
 
-Brilliance links FFmpeg dynamically: replacing the five FFmpeg DLLs in `bin\` with a build of the
-same FFmpeg major versions replaces FFmpeg, and every library inside them, in this program.
+Brilliance links FFmpeg dynamically, through the five FFmpeg DLLs in `bin\`. Replacing all five
+together with another build replaces FFmpeg, and every library inside them, in this program. The
+replacement has to be ABI-compatible: the same DLL names (the same FFmpeg major versions), the
+functions Brilliance imports, and the codecs it uses (the PNG, MJPEG, WebP, `h264_amf`, `h264_mf`
+and AAC encoders, the MP4 muxer, and the decoders for the inputs you send).
 
 **FFmpeg and the libraries inside its DLLs.**
 

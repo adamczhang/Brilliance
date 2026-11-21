@@ -3,9 +3,9 @@
 # 256K tokens of context (262,144), eight requests at once, a bf16 KV cache, MTP speculation 3 deep,
 # prefill steps of up to 6,144 tokens. With no expert read from host memory, the two-card lost write
 # (SUPPORT.md, known issue 1) has not been seen. Supported: soaked at 32K on its earlier settings
-# (2026-11-17: 2,048-token steps and an int8 KV cache), before the four-card re-send and stop
-# (SUPPORT.md, known issue 1). With them, these tuned settings pass the injection, stop and serving
-# checks (2026-11-19); a soak on them has not run yet.
+# (2,048-token steps and an int8 KV cache), before the four-card re-send and stop (SUPPORT.md,
+# known issue 1). With them, these tuned settings pass the injection, stop and serving checks; a
+# soak on them has not run yet.
 #
 # What the tuned settings do:
 #   max-model-len: 262144         the model's full context. On the test machine the KV cache holds

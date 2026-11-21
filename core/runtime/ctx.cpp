@@ -324,6 +324,37 @@ int Ctx::bind_weights() {
     return RAD_OK;
 }
 
+/* Brilliance (ar-bytes-count): the ops that fold an all-reduce into their work, with the operand
+ * that is the message. Each declares `M` rows of `n` elements (r4d_rows.cpp's schemas); the
+ * message is `y` for ar_gather_hc_write, whose first operands are the gather's, and `x` or `y` at
+ * position 0 for the rest. */
+bool ar_billing(const OpInfo& op, int32_t* opd, int64_t* width) {
+    static const struct { const char* name; int32_t opd; } kFused[] = {
+        { "ar_hc_write",              0 },
+        { "ar_gather_hc_write",       5 },
+        { "ar_rmsnorm_quant_fp8",     0 },
+        { "ar_rmsnorm_post_quant_fp8", 0 },
+        { "ar_rmsnorm_had_quant_i8g", 0 },
+        { "ar_rmsnorm_quant_i8",      0 },
+        { "ar_rmsnorm_quant_i8g",     0 },
+        { "ar_ln_had_quant_i8",       0 },
+    };
+    if (op.op == "all_reduce") {
+        if (opd) *opd = 0;
+        if (width) *width = 1;
+        return true;
+    }
+    for (const auto& f : kFused) {
+        if (op.op != f.name) continue;
+        long long n = 0;
+        if (op.ranged_key != "M" || !op.base.get_i("n", &n) || n <= 0) return false;
+        if (opd) *opd = f.opd;
+        if (width) *width = (int64_t)n;
+        return true;
+    }
+    return false;
+}
+
 int Ctx::bind_ops() {
     Program& P = *program_;
 
@@ -357,9 +388,11 @@ int Ctx::bind_ops() {
                 if (!oi.schema->operands[o].optional) p.n_opd_required = o + 1;
             if (p.n_opd_required < 0) p.n_opd_required = 0;
         }
-        /* Matched by name once here, not on the issue path; see OpPlan::billed. */
-        p.billed     = (oi.op == "all_reduce");
-        p.collective = p.billed;
+        /* Matched by name once here, not on the issue path; see OpPlan::billed. Brilliance: the
+         * fused all-reduces are billed too (ar_billing); `collective` keeps upstream's rule, the
+         * conventional all_reduce or a row that says so, so the link hold is unchanged. */
+        p.billed     = ar_billing(oi, &p.bill_opd, &p.bill_width);
+        p.collective = (oi.op == "all_reduce");
         p.lora_site  = oi.lora_site;
         p.order      = oi.anchor > 0 && (size_t)oi.anchor < P.ops.size() ? P.ops[(size_t)oi.anchor].index
                                                                           : oi.index;

@@ -29,9 +29,9 @@ const range = store<number>(RANGES.some(([s]) => s === stored) ? stored : 300)
 export function setRange(s: number) { write("radiance.range", String(s)); range.set(s) }
 export const useRange = () => useSyncExternalStore(range.subscribe, range.get)
 
-export type Tab = "performance" | "requests" | "sessions" | "details"
+export type Tab = "performance" | "requests" | "sessions" | "details" | "sandbox"
 export interface Route { model: string | null; tab: Tab }
-const TABS: Tab[] = ["performance", "requests", "sessions", "details"]
+const TABS: Tab[] = ["performance", "requests", "sessions", "details", "sandbox"]
 function parse(): Route {
   const m = /^#\/m\/([^/]+)(?:\/([a-z]+))?/.exec(location.hash)
   if (!m) return { model: null, tab: "performance" }

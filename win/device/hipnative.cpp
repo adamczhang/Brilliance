@@ -34,6 +34,7 @@
 #if defined(RAD_HAVE_HIP) && RAD_HAVE_HIP && defined(_WIN32)
 
 #include "pin_ledger.h"
+#include "stall_watch.h"
 #include "coll_trace.h"
 #include "device/aql.h"     /* the AQL test hooks this backend answers in aql.cpp's place */
 #include "rad_format.h"     /* RAD_ALIGN_POOL */
@@ -63,6 +64,13 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+
+/* win/device/hip_copy.hip: copies as kernels on the stream's compute queue (copy_kernels below). */
+extern "C" int brl_hip_copy_ranges(void* dst, const void* src, uint64_t prefix,
+                                   const RadCopyRange* ranges, int n, void* stream);
+extern "C" int brl_hip_copy(void* dst, const void* src, uint64_t bytes, void* stream);
+extern "C" int brl_hip_copy2d(void* dst, uint64_t dpitch, const void* src, uint64_t spitch,
+                              uint64_t width, uint64_t height, void* stream);
 
 /* DXGI for the per-process video-memory budgets, gdi32 for the kernel thunks (D3DKMT*) that count
  * every process's use of a card. Named here so the backend carries its own link needs. */
@@ -143,7 +151,9 @@ void runtime_defaults() {
     /* rocm-systems#12571: on gfx1201 a copy issued behind hipEventRecord can run before the kernel
      * it follows when it goes to an SDMA engine. Copies on blit kernels instead are correct and
      * slower. On until a probe on the pinned runtime shows radiance's pattern does not trip it;
-     * BRILLIANCE_SDMA=1 keeps the copy engines. */
+     * BRILLIANCE_SDMA=1 keeps the copy engines. With them on, the engine's small copies and the step
+     * batch's uploads run as kernels on the compute queue (copy_kernels, below), which keeps the
+     * drafters exact; the copy engines then carry only the bulk copies (specdec-sdma, 2026-11-20). */
     if (!env_on("BRILLIANCE_SDMA", false)) set_env_default("PAL_DISABLE_SDMA", "1");
     /* PAL keeps what a hipFree gives back in a resource cache of its own (clr palresource.cpp,
      * ResourceCache::addGpuMemory): every freed allocation smaller than an eighth of the card's
@@ -706,7 +716,9 @@ void* n_device_ptr(void* p) {
  *
  * dev_stuck_ms for this backend. The AQL backend watches its queues' read indices; HIP hides its
  * queues, so here progress is what the host sees of the device: a blocking wait (stream or event
- * synchronize) that returns, or an event query that finds its work done. While some wait is
+ * synchronize) that returns, an event query that finds its work done, or a stream's progress
+ * beacon that moved (namespace beacon below; the decisions are win/device/stall_watch.h's, which
+ * win/tests/stall_watch_test.cpp drives). While some wait is
  * blocked and nothing has made progress for kStallMs, the device is stalled: stuck_ms is the time
  * since the last progress (/health answers 503 past the server's limit), and the verdict is logged
  * once a stall by a watcher thread, since the waiting thread is inside the driver.
@@ -968,14 +980,127 @@ void minute() {
 }
 }  // namespace mbox
 
+/* THE PROGRESS BEACONS (win/device/stall_watch.h): behind every BRILLIANCE_STALL_BEACONS-th op the
+ * engine issues on a stream (default 64; 0 turns them off), the stream writes a fresh serial into
+ * its own word of pinned host memory with hipStreamWriteValue64 -- the BRILLIANCE_SLOG_MARK=write
+ * mechanism, a command processor write that makes HIP submit nothing -- and the stall watch reads
+ * the words with a plain load. A step that keeps the card busy for many seconds (a 32K-token
+ * prefill on one card) then shows the watch its progress, where before only the step's final wait
+ * returning did, and the watch called it a stall.
+ *
+ * One pinned block for the process (portable, mapped, coherent: every card writes it, the host
+ * sees each write), made with the first stream, never freed: kSlots words a cache line apart. A
+ * stream takes a slot when it is made and gives it back when destroyed; a write still queued on a
+ * destroyed stream lands in a slot another stream may hold, which reads as one reading of progress
+ * at most. Past kSlots live streams, the rest have no beacon (said once). Cost: a lock and one
+ * write every `every` ops; nothing on the ops between. */
+namespace beacon {
+constexpr int    kSlots = 64;
+constexpr size_t kStride = 8;   /* uint64_t words: one slot a 64-byte line */
+std::mutex                      mu;
+volatile uint64_t*              block = nullptr;
+bool                            failed = false;
+std::vector<int>                free_slots;
+std::map<hipStream_t, int>      slot_of;
+std::atomic<uint64_t>           serial{0};
+
+uint32_t every() {
+    static const uint32_t v = [] {
+        const char* e = std::getenv("BRILLIANCE_STALL_BEACONS");
+        if (!e || !*e) return 64u;
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(e, &end, 10);
+        if (end == e || *end || n > 1000000ul) {
+            RAD_WARN("device: BRILLIANCE_STALL_BEACONS=%s is not a whole number of ops (0 turns the "
+                     "stall watch's beacons off); 64 is used", e);
+            return 64u;
+        }
+        if (n == 0)
+            RAD_WARN("device: the stall watch's progress beacons are off (BRILLIANCE_STALL_BEACONS=0): "
+                     "a step that keeps a card busy past 5 s reads as a stall");
+        return (uint32_t)n;
+    }();
+    return v;
+}
+
+/* A new stream's slot; the block is made with the first. */
+void attach(hipStream_t s) {
+    if (every() == 0) return;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!block && !failed) {
+        void* p = nullptr;
+        const hipError_t e = hipHostMalloc(&p, kSlots * kStride * sizeof(uint64_t),
+                                           hipHostMallocPortable | hipHostMallocMapped |
+                                               hipHostMallocCoherent);
+        if (e != hipSuccess || !p) {
+            (void)hipGetLastError();
+            failed = true;
+            RAD_WARN("device: the stall watch's progress beacons are off: their pinned block could "
+                     "not be made (%s), so a step that keeps a card busy past 5 s reads as a stall",
+                     hipGetErrorString(e));
+            return;
+        }
+        std::memset(p, 0, kSlots * kStride * sizeof(uint64_t));
+        block = (volatile uint64_t*)p;
+        for (int i = kSlots - 1; i >= 0; --i) free_slots.push_back(i);
+    }
+    if (!block) return;
+    if (free_slots.empty()) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            RAD_WARN("device: more than %d live streams: the ones past it have no stall-watch beacon",
+                     kSlots);
+        }
+        return;
+    }
+    slot_of[s] = free_slots.back();
+    free_slots.pop_back();
+}
+
+void detach(hipStream_t s) {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = slot_of.find(s);
+    if (it == slot_of.end()) return;
+    free_slots.push_back(it->second);
+    slot_of.erase(it);
+}
+
+/* An op the engine issued on `s` (hipnative_note_launch): a beacon behind every every()-th. */
+void on_launch(hipStream_t s) {
+    static thread_local BeaconCadence cadence{ every(), 0 };
+    if (!cadence.due()) return;
+    volatile uint64_t* word = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto it = slot_of.find(s);
+        if (it == slot_of.end()) return;
+        word = block + (size_t)it->second * kStride;
+    }
+    const uint64_t v = serial.fetch_add(1, std::memory_order_relaxed) + 1;
+    const hipError_t r = hipStreamWriteValue64(s, (void*)word, v, 0);
+    if (r != hipSuccess) {
+        (void)hipGetLastError();
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            RAD_WARN("device: a stall-watch beacon could not go on its stream (%s); that stream's "
+                     "long steps can read as a stall", hipGetErrorString(r));
+    }
+}
+
+/* Every slot's word now, into out[kSlots]; 0 when there is no block. */
+size_t read(uint64_t* out) {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!block) return 0;
+    for (int i = 0; i < kSlots; ++i) out[i] = block[(size_t)i * kStride];
+    return (size_t)kSlots;
+}
+}  // namespace beacon
+
 namespace stall {
 constexpr int64_t kStallMs = 5000;
 std::mutex                    mu;
-std::map<uint64_t, int64_t>   waits;       /* wait id -> start, steady ms */
-uint64_t                      next_id = 0;
-std::atomic<int64_t>          last_progress{0};
-std::atomic<bool>             reported{false};
-std::atomic<int64_t>          kicked_at{0};   /* steady ms of the last kick, 0 when none is open */
+StallWatch                    w(kStallMs);   /* under mu */
 std::once_flag                watcher_once;
 
 int64_t now_ms() {
@@ -983,15 +1108,22 @@ int64_t now_ms() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-void progress() {
-    const int64_t t = now_ms();
-    last_progress.store(t, std::memory_order_release);
-    reported.store(false, std::memory_order_release);
-    const int64_t k = kicked_at.exchange(0, std::memory_order_acq_rel);
+/* A reported stall that progress ended: k is its kick's time (StallWatch::progress). */
+void say_resumed(int64_t k, int64_t t) {
     if (k > 0)
         RAD_WARN("device: the device resumed %lld ms after the stall watch's markers: the stall was "
                  "work HIP had queued and not submitted (the streams named above)",
                  (long long)(t - k));
+}
+
+void progress() {
+    const int64_t t = now_ms();
+    int64_t k = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        k = w.progress(t);
+    }
+    say_resumed(k, t);
 }
 
 /* THE KICK. HIP on Windows batches what is queued on a stream and submits it later; work another
@@ -1034,7 +1166,10 @@ void kick() {
         if (hipEventRecord(e, sv.first) != hipSuccess) (void)hipGetLastError();
         (void)hipEventDestroy(e);
     }
-    kicked_at.store(now_ms(), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        w.kicked(now_ms());
+    }
     RAD_WARN("device: stall watch: %d of %zu stream(s) still have work queued:%s. Each was queried "
              "and given a marker event, which makes HIP submit what it holds back",
              n_busy, v.size(), n_busy ? busy.c_str() : " none");
@@ -1050,27 +1185,42 @@ void kick() {
     if (!ov.empty()) RAD_WARN("device: copies into the host mailboxes:%s", ov.c_str());
 }
 
+/* The beacons are read first: a word that moved is progress, which a long step that keeps the card
+ * busy shows here and nowhere else until its wait returns. */
 int64_t stuck_ms() {
-    int64_t oldest = -1;
+    uint64_t words[beacon::kSlots];
+    const size_t n = beacon::read(words);
+    const int64_t t = now_ms();
+    StallWatch::Verdict v;
+    int64_t k = 0, last_beacon = -1;
+    uint64_t moves = 0;
     {
         std::lock_guard<std::mutex> lk(mu);
-        for (const auto& w : waits)
-            if (oldest < 0 || w.second < oldest) oldest = w.second;
+        if (n) k = w.observe(words, n, t);
+        v = w.check(t);
+        moves = w.beacon_moves();
+        last_beacon = w.last_beacon();
     }
-    if (oldest < 0) return 0;   /* nobody is waiting on the device */
-    const int64_t since = std::max(oldest, last_progress.load(std::memory_order_acquire));
-    const int64_t ms = now_ms() - since;
-    if (ms < kStallMs) return 0;
-    if (!reported.exchange(true, std::memory_order_acq_rel)) {
-        RAD_ERR("device: nothing has completed on the device for %lld s while a host wait is "
-                "blocked on it: a hung kernel, work HIP never submitted, or a device the driver "
-                "lost. On Windows the process is not ended for it (scheduler.stuck-exit is not "
-                "armed: TDR resets a GPU that stops answering, and ending a process with work on a "
-                "card has crashed the driver); /health reports the stall",
-                (long long)(ms / 1000));
-        std::thread(kick).detach();
-    }
-    return ms;
+    say_resumed(k, t);
+    if (!v.report) return v.ms;
+    char beacons[160];
+    if (beacon::every() == 0 || n == 0)
+        std::snprintf(beacons, sizeof beacons, "the progress beacons are off, so a step that keeps "
+                      "a card busy this long would read the same");
+    else if (last_beacon < 0)
+        std::snprintf(beacons, sizeof beacons, "no stream's progress beacon has moved since start");
+    else
+        std::snprintf(beacons, sizeof beacons, "no stream's progress beacon has moved for %lld s "
+                      "(%llu readings found one moving before)", (long long)((t - last_beacon) / 1000),
+                      (unsigned long long)moves);
+    RAD_ERR("device: nothing has completed on the device for %lld s while a host wait is "
+            "blocked on it, and %s: a hung kernel, work HIP never submitted, or a device the "
+            "driver lost. On Windows the process is not ended for it (scheduler.stuck-exit is not "
+            "armed: TDR resets a GPU that stops answering, and ending a process with work on a "
+            "card has crashed the driver); /health reports the stall",
+            (long long)(v.ms / 1000), beacons);
+    std::thread(kick).detach();
+    return v.ms;
 }
 
 /* One blocking wait, from entry to return. The watcher starts with the first wait. */
@@ -1087,15 +1237,16 @@ struct Wait {
             }).detach();
         });
         std::lock_guard<std::mutex> lk(mu);
-        id = ++next_id;
-        waits[id] = now_ms();
+        id = w.wait_begin(now_ms());
     }
     ~Wait() {
+        const int64_t t = now_ms();
+        int64_t k = 0;
         {
             std::lock_guard<std::mutex> lk(mu);
-            waits.erase(id);
+            k = w.wait_end(id, t);
         }
-        progress();
+        say_resumed(k, t);
     }
 };
 }  // namespace stall
@@ -1120,6 +1271,7 @@ int n_stream_create(RadStream* out, int high_priority) {
         if (hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess &&
             hipStreamCreateWithPriority(&s, hipStreamNonBlocking, hi) == hipSuccess) {
             streams::add(s, true);
+            beacon::attach(s);
             *out = (RadStream)s;
             return RAD_OK;
         }
@@ -1127,6 +1279,7 @@ int n_stream_create(RadStream* out, int high_priority) {
     }
     HIP_TRY(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
     streams::add(s, false);
+    beacon::attach(s);
     *out = (RadStream)s;
     return RAD_OK;
 }
@@ -1134,6 +1287,7 @@ int n_stream_create(RadStream* out, int high_priority) {
 void n_stream_destroy(RadStream s) {
     if (!s) return;
     streams::remove((hipStream_t)s);
+    beacon::detach((hipStream_t)s);
     slog::forget(s);
     HIP_NOTE(hipStreamDestroy((hipStream_t)s));
 }
@@ -1729,6 +1883,57 @@ bool vm_backed(const void* p, int64_t bytes, const char* what);
 /* Whether `p` lies in an elastic reservation, backed or not. */
 bool vm_elastic(const void* p);
 
+/* COPIES AS KERNELS WHILE THE RUNTIME'S COPY ENGINES ARE ON (specdec-sdma, 2026-11-20).
+ *
+ * With BRILLIANCE_SDMA=1 hipMemcpyAsync goes to an SDMA engine, and on gfx1201 with HIP 7.16 a copy
+ * issued behind hipEventRecord can run before the kernels ahead of it on the same stream have
+ * finished (rocm-systems#12571's class). The engine's per-step metadata lives in single device
+ * buffers that stream order alone protects: the step batch's staging slab (sched/batch.h, Set), a
+ * plugin's derived buffers (BatchBuilder::run_derivations), the coupled drafter's draws. An upload
+ * that overtakes the pass still reading the previous step's values changes that pass's result: a
+ * drafter's acceptance read as 0 where the host counted 7 stopped the engine on its first requests.
+ * So while the copy engines are on, every copy up to kKernelCopyMax bytes between memory the card
+ * reaches (device memory, pinned or mapped host memory) runs as a kernel on the stream's compute
+ * queue (win/device/hip_copy.hip), which the queue orders with the kernels around it; larger copies
+ * -- the expert mover's uploads, what the copy engines are for -- and copies of pageable memory keep
+ * the runtime's. With the copy engines off (the default) the runtime's copies are blit kernels on
+ * the compute queue already, and nothing changes.
+ *
+ * BRILLIANCE_COPY_KERNELS: auto (default, as above), on (also with the copy engines off), off (never;
+ * the runtime's copies only, for an A/B). */
+constexpr int64_t kKernelCopyMax = 256 << 10;
+
+bool copy_kernels() {
+    static const bool on = [] {
+        const char* v = std::getenv("BRILLIANCE_COPY_KERNELS");
+        const char* pal = std::getenv("PAL_DISABLE_SDMA");   /* runtime_defaults has run by now */
+        const bool sdma = !(pal && *pal && std::strcmp(pal, "0") != 0);
+        const bool forced_on = v && (std::strcmp(v, "on") == 0 || std::strcmp(v, "1") == 0);
+        const bool forced_off = v && (std::strcmp(v, "off") == 0 || std::strcmp(v, "0") == 0);
+        const bool k = forced_on || (!forced_off && sdma);
+        RAD_INFO("device: small copies and the step batch's ranged uploads run as %s (copy engines "
+                 "%s; BRILLIANCE_COPY_KERNELS=%s)",
+                 k ? "kernels on the stream's compute queue" : "the runtime's hipMemcpyAsync",
+                 sdma ? "on" : "off", v && *v ? v : "auto");
+        return k;
+    }();
+    return on;
+}
+
+/* Whether a kernel can read or write `p` where it stands: device memory, or pinned or mapped host
+ * memory. Pageable memory (this backend's RAD_MEM_HOST, or memory HIP never registered) cannot. */
+bool card_reaches(const void* p) {
+    const int k = rec_kind(p);
+    if (k == RAD_MEM_DEVICE || k == RAD_MEM_HOST_PINNED || k == RAD_MEM_HOST_MAPPED) return true;
+    if (k == RAD_MEM_HOST) return false;
+    hipPointerAttribute_t a{};
+    if (hipPointerGetAttributes(&a, p) != hipSuccess) {
+        clear_sticky();
+        return false;
+    }
+    return a.type == hipMemoryTypeDevice || a.type == hipMemoryTypeHost;
+}
+
 int n_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
     if (bytes == 0) return RAD_OK;
     if (!dst || !src || bytes < 0 || !s) {
@@ -1738,6 +1943,13 @@ int n_memcpy_async(void* dst, const void* src, int64_t bytes, RadStream s) {
     }
     if (!vm_backed(dst, bytes, "rad_memcpy_async") || !vm_backed(src, bytes, "rad_memcpy_async"))
         return RAD_E_INVAL;
+    if (bytes <= kKernelCopyMax && copy_kernels() && card_reaches(dst) && card_reaches(src)) {
+        if (brl_hip_copy(dst, src, (uint64_t)bytes, s) < 0)
+            return hip_fail(hipGetLastError(), "brl_copy (a small copy's kernel)");
+        (void)slog::note(s, 'C', nullptr, nullptr, 0, bytes);
+        slog::note_copy(dst, bytes, s, 'C');
+        return RAD_OK;
+    }
     HIP_TRY(hipMemcpyAsync(dst, src, (size_t)bytes, hipMemcpyDefault, (hipStream_t)s));
     (void)slog::note(s, 'C', nullptr, nullptr, 0, bytes);
     slog::note_copy(dst, bytes, s, 'C');
@@ -1754,6 +1966,15 @@ int n_memcpy_2d_async(void* dst, int64_t dpitch, const void* src, int64_t spitch
     if (!vm_backed(dst, (height - 1) * dpitch + width, "rad_memcpy_2d_async") ||
         !vm_backed(src, (height - 1) * spitch + width, "rad_memcpy_2d_async"))
         return RAD_E_INVAL;
+    if ((height - 1) * dpitch + width <= kKernelCopyMax && (height - 1) * spitch + width <= kKernelCopyMax &&
+        copy_kernels() && card_reaches(dst) && card_reaches(src)) {
+        if (brl_hip_copy2d(dst, (uint64_t)dpitch, src, (uint64_t)spitch, (uint64_t)width,
+                           (uint64_t)height, s) < 0)
+            return hip_fail(hipGetLastError(), "brl_copy2d (a small pitched copy's kernel)");
+        (void)slog::note(s, 'C', nullptr, nullptr, 0, width * height);
+        slog::note_copy(dst, (height - 1) * dpitch + width, s, '2');
+        return RAD_OK;
+    }
     hipError_t e = hipMemcpy2DAsync(dst, (size_t)dpitch, src, (size_t)spitch, (size_t)width,
                                     (size_t)height, hipMemcpyDefault, (hipStream_t)s);
     /* IN ELASTIC MEMORY THE RUNTIME'S PITCHED COPY STOPS AT ONE MAPPING. It checks the rectangle's
@@ -1828,18 +2049,19 @@ bool host_readable(const void* p) {
     return a.type != hipMemoryTypeDevice && a.type != hipMemoryTypeArray;
 }
 
-/* THE RANGED COPY, SEGMENT BY SEGMENT. On Linux it is one dispatch of the core's copy kernel
- * (aql_blit.hip), which is left out of this build with the rest of the AQL backend. Here it is
- * hipMemcpyAsync calls on the same stream: the prefix, then each range in list order (adjacent
- * ranges, contiguous at both ends, merged into one call). Same stream, so every piece reads the
- * source as it stands when the stream reaches it, and a range written over the prefix lands after
- * it, as the kernel's contract has it.
+/* THE RANGED COPY. While the copy engines are on (copy_kernels above), one kernel on the stream's
+ * compute queue (win/device/hip_copy.hip), as on Linux (the core's aql_blit.hip, left out of this
+ * build with the rest of the AQL backend): the step batch's staging slab is single and stream order
+ * must hold for it. The kernel reads the range list when it runs, from the pinned memory beside the
+ * source, which the contract allows.
  *
- * The list is read here, at the call, not when the stream runs. The contract allows that: the list
- * stays unchanged from the call until the stream passes the copy, and its callers write it on the
- * host before the call (sched/batch.cpp, kvstream/stage.cpp). The cost is a runtime call per merged
- * range instead of one dispatch: a decode step's few changed block-table entries cost a few
- * microseconds each. A copy kernel of the Windows build's own is the performance follow-up.
+ * Otherwise hipMemcpyAsync calls on the same stream (blit kernels on the compute queue with the
+ * copy engines off): the prefix, then each range in list order (adjacent ranges, contiguous at both
+ * ends, merged into one call). Same stream, so every piece reads the source as it stands when the
+ * stream reaches it, and a range written over the prefix lands after it, as the kernel's contract
+ * has it. The list is read here, at the call: it stays unchanged from the call until the stream
+ * passes the copy, and its callers write it on the host before the call (sched/batch.cpp,
+ * kvstream/stage.cpp). The cost is a runtime call per merged range instead of one dispatch.
  *
  * The checks are the AQL backend's (aql.cpp, a_memcpy_ranges_async), which the host backend makes
  * too, so a caller bug fails the same way everywhere: a prefix not a multiple of 16 or a base off 16
@@ -1886,6 +2108,15 @@ int n_memcpy_ranges_async(void* dst, const void* src, int64_t prefix, const RadC
              !vm_backed(f + ranges[i].src, ranges[i].bytes, "rad_memcpy_ranges_async")))
             return RAD_E_INVAL;
     hipStream_t hs = (hipStream_t)s;
+    if (copy_kernels()) {
+        if (brl_hip_copy_ranges(d, f, (uint64_t)prefix, ranges, n, s) < 0)
+            return hip_fail(hipGetLastError(), "brl_copy_ranges (the ranged copy's kernel)");
+        if (prefix > 0) slog::note_copy(d, prefix, s, 'G');
+        for (int i = 0; i < n; ++i)
+            if (ranges[i].bytes > 0) slog::note_copy(d + ranges[i].dst, ranges[i].bytes, s, 'G');
+        (void)slog::note(s, 'G', nullptr, nullptr, 0, prefix);
+        return RAD_OK;
+    }
     if (prefix > 0) HIP_TRY(hipMemcpyAsync(d, f, (size_t)prefix, hipMemcpyDefault, hs));
     if (prefix > 0) slog::note_copy(d, prefix, s, 'G');
     int64_t cs = 0, cd = 0, cb = 0;   /* the merged range being gathered */
@@ -2482,10 +2713,12 @@ int64_t hipnative_pin_limit() {
 /* rad_dev_note_launch on this backend (device.h): the launch into its stream's op log, only when
  * BRILLIANCE_SLOG_LAUNCHES is set -- a lock and a few stores per launch, plus the completion mark
  * behind it (slog::mark_mode, BRILLIANCE_SLOG_MARK), for hunting a stall. Off, one test of a
- * static. */
+ * static. Always, the stall watch's progress beacon (beacon::on_launch): a thread-local count per
+ * op, and a lock and one hipStreamWriteValue64 every BRILLIANCE_STALL_BEACONS-th. */
 void hipnative_note_launch(RadStream s, const char* op, const char* kernel) {
     static const bool on = env_on("BRILLIANCE_SLOG_LAUNCHES", false);
     if (on) (void)slog::note_launch(s, op, kernel);
+    beacon::on_launch((hipStream_t)s);   /* the stall watch's progress beacon, every 64th op */
 }
 
 void hipnative_submit(RadStream s) {
@@ -2566,8 +2799,10 @@ const DeviceBackend* hipnative_backend_if_present(void) {
         /* Null, each because the backend has no such thing (header comment): recorded passes,
          * link hold and gate, gates, expert prefetch, uncached memory, DMA event,
          * host-backed mappings and swaps, kept queues and kept memory, launch-ahead control.
-         * stuck_ms too: HIP gives no view of a queue's progress to time a stall against, so
-         * dev_stuck_ms is 0 and scheduler.stuck-exit never fires on this backend. */
+         * Not stuck_ms: HIP hides its queues, so the stall watch above (n_stuck_ms) times a stall
+         * from what the host sees, and /health answers 503 "stuck" once nothing has completed for
+         * a minute while a wait is blocked (kStuckMs, core/server/admin.cpp). It is reported,
+         * never fatal: scheduler.stuck-exit does not end the process on this backend. */
         g_nat.tape_begin = nullptr;
         g_nat.tape_mark = nullptr;
         g_nat.tape_pause = nullptr;

@@ -1,4 +1,4 @@
-// One model: what it is and how it is doing, in four views.
+// One model: what it is and how it is doing, in four views under Monitoring, and a Sandbox to try it.
 import { Empty, StateBadge } from "@/components/bits"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import type { FleetModel } from "@/lib/api"
@@ -8,6 +8,7 @@ import { hrefOf, type Tab } from "@/lib/ui"
 import { Details } from "./details"
 import { Performance, type Kind } from "./performance"
 import { Requests } from "./requests"
+import { Sandbox } from "./sandbox"
 import { SessionsView } from "./sessions"
 
 const NOUN: Record<string, string> = { image_generation: "Images generated", shape_generation: "Meshes generated", audio_generation: "Clips generated", video_generation: "Videos generated" }
@@ -24,6 +25,7 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
   const scope = useScope(modelScope(id))
   const [kind, noun] = kindOf(model?.capabilities)
   const tabs: [Tab, string][] = kind === "chat" ? [["performance", "Performance"], ["requests", "Requests"], ["sessions", "Sessions"], ["details", "Details"]] : [["performance", "Performance"], ["details", "Details"]]
+  const sandbox = tab === "sandbox"
   const shown = tabs.some(([t]) => t === tab) ? tab : "performance"
   const s = scope.live
   const serving = model?.state === "resident" && !!s
@@ -40,16 +42,20 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
           </span>
         </div>
         {model?.error && <div className="rounded-lg border border-bad/40 bg-bad/10 px-3 py-2 text-sm">{model.error}</div>}
-        <div className="flex flex-wrap items-center justify-between gap-3">
+        <Tabs value={sandbox ? "sandbox" : "monitoring"} onValueChange={(v) => { location.hash = hrefOf(id, v === "sandbox" ? "sandbox" : "performance") }}>
+          <TabsList><TabsTrigger value="monitoring" className="px-3">Monitoring</TabsTrigger><TabsTrigger value="sandbox" className="px-3">Sandbox</TabsTrigger></TabsList>
+        </Tabs>
+        {!sandbox && <div className="flex flex-wrap items-center justify-between gap-3">
           <Tabs value={shown} onValueChange={(v) => { location.hash = hrefOf(id, v as Tab) }}>
             <TabsList>{tabs.map(([t, label]) => <TabsTrigger key={t} value={t} className="px-3">{label}</TabsTrigger>)}</TabsList>
           </Tabs>
           <div className="flex flex-wrap gap-1.5">
             {DOES.filter(([k]) => model?.capabilities?.[k]).map(([k, label]) => <span key={k} className="rounded-md border px-1.5 py-0.5 text-xs text-muted-foreground">{label}</span>)}
           </div>
-        </div>
+        </div>}
       </div>
-      {!model ? <Empty>This process serves no model named {id}</Empty>
+      {sandbox ? <Sandbox id={id} model={model} />
+        : !model ? <Empty>This process serves no model named {id}</Empty>
         : shown === "performance" ? (
           <>
             {!serving && scope.series.t.length > 0 && <div className="text-sm text-muted-foreground">This model is not loaded right now. The charts show its earlier activity.</div>}

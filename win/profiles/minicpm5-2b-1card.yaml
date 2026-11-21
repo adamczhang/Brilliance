@@ -1,0 +1,44 @@
+# Brilliance starter profile: MiniCPM5-2B IQ8R (8-bit weights and activations, its DSpark drafter
+# merged) on one Radeon AI PRO R9700. The small first run: a 3.04 GiB download instead of the
+# preview's 17.42 GiB. Text only; for tools, pictures and video use qwen27-preview.
+# Loads in about 4 s and holds 8.6 GiB of the card (2.55 GiB of weights, a 5.88 GiB KV cache for
+# every sequence at full length), plus the 510 MiB token embedding pinned in host memory.
+# 32K tokens of context, four requests at once, the default (bf16) KV cache. DSpark speculation at
+# the drafter's own depth, as upstream's one-card fleet serves it. Thinking off by default, so a
+# first chat answers in `content` at once; a request turns it on with
+# "chat_template_kwargs": {"enable_thinking": true}. Sampling: the container's own (top_p 0.95).
+#
+#   .\serve.ps1 minicpm5-2b-1card -Fetch -Bus 6     fetch the model if it is not whole, then serve it
+#   .\serve.ps1 minicpm5-2b-1card -Fetch -Cpu       the same on the CPU, no card
+#   .\serve.ps1 minicpm5-2b-1card -Model D:\models\minicpm5-2b-iq8r.rad -Bus 6   a copy you have
+#
+# The model file: StillDeadcode/minicpm5-2b-iq8r on Hugging Face, minicpm5-2b-iq8r.rad, 3.04 GiB
+# (3,267,162,112 bytes), SHA-256 6048448b1ffbb29df9ed44d5277cc00fc71db686959cc67f678c203e4d1d80ac.
+# -Fetch reads the line below, shows the bytes, the commit and the destination before the transfer
+# (the store: -ModelDir, else BRILLIANCE_HF_CACHE, else %LOCALAPPDATA%\radiance\hf), resumes a cut
+# transfer, checks the SHA-256, and serves the verified file; the `model:` line below is then not
+# read, and this file is not changed. Apache 2.0, as OpenBMB's MiniCPM5.
+# brilliance-fetch: StillDeadcode/minicpm5-2b-iq8r main minicpm5-2b-iq8r.rad
+#
+# Without a card, -Cpu: the CPU kernels (libavx,libref) and no drafter, applied over this file.
+# The CPU kernels cannot run the drafter (SUPPORT.md, known issue 10), so the model serves with
+# plain decoding. Started without serve.ps1 (bin\radiance.exe --config ...), the same takes
+# `kernels: libavx,libref` under `server:` and the `num-speculative-tokens: 0` line below.
+#
+# The card: name ONE card with serve.ps1's -Bus (its PCI bus) or -Device (its HIP index). With exactly
+# one card visible, HIP virtual memory is on and the KV cache is elastic; without -Bus every discrete
+# card is visible, the first is used, and the cache is sized whole.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 minicpm5-2b-1card -Bus 6
+# -Listen 0.0.0.0 -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+models:
+  minicpm5-2b:
+    model: D:/models/hf/StillDeadcode/minicpm5-2b-iq8r/minicpm5-2b-iq8r.rad
+    tp: 1
+    max-num-seqs: 4
+    max-model-len: 32768
+    chat-template-kwargs: {"enable_thinking": false}
+    # num-speculative-tokens: 0

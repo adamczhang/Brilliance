@@ -10,6 +10,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include "os/os.h"   /* Brilliance: os::File, os::prefetch (win/os) */
+#else
+#include <sys/mman.h>
+#endif
+
 namespace rad {
 
 NgramWarmPlan ngram_warm_plan(const NgramWarmFacts& f) {
@@ -70,17 +76,142 @@ std::vector<std::pair<int64_t, int64_t>> ngram_warm_ranges(std::vector<std::pair
     return k;
 }
 
+TableWarmOpts table_warm_opts_alpha3() {
+    TableWarmOpts o;
+    o.io = WarmIo::Pread;
+    o.readers = 8;
+    o.piece = (int64_t)16 << 20;
+    return o;
+}
+
+/* "64", "64M", "64MiB", "1G": bytes. */
+static bool warm_size(const std::string& v, int64_t* out) {
+    size_t i = 0;
+    int64_t n = 0;
+    for (; i < v.size() && v[i] >= '0' && v[i] <= '9'; ++i) {
+        if (n > ((int64_t)1 << 40)) return false;
+        n = n * 10 + (v[i] - '0');
+    }
+    if (i == 0) return false;
+    int sh = 0;
+    if (i < v.size()) {
+        const char u = v[i];
+        if (u == 'k' || u == 'K') sh = 10;
+        else if (u == 'm' || u == 'M') sh = 20;
+        else if (u == 'g' || u == 'G') sh = 30;
+        else return false;
+        ++i;
+        if (i < v.size() && (v[i] == 'i' || v[i] == 'I')) ++i;
+        if (i < v.size() && (v[i] == 'b' || v[i] == 'B')) ++i;
+        if (i != v.size()) return false;
+    }
+    *out = n << sh;
+    return true;
+}
+
+int table_warm_opts_parse(const std::string& spec, TableWarmOpts* o, std::string* why) {
+    if (!o || !why) return RAD_E_INVAL;
+    TableWarmOpts t = *o;
+    size_t p = 0;
+    while (p < spec.size()) {
+        size_t q = spec.find_first_of(", ", p);
+        if (q == std::string::npos) q = spec.size();
+        const std::string kv = spec.substr(p, q - p);
+        p = q + 1;
+        if (kv.empty()) continue;
+        const size_t eq = kv.find('=');
+        const std::string k = kv.substr(0, eq);
+        const std::string v = eq == std::string::npos ? std::string() : kv.substr(eq + 1);
+        if (k == "io") {
+            if (v == "pread") t.io = WarmIo::Pread;
+            else if (v == "handle") t.io = WarmIo::Handle;
+            else if (v == "prefetch") t.io = WarmIo::Prefetch;
+            else {
+                *why = fmt("io must be pread, handle or prefetch, not '%s'", v.c_str());
+                return RAD_E_INVAL;
+            }
+        } else if (k == "readers") {
+            int64_t n = 0;
+            if (!warm_size(v, &n) || n < 1 || n > 64) {
+                *why = fmt("readers must be 1 to 64, not '%s'", v.c_str());
+                return RAD_E_INVAL;
+            }
+            t.readers = (int)n;
+        } else if (k == "piece") {
+            int64_t n = 0;
+            if (!warm_size(v, &n) || n < ((int64_t)1 << 20) || n > ((int64_t)1 << 30)) {
+                *why = fmt("piece must be 1M to 1G, not '%s'", v.c_str());
+                return RAD_E_INVAL;
+            }
+            t.piece = n;
+        } else {
+            *why = fmt("unknown key '%s' (io, readers, piece)", k.c_str());
+            return RAD_E_INVAL;
+        }
+    }
+    *o = t;
+    return RAD_OK;
+}
+
+std::string table_warm_opts_str(const TableWarmOpts& o) {
+    const char* io = o.io == WarmIo::Pread ? "pread" : o.io == WarmIo::Handle ? "handle" : "prefetch";
+    return fmt("io=%s readers=%d piece=%s", io, o.readers, humanb(o.piece).c_str());
+}
+
+/* One reader's span [lo, hi) of the container, in `o.piece` steps. */
+static int warm_span(const RadFile& file, const TableWarmOpts& o, int64_t lo, int64_t hi,
+                     const std::atomic<int>& err, std::atomic<int64_t>& done) {
+    if (o.io == WarmIo::Prefetch) {
+        const uint8_t* base = file.base();
+        if (!base) return RAD_E_STATE;
+        for (int64_t at = lo; at < hi && err.load() == RAD_OK; at += o.piece) {
+            const int64_t b = std::min(o.piece, hi - at);
+#if defined(_WIN32)
+            os::prefetch(base + at, b);
+#else
+            /* A page-aligned start, as madvise requires. */
+            const uintptr_t a = (uintptr_t)(base + at) & ~(uintptr_t)4095;
+            posix_madvise((void*)a, (size_t)((uintptr_t)(base + at + b) - a), POSIX_MADV_WILLNEED);
+#endif
+            done.fetch_add(b);
+        }
+        return RAD_OK;
+    }
+    std::vector<uint8_t> buf((size_t)std::min(o.piece, hi - lo));
+#if defined(_WIN32)
+    if (o.io == WarmIo::Handle) {
+        /* No access hint: read-ahead follows this file object along the span. */
+        const os::File f = os::File::open(file.path(), os::File::Read);
+        if (!f.valid()) return RAD_E_IO;
+        for (int64_t at = lo; at < hi && err.load() == RAD_OK; at += o.piece) {
+            const int64_t b = std::min(o.piece, hi - at);
+            if (f.read_at(buf.data(), b, at) != b) return RAD_E_IO;
+            done.fetch_add(b);
+        }
+        return RAD_OK;
+    }
+#endif
+    /* pread, and `handle` where every read already shares one file object (POSIX). */
+    for (int64_t at = lo; at < hi && err.load() == RAD_OK; at += o.piece) {
+        const int64_t b = std::min(o.piece, hi - at);
+        const int rc = file.read_at(buf.data(), b, at);
+        if (rc < 0) return rc;
+        done.fetch_add(b);
+    }
+    return RAD_OK;
+}
+
 int table_warm_read(const RadFile& file, const std::vector<std::pair<int64_t, int64_t>>& ranges,
-                    int64_t* bytes, double* secs, std::string* why) {
+                    int64_t* bytes, double* secs, std::string* why, const TableWarmOpts& o) {
     if (!bytes || !secs || !why) return RAD_E_INVAL;
     *bytes = 0;
     *secs = 0;
     const auto t0 = std::chrono::steady_clock::now();
     /* Readers on contiguous spans, as table_copy_fill reads: a drive serves several queued reads
-     * at full rate, and each reader stays sequential. Eight, not sixteen: nothing waits on this
-     * read but the start, and the buffers are held only while it runs. */
-    const int nt = (int)std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
-    const int64_t piece = (int64_t)16 << 20;
+     * at full rate, and each reader stays sequential. Nothing waits on this read but the start,
+     * and the buffers are held only while it runs. */
+    const unsigned want = (unsigned)std::max(o.readers, 1);
+    const int nt = (int)std::max(1u, std::min(want, std::thread::hardware_concurrency()));
     const int64_t align = (int64_t)2 << 20;
     std::atomic<int> err{RAD_OK};
     std::atomic<int64_t> done{0};
@@ -94,16 +225,15 @@ int table_warm_read(const RadFile& file, const std::vector<std::pair<int64_t, in
                 const int64_t lo = (int64_t)i * span, hi = std::min(n, lo + span);
                 if (lo >= hi) break;
                 rd.emplace_back([&, lo, hi] {
+                    int rc = RAD_OK;
                     try {
-                        std::vector<uint8_t> buf((size_t)std::min(piece, hi - lo));
-                        for (int64_t o = lo; o < hi && err.load() == RAD_OK; o += piece) {
-                            const int64_t b = std::min(piece, hi - o);
-                            const int rc = file.read_at(buf.data(), b, off + o);
-                            if (rc < 0) { err.store(rc); return; }
-                            done.fetch_add(b);
-                        }
+                        rc = warm_span(file, o, off + lo, off + hi, err, done);
                     } catch (const std::exception&) {
-                        err.store(RAD_E_NOMEM);   /* the scratch buffer */
+                        rc = RAD_E_NOMEM;   /* the scratch buffer */
+                    }
+                    if (rc < 0) {
+                        int ok = RAD_OK;
+                        err.compare_exchange_strong(ok, rc);
                     }
                 });
             }

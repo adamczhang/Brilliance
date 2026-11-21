@@ -1,7 +1,10 @@
 # Model licences
 
-The full text of the licence of each model listed in this server's terms of use (`/terms`), as the
-model's makers publish it. Each path below is on this server.
+Brilliance's built-in index of model licences: the full text of the licence of each model listed in
+the terms-of-use template that comes with Brilliance, as the model's makers publish it. Each path
+below is served by this server, whatever terms file its operator has set and whichever models it
+serves. The conditions a licence sets are summarised in the template's terms (`/terms`, unless the
+operator has replaced them).
 
 | Model | Licence | Full text |
 |---|---|---|
@@ -9,7 +12,7 @@ model's makers publish it. Each path below is on this server.
 | SDXL base 1.0 (pictures) | CreativeML Open RAIL++-M License, Stability AI | `/terms/licenses/creativeml-openrail-pp-m` |
 | EmbeddingGemma 2 (embeddings) | Apache 2.0 | `/terms/licenses/apache-2.0`; Google's licence page for Gemma: https://ai.google.dev/gemma/docs/gemma_4_license; the Gemma Prohibited Use Policy: https://ai.google.dev/gemma/prohibited_use_policy |
 | Qwen3.8-27B | Apache 2.0 | `/terms/licenses/apache-2.0` |
-| Qwen3.8-Flash-Next | Qwen Community License 1.0 | `/terms/licenses/qwen-community-1.0` |
+| Qwen3.8-Flash-Next | Qwen Community License 1.0, Qwen (commercial-use and attribution conditions) | `/terms/licenses/qwen-community-1.0` |
 | MiniCPM5-2B | Apache 2.0 | `/terms/licenses/apache-2.0` |
 | Qwen3-ASR 1.7B (transcription) | Apache 2.0 | `/terms/licenses/apache-2.0` |
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | `/terms/licenses/openmdw-1.1`; NVIDIA's notice: `/terms/licenses/nemotron-3.5-rerank-notice` |

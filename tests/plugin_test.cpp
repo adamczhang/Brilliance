@@ -16,6 +16,22 @@
 
 #include "util/json.h"
 
+#if defined(_WIN32)
+#include "diag/diag.h"   /* Brilliance: the FINDINGS line, for the W-line count */
+#include "os/os.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#define NOUSER   /* winuser.h's ReplyMessage and the rest would clash with this file's names */
+#define NOGDI
+#include <windows.h>   /* the priority class the W-line test saves and puts back */
+#include <initializer_list>
+#include <utility>
+#endif
+
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -95,6 +111,14 @@ std::string band_names(const std::vector<Band>& b) {
 std::string libr4d() {
     const std::string so = home() + "/kernels/libr4d.so";
     if (access(so.c_str(), R_OK) == 0) return so;
+#if defined(_WIN32)
+    /* Brilliance: the Windows build is libr4d.dll beside where the .so would be. The compat layer's
+     * dlopen takes the one for the other when the .so does not exist (win/compat/src/compat_dl.cpp);
+     * the existence check maps the name the same way, and the .so spelling is returned, so every case
+     * loads and names the library exactly as it does on Linux. */
+    const std::string dll = home() + "/kernels/libr4d.dll";
+    if (access(dll.c_str(), R_OK) == 0) return so;
+#endif
 #ifdef RAD_TEST_HAS_LIBR4D
     radtest::artifact_missing(__FILE__, __LINE__, so);
 #else
@@ -1441,5 +1465,101 @@ TEST(a_library_that_declines_the_machine_registers_nothing_and_takes_no_place) {
     CHECK(r2.plugins().empty());
     CHECK(r2.load_errors().empty());
 }
+
+#if defined(_WIN32)
+/* Brilliance: the W lines that used to bypass the logger -- process_init's four (win/os/os_win32.cpp)
+ * and libr4d's -- go through it now, so the startup report's FINDINGS counts them (log_warn_lines).
+ * The sinks are set as radiance sets them (core/main.cpp for the OS layer; the loader for the plugin).
+ *
+ * Provoked for real: a bad BRILLIANCE_CPUS and BRILLIANCE_PRIORITY (process_init), and libr4d's
+ * environment checks, which rad_plugin_open reads (r4d_log.h): a bad BRILLIANCE_EXACT_VERIFY, a bad
+ * BRILLIANCE_MAILBOX_MEM, BRILLIANCE_AR_RESEND=0, a bad BRILLIANCE_AR_INJECT and a good one (fault
+ * injection on). Not provoked: a failed SetProcessAffinityMask or SetPriorityClass, which nothing
+ * short of a broken process provokes (a job object with affinity and priority limits does not: both
+ * calls still succeed), so they are sent through os::log_os_line, the call those two sites make; and
+ * libr4d's four runtime lines -- the bad-block comparison, the stall capture's report and the two
+ * fault-injection notices -- which need a two- or four-rank host-mailbox collective on the cards. They
+ * call the same r4d_log as the lines provoked here. */
+TEST(every_w_line_of_process_init_and_libr4d_is_counted_into_findings) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    const Log saved_level = log_level();
+    if ((int)saved_level < (int)Log::Warn) log_set_level(Log::Warn);
+    const DWORD saved_class = GetPriorityClass(GetCurrentProcess());
+    const uint64_t before = log_warn_lines(0);
+
+    os::set_log_sink(&log_line_at);   /* as core/main.cpp does */
+    _putenv_s("BRILLIANCE_CPUS", "not-a-cpu-list");
+    _putenv_s("BRILLIANCE_PRIORITY", "realtime");
+    os::process_init();               /* W: BRILLIANCE_CPUS names no processor; W: BRILLIANCE_PRIORITY */
+    _putenv_s("BRILLIANCE_CPUS", "");
+    _putenv_s("BRILLIANCE_PRIORITY", "");
+    SetPriorityClass(GetCurrentProcess(), saved_class);
+    CHECK_EQ(log_warn_lines(0), before + 2);
+    os::log_os_line(1, "process: BRILLIANCE_CPUS=%s: %s", "0-3", "(test) the affinity call failed");
+    os::log_os_line(1, "process: cannot set priority class %s: %s", "above-normal", "(test) the call failed");
+    CHECK_EQ(log_warn_lines(0), before + 4);
+
+    /* libr4d reads each switch once a process, at open: its test hooks make it read them again. */
+    void* h = dlopen(so.c_str(), RTLD_NOW);
+    CHECK(h != nullptr);
+    if (!h) return;
+    using PinFn = void (*)(int);
+    using UnreadFn = void (*)(void);
+    const auto pin = reinterpret_cast<PinFn>(dlsym(h, "r4d_exact_verify_pin"));
+    const auto unread = reinterpret_cast<UnreadFn>(dlsym(h, "r4d_ar_env_unread"));
+    CHECK(pin != nullptr);
+    CHECK(unread != nullptr);
+    const char* const vars[] = { "BRILLIANCE_EXACT_VERIFY", "BRILLIANCE_MAILBOX_MEM", "BRILLIANCE_AR_RESEND",
+                                 "BRILLIANCE_AR_INJECT" };
+    /* One load through the real loader (rad_plugin_set_log, then rad_plugin_open) with these
+     * variables set, every switch read afresh; the W lines it logged. */
+    auto load_with = [&](std::initializer_list<std::pair<const char*, std::string>> set) {
+        for (const char* v : vars) _putenv_s(v, "");
+        for (const auto& kv : set) _putenv_s(kv.first, kv.second.c_str());
+        pin(-1);
+        unread();
+        const uint64_t at = log_warn_lines(0);
+        {
+            Registry r;
+            CHECK(r.load_plugin(so, 0) >= 0);
+        }
+        return log_warn_lines(0) - at;
+    };
+    /* A load with every variable unset first: the loader's own W lines for this machine (with the
+     * cards hidden, "built for gfx1201 and this machine reports host") are counted too, and are not
+     * libr4d's. */
+    uint64_t loader_own = 0, exact = 0, collectives = 0, inject_on = 0;
+    if (pin && unread) {
+        loader_own = load_with({});
+        exact = load_with({ { "BRILLIANCE_EXACT_VERIFY", "maybe" } });
+        /* A bad BRILLIANCE_AR_INJECT longer than r4d_log's stack buffer: the line is formatted in full. */
+        collectives = load_with({ { "BRILLIANCE_MAILBOX_MEM", "write-combined-please" },
+                                  { "BRILLIANCE_AR_RESEND", "0" },
+                                  { "BRILLIANCE_AR_INJECT", "not-a-spec-" + std::string(1100, 'x') } });
+        inject_on = load_with({ { "BRILLIANCE_AR_INJECT", "hc:lose:1000000" } });
+        for (const char* v : vars) _putenv_s(v, "");
+        pin(-1);
+        unread();
+    }
+    dlclose(h);
+    CHECK_EQ(exact, loader_own + 1);         /* W r4d: BRILLIANCE_EXACT_VERIFY=maybe */
+    CHECK_EQ(collectives, loader_own + 3);   /* W r4d: MAILBOX_MEM, AR_RESEND=0, AR_INJECT not a spec */
+    CHECK_EQ(inject_on, loader_own + 1);     /* W r4d: fault injection ON */
+    const uint64_t logged = log_warn_lines(0) - before;
+    CHECK_EQ(logged, (uint64_t)9 + 4 * loader_own);
+
+    /* What the startup report then says (core/engine_diag.cpp adds log_warn_lines(0) in): every W line
+     * logged, the nine among them. */
+    diag::RunFacts run;
+    run.logged_warnings = (int64_t)logged;
+    const std::string text = diag::render({}, {}, diag::Facts{}, run, {});
+    const std::string want = fmt("FINDINGS -- %llu warnings (%llu logged above as W lines, 0 listed below), 0 notes\n",
+                                 (unsigned long long)logged, (unsigned long long)logged);
+    CHECK(text.find(want) != std::string::npos);
+    os::set_log_sink(nullptr);
+    log_set_level(saved_level);
+}
+#endif
 
 RAD_TEST_MAIN()

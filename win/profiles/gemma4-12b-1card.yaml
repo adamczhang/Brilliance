@@ -2,8 +2,8 @@
 # Radeon AI PRO R9700.
 # 32K tokens of context, four requests at once, the default (bf16) KV cache: the 13.79 GiB container
 # leaves about 17 GiB of the card for the cache. Thinking off by default, as the container's card
-# sets it; a request turns it on with "chat_template_kwargs": {"enable_thinking": true}. Runs, not
-# yet qualified: started, answered chat and stopped cleanly on one card (SUPPORT.md).
+# sets it; a request turns it on with "chat_template_kwargs": {"enable_thinking": true}. Qualified:
+# chat, Responses and Messages, tools, pictures, audio and video on one card (SUPPORT.md).
 #
 #   .\serve.ps1 gemma4-12b-1card -Bus 6
 #   bin\radiance.exe --config profiles\gemma4-12b-1card.yaml

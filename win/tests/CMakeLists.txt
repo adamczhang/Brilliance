@@ -29,7 +29,63 @@ set_tests_properties(service_win_test PROPERTIES
 add_test(NAME serve_service_test
          COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
                  -File "${CMAKE_CURRENT_SOURCE_DIR}/serve_service_test.ps1" -Exe "$<TARGET_FILE:radiance>")
-set_tests_properties(serve_service_test PROPERTIES LABELS unit TIMEOUT 120)
+set_tests_properties(serve_service_test PROPERTIES LABELS unit TIMEOUT 120
+  ENVIRONMENT "BRILLIANCE_SERVE_TEST_DEVICES=0:33:1,1:6:0,2:3:0,3:9:0,4:32:0")
+
+# win\serve.ps1 as a launcher: radiance runs on the profile itself (a reload rereads it); -Listen,
+# -Port and -ApiKey as radiance's own reader applies them over any profile layout; the cards by PCI
+# bus, the integrated GPU hidden by default; -Background -Log with a bare name. The HIP runtime is
+# never asked (BRILLIANCE_SERVE_TEST_DEVICES is the device table); radiance runs as --check, and once
+# with HIP_VISIBLE_DEVICES=-1 on a model that is not there (loopback port 18375).
+add_test(NAME serve_launcher_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/serve_launcher_test.ps1" -Exe "$<TARGET_FILE:radiance>")
+set_tests_properties(serve_launcher_test PROPERTIES LABELS unit TIMEOUT 300
+  ENVIRONMENT "BRILLIANCE_SERVE_TEST_DEVICES=0:33:1,1:6:0,2:3:0,3:9:0,4:32:0;HIP_VISIBLE_DEVICES=-1")
+
+# serve.ps1 on a profile of several models (profiles\sandbox.yaml): the entries needing more cards
+# than radiance will see are dropped and named, and radiance reads a copy without them. The HIP
+# runtime is never asked; radiance runs as --check only.
+add_test(NAME serve_sandbox_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/serve_sandbox_test.ps1" -Exe "$<TARGET_FILE:radiance>")
+set_tests_properties(serve_sandbox_test PROPERTIES LABELS unit TIMEOUT 300
+  ENVIRONMENT "BRILLIANCE_SERVE_TEST_DEVICES=0:33:1,1:6:0,2:3:0,3:9:0,4:32:0;HIP_VISIBLE_DEVICES=-1")
+
+# win\libexec\hfget.ps1 and serve.ps1 -Fetch against a stand-in hub on loopback (hub_stub.py,
+# Python's standard library; skipped, 77, without python.exe): the plan before a transfer, a fresh
+# destination, a warm cache, a cut transfer resumed, a repo of several containers, and the verified
+# file served with no edit to the profile. Fixture bytes only; radiance runs as --check. About 45 s,
+# most of it curl's retry delays on the cut transfer.
+add_test(NAME fetch_launch_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/fetch_launch_test.ps1" -Exe "$<TARGET_FILE:radiance>")
+set_tests_properties(fetch_launch_test PROPERTIES LABELS unit TIMEOUT 300 SKIP_RETURN_CODE 77)
+
+# profiles\sandbox.yaml is generated from the other profiles (win\tools\sandbox_profile.py): it
+# fails while a profile changed and the sandbox was not regenerated.
+find_program(RAD_PYTHON3 NAMES python3)
+if(RAD_PYTHON3)
+  add_test(NAME sandbox_profile_test
+           COMMAND ${RAD_PYTHON3} -I ${CMAKE_SOURCE_DIR}/win/tools/sandbox_profile.py check)
+  set_tests_properties(sandbox_profile_test PROPERTIES LABELS unit TIMEOUT 60)
+endif()
+
+# bin\rad-export.cmd in an unpacked package runs the rad-convert beside it with bin\ off PATH, and
+# returns rad-export's exit status. A stub rad-convert; no conversion. Skipped (77) with no Python.
+add_test(NAME rad_export_cmd_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/rad_export_cmd_test.ps1")
+set_tests_properties(rad_export_cmd_test PROPERTIES LABELS unit TIMEOUT 120 SKIP_RETURN_CODE 77)
+
+# win\tools\gate-lib.ps1, the gate windows' runner, with fixture gates under Windows PowerShell 5.1:
+# a failed gate stops the window and is named, exit codes read right (a hidden process's from its
+# object, a native command's from $LASTEXITCODE even when it writes to stderr). No GPU, no server.
+add_test(NAME gate_lib_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/gate_lib_test.ps1"
+                 -Lib "${CMAKE_SOURCE_DIR}/win/tools/gate-lib.ps1")
+set_tests_properties(gate_lib_test PROPERTIES LABELS unit TIMEOUT 120)
 
 # The process's pinned-memory limit (win/device/pin_ledger.h): BRILLIANCE_PIN_LIMIT_GIB lowers it
 # and is clamped to the shared-memory budget's figure, never raises it. Pure arithmetic on a budget
@@ -40,6 +96,55 @@ target_compile_features(pin_limit_test PRIVATE cxx_std_20)
 set_target_properties(pin_limit_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 add_test(NAME pin_limit_test COMMAND pin_limit_test)
 set_tests_properties(pin_limit_test PROPERTIES
+  LABELS unit
+  SKIP_RETURN_CODE 77
+  TIMEOUT 60
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=-1;RAD_TEST_STRICT=1;RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
+# The native HIP backend's stall watch (win/device/stall_watch.h): a long step whose progress
+# beacons move is never a stall, a real one is still reported once, 5 s after they stop. Driven with
+# the test's own clock; no card, no HIP.
+add_executable(stall_watch_test stall_watch_test.cpp)
+target_include_directories(stall_watch_test PRIVATE "${CMAKE_SOURCE_DIR}/tests" "${CMAKE_SOURCE_DIR}/win/device")
+target_compile_features(stall_watch_test PRIVATE cxx_std_20)
+set_target_properties(stall_watch_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME stall_watch_test COMMAND stall_watch_test)
+set_tests_properties(stall_watch_test PROPERTIES
+  LABELS unit
+  SKIP_RETURN_CODE 77
+  TIMEOUT 60
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=-1;RAD_TEST_STRICT=1;RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
+# The same watch on a card, through the native HIP backend: a batch that keeps the card busy about
+# 8 s behind one wait is not a stall, a stream held still by a host function (the card idle) is.
+# About 20 s on one card; label gpu, one at a time, as the device tests on a card are.
+if(RAD_HIP_FOUND)
+  add_executable(stall_watch_card_test stall_watch_card_test.cpp)
+  target_include_directories(stall_watch_card_test PRIVATE "${CMAKE_SOURCE_DIR}/tests" "${CMAKE_SOURCE_DIR}/core")
+  target_link_libraries(stall_watch_card_test PRIVATE rad_core)
+  target_compile_features(stall_watch_card_test PRIVATE cxx_std_20)
+  set_target_properties(stall_watch_card_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+  add_test(NAME stall_watch_card_test COMMAND stall_watch_card_test)
+  set_tests_properties(stall_watch_card_test PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+    ENVIRONMENT "RAD_TEST_STRICT=1;RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+endif()
+
+# How r4d_selftest finds libref beside the plugin under test when the plugin's path is written with
+# '\' (win/compat/include/brl_path.h): the build tree's libref.dll, loaded through the POSIX layer's
+# dlopen. No card, no HIP.
+add_executable(selftest_ref_path_test selftest_ref_path_test.cpp)
+target_include_directories(selftest_ref_path_test PRIVATE "${CMAKE_SOURCE_DIR}/tests")
+target_link_libraries(selftest_ref_path_test PRIVATE radiance::abi)
+target_compile_features(selftest_ref_path_test PRIVATE cxx_std_20)
+target_compile_definitions(selftest_ref_path_test PRIVATE BRL_TEST_KERNELS="${RAD_PLUGIN_OUT}/kernels")
+add_dependencies(selftest_ref_path_test libref)
+set_target_properties(selftest_ref_path_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME selftest_ref_path_test COMMAND selftest_ref_path_test)
+set_tests_properties(selftest_ref_path_test PROPERTIES
   LABELS unit
   SKIP_RETURN_CODE 77
   TIMEOUT 60

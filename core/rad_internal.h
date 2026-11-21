@@ -33,6 +33,11 @@ uint64_t log_last_line_ns();
  * owner 0 counts those written for no engine, such as the device layer's. A line the log level
  * suppresses is not written and not counted. The startup report counts them into its warnings. */
 uint64_t log_warn_lines(int owner);
+/* Brilliance: one finished line from outside the core's own sources, at `level` (a Log value; out
+ * of range is Info), through log_emit, so it is level-filtered, tagged and, as a W line, counted
+ * like any other. The sink the OS layer's process_init lines take (win/os/os.h set_log_sink) and
+ * the logger a plugin is handed (rad_plugin_set_log, rad_abi.h). */
+void log_line_at(int level, const char* line);
 
 /* A copy safe to interpolate into a log line: every byte below 0x20 but '\t', and DEL, becomes
  * '?'. Client-controlled text reaches the log -- session labels, echoed request fields -- and an

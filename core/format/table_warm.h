@@ -59,11 +59,43 @@ NgramWarmPlan ngram_warm_plan(const NgramWarmFacts& f);
  * merged and empty ones dropped. Sorted by offset. */
 std::vector<std::pair<int64_t, int64_t>> ngram_warm_ranges(std::vector<std::pair<int64_t, int64_t>> r);
 
-/* Read the container's `ranges` once, front to back, through the file cache, keeping nothing: up to
- * eight readers, each one contiguous span in 16 MiB reads into a scratch buffer of its own. No
- * lock, no pin, no drop behind. RAD_OK with `*bytes` read and `*secs` taken; on a failure an error
- * with `why`, and `*bytes` what was read before it. */
+/* How the warm reads (ngram-warm-tune). The first form (alpha.3) read at 2.44 GB/s against the
+ * drive's 6.8: eight readers of 16 MiB `pread`s, and on Windows each `pread` reopens the file
+ * (win/compat), so the cache manager's read-ahead, which follows a file object, never saw two
+ * reads in a row. The modes:
+ *   pread     that first form, kept to measure against;
+ *   handle    each reader opens the container once and reads its span through that handle, with
+ *             no access hint, so read-ahead runs ahead of it (the default);
+ *   prefetch  each reader asks the OS to bring its span of the container's mapping in
+ *             (PrefetchVirtualMemory on Windows, madvise(WILLNEED) elsewhere), with no copy. A hint:
+ *             it may return before the reads land, so rad-warm-bench's second pass checks it.
+ * No mode uses a sequential-scan hint: Windows lets the cache reuse a sequentially scanned file's
+ * pages first, which would undo the warm. */
+enum class WarmIo { Pread, Handle, Prefetch };
+
+struct TableWarmOpts {
+    WarmIo  io      = WarmIo::Handle;
+    int     readers = 16;                    /* at most this many, and no more than the host's threads */
+    int64_t piece   = (int64_t)64 << 20;     /* bytes a read (or a prefetch call) */
+};
+
+/* The alpha.3 form, `io=pread,readers=8,piece=16M`, for a before/after. */
+TableWarmOpts table_warm_opts_alpha3();
+
+/* Parse `io=pread|handle|prefetch,readers=N,piece=SIZE` (SIZE in bytes or with K, M or G; any
+ * subset, in any order) over `*o`. Readers 1-64, piece 1 MiB to 1 GiB. RAD_OK, or RAD_E_INVAL with
+ * `why`. Where the engine reads it: BRILLIANCE_NGRAM_WARM_IO, for a measurement. */
+int table_warm_opts_parse(const std::string& spec, TableWarmOpts* o, std::string* why);
+
+/* "io=handle readers=16 piece=64 MiB", for logs. */
+std::string table_warm_opts_str(const TableWarmOpts& o);
+
+/* Read the container's `ranges` once, front to back, through the file cache, keeping nothing: each
+ * reader one contiguous span, in `o.piece` reads into a scratch buffer of its own (none for
+ * prefetch). No lock, no pin, no drop behind. RAD_OK with `*bytes` read and `*secs` taken; on a
+ * failure an error with `why`, and `*bytes` what was read before it. */
 int table_warm_read(const RadFile& file, const std::vector<std::pair<int64_t, int64_t>>& ranges,
-                    int64_t* bytes, double* secs, std::string* why);
+                    int64_t* bytes, double* secs, std::string* why,
+                    const TableWarmOpts& o = TableWarmOpts{});
 
 }  /* namespace rad */

@@ -4,32 +4,48 @@
 
 A native Windows 11 distribution of [Radiance](https://codeberg.org/StillDeadcode/radiance), the C++/HIP
 LLM inference engine, for AMD Radeon AI PRO R9700 cards (RDNA4, `gfx1201`): no WSL, no Linux, no Docker.
-It speaks Radiance's HTTP API (OpenAI's Chat Completions and Responses, Anthropic's Messages), so existing
-clients work unchanged.
+It serves Radiance's HTTP API: OpenAI-style Chat Completions and Responses, and Anthropic-style Messages.
+A client that lets you set its base URL and model name can use it ([Connect a client](#connect-a-client));
+Open WebUI and OpenCode tool round trips were checked on Qwen3.8-27B.
 
 **This is a new fork, based on Radiance 2.2:** upstream's `v2.2.0` tag (`b6b8751c`, 2026-11-19), with the
-Windows port on top. It is not a continuation of Brilliance 0.2.2's code. Upstream's source layout,
-YAML configuration, model implementations and plugin ABI are kept; the Windows work is a reviewable layer
-over them.
+Windows port on top. It is not a continuation of Brilliance 0.2.2's code. It keeps upstream's YAML
+configuration and model implementations; the port adds a Windows device backend and platform layer, and
+some of upstream's features work differently on Windows or not at all ([Feature parity](#feature-parity)).
+Plugins are built for Windows from a source build's SDK.
 
 - **The new home** is [github.com/adamczhang/Brilliance](https://github.com/adamczhang/Brilliance).
 - **Brilliance 0.2.2 is archived** at its original address,
   [codeberg.org/Dad_Vibes/Brilliance](https://codeberg.org/Dad_Vibes/Brilliance). Its `.rad` containers do
   not load in this version ([from 0.2.2](#from-brilliance-022)).
-- **Brilliance 0.3.0-alpha.3 is this fork's current release: the third alpha preview of 0.3.0**
-  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.3-<sha>-win64.zip`,
-  is on the [v0.3.0-alpha.3 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.3).
+- **Brilliance 0.3.0-alpha.4 is this fork's current release: the fourth alpha preview of 0.3.0**
+  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.4-<sha>-win64.zip`,
+  is on the [v0.3.0-alpha.4 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.4).
   Expect rough edges: what is qualified and what is not is listed below and in
   [win/SUPPORT.md](win/SUPPORT.md).
 
 Upstream's own README is kept unchanged as [RADIANCE-README.md](RADIANCE-README.md).
 
+## How you use it
+
+- **Brilliance is an API server.** You start it on a model, then connect an app or agent to it: its
+  OpenAI-style base URL is `http://<host>:<port>/v1` and its Anthropic-style base URL is
+  `http://<host>:<port>` ([Connect a client](#connect-a-client)).
+- **Its dashboard, at `http://<host>:<port>/` in a browser, is for watching it:** each model's
+  Monitoring tab has its speed, requests, sessions and details. A model's **Sandbox** tab is for a
+  quick check that the model works: Start and Stop load and unload it (from a browser on the
+  server's own machine), and a plain chat box streams its replies. It keeps nothing.
+- **For everyday chat in a browser, use Open WebUI; for coding, OpenCode.** Both connect as in
+  [Connect a client](#connect-a-client).
+
 ## Status
 
-Alpha preview (0.3.0-alpha.3). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
+Alpha preview (0.3.0-alpha.4). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
 
-- **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean).
-- **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4).
+- **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean); Gemma 4 31B a4 and Gemma 4
+  12B i8g, qualified (chat, tools, pictures and video; audio too on the 12B).
+- **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4); Qwen3.6-35B-A3B
+  IQ8R qualified, every expert on the cards.
 - **Four cards:** Qwen3.8-Flash-Next IQR-V4, supported with every expert on the cards (soaked at 32K on
   its earlier settings, 2026-11-17; its profile's tuned 256K settings pass the injection, stop and
   serving checks; a soak on them has not run yet).
@@ -37,7 +53,9 @@ Alpha preview (0.3.0-alpha.3). What is qualified on Windows today, from [win/SUP
 - **Embeddings** (`/v1/embeddings`) with EmbeddingGemma 2.
 - **Transcription and realtime** (`/v1/audio/transcriptions`, `/v1/realtime`) with Qwen3-ASR 1.7B, and
   **rerank** (`/rerank`, `/v1/rerank`) with Nemotron 3.5 Rerank 8B, each on one card.
-- **Image generation** (`/v1/images/generations`) with SDXL base 1.0, on one card.
+- **Image generation** (`/v1/images/generations`) with SDXL base 1.0 and Qwen-Image 2.1 IQ8R, each
+  on one card. Qwen-Image's edits work for most seeds ([known issue 13](win/SUPPORT.md#known-issues)),
+  and its licence allows non-commercial use only.
 - **Clients:** Open WebUI and OpenCode pass their tool round trips.
 
 The main known issues ([all of them](win/SUPPORT.md#known-issues)):
@@ -47,22 +65,34 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
   decode; one that cannot be recovered stops the server, which exits with status 70. Flash-Next on two
   cards is Supported; an 8-hour soak has not been run on it yet. Profile: `flashnext-2card`.
 - **Flash-Next's output can change when requests share a step:** identical requests sent together can get
-  different next-token distributions. This is rounding, not wrong data, as upstream documents for batched
-  requests; one request at a time is repeatable.
+  different next-token distributions. On the tested prompts this came from rounding, not wrong data, as
+  upstream documents for batched requests. Compare repeats of one request from the same cache state: in
+  alpha.3's two-card checks, a long prompt sent again and resumed from the prefix cache changed its
+  reasoning text, with the same final answer.
 - **Video generation works on one card and is not yet qualified** (LTX-2.5 distilled IQ8R). It writes H.264
   only through AMD's or Windows' licensed encoders, on Brilliance's own FFmpeg ([H.264](#h264)).
 - **Speech synthesis (TTS) is not supported** in 0.3.0, and **music generation is not served**:
   `/v1/audio/speech`, which both use, answers 501, "not supported in this build", for every model.
-  A model without an endpoint answers 501 with the reason.
+  A request for something the loaded model does not do (chat on an image model, say) answers 501 with the
+  reason. A path the server does not have answers 404, and a missing key or a malformed request is refused
+  before any model sees it.
 
 ## Installation
 
 ### 1. Requirements
 
+Check your hardware before you download anything:
+
+| Your hardware | What this package does |
+|---|---|
+| AMD Radeon AI PRO R9700 (`gfx1201`, 32 GB) | The card it is built for and tested on. What each model does on one, two or four of them is in [Supported models](#supported-models). |
+| AMD Radeon RX 9070 family (`gfx1201`) | The same GPU code target, so the package can start on these cards, but **Not run**: no model has been checked on one. They have 16 GB or less, which the 17.42 GiB starter model does not fit on one card. |
+| Other AMD GPUs (RDNA4 `gfx1200`, RDNA3 `gfx11xx`, Strix Halo `gfx1151`, older), NVIDIA or Intel | **Not supported** by this package: it carries GPU code for `gfx1201` only. Upstream Radiance serves several of these AMD targets on Linux. |
+| No usable GPU | The same package serves a small model on the CPU: `.\serve.ps1 <profile> -Cpu` ([Serving on the CPU](#serving-on-the-cpu)). Checked with MiniCPM5-2B IQ8R and EmbeddingGemma 2, not qualified; expect a fraction of a card's speed. A CPU-only package can be built from source. |
+
 - **Windows 11.**
-- **One or more AMD Radeon AI PRO R9700** (`gfx1201`, 32 GB each). The package carries GPU code for
-  `gfx1201` (R9700, RX 9070 family) only; other cards are not supported.
-- **The AMD Adrenalin driver 32.0.32015.12012 or later**, the version it was tested on.
+- **The AMD Adrenalin driver 32.0.32015.12012**, the version it was tested on. Later drivers have not been
+  checked; if one misbehaves, report it with its version ([Getting help](#getting-help)).
 - **Memory.**
   - One card holds Qwen3.8-27B IQ4R-L-V4 (a 17.42 GiB file). IQ8R-V4 on one card (26.67 GiB of weights)
     leaves about 3 GiB of KV cache.
@@ -71,15 +101,18 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
   - A process can pin about the shared-memory budget (half of RAM or more), divided by the cards it sees,
     less 2 GiB. Multi-card exchanges go through that pinned memory.
 - **Disk** for the models you serve.
-- **Recommended:** an integrated GPU or another display card for the desktop. `serve.ps1` leaves the
-  integrated GPU out on its own.
+- **Recommended:** an integrated GPU or another display card for the desktop. The engine never runs a model
+  on an integrated GPU beside a discrete card, but while HIP can still see it, it divides the pinned-memory
+  limit and turns HIP virtual memory off. `serve.ps1` hides it from HIP unless told otherwise, and `-Bus`
+  chooses the cards that serve ([step 4](#4-start-a-server)).
 
 ### 2. Get the package
 
-Download `Brilliance-0.3.0-alpha.3-<sha>-win64.zip` from the
-[v0.3.0-alpha.3 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.3), check it
+Download `Brilliance-0.3.0-alpha.4-<sha>-win64.zip` from the
+[v0.3.0-alpha.4 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.4), check it
 against the `.sha256` beside it (`Get-FileHash <zip>` in PowerShell), and unzip it anywhere; a path with spaces
-works. You can also [build it from source](#building-from-source). A CPU-only package
+works. You can also [build it from source](#building-from-source). With no usable GPU, the same package serves
+on the CPU: `serve.ps1 -Cpu` ([Serving on the CPU](#serving-on-the-cpu)). A CPU-only package
 (`Brilliance-<version>-<sha>-win64-cpu.zip`), which serves on the CPU kernels and needs no card, can be built
 from source; it is not published with this release.
 
@@ -88,161 +121,463 @@ from source; it is not published with this release.
 | `bin\` | `radiance.exe`, the `rad-*` tools, the HIP runtime, FFmpeg, the VC++ runtime; `brl-stacks.exe` for reading a hung server |
 | `share\radiance\` | the plugins (kernels, architectures, quantizers) and the conversion recipes |
 | `share\doc\radiance\` | `LICENSE`, `NOTICE`, and the third-party licences under `third_party\` |
-| `profiles\` | the qualified YAML profiles |
+| `profiles\` | YAML profiles; status and card count for each in [step 4](#4-start-a-server) |
 | `libexec\brilliance\` | `hfget.ps1`, the Hugging Face fetcher |
 | `tools\` | `serve-bg.ps1`, `stop-server.ps1`, `reload-server.ps1`, `STACKS.md` |
 | `serve.ps1` | starts a profile, choosing cards by PCI bus |
 | `PREVIEW.md`, `SUPPORT.md`, `SERVICE.md` | quick start and limits; models, features and known issues; running as a service |
-| `MANIFEST.json` | the source commit, toolchain, HIP runtime and driver it was built and tested with, and every file's SHA-256 |
+| `MANIFEST.json` | the source commit, toolchain, HIP runtime and the driver on the build machine, and the SHA-256 of every other file in the package |
 
 Nothing else is installed: no ROCm, no VC++ redistributable.
 
+**Open PowerShell in the unzipped folder:** in File Explorer, type `powershell` in the folder's address bar
+and press Enter. Windows PowerShell runs no scripts on many machines until told to, so allow the package's
+scripts for this window only:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force   # this PowerShell window only; nothing is changed for good
+```
+
+Run that again in each new PowerShell window you use for the commands below. If it reports that a policy set
+by your organisation overrides it, the scripts cannot run on that machine until its administrator allows
+them; check the ZIP's hash and follow your organisation's script policy.
+
 ### 3. Get a model
 
-The package's profiles serve three containers (the profiles are in [step 4](#4-start-a-server)):
+The profiles serve eight model containers. There are two ways in, each on one card:
 
-- **Qwen3.8-27B IQ4R-L-V4** (`qwen27-preview`, `qwen27-8k-plain`): file `qwen3.8-27b-iq4r-l-v4.rad` (17.42 GiB,
-  SHA-256 `d57d1428218e20a4cd578c3e286f30a2e566e589c832bf5004f49e164cb48ae4`) from the Hugging Face repository
-  [`StillDeadcode/qwen3.8-27b-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4).
-- **Qwen3.8-27B IQ8R-V4** (`qwen27-iq8r-1card`, `qwen27-iq8r-2card`): file `qwen3.8-27b-iq8r-v4.rad`
-  (27.58 GiB, SHA-256 `474cb9fc49714a56455a26c0ab3049bd029dc1abae31e4eb9cc66026f0edf04d`) from the same
-  repository.
-- **Qwen3.8-Flash-Next IQR-V4** (`flashnext-4card`, `flashnext-2card`): file `qwen3.8-next-flash-iqr-v4.rad` (113.32 GiB,
-  SHA-256 `25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0`) from
-  [`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4).
+- **A small first run:** MiniCPM5-2B IQ8R, `minicpm5-2b-1card`, a 3.04 GiB text-only model that loads in
+  seconds ([below](#a-small-first-run-minicpm5-2b)). Good on a slow link or a small disk.
+- **The full example:** Qwen3.8-27B IQ4R-L-V4, `qwen27-preview`, the qualified model, 17.42 GiB, with tools,
+  pictures and video. The numbered steps below and steps 4 to 6 use it.
 
-- **Download it** from that page, or fetch the one file with the package's fetcher, which resumes and checks
-  each file's SHA-256:
+Every container is on Hugging Face:
 
-  ```powershell
-  .\libexec\brilliance\hfget.ps1 <repo-id> [dest-dir] [revision] [file]
-  .\libexec\brilliance\hfget.ps1 StillDeadcode/qwen3.8-27b-iqr-v4 D:\models\hf\StillDeadcode\qwen3.8-27b-iqr-v4 main qwen3.8-27b-iq4r-l-v4.rad
-  ```
+| Container file | Repository | Size | Profiles |
+|---|---|---|---|
+| `minicpm5-2b-iq8r.rad` | [`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r) | 3.04 GiB | `minicpm5-2b-1card` |
+| `qwen3.8-27b-iq4r-l-v4.rad` | [`StillDeadcode/qwen3.8-27b-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | 17.42 GiB | `qwen27-preview`, `qwen27-8k-plain` |
+| `qwen3.8-27b-iq8r-v4.rad` | the same repository | 27.58 GiB | `qwen27-iq8r-1card`, `qwen27-iq8r-2card` |
+| `qwen3.8-next-flash-iqr-v4.rad` | [`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | 113.32 GiB | `flashnext-4card`, `flashnext-2card`, `flashnext-2card-fast` |
+| `gemma4-31b-a4.rad` | [`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4) | 19.95 GiB | `gemma4-31b-1card` |
+| `gemma4-12b-i8g.rad` | [`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g) | 13.79 GiB | `gemma4-12b-1card` |
+| `qwen3.6-35b-a3b-iq8r.rad` | [`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r) | 35.04 GiB | `qwen36-35b-2card` |
+| `qwen-image-2.1-iq8r.rad` | [`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r) | 16.13 GiB | `qwen-image-1card` |
 
-  `HF_TOKEN` authenticates a gated or private repository.
-- **Point the profile at it:** edit `model:` in the profile (`profiles\qwen27-preview.yaml`, say) to the file's
-  path. The profiles name `D:\models\hf\<owner>\<repo>\<file>`.
-- **Or name a repository** as `model: owner/name`, and the server fetches it with
-  `libexec\brilliance\hfget.ps1` before it starts, into `<dir>\<owner>\<name>`. `<dir>` is the
-  `download-dir:` under `server:` if set, else `BRILLIANCE_HF_CACHE`, else `%LOCALAPPDATA%\radiance\hf`.
-  This serves the one `.rad` at the repository's top level. A repository with several containers, such as
-  `qwen3.8-27b-iqr-v4`, is refused; fetch the file instead.
-  - Every start checks the repository and fetches what changed. A start that cannot reach it serves the copy
-    fetched before.
-  - Without `model-revision:` it follows the repository's `main` branch. Name a tag or a commit so a restart
-    does not bring weights nobody reviewed.
-- **Where a model is served from:** where its `model:` points. `serve.ps1` copies nothing; keep the files on
-  the fastest drive you have.
+Each profile's comment has its file's SHA-256 (`qwen3.8-27b-iq4r-l-v4.rad`:
+`d57d1428218e20a4cd578c3e286f30a2e566e589c832bf5004f49e164cb48ae4`). The other models in
+[Supported models](#supported-models) have no profile in the package.
 
-The other containers are in [Supported models](#supported-models).
+1. **Choose where the file goes.** Every profile expects `D:\models\hf\<owner>\<repo>\<file>`. Put it there
+   and the profile needs no edit; any other folder works once you edit the profile (step 3 below).
+2. **Download the one file**, from the repository's "Files" page or with the package's fetcher. The fetcher
+   resumes a partial download and checks each large file it downloads against the SHA-256 the repository
+   lists (`HF_TOKEN` authenticates a gated or private repository):
+
+   ```powershell
+   # .\libexec\brilliance\hfget.ps1 <repo-id> <dest-dir> <revision> <file>
+   .\libexec\brilliance\hfget.ps1 StillDeadcode/qwen3.8-27b-iqr-v4 D:\models\hf\StillDeadcode\qwen3.8-27b-iqr-v4 main qwen3.8-27b-iq4r-l-v4.rad
+   Get-FileHash D:\models\hf\StillDeadcode\qwen3.8-27b-iqr-v4\qwen3.8-27b-iq4r-l-v4.rad   # compare with the SHA-256 above
+   ```
+
+3. **Elsewhere, point the profile at it:** open `profiles\qwen27-preview.yaml` in a text editor and change the
+   `model:` line to the file's full path. Use forward slashes, and put a path with spaces in double quotes:
+
+   ```yaml
+   models:
+     qwen3.8-27b:
+       model: "C:/Users/me/My Models/qwen3.8-27b-iq4r-l-v4.rad"
+   ```
+
+   `qwen3.8-27b`, the name above `model:`, is the model's name in the API.
+4. **Check the path:** `Test-Path` on it must print `True`. The profile check in step 4 reads the YAML only and
+   does not open the model file.
+
+**A model is served from where its `model:` points.** `serve.ps1` copies nothing; keep the files on the
+fastest drive you have.
+
+#### Fetching with serve.ps1
+
+Steps 1 to 4 can be one command. `-Fetch` fetches the file a profile names in its
+`# brilliance-fetch: <owner/repo> <revision> <file>` line, then serves it, with no edit to the profile:
+
+```powershell
+.\serve.ps1 qwen27-preview -Fetch -Bus 3
+.\serve.ps1 qwen27-preview -Fetch -Bus 3 -WhatIf   # the plan only: nothing is fetched or started
+```
+
+- Before a byte moves it prints the repository, the revision and the commit it resolves to, the destination
+  and each file's size in bytes.
+- The destination is `<dir>\<owner>\<repo>`. `<dir>` is `-ModelDir` if given, else `BRILLIANCE_HF_CACHE`,
+  else `%LOCALAPPDATA%\radiance\hf`: the same store as a repository named as `model:` (below).
+- A whole copy is kept with no transfer. A cut transfer resumes when the command runs again. Each file is
+  checked against its SHA-256 before it is kept, and the verified file is what the server is given.
+- With no network, a copy a complete fetch left is served, and the output says so.
+- The profile's `model:` line is not read and the file is not changed. `-Model <path>` does the same for a
+  file you fetched yourself. In a profile of several models, `-ModelName` says which one.
+
+`hfget.ps1` alone prints the same plan, and `-Plan` stops after it. Without a file it refuses a repository of
+several containers, listing each with its size, before anything is downloaded.
+
+**Or name a repository** as `model: owner/name`. When the model loads, the server fetches the whole
+repository with `hfget.ps1` into `<dir>\<owner>\<name>`. `<dir>` is `download-dir:` under `server:` if set,
+else `BRILLIANCE_HF_CACHE`, else `XDG_CACHE_HOME\radiance\hf`, else `%LOCALAPPDATA%\radiance\hf`.
+
+- It serves the repository's one top-level `.rad`; with none, a directory of supported checkpoint files.
+- A repository with several containers, such as `qwen3.8-27b-iqr-v4`, is refused before anything is
+  downloaded, naming each with its size. Fetch the one file instead, as above.
+- At each load it checks the repository for changes. If the check changes nothing on disk (the repository
+  cannot be listed, say) and a complete copy was fetched before, that copy is served; any other failed
+  transfer stops the load.
+- Without `model-revision:` it follows the repository's `main` branch. Name a tag or a commit so a restart
+  does not bring weights nobody reviewed.
+
+#### A small first run: MiniCPM5-2B
+
+MiniCPM5-2B IQ8R answers text only, loads in about 4 s and holds about 9 GiB of the card. Its profile has
+thinking off, so the answer arrives in `content` at once. In the PowerShell window from
+[step 2](#2-get-the-package):
+
+1. **Fetch it and start it** on the card's PCI bus ([step 4](#4-start-a-server) shows how to find it):
+
+   ```powershell
+   .\serve.ps1 minicpm5-2b-1card -Fetch -Bus 3
+   ```
+
+   `-Fetch` gets `minicpm5-2b-iq8r.rad` (3.04 GiB, 3,267,162,112 bytes, SHA-256
+   `6048448b1ffbb29df9ed44d5277cc00fc71db686959cc67f678c203e4d1d80ac`) from
+   [`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r), as
+   [Fetching with serve.ps1](#fetching-with-serveps1) describes, then serves it. No edit to the profile. Without
+   a card, use `-Cpu` in place of `-Bus 3` ([Serving on the CPU](#serving-on-the-cpu)). It is ready when it
+   prints `server: listening on http://127.0.0.1:8000`.
+2. **Next time**, the same command transfers nothing: the copy is whole. A copy you already have is served
+   with `-Model <its path>` in place of `-Fetch`.
+3. **Ask it something**, from a second PowerShell window:
+
+   ```powershell
+   $body = '{"model":"minicpm5-2b","messages":[{"role":"user","content":"Say hello in one sentence."}],"max_tokens":64}'
+   Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/v1/chat/completions -ContentType application/json -Body $body |
+     ForEach-Object { $_.choices[0].message.content }
+   ```
+
+   Or **in cmd** (not PowerShell, which strips the `\"` quotes and gets a 400), with the `curl.exe` Windows
+   ships:
+
+   ```
+   curl.exe http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"minicpm5-2b\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in one sentence.\"}],\"max_tokens\":64}"
+   ```
+
+4. **Stop it** with Ctrl-C in its window ([step 6](#6-stop-it)).
+
+To let it reason first, a request sends `"chat_template_kwargs": {"enable_thinking": true}`. For tools,
+pictures and video, use `qwen27-preview`.
 
 ### 4. Start a server
 
-From the unzipped folder, in PowerShell:
+In the PowerShell window from [step 2](#2-get-the-package), in the unzipped folder.
+
+**Find the card's PCI bus number.** In Device Manager, expand "Display adapters", double-click the Radeon
+AI PRO R9700 and read "Location" on the General tab: `PCI bus 3, device 0, function 0` is bus 3. Or list
+every display adapter at once:
 
 ```powershell
-.\serve.ps1 qwen27-preview -Check     # validate the profile and exit
+Get-PnpDevice -Class Display -PresentOnly | ForEach-Object { '{0}: {1}' -f $_.FriendlyName, (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_LocationInfo).Data }
+```
+
+`-Bus` takes these decimal numbers. Some tools, and the server's own log, write the bus in hexadecimal
+(`0000:20:00.0` is bus 32); `-Bus` takes that form too, or `0x20`. Put your bus number where the commands
+below say `3`. A machine with one discrete card can leave `-Bus` out.
+
+**Check the profile, then start the server in this window:**
+
+```powershell
+.\serve.ps1 qwen27-preview -Check     # read the profile and exit; success ends "model qwen3.8-27b = <path>, tp 1"
 .\serve.ps1 qwen27-preview -Bus 3     # serve on the card at PCI bus 3
 ```
 
-- **`-Bus`** picks cards by PCI bus number (Device Manager or GPU-Z show it). Without it, every discrete card
-  HIP shows is used, and the integrated GPU is left out. `-Device` takes HIP indices instead.
-- It is ready when it prints `server: listening on http://127.0.0.1:8000`.
-- **The API** is at `http://127.0.0.1:8000/v1`: Chat Completions, Responses and Messages, streamed or not,
-  with tools, and pictures and video clips as `image_url` / `video_url` parts.
+- Lines starting `I ` are the server's log, written to standard error; they are not errors. `W ` is a
+  warning, `E ` an error.
+- It is ready when it prints `server: listening on http://127.0.0.1:8000`, once the model has loaded. Leave
+  this window open and send requests from a second PowerShell window ([step 5](#5-send-a-first-request)).
+- **`-Bus`** picks cards by PCI bus number, one or several (`-Bus 3,9`). `-Device` takes HIP indices
+  instead. With neither, the server sees the cards `$env:HIP_VISIBLE_DEVICES` names if this window set it,
+  and otherwise every discrete card, with an integrated GPU hidden from HIP: the engine runs no model on
+  one beside a discrete card, and one left visible would divide the pinned-memory limit and turn HIP
+  virtual memory off. A machine with one discrete card needs no `-Bus`, integrated GPU or not.
+- **Every start lists the cards the server will see**, as its card 0, 1, ..., each with its PCI bus and
+  HIP index, and what is hidden (`serve: card 0 = PCI bus 3 (0x03), HIP device 2`). A profile's `cards:`
+  and `memory.card-headroom-mib` count these cards from 0.
 - **The dashboard** is at `http://127.0.0.1:8000/`: models, memory, performance, requests and sessions.
-- **The terms of use** are at `http://127.0.0.1:8000/terms`, linked from the dashboard (section 6), and the
-  models' full licence texts at `/terms/licenses`.
-- **`-Background -Log FILE`** starts the server in a console of its own.
-- **`-WhatIf`** prints what a start would set (the cards, the environment) and the command line, and starts
-  nothing.
-- **The environment:** a profile can name variables its server needs in a comment line,
-  `# brilliance-env: NAME=VALUE`, and `-Env NAME=VALUE[,NAME=VALUE]` adds or overrides them for one start.
-  Only `GPU_*`, `HIP_*`, `AMD_*`, `BRILLIANCE_*` and `RADIANCE_*` are taken; the cards stay with `-Bus`. They
-  are set for the server only, and the startup output names each one.
+- **The terms of use** are at `http://127.0.0.1:8000/terms`, linked from the dashboard
+  ([step 7](#7-serve-the-local-network)), and the models' full licence texts at `/terms/licenses`.
+- **`-WhatIf`** prints what a start would set (the cards, the environment) and the command line, and the
+  host, port and key the server reads from the profile with them; it starts nothing.
+- **The environment:** a profile can set runtime variables in comment lines, `# brilliance-env: NAME=VALUE`,
+  and `-Env NAME=VALUE[,NAME=VALUE]` adds or overrides them for one start. Only names starting `GPU_`,
+  `HIP_`, `AMD_`, `BRILLIANCE_` and `RADIANCE_` are taken. `HIP_VISIBLE_DEVICES` is refused (choose cards
+  with `-Bus` or `-Device`), and so is any name containing `KEY`, `TOKEN`, `SECRET` or `PASSWORD`. They are
+  set for the server only, and the startup output names each one.
 - `bin\radiance.exe --config profiles\qwen27-preview.yaml` works too. With an integrated GPU or several cards,
   set `$env:HIP_VISIBLE_DEVICES` to the card's HIP index first. It does not read `# brilliance-env:` lines:
   set those variables yourself.
 
+**Or start it in the background**, with no window of its own, and keep using this one:
+
+```powershell
+$server = .\serve.ps1 qwen27-preview -Bus 3 -Background                  # the server's process ID
+Select-String -Path .\radiance-qwen27-preview.log -Pattern 'listening on'   # prints the line once it is ready
+```
+
+- The log goes to `radiance-<profile>.log` in the current folder. `-Log` names another: a file name
+  (`-Log srv.log`, in the current folder) or a full path (`-Log "$env:USERPROFILE\qwen27.log"`). It starts
+  with `serve.ps1`'s own lines (the cards, any `-Listen`, `-Port` or `-ApiKey`, and the file a reload
+  rereads), then the server's.
+- `Get-Content .\radiance-qwen27-preview.log -Tail 20` shows the end of the log; a start that fails says why
+  there.
+- Stop it with `tools\stop-server.ps1` ([step 6](#6-stop-it)), never from Task Manager.
+
 | Profile | Model | Cards | Status | Context | Requests at once | Speculation | KV cache |
 |---|---|---|---|---|---|---|---|
+| `minicpm5-2b-1card` | MiniCPM5-2B IQ8R (text) | 1 | **Runs, not yet qualified**: the small first run | 32K | 4 | DSpark, depth 7 | bf16 |
 | `qwen27-preview` | Qwen3.8-27B IQ4R-L-V4 | 1 | **Qualified** | 32K | 4 | DFlash2, depth 7 | bf16 |
 | `qwen27-8k-plain` | Qwen3.8-27B IQ4R-L-V4 | 1 | **Qualified** | 8K | 1 | off | bf16 |
-| `qwen27-iq8r-1card` | Qwen3.8-27B IQ8R-V4 | 1 | **Soak-clean** | 16K | 4 | DFlash2 | int8 |
+| `qwen27-iq8r-1card` | Qwen3.8-27B IQ8R-V4 | 1 | **Soak-clean** | 16K (about 55.6K tokens of KV cache in all) | 4 | DFlash2 | int8 |
 | `qwen27-iq8r-2card` | Qwen3.8-27B IQ8R-V4 | 2 (TP2) | **Soak-clean** | 32K | 4 | DFlash2 | bf16 |
 | `flashnext-4card` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | **Supported**: soaked at 32K on its earlier settings (2026-11-17); these tuned settings pass the injection, stop and serving checks; a soak on them has not run yet | 256K | 8 | MTP, depth 3 | bf16 |
-| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**: upstream's two-card settings, tuned | 256K | 8 | MTP, adaptive depth to 5 | int8 |
-| `gemma4-31b-1card` | Gemma 4 31B a4 | 1 | **Runs, not yet qualified** | 32K | 2 | MTP, depth 3 | bf16 |
-| `gemma4-12b-1card` | Gemma 4 12B i8g | 1 | **Runs, not yet qualified** | 32K | 4 | MTP, depth 3 | bf16 |
-| `qwen36-35b-2card` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | **Runs, not yet qualified** | 32K | 4 | MTP, depth 3 | int8 |
-| `qwen-image-1card` | Qwen-Image 2.1 IQ8R (pictures) | 1 | **Runs, not yet qualified**: generation only (known issue 13) | 8,192 tokens a request | - | off | - |
+| `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**, recommended safe profile | 256K | 8 | MTP, adaptive depth to 5 | int8 |
+| `flashnext-2card-fast` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Runs** (functional smoke), fastest option | 256K | 8 | MTP, adaptive depth to 5 | int8 |
+| `gemma4-31b-1card` | Gemma 4 31B a4 | 1 | **Qualified** | 32K | 2 | MTP, depth 3 | bf16 |
+| `gemma4-12b-1card` | Gemma 4 12B i8g | 1 | **Qualified** | 32K | 4 | MTP, depth 3 | bf16 |
+| `qwen36-35b-2card` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | **Qualified** | 32K | 4 | MTP, depth 3 | int8 |
+| `qwen-image-1card` | Qwen-Image 2.1 IQ8R (pictures) | 1 | **Qualified** for generation; edits: known issue 13 | Pictures to 2048x2048, the default | - | off | - |
 
+- **Context and requests at once are limits, not a promise that all of them fit at full length.** Context is
+  the longest one request may be; requests at once is how many the scheduler runs together. All of them
+  share one KV cache, which can hold fewer tokens than the two multiplied. On the test machine: about 131K
+  tokens for `qwen27-preview` and `minicpm5-2b-1card` (4 x 32K fit), about 55.6K for `qwen27-iq8r-1card`, about 262K for
+  `flashnext-2card` and about 919K for `flashnext-4card`. The startup log gives the figure on your machine
+  (`kv cache ... tokens`).
 - **Name the cards a profile needs** with `-Bus` (or `-Device`): `-Bus 6` for one card, `-Bus 3,9` for two.
-  Without it every discrete card is visible and the profile takes the first one, two or four in HIP's order.
-  A card left visible but unused still costs: HIP virtual memory is on only with exactly one card visible,
-  and the pin limit is divided by every card the process sees. On a machine with exactly four cards,
-  `.\serve.ps1 flashnext-4card` needs no `-Bus`.
-- **`flashnext-4card` has two known issues.** Flash-Next's output can change when requests share a step.
-  Identical requests sent together can get different next-token distributions, and sampling over them is
-  looser than the temperature asked; one request at a time is repeatable. This is rounding, not wrong data
-  ([known issue 8](win/SUPPORT.md#known-issues)). And it hard-locked the test machine once, when stopped
-  during a long prefill beside a large build: let a prefill finish before stopping, or keep the CPU
-  light ([known issue 12](win/SUPPORT.md#known-issues)).
-- **`flashnext-2card`** carries upstream's two-card settings on the exact wire (`tp-wire` left at its
-  default), and with them a 64-byte write to host memory is lost now and then
-  ([known issue 1](win/SUPPORT.md#known-issues)). The server re-sends the block, at about 4% of
-  single-stream decode. It sets no runtime variable.
-- **Both Flash-Next profiles are tuned:** the model's full 256K context, prefill steps of up to 6,144
+  With neither, the server sees `$env:HIP_VISIBLE_DEVICES`'s cards if it is set, else every discrete card
+  (an integrated GPU hidden), and the profile takes the first one, two or four in HIP's order. A card left
+  visible but unused still costs: HIP virtual memory is on only with exactly one device visible, and the pin
+  limit is divided by every device the process sees. Give `-Bus` for `flashnext-4card` too, unless the
+  machine has exactly four discrete cards and no `HIP_VISIBLE_DEVICES` set.
+- **`flashnext-4card` has two known issues.** When requests share a step, rounding can change Flash-Next's
+  next-token distributions, so sampling over requests sent together is looser than the temperature asked
+  ([known issue 8](win/SUPPORT.md#known-issues)). Compare repeats of one request from the same cache state.
+  And it hard-locked the test machine once, when stopped during a long prefill beside a large build: let a
+  prefill finish before stopping, or keep the CPU light ([known issue 12](win/SUPPORT.md#known-issues)).
+- **Safe `flashnext-2card`** is the recommended two-card profile. It uses the exact wire with copy
+  engines (SDMA) off by default. The server re-sends a lost host-memory write at about 4% of
+  single-stream decode. [Known issue 1](win/SUPPORT.md#known-issues)
+- **Fastest `flashnext-2card-fast`** uses lossy wht6 and turns SDMA on at launch with
+  `.\serve.ps1 flashnext-2card-fast -Bus 3,9`. On two R9700s, wht6 gave about 10% faster
+  prefill for 32K–128K prompts. It can change greedy text, with a small measured effect on next-token
+  probabilities. SDMA prefill was unchanged and decode gains were inconclusive.
+  [Flash-Next profile evidence](win/SUPPORT.md#models-and-card-counts)
+- **The Flash-Next profiles are tuned:** the model's full 256K context, prefill steps of up to 6,144
   tokens for a prompt alone in its step (`max-num-batched-tokens: 6144`, `prefill-span: 3`), eight
-  linear-state snapshots and the picture and audio encoders in host memory. The two-card KV cache holds
-  about 262K tokens across all requests, the four-card one about 917K. Each profile's comment explains
+  linear-state snapshots and the picture and audio encoders in host memory. Each profile's comment explains
   its settings.
-- `kv-cache-dtype: i8` halves the cache (5.3 GiB instead of 9.4 GiB at 32K x 4).
+- **Leave `p2p:` at `auto`** (the default) in profiles of your own. Windows' driver gives these cards no
+  peer-to-peer access, so `auto` exchanges between cards through pinned host memory, and `p2p: on`, which
+  some upstream recipes set, refuses to start. The lossy compressed exchange `tp-wire: wht6`
+  has the same two-card resend and stop protection. [Known issue 1](win/SUPPORT.md#known-issues)
+- `kv-cache-dtype: i8` shrinks the cache: about 5.3 GiB instead of 9.4 GiB for bf16 at 32K x 4 on
+  Qwen3.8-27B, about 44% less.
 
-### 5. Stop it
+### 5. Send a first request
 
-- **Ctrl-C** in its window: it finishes what is in flight, releases the card and exits.
-- From a script: `tools\stop-server.ps1 -ProcessId <pid>` sends Ctrl-Break, the same drain.
+From a second PowerShell window, once the server prints `server: listening`. These use PowerShell's own
+`Invoke-RestMethod` and need no execution-policy change. They are for `qwen27-preview`; for another profile,
+use the model name `/v1/models` lists.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health                 # status ok, the model resident
+(Invoke-RestMethod http://127.0.0.1:8000/v1/models).data.id    # the model's name in the API: qwen3.8-27b
+$body = @{
+  model = 'qwen3.8-27b'
+  messages = @(@{ role = 'user'; content = 'Say hello in five words.' })
+  enable_thinking = $false
+  max_tokens = 64
+} | ConvertTo-Json -Depth 10
+(Invoke-RestMethod http://127.0.0.1:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body).choices[0].message.content
+```
+
+- **Qwen3.8 thinks before it answers** unless a request says otherwise, and its reasoning counts against
+  `max_tokens`. With a small limit the whole budget can go on reasoning: the answer comes back empty, with
+  `finish_reason` `length`. `enable_thinking = $false` turns thinking off for the request; or give it more
+  tokens.
+- **Streamed:** `curl.exe`, not `curl`, which in Windows PowerShell is `Invoke-WebRequest` and cannot stream.
+  Each `data:` line is one chunk, and the stream ends with `data: [DONE]`:
+
+  ```powershell
+  $body = @{ model = 'qwen3.8-27b'; messages = @(@{ role = 'user'; content = 'Count from one to ten.' }); stream = $true; enable_thinking = $false; max_tokens = 100 } | ConvertTo-Json -Depth 10
+  $body | curl.exe -sN http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" --data-binary "@-"
+  ```
+
+- **A tool call, round trip:** the model asks for a tool, you run it, and you send the result back with the
+  call's `id`. Here the "tool" is a fixed answer:
+
+  ```powershell
+  $tools = @(@{ type = 'function'; function = @{
+    name = 'get_time'; description = 'The current time in a city'
+    parameters = @{ type = 'object'; properties = @{ city = @{ type = 'string' } }; required = @('city') } } })
+  $req = @{ model = 'qwen3.8-27b'; tools = $tools; enable_thinking = $false; max_tokens = 300
+            messages = @(@{ role = 'user'; content = 'What time is it in Paris? Use get_time.' }) }
+  $r = Invoke-RestMethod http://127.0.0.1:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body ($req | ConvertTo-Json -Depth 10)
+  $call = $r.choices[0].message.tool_calls[0]
+  $call.function.name; $call.function.arguments                              # get_time {"city":"Paris"}
+  $req.messages += $r.choices[0].message                                     # the assistant's tool call
+  $req.messages += @{ role = 'tool'; tool_call_id = $call.id; content = '14:05' }   # the tool's result
+  (Invoke-RestMethod http://127.0.0.1:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body ($req | ConvertTo-Json -Depth 10)).choices[0].message.content
+  ```
+
+  Streamed, the call arrives in pieces: `delta.tool_calls` chunks carry the `id` and name first, then the
+  arguments, and the stream's last chunk says `finish_reason` `tool_calls`.
+- **Pictures and video clips** go in Chat Completions as `image_url` and `video_url` content parts (checked on
+  Qwen3.8-27B). The Responses and Messages APIs take their own content formats.
+
+#### Connect a client
+
+| Setting | Value |
+|---|---|
+| OpenAI-style base URL (OpenAI SDKs, Open WebUI, OpenCode and most agents) | `http://127.0.0.1:8000/v1` |
+| Anthropic-style base URL (the Anthropic SDK, and clients that add `/v1/messages` themselves) | `http://127.0.0.1:8000` |
+| Model | the name `/v1/models` lists: `qwen3.8-27b` for the Qwen3.8-27B profiles |
+| API key | none, unless the server was started with one ([step 7](#7-serve-the-local-network)); a client that insists on a key can be given any text, such as `none` |
+
+The routes are `/v1/chat/completions`, `/v1/responses` and `/v1/messages`. A Messages client given the
+OpenAI-style base sends to `/v1/v1/messages`, which answers 404.
+
+**OpenCode** was checked with this `opencode.json` in the project folder, against `qwen27-preview` on one
+card:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "brilliance/qwen3.8-27b",
+  "provider": {
+    "brilliance": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Brilliance",
+      "options": { "baseURL": "http://127.0.0.1:8000/v1", "apiKey": "none" },
+      "models": {
+        "qwen3.8-27b": { "name": "Qwen3.8-27B IQ4R-L-V4", "tool_call": true, "reasoning": true,
+                         "limit": { "context": 32768, "output": 4096 } }
+      }
+    }
+  }
+}
+```
+
+**Open WebUI** connects as an OpenAI API connection with the OpenAI-style base URL above. Other clients and
+agents have not been checked; any that lets you set the base URL and model name may work.
+
+### 6. Stop it
+
+- **Ctrl-C** in its window: the server stops taking requests, lets those in flight finish within the drain
+  timeout (30 s by default, `drain-timeout:` under `scheduler:`), releases the card and exits.
+- **A background server**, or one in another window: `tools\stop-server.ps1` sends Ctrl-Break, the same drain,
+  and waits for the exit:
+
+  ```powershell
+  .\tools\stop-server.ps1 -ProcessId $server            # "stop: <id> exited in 1.6 s"
+  Get-Content .\radiance-qwen27-preview.log -Tail 1     # "radiance exit status 0"
+  ```
+
+- **Let a long prefill finish before stopping.** A stop waits for the GPU step in hand, and a stop during a
+  long prefill once hard-locked the test machine ([known issue 12](win/SUPPORT.md#known-issues)).
 - **Do not end it from Task Manager** while it is working: a GPU process killed mid-work has taken the driver
   down. A server that does not stop can be read with `bin\brl-stacks.exe` (`tools\STACKS.md`).
 - **Reload the YAML** without a restart with `tools\reload-server.ps1 -ProcessId <pid>` (Windows' counterpart
-  of `kill -HUP`) or `POST /admin/reload`.
+  of `kill -HUP`) or `POST /admin/reload`. The server rereads the file it was started on: for `serve.ps1`,
+  the profile itself, so edit it and reload (`reload-server.ps1` prints which file that is). `-Listen`,
+  `-Port` and `-ApiKey` stay applied over it. Changed models reload; a change to `server:` or `cards:` is
+  refused until a restart.
 
-### 6. Serve the local network
+### 7. Serve the local network
 
 The profiles listen on loopback with no key. `serve.ps1` changes that from the command line:
 
 ```powershell
-.\serve.ps1 qwen27-preview -Listen 0.0.0.0 -ApiKey env:MY_KEY   # every interface; requires the key MY_KEY holds
-.\serve.ps1 qwen27-preview -Listen 0.0.0.0 -ApiKey off          # every interface, no key
+$env:MY_KEY = Read-Host 'API key'                                 # set the key in this window first
+.\serve.ps1 qwen27-preview -Listen 0.0.0.0 -ApiKey env:MY_KEY   # every IPv4 interface; requires the key MY_KEY holds
+.\serve.ps1 qwen27-preview -Listen 0.0.0.0 -ApiKey off          # every IPv4 interface, no key
 ```
 
 - `-ApiKey` takes `off` or `env:NAME`. A key itself is refused on the command line, where other processes can
   read it. Without `-ApiKey`, the profile's own key setting stands.
+- With a key, every inference request must carry it, as `Authorization: Bearer <key>` or `X-Api-Key: <key>`.
+  The health probes, the dashboard page and the terms pages stay readable without it.
 - **The firewall rule is yours to add.** Allow the port for the private network only.
 - **Adopt the terms of use before serving other people.** Some model licences (LTX-2.5's, SDXL's) require
   whoever serves the model to other people to pass its use restrictions on to them as enforceable terms. The
   server shows a terms-of-use page at `/terms`, open without the key. Out of the box it is
   [win/TERMS-OF-USE.md](win/TERMS-OF-USE.md) (`TERMS-OF-USE.md` in the package), a template that carries
   those restrictions. Copy it, make it yours (name yourself, remove the models you do not serve, add your own
-  terms), and set `terms-file:` under `server:` in the profile to your copy; `.html` is served as HTML,
-  anything else as plain text. The file is read at startup, and one that cannot be read stops the start. The
+  terms), and set `terms-file:` under `server:` in the profile to your copy's full path. A `.html` or `.htm`
+  file is served as HTML with scripts blocked, anything else as UTF-8 plain text. The file is read at
+  startup, so restart to change it; one that is missing, empty, not UTF-8 or over 1 MiB stops the start. The
   template is not legal advice.
 
-### 7. Optional: run as a Windows service
+### 8. Optional: run as a Windows service
 
 `.\serve.ps1 <profile> -Install` registers the profile as a service, started at boot and stopped by the same
 drain as Ctrl-C. **It is not advertised yet:** it passes its host tests, and its qualification in an elevated
 shell is open. [SERVICE.md](win/SERVICE.md) has the steps.
 
-- Unpack the package under `C:\Program Files` first: the service runs as LocalSystem from that folder.
+- Unpack the package into a folder only administrators can change, such as `C:\Program Files\Brilliance`,
+  first: the service runs `radiance.exe` from there as LocalSystem, and anyone who can write to that folder
+  could run code as SYSTEM. `serve.ps1` warns when the package is elsewhere. The service's working folder is
+  its YAML's, under `%ProgramData%\Brilliance`, so give paths in the profile in full.
 - Run it from an elevated PowerShell. `-WhatIf` prints every step first and changes nothing.
 - With `-ApiKey env:NAME`, the key goes into a file only SYSTEM and Administrators can read, never onto a
   command line or into the registry.
 - The cards, `BRILLIANCE_HF_CACHE`, and the profile's `# brilliance-env:` and `-Env` variables go into the
   service's own environment.
-- A failure nobody asked for restarts it once, after 2 minutes, and not again that day (`-NoRestart`: never).
+- A failure nobody asked for restarts it once, after 2 minutes. A later failure restarts nothing until a day
+  has passed with no failure, when Windows resets the count (`-NoRestart`: never restart).
 - `-Uninstall` stops it with the drain and removes it.
+- A service installed from alpha.3 keeps running alpha.3: remove it and install it again from this
+  package, as [SERVICE.md](win/SERVICE.md) "Moving an alpha.3 service to alpha.4" describes (not yet run
+  in an elevated shell).
+
+### Serving on the CPU
+
+Add `-Cpu` to `serve.ps1`, from the GPU package or the CPU package:
+
+```powershell
+.\serve.ps1 minicpm5-2b-1card -Cpu
+```
+
+`-Cpu` starts the server on the CPU with no GPU at all, and changes nothing in the profile. It applies three
+settings over the profile, which the server's startup report names:
+
+- the host backend only: the HIP runtime is never asked for a device, and every card is hidden from it;
+- the CPU kernels, `libavx,libref` (the package's `gfx1201` kernels cannot run on the CPU);
+- no speculative decoding for any model (the CPU kernels cannot run every drafter; MiniCPM5-2B's cannot).
+
+`-Cpu` takes neither `-Bus` nor `-Device`. A profile of several models keeps only the one-card ones. Without
+`-Cpu`, a start that would leave the server no card (HIP shows none, or `HIP_VISIBLE_DEVICES` hides them
+all) is refused, so a card that has failed never turns into a CPU server unasked. Expect a fraction of a
+card's speed. This was checked with MiniCPM5-2B IQ8R and EmbeddingGemma 2, and is not qualified
+([known issues 4 and 10](win/SUPPORT.md#known-issues)). The CPU-only package (`-win64-cpu`) can be
+[built from source](#building-from-source).
+
+### Getting help
+
+- **Bugs and questions about the Windows build:** open an issue at
+  [github.com/adamczhang/Brilliance/issues](https://github.com/adamczhang/Brilliance/issues). Check
+  [win/SUPPORT.md](win/SUPPORT.md)'s known issues first.
+- **Include:** the release (`0.3.0-alpha.4`, or the `MANIFEST.json` commit), the Adrenalin driver version, the
+  cards and the `-Bus` you gave, the profile and anything you changed in it, the exact command (with any key
+  removed), and the server's log from its start to the failure.
+- **A server that stopped making progress:** read it with `bin\brl-stacks.exe` before stopping it
+  (`tools\STACKS.md`), and attach what it prints.
+- **Upstream Radiance** ([codeberg.org/StillDeadcode/radiance](https://codeberg.org/StillDeadcode/radiance))
+  is for problems that also happen on its Linux build. Report a Windows problem here first.
 
 ## Dependencies
 
@@ -262,11 +597,21 @@ The engine's own third-party code (cpp-httplib, yyjson, llama.cpp and the rest) 
 
 ### What you need to run it
 
-- **The AMD Adrenalin driver**, 32.0.32015.12012 or later.
-- **Python 3, only for `rad-export`** (`bin\rad-export.cmd`, turning a finetune into a container), plus
-  torch and safetensors for a LoRA adapter, and for `resolve-stacks.py`, which names a hung server's frames
-  (`tools\STACKS.md`). The source tree's test and qualification tools (`win\tools\*.py`) use Python too.
-  Serving needs no Python.
+- **The AMD Adrenalin driver** 32.0.32015.12012, the version it was tested on; later ones have not been
+  checked.
+- **Serving needs no Python.** Python 3 is needed for `rad-export` (`bin\rad-export.cmd`, turning a finetune
+  into a container), with torch and safetensors to fold in a LoRA adapter, and for `resolve-stacks.py`,
+  which names a hung server's frames (`tools\STACKS.md`). The source tree's test and qualification tools
+  (`win\tools\*.py`) use Python too.
+- **`rad-export` runs the package's own converter** (`bin\rad-convert.exe`, beside it) and lists its
+  recipes (`share\radiance\recipes`). From the unzipped folder:
+
+  ```powershell
+  .\bin\rad-export.cmd --list-recipes
+  ```
+
+  Export with the finetune's folder and `-o OUTPUT.rad`. `--rad-convert PATH` chooses another converter.
+  Its exit status is rad-export's, so a script can tell a failed export.
 - `hfget.ps1` uses the `curl.exe` and PowerShell that Windows ships.
 
 ### What you need to build from source
@@ -301,38 +646,37 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | Qwen3.8-27B IQ4R-L-V4 ([`StillDeadcode/qwen3.8-27b-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4)) | **Qualified**: 8K and 32K x 4, DFlash2 or plain, bf16 or i8 KV; text, tools, pictures, video | Not run | Not run |
 | Qwen3.8-27B IQ8R-V4 (same repository, `qwen3.8-27b-iq8r-v4.rad`, 27.58 GiB) | **Soak-clean**: 16K x 4, int8 KV, DFlash2 | **Soak-clean**: 32K x 4, DFlash2 | Not run |
 | Qwen3.8-Flash-Next IQR-V4 ([`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4), 113 GiB) | Not run (upstream lists a one-card layout with experts in host memory) | **Supported**: with production settings a lost write is re-sent, at about 4% of single-stream decode. An 8-hour soak has not been run on it yet. Profile: `flashnext-2card` | **Supported**: every expert on the cards (`placement: all_vram`); soaked at 32K x 8, int8 KV, MTP on its earlier settings (2026-11-17), before the four-card re-send and stop were added; with them the profile's tuned 256K x 8, bf16 KV settings pass the injection, stop and serving checks; a soak on them has not run yet. Profile: `flashnext-4card` |
-| MiniCPM5-2B IQ8R ([`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r)) | Runs (the bring-up model); also on the CPU package, without its drafter: set `num-speculative-tokens: 0` | - | - |
+| MiniCPM5-2B IQ8R ([`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r), 3.04 GiB) | **Runs, not yet qualified**: chat and streaming, 32K x 4, bf16 KV, DSpark; the small first run. Also on the CPU kernels, without its drafter: `.\serve.ps1 minicpm5-2b-1card -Cpu` turns it off. Profile: `minicpm5-2b-1card` | - | - |
 | EmbeddingGemma 2 bf16 (`google/embeddinggemma-2`, converted with `rad-convert`, 1.40 GiB) | **Qualified**: `/v1/embeddings` for text, pictures, video and audio; also on the CPU kernels | - | - |
 | Qwen3-ASR 1.7B bf16 (`Qwen/Qwen3-ASR-1.7B-hf` as it ships, 4.09 GB) | **Qualified**: `/v1/audio/transcriptions` (5 formats, 4 response forms) and `/v1/realtime`, 16 sequences | - | - |
 | Nemotron 3.5 Rerank 8B BF16 (`nvidia/Nemotron-3.5-Rerank-8B-BF16` as it ships, 16.78 GB) | **Qualified**: `/rerank` and `/v1/rerank`, text and picture documents, 32,768 tokens a pair | - | - |
 | SDXL base 1.0 bf16 (`stabilityai/stable-diffusion-xl-base-1.0`, the single-file checkpoint converted with `rad-convert`, 6.39 GiB) | **Qualified**: `/v1/images/generations`; PNG, JPEG and WebP; about 5.4 s at 1024x1024, 28 steps | - | - |
 | LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`) | **Runs, not yet qualified**: `/v1/videos`, text and image to video, MP4 | - | - |
-| Gemma 4 31B a4 ([`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4), 19.95 GiB) | **Runs, not yet qualified**: chat, 32K x 2, bf16 KV, MTP; pictures and video not yet checked | Not run | Not run |
-| Gemma 4 12B i8g ([`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g), 13.79 GiB) | **Runs, not yet qualified**: chat, 32K x 4, bf16 KV, MTP; pictures and audio not yet checked | - | - |
-| Qwen3.6-35B-A3B IQ8R ([`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r), 35.04 GiB) | - | **Runs, not yet qualified**: chat, 32K x 4, int8 KV, MTP; every expert on the cards | Not run |
-| Qwen-Image 2.1 IQ8R ([`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r), 16.13 GiB; non-commercial licence) | **Runs, not yet qualified**, generation only: `/v1/images/generations`; edits come out with colour noise ([known issue 13](win/SUPPORT.md#known-issues)) | Not run | - |
-| Every other upstream model | Source builds; not run on Windows | | |
+| Gemma 4 31B a4 ([`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4), 19.95 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 2, bf16 KV, MTP. Audio is refused with a 501 | Not run | Not run |
+| Gemma 4 12B i8g ([`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g), 13.79 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures, audio and video; 32K x 4, bf16 KV, MTP | - | - |
+| Qwen3.6-35B-A3B IQ8R ([`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r), 35.04 GiB) | - | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 4, int8 KV, MTP; every expert on the cards. It thinks before answering by default. Audio is refused with a 501 | Not run |
+| Qwen-Image 2.1 IQ8R ([`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r), 16.13 GiB; non-commercial licence) | **Qualified** for generation: `/v1/images/generations`, PNG, JPEG and WebP; a seed repeats its picture byte for byte; sizes from 512x512 to the default 2048x2048. Edits work for most seeds ([known issue 13](win/SUPPORT.md#known-issues)) | Not run | - |
+| Other upstream models | Not run on Windows. The package carries many of upstream's architecture plugins, but no other model has been checked. Speech-synthesis and music models cannot be served by this build | | |
 
-**The package's profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, two
-that are **Supported**, and four models that run, not yet qualified ([step 4](#4-start-a-server) has their
-settings):
+**The profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, two that are
+**Supported**, four more **Qualified** models, and one that runs, not yet qualified ([step 4](#4-start-a-server) has their settings):
 
+- MiniCPM5-2B IQ8R, 1 card, **Runs, not yet qualified**: `minicpm5-2b-1card` (32K x 4), the small first run.
 - Qwen3.8-27B IQ4R-L-V4, 1 card, **Qualified**: `qwen27-preview` (32K x 4) and `qwen27-8k-plain` (8K, one request).
 - Qwen3.8-27B IQ8R-V4, 1 card, **Soak-clean**: `qwen27-iq8r-1card`.
 - Qwen3.8-27B IQ8R-V4, 2 cards, **Soak-clean**: `qwen27-iq8r-2card`.
 - Qwen3.8-Flash-Next IQR-V4, 4 cards, **Supported**: `flashnext-4card`, soaked at 32K on its earlier settings
   (2026-11-17), before the four-card re-send and stop were added; with them its tuned 256K settings pass the
   injection, stop and serving checks. A soak on them has not run yet.
-  Its known issues: the output can change when requests share a step, so sampling is looser than asked
-  (rounding, not wrong data); and one hard lock, seen once, when it was stopped during a long prefill
-  beside a large build.
+  Its known issues: when requests share a step, rounding can change the output, so sampling is looser than
+  asked; and one hard lock, seen once, when it was stopped during a long prefill beside a large build.
 - Qwen3.8-Flash-Next IQR-V4, 2 cards, **Supported**: `flashnext-2card`, upstream's two-card settings, tuned,
   on the exact wire; a lost write is re-sent. An 8-hour soak has not been run on it yet.
-- Gemma 4 31B a4, 1 card, **Runs, not yet qualified**: `gemma4-31b-1card` (32K x 2).
-- Gemma 4 12B i8g, 1 card, **Runs, not yet qualified**: `gemma4-12b-1card` (32K x 4).
-- Qwen3.6-35B-A3B IQ8R, 2 cards, **Runs, not yet qualified**: `qwen36-35b-2card` (32K x 4). It thinks
+- Gemma 4 31B a4, 1 card, **Qualified**: `gemma4-31b-1card` (32K x 2).
+- Gemma 4 12B i8g, 1 card, **Qualified**: `gemma4-12b-1card` (32K x 4).
+- Qwen3.6-35B-A3B IQ8R, 2 cards, **Qualified**: `qwen36-35b-2card` (32K x 4). It thinks
   before answering by default, and a client's token limit counts the reasoning too.
-- Qwen-Image 2.1 IQ8R, 1 card, **Runs, not yet qualified**, generation only: `qwen-image-1card`. Its edits
+- Qwen-Image 2.1 IQ8R, 1 card, **Qualified** for generation: `qwen-image-1card`. Some of its edits
   come out with colour noise ([known issue 13](win/SUPPORT.md#known-issues)), and its licence allows
   non-commercial use only ([Licence and credits](#licence-and-credits)).
 
@@ -365,19 +709,28 @@ Radiance 2.2's features, and where each stands on Windows, from [win/SUPPORT.md]
 | Speculation: DFlash2, MTP | **Yes** | |
 | Drafting options (`draft-coupling`, `draft-verify`, `draft-depth: adaptive`, `draft-suffix`) | **Yes** | Checked on Qwen3.8-Flash-Next, two cards (2026-11-19), not qualified: greedy text identical to the uncoupled base. Coupling and the traversal verify also on Qwen3.8-27B's DFlash2. A model that cannot take an option is refused at start, naming why |
 | Control vectors | **Yes** | Checked on Qwen3.8-Flash-Next with the shipped vector, two cards (2026-11-19), not qualified: the per-request field, the `MODEL:NAME` variant, `/admin/control-vector`. Only Flash-Next's architecture applies them |
-| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory (a lost write is re-sent; no 8-hour soak run yet), on the exact wire; `tp-wire: wht6` runs with the same protection, not qualified |
+| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory on the exact wire (a lost write is re-sent; no 8-hour soak run yet). The Flash-Next fastest profile runs with the same protection on lossy wht6 |
 | Tensor parallel, 4 cards | **Partial** | Flash-Next supported with every expert on the cards: soaked at 32K on its earlier settings, before the four-card re-send and stop; with them, a lost write is re-sent as on two cards, and its tuned settings pass the injection, stop and serving checks (a soak on them has not run yet); 3 and 8 cards not run |
-| Peer-to-peer between cards | **Not on Windows** | Collectives go through pinned host memory |
+| Peer-to-peer between cards | **Not on Windows** | The driver gives no peer access, so collectives go through pinned host memory with `p2p: auto` (the default); `p2p: on` refuses to start ([step 4](#4-start-a-server)) |
 | Dashboard | **Partial** | Per card it shows temperature, not load or power |
 | Diagnose mode | **Yes** | The busy-host warning reads the CPUs' load over a quarter second |
 | `rad-convert` | **Partial** | CPU only, by decision; `--gpus` is refused. A real model converted: SDXL, 9.6 s on the CPU |
-| `rad-export` (finetune to container) | **Yes** | With Python 3 (`bin\rad-export.cmd`) |
+| `rad-export` (finetune to container) | **Yes** | With Python 3 (`bin\rad-export.cmd`), which runs the package's converter and recipes ([What you need to run it](#what-you-need-to-run-it)) |
 | Model fetch by repository id | **Yes** | `hfget.ps1`, with curl.exe and PowerShell |
 | Running as a service | **Not yet** | `radiance --service`, installed by `serve.ps1 -Install`; host-tested, its elevated-shell qualification open ([SERVICE.md](win/SERVICE.md)) |
 | `--ngram-placement ram=DIR` | **Partial** | Device tests pass; not run end to end |
 | Plugin SDK, out-of-tree plugins | **Partial** | From a source build's install; not in the package |
 | Linux `scripts/` (measurement, traces, Docker) | **Not on Windows** | `win/tools` has the Windows tools |
 | Cards other than `gfx1201` | **Not on Windows** | The toolchain is pinned to `gfx1201` |
+| Tensor parallel, 3 and 8 cards ([docs/TP3.md](docs/TP3.md); eight cards on unequal links, [GUIDE](docs/GUIDE.md) section 4.7) | **Not run on Windows** | The test machine has four cards. Flash-Next on three would need its experts tiered to host memory, a layout not run here |
+| Streaming KV (`kv-resident`, [GUIDE](docs/GUIDE.md) section 4.4.1, [docs/KV-STREAMING.md](docs/KV-STREAMING.md)) | **Not run on Windows** | It needs a model with indexer-selected attention; none has been run here |
+| LoRA adapters beside the base model ([GUIDE](docs/GUIDE.md) section 4.9.1) | **Not run on Windows** | No adapter has been served here. Folding an adapter into a container with `rad-export` is a separate step |
+| Decisions (`/v1/systemone`, `/v1/decisions`; [GUIDE](docs/GUIDE.md) section 5.13) | **Not run on Windows** | No decision model has been run here |
+| 3-D shapes (Hunyuan3D-2's `/generate`, `/send`, `/status/:uid`; [GUIDE](docs/GUIDE.md) section 5.17) | **Not run on Windows** | No shape model has been run here |
+
+[RADIANCE-README.md](RADIANCE-README.md) and upstream's guide ([docs/GUIDE.md](docs/GUIDE.md)) are upstream's
+own: their model lists and timings are upstream's, measured on Linux. A feature they describe that this table
+does not list has not been run on Windows.
 
 ## From Brilliance 0.2.2
 
@@ -412,12 +765,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File win\package.ps1             
 | | |
 |---|---|
 | [win/SUPPORT.md](win/SUPPORT.md) | models and card counts, upstream's features on Windows, the known issues, and what changes from 0.2.2 |
-| [win/PREVIEW.md](win/PREVIEW.md) | the package's quick start and known limits |
+| [win/PREVIEW.md](win/PREVIEW.md) | the package's quick start, first requests, client settings and known limits |
 | [win/SERVICE.md](win/SERVICE.md) | running the server as a Windows service, and its qualification steps |
 | [win/TERMS-OF-USE.md](win/TERMS-OF-USE.md) | the terms-of-use template the server shows at `/terms`, to adopt before serving other people |
 | [win/licenses/THIRD-PARTY.md](win/licenses/THIRD-PARTY.md) | every third-party DLL and library in the package, its licence and source |
 | [tools/STACKS.md](win/tools/stacks/README.md) | reading a server that stopped making progress (`brl-stacks`) |
-| [RADIANCE-README.md](RADIANCE-README.md), [docs/](docs/) | upstream Radiance's README and documentation, unchanged; [docs/GUIDE.md](docs/GUIDE.md) covers configuration and the HTTP API |
+| [RADIANCE-README.md](RADIANCE-README.md), [docs/](docs/) | upstream Radiance's README and documentation, unchanged. They describe the Linux build: its install, service, plugin and stop commands do not apply here, and on Windows a stuck card neither turns `/health` to 503 nor ends the server (`stuck-exit`), so watch the log and use `bin\brl-stacks.exe`. Use [docs/GUIDE.md](docs/GUIDE.md) for the YAML keys and the HTTP API's request fields, within the Windows limits in [win/SUPPORT.md](win/SUPPORT.md); its `curl` examples are written for a Linux shell and the model name `m`: in Windows PowerShell, `curl` is not curl and the JSON's inner quotes are stripped on the way to `curl.exe`, so send the body as [step 5](#5-send-a-first-request) does, with your model's name |
 
 ## Licence and credits
 
@@ -449,7 +802,7 @@ are theirs; Brilliance adds the Windows port. To support the development of Radi
   - Generated videos must be disclosed as machine generated. Brilliance marks each MP4 so in its metadata;
     keep that marking.
   - [win/TERMS-OF-USE.md](win/TERMS-OF-USE.md), the template the server shows at `/terms`, carries the use
-    restrictions to pass on ([Serve the local network](#6-serve-the-local-network)).
+    restrictions to pass on ([Serve the local network](#7-serve-the-local-network)).
 
 Thanks to **Roberto Franchetti** for one-to-one testing of Brilliance 0.2 on a four-R9700 machine of their
 own. Those runs traced the earlier port's pinned-memory limit to the integrated GPU left visible to the

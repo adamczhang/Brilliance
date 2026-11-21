@@ -7,7 +7,21 @@
   The Windows twin of scripts/hfget.sh, step for step and exit code for exit code, so
   `radiance --model <org/repo>` behaves the same on both platforms (core/hf_model.cpp runs it):
 
-    hfget.ps1 <repo-id> [dest-dir] [revision] [file]
+    hfget.ps1 <repo-id> [dest-dir] [revision] [file] [-Plan]
+
+  WHAT IT WILL DO COMES FIRST: before any transfer it prints the repo, the revision with the commit
+  the hub resolves it to (the listing and every file are then read at that commit, so they agree),
+  the destination, and each file with its exact size in bytes and what is done with it (fetched,
+  resumed, kept), then the bytes still to fetch against the free space. -Plan stops there: nothing
+  is created, changed or transferred (serve.ps1 -Fetch -WhatIf shows it so).
+
+  A REPO OF SEVERAL CONTAINERS NEEDS A CHOICE: with no [file], a listing that holds more than one
+  top-level .rad (a ladder of sizes of one model) is refused before anything is fetched, with each
+  container's name and size and the line that fetches one (exit 4). radiance serves one container,
+  and would refuse the directory after a download of every size.
+
+  Without [dest-dir]: <store>\<owner>\<repo>, the store radiance's own fetch of a repo id uses:
+  BRILLIANCE_HF_CACHE, else %XDG_CACHE_HOME%\radiance\hf, else %LOCALAPPDATA%\radiance\hf.
 
   ONE FILE OF A REPO: with [file], only that file is fetched. A repo that holds a whole ladder of
   containers (sixteen sizes of one model, 170 GiB) is not what a profile serving one of them wants.
@@ -43,10 +57,11 @@
 
   Adapted from Brilliance 0.2.2's scripts/hfget.ps1 to radiance 2.1's hfget.sh.
 
-  Exit status: 0 complete; 3 nothing on disk was changed (the listing could not be read, what is
-  still to fetch does not fit, or a file to be replaced is open in another process), so a complete
-  earlier copy is intact; anything else, a transfer failed and a file may be partial -- re-run to
-  resume.
+  Exit status: 0 complete (with -Plan: the plan was printed); 3 nothing on disk was changed (the
+  listing could not be read, what is still to fetch does not fit, or a file to be replaced is open
+  in another process), so a complete earlier copy is intact; 4 the repo holds several containers
+  and no [file] chose one, nothing changed; anything else, a transfer failed and a file may be
+  partial -- re-run to resume.
 
   HFGET_JOBS concurrent transfers, default 4, 1 to 16. HF_ENDPOINT replaces https://huggingface.co
   (a mirror, or a local stand-in for tests).
@@ -57,7 +72,8 @@ param(
   [Parameter(Position = 0)][string]$Repo,
   [Parameter(Position = 1)][string]$Dest,
   [Parameter(Position = 2)][string]$Rev = 'main',
-  [Parameter(Position = 3)][string]$Only = ''
+  [Parameter(Position = 3)][string]$Only = '',
+  [switch]$Plan
 )
 
 $ErrorActionPreference = 'Continue'
@@ -73,8 +89,16 @@ trap {
 $ProgressPreference = 'SilentlyContinue'   # the progress bar makes Invoke-WebRequest crawl
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-if (-not $Repo) { [Console]::Error.WriteLine('usage: hfget.ps1 <repo-id> [dest-dir] [revision]'); exit 2 }
-if (-not $Dest) { $Dest = Join-Path (Join-Path $env:USERPROFILE 'models') ($Repo -replace '/', '\') }
+if (-not $Repo) { [Console]::Error.WriteLine('usage: hfget.ps1 <repo-id> [dest-dir] [revision] [file] [-Plan]'); exit 2 }
+if (-not $Dest) {
+  # radiance's own store for a repo id (core\hf_model.cpp, hf_default_download_dir), so a file
+  # fetched here and a profile naming the repo find the same copy.
+  $store = $env:BRILLIANCE_HF_CACHE
+  if (-not $store -and $env:XDG_CACHE_HOME) { $store = Join-Path $env:XDG_CACHE_HOME 'radiance\hf' }
+  if (-not $store -and $env:LOCALAPPDATA) { $store = Join-Path $env:LOCALAPPDATA 'radiance\hf' }
+  if (-not $store) { [Console]::Error.WriteLine('hfget: no destination given, and neither BRILLIANCE_HF_CACHE nor LOCALAPPDATA names a store'); exit 2 }
+  $Dest = Join-Path $store ($Repo -replace '/', '\')
+}
 # 0 would never start a transfer; past a few streams the link is saturated and the disk only seeks.
 $jobs = 4
 if ($env:HFGET_JOBS -match '^\d+$') { $jobs = [int][Math]::Max(1, [Math]::Min(16, [double]$env:HFGET_JOBS)) }
@@ -118,10 +142,20 @@ public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(strin
   $native = $true
 } catch { $native = $false }
 
-Write-Output "hfget: listing $Repo@$Rev"
+# THE COMMIT THE REVISION NAMES, asked first, so the listing and every file are read at that one
+# commit and the plan can say which it is. A hub or mirror that does not answer (or answers with
+# something else) leaves the revision as given, which is how this script read it before.
+$commit = ''
+try {
+  $rv = Invoke-WebRequest -Uri "$hub/api/models/$Repo/revision/$([Uri]::EscapeDataString($Rev))" -Headers $headers -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop
+  $rj = ConvertFrom-Json -InputObject $rv.Content
+  if ($rj -is [System.Management.Automation.PSCustomObject] -and $rj.PSObject.Properties['sha'] -and [string]$rj.sha -match '^[0-9a-f]{40}$') { $commit = [string]$rj.sha }
+} catch { $commit = '' }
+$at = if ($commit) { $commit } else { $Rev }
+Write-Output "hfget: listing $Repo@$Rev$(if ($commit) { " (commit $commit)" })"
 # THE LISTING IS PAGINATED AND THE PAGE SIZE IS SMALL: follow the Link rel="next" cursor until
 # there is none, or a checkpoint arrives missing most of its shards with every size check passing.
-$api = "$hub/api/models/$Repo/tree/$Rev`?recursive=true&expand=true"
+$api = "$hub/api/models/$Repo/tree/$at`?recursive=true&expand=true"
 $listing = New-Object System.Collections.Generic.List[object]
 $page = 0
 while ($api) {
@@ -175,6 +209,17 @@ if ($haveSt -gt 0) {
           $_.path -match '(^|/)(pytorch_model|consolidated)[^/]*\.pth$')
   })
 }
+# Several top-level containers and no file named: the choice is the operator's, made before a byte
+# moves (radiance serves one, and core\hf_model.cpp refuses such a directory after the download).
+$rads = @($files | Where-Object { $_.path -like '*.rad' -and $_.path -notmatch '/' })
+if (-not $Only -and $rads.Count -gt 1) {
+  [Console]::Error.WriteLine("hfget: $Repo@$Rev holds $($rads.Count) containers; name the one to fetch (nothing was fetched):")
+  foreach ($r in ($rads | Sort-Object { [int64]$_.size })) {
+    [Console]::Error.WriteLine(("  {0,-48} {1,19:N0} bytes ({2:N2} GiB)" -f $r.path, [int64]$r.size, ([int64]$r.size / 1GB)))
+  }
+  [Console]::Error.WriteLine("  hfget.ps1 $Repo <dest-dir> $Rev <file>")
+  exit 4
+}
 if ($Only) {
   $files = @($files | Where-Object { $_.path -eq $Only })
   if ($files.Count -eq 0) { [Console]::Error.WriteLine("hfget: $Repo@$Rev has no file '$Only'"); exit 3 }
@@ -195,7 +240,7 @@ $entries = @(foreach ($f in $files) {
 # process directory, which is not PowerShell's, and Resolve-Path's .Path gives a UNC one back as
 # FileSystem::\\server\share.
 $Dest = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dest)
-[void][System.IO.Directory]::CreateDirectory($Dest)
+if (-not $Plan) { [void][System.IO.Directory]::CreateDirectory($Dest) }
 $mark = if ($Only) { '-' + ($Only -replace '[\\/]', '_') } else { '' }
 $manifest = Join-Path $Dest ".hfget-manifest$mark"
 $manTmp = "$manifest.tmp"
@@ -267,7 +312,7 @@ function Test-InUse([string]$p) {
 # version gives the right length and the wrong bytes (or, when it shrank, curl's 416 forever), so
 # only a short file of the version being fetched is resumed; one that is longer, or of another
 # version, is fetched whole. A whole file nothing vouches for is hashed once, here.
-$plan = New-Object System.Collections.Generic.List[object]
+$work = New-Object System.Collections.Generic.List[object]
 foreach ($e in $entries) {
   $lp = Local-Path $e.Path
   $len = [int64]-1
@@ -281,36 +326,53 @@ foreach ($e in $entries) {
   elseif ($ver -and $ver -ne $e.Key) { $act = 'fresh'; $why = 'changed upstream' }
   elseif ($len -lt $e.Size) { $act = 'resume' }
   elseif (-not $whole -and $e.Sha) {
-    Write-Output "hfget: checking $($e.Path) against its sha256 (no record of it)"
-    if ((Get-Sha256 $lp) -eq $e.Sha) { Add-Progress 'done' $e }
-    else { $act = 'fresh'; $why = 'sha256 mismatch' }
+    # -Plan records nothing; a real run hashes it here, once.
+    if ($Plan) { $why = 'whole; its sha256 is checked before it is kept' }
+    else {
+      Write-Output "hfget: checking $($e.Path) against its sha256 (no record of it)"
+      if ((Get-Sha256 $lp) -eq $e.Sha) { Add-Progress 'done' $e }
+      else { $act = 'fresh'; $why = 'sha256 mismatch' }
+    }
   }
-  $plan.Add([pscustomobject]@{ Entry = $e; Local = $lp; Len = $len; Act = $act; Why = $why })
+  $work.Add([pscustomobject]@{ Entry = $e; Local = $lp; Len = $len; Act = $act; Why = $why })
 }
 
 # WHAT IS STILL TO FETCH, not the repo's size: a warm cache must not read as a download that does
 # not fit. A file counts from its local length, and whole when it is fetched again.
 $todo = [int64]0
 $need = [int64]0
-foreach ($p in $plan) {
+foreach ($p in $work) {
   $need += $p.Entry.Size
   if ($p.Act -eq 'resume') { $todo += $p.Entry.Size - $p.Len }
   elseif ($p.Act -ne 'keep') { $todo += $p.Entry.Size }
 }
 $free = Get-FreeBytes $Dest
-Write-Output ("hfget: {0} file(s), {1:N1} GiB -> {2}" -f $entries.Count, ($need / 1GB), $Dest)
+# THE PLAN, before anything changes: where from (repo, revision, commit), where to, each file with
+# its exact size and what happens to it, and the bytes still to fetch.
+Write-Output "hfget: from    $hub/$Repo, revision $Rev$(if ($commit) { ", commit $commit" } else { ' (the hub reported no commit for it)' })"
+Write-Output "hfget: to      $Dest"
+foreach ($p in $work) {
+  $what = switch ($p.Act) {
+    'keep'   { if ($p.Why) { "kept ($($p.Why))" } else { 'kept (already whole)' } }
+    'new'    { 'to fetch' }
+    'resume' { "to resume at byte $($p.Len)" }
+    'fresh'  { "to fetch again whole ($($p.Why))" }
+  }
+  Write-Output ("hfget:   {0}  {1:N0} bytes, {2}" -f $p.Entry.Path, $p.Entry.Size, $what)
+}
+Write-Output ("hfget: {0} file(s), {1:N0} bytes ({2:N2} GiB); {3:N0} bytes ({4:N2} GiB) to fetch" -f $entries.Count, $need, ($need / 1GB), $todo, ($todo / 1GB))
 if ($haveSt -gt 0) { Write-Output 'hfget: safetensors present, pickle weight formats skipped' }
 if ($null -eq $free) {
-  Write-Output ("hfget: {0:N1} GiB to fetch" -f ($todo / 1GB))
   [Console]::Error.WriteLine('hfget: warning: free space on the destination cannot be measured; going ahead')
 } else {
-  Write-Output ("hfget: {0:N1} GiB to fetch, {1:N1} GiB free on the destination volume" -f ($todo / 1GB), ($free / 1GB))
+  Write-Output ("hfget: {0:N1} GiB free on the destination volume" -f ($free / 1GB))
   if ($todo -gt $free) { [Console]::Error.WriteLine('hfget: THE DOWNLOAD DOES NOT FIT'); exit 3 }
 }
+if ($Plan) { Write-Output 'hfget: -Plan: nothing was fetched or changed'; exit 0 }
 
 # A FILE TO BE REPLACED THAT ANOTHER PROCESS HOLDS stops the run before anything changes: deleting
 # the rest would leave neither revision whole, and exit 3 lets hf_model.cpp serve the copy as is.
-$stale = @($plan | Where-Object { $_.Act -eq 'fresh' })
+$stale = @($work | Where-Object { $_.Act -eq 'fresh' })
 foreach ($p in $stale) {
   if (Test-InUse $p.Local) {
     [Console]::Error.WriteLine("hfget: $($p.Entry.Path) is to be fetched again ($($p.Why)) but another process has it open; nothing was changed")
@@ -372,7 +434,7 @@ function Finish-One($job) {
   Add-Progress 'done' $e
 }
 
-foreach ($p in $plan) {
+foreach ($p in $work) {
   $e = $p.Entry
   if ($p.Act -eq 'failed') { continue }
   if ($p.Act -eq 'keep') {
@@ -386,7 +448,7 @@ foreach ($p in $plan) {
   Begin-Change
   Add-Progress 'part' $e
   [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($p.Local))
-  $url = "$hub/$Repo/resolve/$Rev/$($e.Path)"
+  $url = "$hub/$Repo/resolve/$at/$($e.Path)"
   # One command line, quoted here: ProcessStartInfo takes the arguments as a single string. The
   # token goes on stdin (-K -), never here.
   $cargs = @('-sSL', '--fail', '--retry', '5', '--retry-delay', '5', '--retry-all-errors', '-C', '-')
@@ -422,4 +484,5 @@ Move-Item -LiteralPath $manTmp -Destination $manifest -Force
 if (Test-Path -LiteralPath $ledger) { Remove-Item -LiteralPath $ledger -Force }
 $total = if ($Only) { ($entries | Measure-Object Size -Sum).Sum } else { (Get-ChildItem -LiteralPath $Dest -Recurse -File | Measure-Object Length -Sum).Sum }
 Write-Output ("hfget: complete -- {0:N1} GiB in {1}" -f ($total / 1GB), $Dest)
+if ($Only) { Write-Output "hfget: verified $(Local-Path $Only)" }
 exit 0

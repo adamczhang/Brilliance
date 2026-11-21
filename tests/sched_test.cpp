@@ -6370,11 +6370,13 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
  * good, since the next step's history starts at its own context. */
 TEST(a_refused_lookahead_still_runs_the_history_pass) {
     Fixture f;
-    f.build(/*blocks=*/10, /*states=*/64);          /* exactly the prompt; nothing to look ahead into */
+    /* Brilliance: a prompt one short of the pool, which keeps the one position generation needs
+     * (a prompt of the pool's own size is refused at submission); still nothing to look ahead into. */
+    f.build(/*blocks=*/10, /*states=*/64);          /* the prompt and one position */
     f.cfg.n_spec = 4;
     CHECK_OK(f.start());
 
-    f.submit(160, 64);
+    f.submit(159, 64);
     CHECK(f.sch.step() != nullptr);
     f.commit_plain();
 
@@ -6383,7 +6385,7 @@ TEST(a_refused_lookahead_still_runs_the_history_pass) {
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 0);   /* nobody drafts */
     const RadBatch* hb = f.sch.serial_batch(0, 1);
     REQUIRE(hb != nullptr);
-    CHECK_EQ(hb->n_tok, 160);                             /* but the history is written */
+    CHECK_EQ(hb->n_tok, 159);                             /* but the history is written */
     f.sch.serial_end(0);
 }
 
@@ -6535,13 +6537,15 @@ TEST(a_head_with_no_cache_of_its_own_runs_one_row_and_stays_put) {
 TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
     for (int shared = 0; shared < 2; ++shared) {
         Fixture f;
-        f.build(/*blocks=*/10, /*states=*/64);      /* exactly the prompt: nothing to look ahead into */
+        /* Brilliance: the prompt and the one position generation needs (a prompt of the pool's own
+         * size is refused at submission): nothing to look ahead into. */
+        f.build(/*blocks=*/10, /*states=*/64);
         f.cfg.n_spec = 4;
         f.prog.drafter.kind  = RAD_DRAFT_SERIAL;
         f.prog.drafter.depth = 4;
         f.prog.drafter_shared_kv = shared != 0;
         CHECK_OK(f.start());
-        f.submit(160, 64);
+        f.submit(159, 64);
         CHECK(f.sch.step() != nullptr);
         f.commit_plain();
         int rounds = 4;
@@ -6552,7 +6556,7 @@ TEST(a_head_with_no_cache_of_its_own_runs_no_pass_when_nothing_drafts) {
             CHECK(hb == nullptr);
         } else {
             REQUIRE(hb != nullptr);
-            CHECK_EQ(hb->n_tok, 160);
+            CHECK_EQ(hb->n_tok, 159);
         }
         f.sch.serial_end(0);
     }
@@ -6738,15 +6742,159 @@ TEST(a_refused_admission_holds_its_chain_until_the_request_goes) {
     Fixture f;
     f.build(/*blocks=*/20, /*states=*/64);
     CHECK_OK(f.start());
+    f.submit(32, 64);                             /* a runner can still free capacity */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain();
     f.pc.seed(240);
     f.pc.attn = 0;
     const uint64_t a = f.submit(160, 8);             /* the cache gives nothing back */
-    CHECK(f.sch.step() == nullptr);
+    CHECK(f.sch.step() != nullptr);
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Waiting);
     REQUIRE_EQ(f.pc.holds.size(), 1u);
     CHECK_EQ(f.pc.holds[0], a);
     CHECK_OK(f.sch.cancel(a));
     CHECK(std::find(f.pc.releases.begin(), f.pc.releases.end(), a) != f.pc.releases.end());
+}
+
+TEST(an_idle_capacity_blocked_head_fails_and_releases_its_hold_for_a_follower) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/4096,
+            /*windowed=*/false, /*linear=*/false);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 64;                              /* the head adopts four cached blocks */
+    const uint64_t head = f.submit(160, 8);
+    const uint64_t small = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.find(head)->n_computed, 64);
+    CHECK(!f.kv.has_sequence(head));
+    CHECK_EQ(std::count(f.pc.holds.begin(), f.pc.holds.end(), head), 1);
+    CHECK_EQ(std::count(f.pc.releases.begin(), f.pc.releases.end(), head), 1);
+    for (int32_t block : f.pc.seeded[0]) CHECK_EQ(f.kv.refcnt[0][(size_t)block], 1);
+}
+
+TEST(a_fresh_idle_request_recovers_an_orphaned_state_slot) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/1);
+    CHECK_OK(f.start());
+    f.kv.state_free[1].clear();
+    const uint64_t head = f.submit(16, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(an_admission_allocator_error_keeps_its_status_without_cache_eviction) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(an_allocator_error_after_passing_the_whole_prompt_gate_keeps_its_status) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_STATE;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_STATE);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(an_idle_request_waits_for_external_capacity_and_runs_when_it_arrives) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 1);
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+}
+
+TEST(prefix_eviction_can_admit_an_external_waiter_without_a_broker_grant) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_frees = true;
+    f.pc.evict_grant = 1 << 20;
+    f.kv.waiting_for_fleet = true;                 /* the broker allowance never changes */
+    const uint64_t head = f.submit(160, 8);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Running);
+    CHECK(f.pc.evict_calls > 0);
+    CHECK(f.kv.waiting_for_fleet);
+}
+
+TEST(an_external_capacity_wait_can_be_cancelled_without_blocking_its_follower) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit(16, 8);
+    const uint64_t small = f.submit(16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_FULL;
+    f.kv.waiting_for_fleet = true;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Waiting);
+    CHECK_OK(f.sch.cancel(head));
+    f.kv.ensure_error = RAD_OK;
+    f.kv.waiting_for_fleet = false;
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ((int)f.sch.find(small)->state, (int)ReqState::Running);
+    CHECK(!f.kv.has_sequence(head));
+}
+
+TEST(a_backing_allocation_failure_does_not_evict_prefix_cache) {
+    server::Sink sink;
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    const uint64_t head = f.submit_to(&sink, 16, 8);
+    f.kv.ensure_fail_id = head;
+    f.kv.ensure_error = RAD_E_NOMEM;
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
+    CHECK_EQ(f.pc.evict_calls, 0);
+    CHECK_EQ(sink.status(), RAD_E_NOMEM);
+}
+
+TEST(an_idle_admission_still_reclaiming_cache_gets_another_pass) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    f.pc.seed(240);
+    f.pc.attn = 0;
+    f.pc.evict_grant = 256 * 256 + 1;
+    const uint64_t head = f.submit(160, 8);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Waiting);
+    CHECK_EQ(f.pc.evict_calls, 256);
+    CHECK(f.sch.step() == nullptr);
+    CHECK_EQ((int)f.sch.find(head)->state, (int)ReqState::Failed);
 }
 
 /* An engine that has stopped answers every request it held and refuses new ones, rather than
@@ -7752,7 +7900,8 @@ TEST(the_last_request_short_of_a_block_yields_to_the_requests_ahead_of_it) {
 /* A prompt the KV pool cannot hold even alone is refused when it is submitted, with the sink
  * failed and the reason naming the pool's size, and the queue behind it moves on. Admitted, it
  * would wait at the head of the queue forever (admission takes only what the pool holds), and
- * its client would get no reply at all. A prompt of exactly the pool's size runs. */
+ * its client would get no reply at all. A prompt one short of the pool's size runs (Brilliance:
+ * the pool's own size leaves no position to generate in; the test below). */
 TEST(a_prompt_the_kv_pool_can_never_hold_is_refused_when_submitted) {
     server::Sink refused, fits;
     Fixture f;
@@ -7766,9 +7915,9 @@ TEST(a_prompt_the_kv_pool_can_never_hold_is_refused_when_submitted) {
     CHECK_EQ(refused.status(), (int)RAD_E_FULL);
     CHECK(has(refused.why() ? refused.why() : "", "maximum context length is 320 tokens"));
 
-    const uint64_t ok = f.submit_to(&fits, 320, 1);
+    const uint64_t ok = f.submit_to(&fits, 319, 1);
     REQUIRE(ok != 0);
-    for (int t = 0; t < 4 && !fits.done(); ++t) {      /* two chunks: 256, then 64 */
+    for (int t = 0; t < 4 && !fits.done(); ++t) {      /* two chunks: 256, then 63 */
         REQUIRE(f.sch.step() != nullptr);
         CHECK_EQ(f.sch.plan().e[0].seq, ok);
         f.commit_plain();
@@ -7776,6 +7925,37 @@ TEST(a_prompt_the_kv_pool_can_never_hold_is_refused_when_submitted) {
     CHECK(fits.done());
     CHECK_EQ(fits.n_produced(), (int64_t)1);
     CHECK_EQ((int)fits.finish_reason(), (int)server::Finish::Length);
+}
+
+/* Brilliance (2026-11-20, found on a card under #558's check): the pool's boundary is the
+ * context's. A generation prompt of exactly the pool's size leaves no position to generate in, so
+ * it is refused at submission as a context overflow (RAD_E_FULL, a 400 at the front door) rather
+ * than prefilled and then failed at its first decode step as kv_exhausted (a 500). An embedding
+ * needs no generation position and is admitted at that size; one past it is refused. */
+TEST(the_kv_pool_boundary_distinguishes_embeddings_from_generation) {
+    for (bool embed : {false, true}) {
+        for (int length : {319, 320, 321}) {
+            server::Sink sink;
+            Fixture f;
+            f.build(/*blocks=*/20, /*states=*/64);  /* 320 tokens, under the 4096 context */
+            REQUIRE_EQ(f.start(), RAD_OK);
+            auto r = f.request(length, 8);
+            r->embed = embed;
+            r->sink = &sink;
+            const bool fits = length < 320 || (embed && length == 320);
+            const int added = f.sch.add(std::move(r));
+            if (fits) {
+                CHECK_EQ(added, (int)RAD_OK);
+                CHECK(!sink.done());
+                continue;
+            }
+            CHECK_EQ(added, (int)RAD_E_FULL);
+            CHECK(sink.done());
+            CHECK_EQ(sink.status(), (int)RAD_E_FULL);
+            CHECK(has(sink.why() ? sink.why() : "", "maximum context length is 320 tokens"));
+            CHECK(f.sch.step() == nullptr);          /* nothing was queued: no kv_exhausted */
+        }
+    }
 }
 
 /* A client that hung up is closed Cancelled at the next commit, and its blocks go back then. */

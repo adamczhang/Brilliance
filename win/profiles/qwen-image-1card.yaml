@@ -1,10 +1,10 @@
 # Brilliance profile: Qwen-Image 2.1 IQ8R (pictures) on one Radeon AI PRO R9700.
 # OpenAI's images API only: /v1/images/generations and /v1/images/edits; chat and embeddings answer
-# 501. 8,192 tokens a request: pictures up to about 1.9 megapixels (1024x1024 is 4,096 tokens), as
-# upstream's one-card entry (deploy/compose/tp1.radiance.yaml). The engine sizes the step and batch
-# for an image model itself, and turns drafting and the prefix cache off. Runs, not yet qualified:
-# started, made a 1024x1024 picture and stopped cleanly on one card; edits come out with colour noise
-# (SUPPORT.md, known issue 13).
+# 501. max-model-len 8192 is upstream's one-card entry (deploy/compose/tp1.radiance.yaml); it does
+# not limit the picture: the engine takes up to 16,800 latent tokens, and 1536x1536 and 2048x2048, the
+# model's default size, were generated on one card. The engine sizes the step and batch for an
+# image model itself, and turns drafting and the prefix cache off. Qualified for generation on one
+# card; edits work for most seeds, but some come out with colour noise (SUPPORT.md, known issue 13).
 #
 #   .\serve.ps1 qwen-image-1card -Bus 6
 #   bin\radiance.exe --config profiles\qwen-image-1card.yaml

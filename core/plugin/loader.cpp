@@ -556,6 +556,10 @@ int Registry::commit_(Staged& s, int order) {
         return RAD_E_INVAL;
     }
 
+    /* Brilliance: the plugin's own lines through this logger (rad_plugin_set_log, optional), so its
+     * W lines count into the startup report's FINDINGS; handed over before it opens, which logs. */
+    if (auto set_log = dl_fn<RadPluginSetLogFn>(s.handle, "rad_plugin_set_log")) set_log(&log_line_at);
+
     /* Called once after load, before any selection (rad_abi.h). A plugin that cannot open is
      * refused. */
     if (auto open = dl_fn<RadPluginOpenFn>(s.handle, "rad_plugin_open")) {

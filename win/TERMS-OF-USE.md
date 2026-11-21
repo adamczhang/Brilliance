@@ -9,7 +9,9 @@ server, the person or organisation that runs it, sets them and is responsible fo
 > models you do not serve, add your own terms, and set `terms-file:` under `server:` to your copy.
 > Then remove this note. Some model licences require whoever serves the model to other people to
 > pass the licence's use restrictions on to them as enforceable terms. The sections below carry
-> those restrictions for the models Brilliance 0.3.0 lists.
+> those restrictions for the models Brilliance 0.3.0 lists. Other licences set conditions on you,
+> the operator, before you serve the model commercially: Qwen3.8-Flash-Next's licence is one
+> (its section below). Read those conditions before you serve the model to anyone.
 
 ## Using this service
 
@@ -32,7 +34,7 @@ The full text of each licence is at `/terms/licenses` on this server.
 | SDXL base 1.0 (pictures) | CreativeML Open RAIL++-M | Yes, below |
 | EmbeddingGemma 2 (embeddings) | Apache 2.0 | The Gemma Prohibited Use Policy, below |
 | Qwen3.8-27B | Apache 2.0 | None |
-| Qwen3.8-Flash-Next | Qwen Community License 1.0 | None |
+| Qwen3.8-Flash-Next | Qwen Community License 1.0 | Yes, below: lawful use that infringes no one's intellectual property; commercial-use and attribution conditions on the operator |
 | MiniCPM5-2B | Apache 2.0 | None |
 | Qwen3-ASR 1.7B (transcription) | Apache 2.0 | None |
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | None |
@@ -225,6 +227,42 @@ Deployments must adhere to the [Gemma Prohibited Use Policy](https://ai.google.d
 
 By using EmbeddingGemma 2 here you agree to follow the Gemma Prohibited Use Policy:
 https://ai.google.dev/gemma/prohibited_use_policy
+
+## Qwen3.8-Flash-Next
+
+Qwen3.8-Flash-Next is licensed under the Qwen Community License 1.0 (Copyright (c) 2026 Qwen). It
+lets anyone use, copy, modify, distribute, deploy and host the model, subject to two conditions,
+quoted below as the licence states them. The whole licence is at
+`/terms/licenses/qwen-community-1.0` on this server, and in the model's repository,
+https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4.
+
+The conditions and the licence's definitions:
+
+```text
+1. The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software. If the Software (or any derivative works thereof) is Used for any of the licensee's commercial products or services that have more than 100,000,000 monthly active users or US$ 20,000,000 (or equivalent in other currencies) monthly revenue, respective model name must be prominently displayed on the user interface of such product or service; and,
+
+2. If the licensee or any of its affiliates conducts a Model as a Service or AI Work Assistant business, the licensee shall obtain a separate license from Qwen before Using the Software or its derivative works for any commercial purpose. The foregoing requirement shall not apply to the licensee's internal Use of the Software, provided that such Use does not make the Software, its outputs, or its underlying model capabilities available to any third party.
+
+"Model as a Service" means giving a third party access to language model inference or fine-tuning (e.g., via API or a hosted endpoint) in a manner that allows such third parties to exercise meaningful control over the inputs, parameters, or training data. This does not include the mere relaying of requests to models hosted by other third parties.
+“AI Work Assistant” means an independent AI-powered product primarily designed for AI-assisted coding or office productivity (e.g., Qoder and QwenWork). It does not include: (a) a single-purpose AI tool (such as an AI translation tool); (b) an AI assistant primarily designed for a domain other than coding or office productivity (such as Taobao AI Shopping Assistant or AMap AI Chat); or (c) an AI assistant that is a feature of a product whose primary purpose is not AI-assisted coding or office productivity.
+```
+
+What they mean in practice:
+
+- **A separate licence for some commercial use.** If the operator, or any of its affiliates, runs
+  a Model as a Service or AI Work Assistant business, it needs a separate licence from Qwen before
+  it uses the model for any commercial purpose. Serving the model to other people through this
+  server's API can be Model as a Service under the definition above. Qwen's contact for licences
+  is model-business@notice.qwencloud.com.
+- **The model's name on large products.** A commercial product or service built on the model
+  with more than 100,000,000 monthly active users or US$ 20,000,000 monthly revenue must show the
+  model's name prominently in its user interface.
+- **The notice.** Copies of the model, or substantial portions of it, keep the licence's copyright
+  and permission notice.
+
+The licence also says: "THE USE OF THE SOFTWARE MUST COMPLY WITH APPLICABLE LAWS AND REGULATIONS,
+AND MUST NOT INFRINGE THE INTELLECTUAL PROPERTY RIGHTS OF ANY THIRD PARTY." By using
+Qwen3.8-Flash-Next here you agree to do so.
 
 ## Qwen-Image 2.1 (pictures)
 

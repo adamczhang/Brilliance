@@ -1072,11 +1072,13 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
 
     /* All-reduce link accounting: `n` is the collective's numel (its ranged parameter) and operand
      * 0's dtype is the wire element type. The op's `dtype` key ("w4a8") is not an element
-     * width. */
-    if (p.billed && n_opd > 0) {
-        const int bits = rad_dtype_bits(t[0].dtype);
+     * width. Brilliance: a fused all-reduce's `n` is its row count, so it is scaled by the row
+     * length, and its message operand need not be the first (OpPlan::bill_opd, bill_width). */
+    if (p.billed && n_opd > p.bill_opd) {
+        const int bits = rad_dtype_bits(t[p.bill_opd].dtype);
         ar_calls_.fetch_add(1, std::memory_order_relaxed);
-        if (bits > 0) ar_bytes_.fetch_add(n * bits / 8, std::memory_order_relaxed);
+        if (bits > 0)
+            ar_bytes_.fetch_add(n * p.bill_width * bits / 8, std::memory_order_relaxed);
     }
 
     /* The oracle snapshots every operand before the launch, so the host kernel sees the same

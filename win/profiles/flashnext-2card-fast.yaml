@@ -1,0 +1,47 @@
+# Fastest option for Qwen3.8-Flash-Next IQR-V4 on two cards. Use flashnext-2card for the
+# recommended safe settings (exact wire and copy engines off).
+#
+# wht6 compresses all-reduce messages of 128 KiB and above, including prefill. It is lossy
+# and can change greedy text. On Flash-Next TP2 the measured change in next-token probabilities
+# was small, comparable to changing prefill chunks or KV cache precision. All 124 greedy
+# test answers matched the exact wire.
+#
+# Two timing sessions on Radeon AI PRO R9700s (PCI buses 3 and 9, -20% board power,
+# -50 mV, 2518 MHz VRAM) measured about 10% faster prefill at 32K-128K with wht6.
+# With the exact wire, enabling SDMA kept the drafters exact in sequential greedy tests.
+# SDMA showed no prefill gain. Single-stream decode was 4-6% faster against the second
+# off baseline, within run-to-run variation.
+#
+#   .\serve.ps1 flashnext-2card-fast -Bus 3,9
+# The launcher applies the directive below at startup. For a direct radiance.exe launch, set
+# BRILLIANCE_SDMA=1 in the process environment as well as selecting the two cards.
+# brilliance-env: BRILLIANCE_SDMA=1
+server:
+  host: 127.0.0.1
+  port: 8000
+memory:
+  gpu-headroom-mib: 160
+scheduler:
+  load-timeout: 600s
+models:
+  qwen3.8-next-flash:
+    model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
+    tp: 2
+    tp-wire: wht6
+    placement: expert_tiered
+    host-pool-mib: 16384
+    max-num-seqs: 8
+    max-model-len: 262144
+    kv-cache-dtype: i8
+    prefix-cache-mib: 4096
+    checkpoint-slots: 8
+    vision-tower-placement: ram
+    num-speculative-tokens: 5
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+    draft-depth-load: on
+    max-num-batched-tokens: 6144
+    prefill-span: 3
+    ngram-warm: true

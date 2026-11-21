@@ -27,6 +27,7 @@
 // This file was BRILLIANCE_AR4_CHECK's (a diagnostic that verified AFTER the reduce, reading the
 // mailbox once): W1 retires the switch and keeps its check words and writer (design 2.3, item 5).
 #include "r4d.h"
+#include "r4d_log.h"   // Brilliance: W lines through the host's logger
 #include <cstring>
 #include <cstdio>
 #include <mutex>
@@ -529,14 +530,13 @@ unsigned int inj_pick(long long req, unsigned int op, int rank, int nb, int word
   }
   int dev = -1;
   if (hipGetDevice(&dev) != hipSuccess) (void)hipGetLastError();
-  std::fprintf(stderr, "W r4d: fault injection (BRILLIANCE_AR_INJECT): %s%s%s into %s%s%s on device "
-               "%d, rank %d's push to rank %d, block %d of %d (about %d words a block), line %d of the "
-               "block; injection %llu\n", k_mode[asked], mode != asked ? " as " : "",
-               mode != asked ? k_mode[mode] : "", op_name(op),
-               op == R4D_AR_OP_W_TWOSHOT || op == R4D_AR_OP_W_CODED ? (phase ? " (hop 2)" : " (hop 1)") : "",
-               rs ? " (with the resend)" : "", dev, rank, peer_rank, blk, nb, words_a_block, off,
-               ord + 1ull);
-  std::fflush(stderr);
+  r4d_log(1, "r4d: fault injection (BRILLIANCE_AR_INJECT): %s%s%s into %s%s%s on device "
+          "%d, rank %d's push to rank %d, block %d of %d (about %d words a block), line %d of the "
+          "block; injection %llu", k_mode[asked], mode != asked ? " as " : "",
+          mode != asked ? k_mode[mode] : "", op_name(op),
+          op == R4D_AR_OP_W_TWOSHOT || op == R4D_AR_OP_W_CODED ? (phase ? " (hop 2)" : " (hop 1)") : "",
+          rs ? " (with the resend)" : "", dev, rank, peer_rank, blk, nb, words_a_block, off,
+          ord + 1ull);
   return r4d_arw_inj_word(mode, (unsigned int)blk, (unsigned int)pidx, phase, (unsigned int)off);
 }
 

@@ -16,7 +16,11 @@
 #include "rad_test.h"
 #include "rad_core.h"
 #include "fleet/config.h"
+#include "format/radfile.h"
 #include "format/table_warm.h"
+
+#include <cstdio>
+#include <cstdint>
 
 #include <string>
 #include <utility>
@@ -179,6 +183,102 @@ TEST(the_profile_key_is_ngram_warm_true_or_false) {
     fleet::FleetConfig bad;
     CHECK(fleet::parse("models:\n  q:\n    model: /m/q.rad\n    ngram-warm: yes\n", "p.yaml", &bad) !=
           RAD_OK);
+}
+
+/* ---- how it reads (ngram-warm-tune) ------------------------------------------------------- */
+
+TEST(the_default_reads_through_a_handle_per_reader_and_alpha3_is_kept) {
+    const TableWarmOpts d;
+    CHECK(d.io == WarmIo::Handle);
+    CHECK_EQ(d.readers, 16);
+    CHECK_EQ(d.piece, (int64_t)64 << 20);
+    const TableWarmOpts a = table_warm_opts_alpha3();
+    CHECK(a.io == WarmIo::Pread);
+    CHECK_EQ(a.readers, 8);
+    CHECK_EQ(a.piece, (int64_t)16 << 20);
+    CHECK_EQ(table_warm_opts_str(d), std::string("io=handle readers=16 piece=64.00 MiB"));
+}
+
+TEST(the_io_spec_sets_any_subset_and_refuses_the_rest) {
+    TableWarmOpts o;
+    std::string why;
+    CHECK_EQ(table_warm_opts_parse("io=pread,readers=8,piece=16M", &o, &why), RAD_OK);
+    CHECK(o.io == WarmIo::Pread);
+    CHECK_EQ(o.readers, 8);
+    CHECK_EQ(o.piece, (int64_t)16 << 20);
+    /* A subset keeps the rest; spaces separate as commas do; MiB and G spell sizes. */
+    CHECK_EQ(table_warm_opts_parse("io=prefetch piece=1GiB", &o, &why), RAD_OK);
+    CHECK(o.io == WarmIo::Prefetch);
+    CHECK_EQ(o.readers, 8);
+    CHECK_EQ(o.piece, (int64_t)1 << 30);
+    CHECK_EQ(table_warm_opts_parse("", &o, &why), RAD_OK);
+    CHECK(o.io == WarmIo::Prefetch);
+    /* Refused, and `o` left as it was. */
+    for (const char* bad : { "io=seq", "readers=0", "readers=65", "piece=512K", "piece=2G",
+                             "piece=12Q", "threads=4", "readers=" }) {
+        why.clear();
+        CHECK_EQ(table_warm_opts_parse(bad, &o, &why), RAD_E_INVAL);
+        CHECK(!why.empty());
+    }
+    CHECK(o.io == WarmIo::Prefetch);
+    CHECK_EQ(o.piece, (int64_t)1 << 30);
+}
+
+/* A real read of a small container's weight range in each mode: every byte of the range is
+ * counted once, whatever the split into readers and pieces, and a range past the end fails with
+ * what was read before it. */
+TEST(each_mode_reads_the_whole_range_once) {
+    const std::string path = radtest::tmp_path("ngram_warm_read.rad");
+    {
+        RadWriter w;
+        CHECK_OK(w.begin(path.c_str()));
+        w.set_arch("radtest");
+        RadWriter::Weight x;
+        x.name = "blk.1.ple_ngram.weight";
+        x.enc = rad_enc_plain(RAD_BF16);
+        x.rank = 2;
+        x.shape[0] = 1536;    /* 1536 x 2048 bf16: 6 MiB, three 2 MiB-aligned spans of 2 MiB */
+        x.shape[1] = 2048;
+        x.layer = 1;
+        std::vector<uint8_t> plane((size_t)1536 * 2048 * 2, 0x5a);
+        const void* p[1] = { plane.data() };
+        CHECK(w.add_weight(x, p) >= 0);
+        CHECK_OK(w.finish());
+    }
+    RadFile f;
+    REQUIRE(f.open(path.c_str()) >= 0);
+    const RadFileEntry* e = nullptr;
+    for (int64_t i = 0; i < f.entry_count(); ++i)
+        if (std::string(f.str(f.entry(i).name)) == "blk.1.ple_ngram.weight") e = &f.entry(i);
+    REQUIRE(e != nullptr);
+    const RadFilePlane& pl = f.plane(*e, 0);
+    const std::vector<std::pair<int64_t, int64_t>> rg = { { (int64_t)pl.offset, (int64_t)pl.bytes } };
+    for (const char* spec : { "io=pread,readers=8,piece=16M", "io=handle,readers=3,piece=1M",
+                              "io=handle,readers=16,piece=64M", "io=prefetch,readers=4,piece=1M" }) {
+        TableWarmOpts o;
+        std::string why;
+        REQUIRE_EQ(table_warm_opts_parse(spec, &o, &why), RAD_OK);
+        int64_t bytes = -1;
+        double secs = -1;
+        CHECK_EQ(table_warm_read(f, rg, &bytes, &secs, &why, o), RAD_OK);
+        CHECK_EQ(bytes, (int64_t)pl.bytes);
+        CHECK(secs >= 0);
+        CHECK(why.empty());
+    }
+    /* Past the end: an error and a reason (pread and handle; prefetch reads nothing itself). */
+    for (const char* spec : { "io=pread", "io=handle" }) {
+        TableWarmOpts o;
+        std::string why;
+        REQUIRE_EQ(table_warm_opts_parse(spec, &o, &why), RAD_OK);
+        int64_t bytes = -1;
+        double secs = -1;
+        const std::vector<std::pair<int64_t, int64_t>> past = { { f.size() - 4096, 1 << 20 } };
+        CHECK(table_warm_read(f, past, &bytes, &secs, &why, o) < 0);
+        CHECK(!why.empty());
+        CHECK(bytes < (int64_t)(1 << 20));
+    }
+    f.close();
+    std::remove(path.c_str());
 }
 
 RAD_TEST_MAIN()

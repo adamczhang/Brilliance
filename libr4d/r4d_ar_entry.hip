@@ -20,6 +20,7 @@
 
 #include "r4d_args.h"
 #include "r4d.h"
+#include "r4d_log.h"       /* Brilliance: W lines through the host's logger */
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
 #include "r4d_ar_seq.h"     /* the two-rank flags layout (R4D_AR2_*) and the fault record */
@@ -390,19 +391,26 @@ int ar8_settle(ArInst* in, int rank, int world) {
 static const char* const kMbMemName[] = { "default", "coherent", "wc", "noncoherent", "uncached",
                                           "noncoherent-slots" };
 static const int kMbNcSlots = 5;   /* kMbMemName's noncoherent-slots */
+/* Brilliance: read once a process (r4d_ar_env_read reads it at rad_plugin_open), its warning
+ * through r4d_log; r4d_ar_env_unread makes a test read it again. */
+static std::atomic<int> g_mb_mem{ -2 };   /* -2 not read yet, -1 unset, else kMbMemName's index */
 static int mailbox_mem_mode() {
-    static const int m = [] {
-        const char* v = std::getenv("BRILLIANCE_MAILBOX_MEM");
-        if (!v || !*v) return -1;
+    int m = g_mb_mem.load(std::memory_order_relaxed);
+    if (m != -2) return m;
+    const char* v = std::getenv("BRILLIANCE_MAILBOX_MEM");
+    bool bad = false;
+    m = -1;
+    if (v && *v) {
+        bad = true;
         for (int i = 0; i < 6; ++i)
-            if (!std::strcmp(v, kMbMemName[i])) return i;
-        std::fprintf(stderr, "W r4d: BRILLIANCE_MAILBOX_MEM=%s is not one of default, coherent, wc, "
-                     "noncoherent, uncached, noncoherent-slots; ignored, the host mailboxes take the "
-                     "default (noncoherent-slots)\n", v);
-        std::fflush(stderr);
-        return -1;
-    }();
-    return m;
+            if (!std::strcmp(v, kMbMemName[i])) { m = i; bad = false; break; }
+    }
+    int want = -2;
+    if (g_mb_mem.compare_exchange_strong(want, m) && bad)
+        r4d_log(1, "r4d: BRILLIANCE_MAILBOX_MEM=%s is not one of default, coherent, wc, "
+                "noncoherent, uncached, noncoherent-slots; ignored, the host mailboxes take the "
+                "default (noncoherent-slots)", v);
+    return g_mb_mem.load(std::memory_order_relaxed);
 }
 
 static unsigned mailbox_mem_flags(int mode, bool slots) {
@@ -1364,9 +1372,8 @@ static void mb_bad_async(MbJob j) {
             out += b;
         }
     }
-    std::fprintf(stderr, "W r4d: bad-block comparison (rank %d's mailbox, slot %d, block %d; read after the "
-                 "dump):%s\n", j.rank, slot, blk, out.c_str());
-    std::fflush(stderr);
+    r4d_log(1, "r4d: bad-block comparison (rank %d's mailbox, slot %d, block %d; read after the "
+            "dump):%s", j.rank, slot, blk, out.c_str());
 }
 
 /* ------------------------------------------------------------------ the stall capture
@@ -2051,8 +2058,7 @@ static void cap_run(const MbJob& j) {
                      head.c_str(), rep.c_str());
         std::fclose(f);
     }
-    std::fprintf(stderr, "W r4d: %s%s\n", head.c_str(), rep.c_str());
-    std::fflush(stderr);
+    r4d_log(1, "r4d: %s%s", head.c_str(), rep.c_str());
 }
 
 /* Brilliance, diagnostic: the backend's pinned host allocations, for the stall capture's origin
@@ -3124,25 +3130,24 @@ static int ar_inj_set(const char* spec, bool from_env) {
     if (v && *v && std::strcmp(v, "0") && _stricmp(v, "off")) {
         on = ar_inj_parse(v, &c);
         if (!on)
-            std::fprintf(stderr, "W r4d: BRILLIANCE_AR_INJECT=\"%s\" is not <op>:<mode>:<every>[:<rank>] "
-                         "(op hc|ghc|exact|gather|wht6|hc6|ghc6, mode lose|dup|stuck|noflag|ctl-flag|"
-                         "pair|late|ctl-ack|ctl-rq, every >= 1, rank 0|1) or <op>:<mode>:<every>[:<rank>"
-                         "[:<peer>]] (op hc4|ghc4|exact4|gather4|ts4a|ts4b|ts4ca|ts4cb, mode lose|dup|stuck|noflag|"
-                         "ctl-flag|pair|late|ctl-ack|ctl-rq|multi|cross, rank 0-3, peer 0-3 not the "
-                         "rank); no injection\n", v);
+            r4d_log(1, "r4d: BRILLIANCE_AR_INJECT=\"%s\" is not <op>:<mode>:<every>[:<rank>] "
+                    "(op hc|ghc|exact|gather|wht6|hc6|ghc6, mode lose|dup|stuck|noflag|ctl-flag|"
+                    "pair|late|ctl-ack|ctl-rq, every >= 1, rank 0|1) or <op>:<mode>:<every>[:<rank>"
+                    "[:<peer>]] (op hc4|ghc4|exact4|gather4|ts4a|ts4b|ts4ca|ts4cb, mode lose|dup|stuck|noflag|"
+                    "ctl-flag|pair|late|ctl-ack|ctl-rq|multi|cross, rank 0-3, peer 0-3 not the "
+                    "rank); no injection", v);
         else if (c.wide && c.rank2 >= 0)
-            std::fprintf(stderr, "W r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): ranks %d's and %d's "
-                         "pushes to rank %d, in the same block, every %lld-th launch of the op on each "
-                         "four-rank host instance\n", v, c.rank, c.rank2, c.peer, c.every);
+            r4d_log(1, "r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): ranks %d's and %d's "
+                    "pushes to rank %d, in the same block, every %lld-th launch of the op on each "
+                    "four-rank host instance", v, c.rank, c.rank2, c.peer, c.every);
         else if (c.wide)
-            std::fprintf(stderr, "W r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): rank %d's push to "
-                         "rank %d, every %lld-th launch of the op on each four-rank host instance\n",
-                         v, c.rank, c.peer, c.every);
+            r4d_log(1, "r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): rank %d's push to "
+                    "rank %d, every %lld-th launch of the op on each four-rank host instance",
+                    v, c.rank, c.peer, c.every);
         else
-            std::fprintf(stderr, "W r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): rank %d's push, "
-                         "every %lld-th launch of the op on each two-rank host instance\n", v, c.rank,
-                         c.every);
-        std::fflush(stderr);
+            r4d_log(1, "r4d: fault injection ON (BRILLIANCE_AR_INJECT=%s): rank %d's push, "
+                    "every %lld-th launch of the op on each two-rank host instance", v, c.rank,
+                    c.every);
     }
 #else
     (void)spec; (void)from_env;
@@ -3221,15 +3226,14 @@ static bool ar_resend_on() {
         v = (e && *e && (!std::strcmp(e, "0") || !std::strcmp(e, "off") || !std::strcmp(e, "OFF"))) ? 0 : 1;
         int want = -1;
         if (g_resend.compare_exchange_strong(want, v) && !v) {
-            std::fprintf(stderr, "W r4d: BRILLIANCE_AR_RESEND=%s: the two-rank host collectives "
-                         "(ar_hc_write, ar_gather_hc_write, the exact all-reduce, the all-gather) and "
-                         "the four-rank ones (W2-W4: ar_hc_write_4rank, ar_gather_hc_write_4rank, "
-                         "ar_oneshot_4rank_exact, ar_gather_4rank, ar_twoshot_4rank_exact) run without "
-                         "the resend (a wrong push block stops the engine, as in stage 1 and W1); the "
-                         "four-rank coded two-shot (overlap 1) runs its default kernel, with no stop; on "
-                         "tp-wire wht6, the wht6 all-reduce and the wht6 fused writes run as before the "
-                         "exchange, with no stop (a wrong push block waits for ever)\n", e);
-            std::fflush(stderr);
+            r4d_log(1, "r4d: BRILLIANCE_AR_RESEND=%s: the two-rank host collectives "
+                    "(ar_hc_write, ar_gather_hc_write, the exact all-reduce, the all-gather) and "
+                    "the four-rank ones (W2-W4: ar_hc_write_4rank, ar_gather_hc_write_4rank, "
+                    "ar_oneshot_4rank_exact, ar_gather_4rank, ar_twoshot_4rank_exact) run without "
+                    "the resend (a wrong push block stops the engine, as in stage 1 and W1); the "
+                    "four-rank coded two-shot (overlap 1) runs its default kernel, with no stop; on "
+                    "tp-wire wht6, the wht6 all-reduce and the wht6 fused writes run as before the "
+                    "exchange, with no stop (a wrong push block waits for ever)", e);
         }
         v = g_resend.load(std::memory_order_relaxed);
     }
@@ -3260,6 +3264,30 @@ static long long ar_wht6_bits(const ArInst* in, unsigned op) {
  * null to read the environment again); the launch counts start over. Returns 1 when on, 0 off. */
 extern "C" int r4d_ar_inject_pin(const char* spec) {
     return spec ? ar_inj_set(*spec ? spec : "off", false) : ar_inj_set(nullptr, true);
+}
+
+/* Brilliance (r4d_log.h): the collectives' environment switches, read at rad_plugin_open, so their
+ * W lines -- a bad BRILLIANCE_MAILBOX_MEM, BRILLIANCE_AR_RESEND=0, a bad BRILLIANCE_AR_INJECT or
+ * fault injection on -- are logged at start and counted into the startup report's FINDINGS. Each is
+ * read once and kept, as at the first collective that asked before; a value already read (or pinned
+ * by a test) stays. */
+extern "C" void r4d_ar_env_read(void) {
+    (void)mailbox_mem_mode();
+    (void)ar_resend_on();
+    if (g_inj_state.load(std::memory_order_acquire) < 0) (void)ar_inj_set(nullptr, true);
+}
+
+/* Test hook (plugin_test): the three switches above read again at the next ask (the next
+ * rad_plugin_open, or the first collective that asks), as in a fresh process. Only while no
+ * collective is built. */
+extern "C" void r4d_ar_env_unread(void) {
+    g_mb_mem.store(-2);
+    g_resend.store(-1);
+    std::lock_guard<std::mutex> lk(g_inj_cfg_mu);
+    g_inj_count.clear();
+    g_inj_done = 0;
+    g_inj_cfg = ArInjCfg{};
+    g_inj_state.store(-1, std::memory_order_release);
 }
 
 /* Test hook (r4d_selftest): clears every two-rank host twin's fault record and count, and the

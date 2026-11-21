@@ -17,13 +17,17 @@ param(
   [Parameter(Mandatory)][string]$Config,
   [Parameter(Mandatory)][string]$Log,
   [string]$Devices = '',
-  [string]$RadianceHome = ''
+  [string]$RadianceHome = '',
+  # Add to the log rather than start it afresh (serve.ps1 writes its own lines at its head first).
+  [switch]$Append
 )
 $ErrorActionPreference = 'Stop'
 $Bin = (Resolve-Path $Bin).Path
 $Config = (Resolve-Path $Config).Path
-New-Item -ItemType Directory -Force (Split-Path $Log) | Out-Null
-$Log = [IO.Path]::GetFullPath($Log)
+# The log's full path first, against this PowerShell's location (a bare `srv.log` has no parent of
+# its own, and New-Item refuses the empty one), then its folder.
+$Log = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Log)
+New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($Log)) | Out-Null
 # Without -RadianceHome the engine finds its plugin home beside itself: share\radiance in a
 # package, radiance_home in a build tree.
 if ($RadianceHome) { $env:RADIANCE_HOME = $RadianceHome }
@@ -34,7 +38,8 @@ if ($Devices) { $env:HIP_VISIBLE_DEVICES = $Devices }
 # hidden (the owner, 2026-11-18: no windows on the desktop); the console still exists, so the
 # Ctrl-Break that stop-server.ps1 sends through AttachConsole still reaches the engine. Closing a
 # visible server console had ended a hung test server once (why-prod-hwq2-1).
-$cmd = "`"`"$Bin\radiance.exe`" --config `"$Config`" > `"$Log`" 2>&1 & echo radiance exit status !errorlevel! >> `"$Log`"`""
+$redir = if ($Append) { '>>' } else { '>' }
+$cmd = "`"`"$Bin\radiance.exe`" --config `"$Config`" $redir `"$Log`" 2>&1 & echo radiance exit status !errorlevel! >> `"$Log`"`""
 $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/v:on', '/c', $cmd -WindowStyle Hidden -PassThru
 # The engine is cmd's child; wait until it exists and report its id.
 for ($i = 0; $i -lt 100; $i++) {

@@ -101,6 +101,11 @@ uint64_t log_warn_lines(int owner) {
     return it == warn_lines().end() ? 0 : it->second;
 }
 
+void log_line_at(int level, const char* line) {
+    const Log l = level >= (int)Log::Error && level <= (int)Log::Trace ? (Log)level : Log::Info;
+    RAD_LOG_AT(l, "%s", line ? line : "");
+}
+
 std::string log_sanitize(const std::string& s) {
     std::string out = s;
     for (char& c : out) {

@@ -84,15 +84,31 @@ struct OpPlan {
      * (rad_kernel_collective) and the conventional all_reduce. The weight stager's copies share
      * the link and give way to it while it runs (Ctx::issue_body). */
     bool          collective = false;
-    /* The conventional all_reduce, whose `n` is the message's element count, so its link bytes
-     * can be counted (ar_bytes) apart from the expert mover's. */
+    /* An op that all-reduces a message, so its link bytes are counted (ar_bytes) apart from the
+     * expert mover's: the conventional all_reduce, and the ops that fold one in (ar_hc_write,
+     * ar_gather_hc_write, the ar_rmsnorm_* and ar_ln_* families). Brilliance: upstream bills only
+     * the all_reduce, which left the fused residual writes, most of a TP2 prefill step's bytes,
+     * out of /stats. See ar_billing(). */
     bool          billed = false;
+    /* For a billed op, the message's operand and its elements per unit of the issued `n`: the
+     * all_reduce's `n` is the element count (width 1), a fused op's is its row count `M` (width
+     * its row length `n`). The bytes an issue adds are n * bill_width * the operand's element
+     * size. */
+    int32_t       bill_opd   = 0;
+    int64_t       bill_width = 1;
     /* Runtime LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
     int32_t       lora_site = -1;
     /* Its position in the declared order, or its anchor's for a core-appended op: what the second
      * lane's window (Program::lane1_w0..lane1_w1) is checked against. */
     int32_t       order = 0;
 };
+
+/* Brilliance: whether issuing `op` all-reduces a message, and if so the message's operand and its
+ * elements per unit of the issued `n` (OpPlan::bill_opd, bill_width). The all_reduce bills operand
+ * 0 at width 1. An op that folds an all-reduce in bills its message operand at width `n` (its row
+ * length) when its ranged parameter is the row count `M`; with no such range, or no `n`, it is not
+ * billed rather than billed wrong. Every other op: false. Pure; bind calls it once per op. */
+bool ar_billing(const OpInfo& op, int32_t* opd, int64_t* width);
 
 /* ------------------------------------------------------------------ routing handoff */
 /* A ring of routing-histogram staging banks, indexed by step, so the heat engine reads histograms
@@ -396,7 +412,9 @@ public:
      *
      * `ar_bytes` is the message payload, numel * element size, summed over issues. At two ranks
      * that equals the bytes pushed across the link (one-shot and two-shot alike); at more ranks it
-     * is a floor. A lossy wire (--tp-wire) still counts the uncompressed payload.
+     * is a floor. A lossy wire (--tp-wire) still counts the uncompressed payload. Brilliance: the
+     * ops that fold an all-reduce in (ar_hc_write and the rest, OpPlan::billed) count too, rows *
+     * row length * element size; `ar_calls` counts them as calls.
      *
      * Relaxed atomics: written by this rank's step thread, read by any thread. */
     int64_t     ar_calls() const { return ar_calls_.load(std::memory_order_relaxed); }

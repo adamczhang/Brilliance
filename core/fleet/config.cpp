@@ -150,6 +150,7 @@ private:
     std::vector<std::string> shared_args_;              /* server flags, in file order */
     std::vector<std::string> memory_args_;              /* memory flags, in file order */
     std::map<std::string, std::string> shared_given_;   /* flag (with dashes) -> YAML path */
+    std::string model_path_for_;                         /* the model BRILLIANCE_MODEL_PATH replaces */
 
     std::string where(Node n) const {
         const ryml::Location loc = n.location(parser_);
@@ -334,6 +335,10 @@ private:
     }
 
     int read_server(const Item& sec, FleetConfig* out);
+    int server_overrides();
+    int model_target(const Item& models, const std::vector<Item>& entries);
+    void model_overrides(const std::string& name, std::vector<std::string>* args,
+                         std::map<std::string, std::string>* given) const;
     int read_memory(const Item& sec, FleetConfig* out);
     int read_scheduler(const Item& sec, FleetConfig* out);
     int read_cards(const Item& sec, FleetConfig* out);
@@ -367,6 +372,141 @@ int Reader::read_server(const Item& sec, FleetConfig* out) {
         shared_given_[flags_.at(k)->name] = it.path;
     }
     return RAD_OK;
+}
+
+/* Brilliance: the listener and key the launcher was asked for (win\serve.ps1 -Listen, -Port,
+ * -ApiKey), applied here over the file's server: block rather than written into a copy of the file.
+ * So the file radiance names, and rereads on a reload, is the profile itself, read by this parser
+ * whatever its layout (flow mappings, comments, anchors), and a reload applies the same values
+ * again. Each variable that is set and not empty replaces its keys; the startup report names the
+ * variable as the source.
+ *   BRILLIANCE_SERVER_HOST      server.host
+ *   BRILLIANCE_SERVER_PORT      server.port
+ *   BRILLIANCE_SERVER_API_KEY   off (neither api-key nor api-key-env) or env:NAME (api-key-env: NAME).
+ *                               Never a key itself.
+ *   BRILLIANCE_SERVER_KERNELS   server.kernels (serve.ps1 -Cpu: libavx,libref, the host kernels, so
+ *                               the GPU package's card kernels are not loaded). Unlike upstream's
+ *                               RADIANCE_KERNELS it replaces the file's own list.
+ * Model keys, for the same reason (model_overrides):
+ *   BRILLIANCE_MODEL_SPECULATION  off: every model with num-speculative-tokens: 0 and no spec-ngram
+ *                               (serve.ps1 -Cpu: the host kernels cannot run every drafter).
+ *   BRILLIANCE_MODEL_PATH       the model: of the file's one model, or of BRILLIANCE_MODEL_NAME's
+ *                               when it names several (serve.ps1 -Model, -Fetch); its
+ *                               model-revision goes with it. */
+int Reader::server_overrides() {
+    auto drop = [this](const char* flag) {
+        for (size_t i = 0; i < shared_args_.size();) {
+            const ConfigFlag* f = flags_.at(shared_args_[i].substr(2));
+            const size_t n = f->arg ? 2 : 1;
+            if (shared_args_[i] == flag) shared_args_.erase(shared_args_.begin() + (long)i, shared_args_.begin() + (long)(i + n));
+            else i += n;
+        }
+        shared_given_.erase(flag);
+    };
+    auto set = [&](const char* flag, const std::string& v, const char* var) {
+        drop(flag);
+        shared_args_.push_back(flag);
+        shared_args_.push_back(v);
+        shared_given_[flag] = std::string("environment (") + var + ")";
+    };
+    auto env = [](const char* var) -> std::string {
+        const char* v = std::getenv(var);
+        return v ? std::string(v) : std::string();
+    };
+    if (const std::string h = env("BRILLIANCE_SERVER_HOST"); !h.empty())
+        set("--host", h, "BRILLIANCE_SERVER_HOST");
+    if (const std::string p = env("BRILLIANCE_SERVER_PORT"); !p.empty())
+        set("--port", p, "BRILLIANCE_SERVER_PORT");
+    if (const std::string k = env("BRILLIANCE_SERVER_KERNELS"); !k.empty())
+        set("--kernels", k, "BRILLIANCE_SERVER_KERNELS");
+    if (const std::string k = env("BRILLIANCE_SERVER_API_KEY"); !k.empty()) {
+        if (k == "off") {
+            drop("--api-key");
+            drop("--api-key-env");
+        } else if (k.rfind("env:", 0) == 0 && k.size() > 4) {
+            drop("--api-key");
+            set("--api-key-env", k.substr(4), "BRILLIANCE_SERVER_API_KEY");
+        } else {
+            RAD_ERR("%s: BRILLIANCE_SERVER_API_KEY takes off or env:NAME (the variable holding the "
+                    "key), not a key itself", origin_.c_str());
+            return RAD_E_INVAL;
+        }
+    }
+    return RAD_OK;
+}
+
+static std::string env_text(const char* var) {
+    const char* v = std::getenv(var);
+    return v ? std::string(v) : std::string();
+}
+
+/* Brilliance: which model BRILLIANCE_MODEL_PATH replaces -- the file's only one, or the one
+ * BRILLIANCE_MODEL_NAME names -- decided once the models are listed, so a profile with several is
+ * refused rather than guessed at. Speculation off is checked here too: it takes one word. */
+int Reader::model_target(const Item& models, const std::vector<Item>& entries) {
+    const std::string spec = env_text("BRILLIANCE_MODEL_SPECULATION");
+    if (!spec.empty() && spec != "off") {
+        RAD_ERR("%s: BRILLIANCE_MODEL_SPECULATION takes off, not '%s'", origin_.c_str(), spec.c_str());
+        return RAD_E_INVAL;
+    }
+    const std::string path = env_text("BRILLIANCE_MODEL_PATH");
+    const std::string want = env_text("BRILLIANCE_MODEL_NAME");
+    if (path.empty()) {
+        if (!want.empty()) {
+            RAD_ERR("%s: BRILLIANCE_MODEL_NAME (%s) names the model BRILLIANCE_MODEL_PATH replaces, "
+                    "and that is not set", origin_.c_str(), want.c_str());
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+    std::string names;
+    for (const Item& e : entries) names += (names.empty() ? "" : ", ") + e.key;
+    if (want.empty()) {
+        if (entries.size() != 1)
+            return fail(models.node, "BRILLIANCE_MODEL_PATH (" + path + ") replaces one model's model:, "
+                                     "and models: names " + std::to_string(entries.size()) + " (" +
+                                     names + "); name it with BRILLIANCE_MODEL_NAME (serve.ps1 -ModelName)");
+        model_path_for_ = entries.front().key;
+        return RAD_OK;
+    }
+    for (const Item& e : entries)
+        if (e.key == want) { model_path_for_ = want; return RAD_OK; }
+    return fail(models.node, "BRILLIANCE_MODEL_NAME (" + want + ") is not a model under models: (" +
+                             names + ")");
+}
+
+/* Brilliance: a model's flags with the launcher's model overrides applied over the file's
+ * (server_overrides has the server's). Each replaced flag is dropped with its value, the new one
+ * appended, and its source recorded as the variable. */
+void Reader::model_overrides(const std::string& name, std::vector<std::string>* args,
+                             std::map<std::string, std::string>* given) const {
+    auto drop = [&](const char* flag) {
+        for (size_t i = 0; i < args->size();) {
+            const std::string& a = (*args)[i];
+            size_t n = 1;
+            if (a.rfind("--", 0) == 0) {
+                const auto f = flags_.find(a.substr(2));
+                if (f != flags_.end() && f->second->arg) n = 2;
+            }
+            if (a == flag) args->erase(args->begin() + (long)i, args->begin() + (long)std::min(i + n, args->size()));
+            else i += n;
+        }
+        given->erase(flag);
+    };
+    auto set = [&](const char* flag, const std::string& v, const char* var) {
+        drop(flag);
+        args->push_back(flag);
+        args->push_back(v);
+        (*given)[flag] = std::string("environment (") + var + ")";
+    };
+    if (env_text("BRILLIANCE_MODEL_SPECULATION") == "off") {
+        drop("--spec-ngram");
+        set("--num-speculative-tokens", "0", "BRILLIANCE_MODEL_SPECULATION");
+    }
+    if (!model_path_for_.empty() && name == model_path_for_) {
+        drop("--model-revision");
+        set("--model", env_text("BRILLIANCE_MODEL_PATH"), "BRILLIANCE_MODEL_PATH");
+    }
 }
 
 int Reader::read_memory(const Item& sec, FleetConfig* out) {
@@ -633,6 +773,7 @@ int Reader::build_model(const std::string& name, Node at, const std::vector<Item
         if (int s = flag_args(*it, &args); s < 0) return s;
         given[flags_.at(it->key)->name] = it->path;
     }
+    model_overrides(name, &args, &given);
 
     std::vector<std::string> argv_store{ "radiance" };
     argv_store.insert(argv_store.end(), args.begin(), args.end());
@@ -686,6 +827,7 @@ int Reader::run(FleetConfig* out) {
         else return refuse_key(it, "top", "top-level", as_vector(kTopKeys));
         if (s < 0) return s;
     }
+    if (int s = server_overrides(); s < 0) return s;
     if (!models) return fail(doc, "no models: section; the file must name at least one model");
 
     std::vector<Item> base;
@@ -695,6 +837,7 @@ int Reader::run(FleetConfig* out) {
     std::vector<Item> entries;
     if (int s = children(models->node, models->path, &entries); s < 0) return s;
     if (entries.empty()) return fail(models->node, "models: names no model");
+    if (int s = model_target(*models, entries); s < 0) return s;
 
     std::map<std::string, std::string> taken;   /* name or alias -> the model it names */
     for (const Item& ent : entries) {

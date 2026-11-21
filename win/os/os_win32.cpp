@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -107,6 +108,34 @@ std::string win32_message(unsigned long err) {
     while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ' || m.back() == '.'))
         m.pop_back();
     return m;
+}
+
+/* os.h: this layer's lines go to the core's logger once radiance has set it, so their W lines are
+ * counted (FINDINGS); before that, or in a tool that never sets it, to stderr as they always were. */
+static std::atomic<LogSink> g_log_sink{ nullptr };
+void set_log_sink(LogSink sink) { g_log_sink.store(sink); }
+
+void log_os_line(int level, const char* fmt, ...) {
+    char buf[2048];
+    std::string big;
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    const int n = std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0) buf[0] = '\0';
+    if (n >= (int)sizeof buf) {
+        big.resize((size_t)n + 1);
+        std::vsnprintf(big.data(), big.size(), fmt, ap2);
+        big.resize((size_t)n);
+    }
+    va_end(ap2);
+    const char* msg = big.empty() ? buf : big.c_str();
+    if (const LogSink sink = g_log_sink.load()) {
+        sink(level, msg);
+        return;
+    }
+    std::fprintf(stderr, "%c %s\n", level >= 0 && level <= 4 ? "EWIDT"[level] : '?', msg);
 }
 
 // ------------------------------------------------------------------------------- File
@@ -1385,16 +1414,16 @@ void apply_cpus() {
         doms += (i ? "; " : "") + std::string("l3:") + std::to_string(i) + " = " + cpu_list(l3[i].mask) +
                 " (" + std::to_string(l3[i].bytes >> 20) + " MiB)";
     if (!want) {
-        std::fprintf(stderr, "W process: BRILLIANCE_CPUS=%s names no processor of this machine; "
-                     "running on all of them. L3 domains: %s\n", v, doms.empty() ? "none" : doms.c_str());
+        log_os_line(1, "process: BRILLIANCE_CPUS=%s names no processor of this machine; "
+                    "running on all of them. L3 domains: %s", v, doms.empty() ? "none" : doms.c_str());
         return;
     }
     if (!SetProcessAffinityMask(GetCurrentProcess(), (DWORD_PTR)want)) {
-        std::fprintf(stderr, "W process: BRILLIANCE_CPUS=%s: %s\n", v, win32_message().c_str());
+        log_os_line(1, "process: BRILLIANCE_CPUS=%s: %s", v, win32_message().c_str());
         return;
     }
-    std::fprintf(stderr, "I process: running on CPUs %s (BRILLIANCE_CPUS=%s, %s). L3 domains: %s\n",
-                 cpu_list(want).c_str(), v, how.c_str(), doms.c_str());
+    log_os_line(2, "process: running on CPUs %s (BRILLIANCE_CPUS=%s, %s). L3 domains: %s",
+                cpu_list(want).c_str(), v, how.c_str(), doms.c_str());
 }
 }   // namespace
 
@@ -1418,13 +1447,12 @@ void process_init() {
         if (_stricmp(p, "high") == 0) { cls = HIGH_PRIORITY_CLASS; name = "high"; }
         else if (_stricmp(p, "normal") == 0) { cls = NORMAL_PRIORITY_CLASS; name = "normal"; }
         else if (_stricmp(p, "above") != 0)
-            std::fprintf(stderr, "W process: BRILLIANCE_PRIORITY=%s is not high, above or normal; using above\n", p);
+            log_os_line(1, "process: BRILLIANCE_PRIORITY=%s is not high, above or normal; using above", p);
     }
     if (SetPriorityClass(GetCurrentProcess(), cls))
-        std::fprintf(stderr, "I process: priority class %s (BRILLIANCE_PRIORITY), power throttling off, 1 ms timer\n",
-                     name);
+        log_os_line(2, "process: priority class %s (BRILLIANCE_PRIORITY), power throttling off, 1 ms timer", name);
     else
-        std::fprintf(stderr, "W process: cannot set priority class %s: %s\n", name, win32_message().c_str());
+        log_os_line(1, "process: cannot set priority class %s: %s", name, win32_message().c_str());
 }
 
 void sleep_us(int64_t us) {

@@ -16,14 +16,14 @@
     3. bin\radiance.exe --help from a minimal environment (SystemRoot, a PATH of System32 only,
        TEMP): every DLL comes from the package or Windows
     4. --check on a CPU profile written into the folder
-    5. serve.ps1 <profile> -Listen 0.0.0.0 -Port <Port> -ApiKey off -Background, all GPUs hidden
-       (HIP_VISIBLE_DEVICES=-1, so the host backend serves): /health, a chat request and the
-       dashboard page over loopback AND over this machine's LAN address
+    5. serve.ps1 <profile> -Cpu -Listen 0.0.0.0 -Port <Port> -ApiKey off -Background: no GPU
+       (-Cpu: the host backend, HIP not asked, the CPU kernels, no drafting): /health, a chat
+       request and the dashboard page over loopback AND over this machine's LAN address
     6. stopped with tools\stop-server.ps1 (Ctrl-Break), exit status 0 in the log
 
-  The GPU package serves on the CPU only without its gfx1201 kernel libraries, as upstream's startup
-  warning advises for a GPU build on a host with no card: -Kernels libavx,libref writes that into
-  the profile (server.kernels). -NoServe stops after step 4.
+  The GPU package serves on the CPU only without its gfx1201 kernel libraries. Step 5's -Cpu sets
+  the CPU kernels (libavx,libref) itself, so -Kernels is not needed; if given, it is written into
+  the test profile (server.kernels). -NoServe stops after step 4.
 
   The LAN step proves the bind and the address; a request from another machine is what proves the
   firewall rule, and is left to the user (printed at the end).
@@ -35,8 +35,8 @@ param(
   [Parameter(Mandatory)][string]$Model,
   [string]$Work = '',
   [int]$Port = 8000,
-  # server.kernels for the CPU profile. The GPU package serves on the CPU with 'libavx,libref': its
-  # gfx1201 kernel libraries cannot run on the host, as upstream's startup warning says.
+  # Optional server.kernels for the CPU profile. Not needed: serve.ps1 -Cpu (step 5) sets
+  # 'libavx,libref' itself, since the package's gfx1201 kernel libraries cannot run on the host.
   [string]$Kernels = '',
   # Steps 1-4 only
   [switch]$NoServe
@@ -170,12 +170,12 @@ if ($NoServe) {
 $log = Join-Path $dir 'serve ü.log'
 $serve = Join-Path $root 'serve.ps1'
 $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$r = Invoke-Minimal $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $serve, $yaml, '-Listen', '0.0.0.0',
+$r = Invoke-Minimal $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $serve, $yaml, '-Cpu', '-Listen', '0.0.0.0',
                           '-Port', "$Port", '-ApiKey', 'off', '-Background', '-Log', $log) @{ HIP_VISIBLE_DEVICES = '-1' }
 $serverPid = 0
 $pidLine = ($r.out -split "`r?`n" | Where-Object { $_ -match '^\s*\d+\s*$' } | Select-Object -Last 1)
 if ($pidLine) { $serverPid = [int]$pidLine.Trim() }
-Result ($serverPid -gt 0) "serve.ps1 -Listen 0.0.0.0 -Port $Port -ApiKey off -Background (pid $serverPid)"
+Result ($serverPid -gt 0) "serve.ps1 -Cpu -Listen 0.0.0.0 -Port $Port -ApiKey off -Background (pid $serverPid)"
 if (-not $serverPid) { Write-Host $r.out }
 $deadline = (Get-Date).AddSeconds(180)
 $up = $false

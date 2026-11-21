@@ -19,7 +19,7 @@
 #                                 memory, their VRAM given to the KV cache.
 #   ngram-warm: true              the n-gram table (below) read once at load into the Windows file
 #                                 cache, so rows are not read from the drive mid-step (a cold
-#                                 row cost about 9% of one-stream decode, 2026-11-20). Not pinned;
+#                                 row costs about 9% of one-stream decode). Not pinned;
 #                                 skipped, with the reason in the log, without the table's size
 #                                 plus 24 GiB of memory available. It adds 7 s or more to the load.
 # The n-gram table (47.68 GiB) is read from the file (ngram-placement left at auto): a pinned copy
@@ -29,7 +29,7 @@
 # Now and then a 64-byte write from one GPU to host memory in an all-reduce is lost or misdirected;
 # the server re-sends the block and the step completes, at about 4% of single-stream decode. A block
 # that cannot be recovered stops the server (exit status 70). The re-send and the stop were checked
-# at 6,144-token steps (2026-11-19). No runtime variable is set.
+# at 6,144-token steps. No runtime variable is set.
 #
 #   .\serve.ps1 flashnext-2card -Bus 3,9
 #   .\serve.ps1 flashnext-2card -Bus 3,9 -WhatIf     what it would set and run
@@ -68,7 +68,7 @@ models:
     prefix-cache-mib: 4096
     checkpoint-slots: 8
     vision-tower-placement: ram
-    # The drafting stack (alpha.3): up to 5 MTP drafts, coupled drafting, traversal verify, an
+    # The drafting stack: up to 5 MTP drafts, coupled drafting, traversal verify, an
     # adaptive depth that stops at 0.85 and backs off under load. Greedy output is unchanged; about 13%
     # faster single-stream decode and 8% more eight-request throughput on two R9700s.
     num-speculative-tokens: 5

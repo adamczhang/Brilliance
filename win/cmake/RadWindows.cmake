@@ -12,7 +12,7 @@ include_guard(GLOBAL)
 
 # Brilliance's own release: what the package name carries. The project() version stays radiance's,
 # the release this tree was taken from.
-set(BRILLIANCE_VERSION "0.3.0-alpha.3" CACHE INTERNAL "Brilliance's release")
+set(BRILLIANCE_VERSION "0.3.0-alpha.4" CACHE INTERNAL "Brilliance's release")
 # The upstream revision the port is on, as `git describe --tags` names it, and its commit; an upstream
 # merge moves it. Since the merge of upstream's v2.2.0 tag (b6b8751c, 2026-11-19) it is that release.
 set(BRILLIANCE_UPSTREAM "v2.2.0 b6b8751cccb0e834a13ae9e5afca824ee9a487aa" CACHE INTERNAL
@@ -373,6 +373,11 @@ function(brl_windows_finalize)
     get_target_property(_src rad_core SOURCES)
     list(FILTER _src EXCLUDE REGEX "/core/device/(aql\\.cpp|aql_blit\\.hip)$")
     list(APPEND _src "${CMAKE_SOURCE_DIR}/win/device/hipnative.cpp")
+    # The ranged copy as a kernel on the stream's compute queue (aql_blit.hip's, which leaves with
+    # the AQL backend): the step batch's single staging slab depends on stream order, which a copy
+    # on the runtime's copy engines does not keep (hip_copy.hip says why).
+    list(APPEND _src "${CMAKE_SOURCE_DIR}/win/device/hip_copy.hip")
+    set_source_files_properties("${CMAKE_SOURCE_DIR}/win/device/hip_copy.hip" PROPERTIES LANGUAGE HIP)
     set_property(TARGET rad_core PROPERTY SOURCES "${_src}")
     get_target_property(_lo rad_core INTERFACE_LINK_OPTIONS)
     if(_lo)

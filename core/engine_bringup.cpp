@@ -66,6 +66,8 @@
 #include <chrono>
 
 namespace rad {
+#ifndef RAD_LOADER_INTERNALS_TEST
+
 
 /* ================================================================== the miss report */
 /* What did not resolve, in three classes reported differently:
@@ -2465,6 +2467,13 @@ int Engine::plan() {
     return RAD_OK;
 }
 
+#endif /* !RAD_LOADER_INTERNALS_TEST */
+
+#ifdef RAD_LOADER_INTERNALS_TEST
+/* The actual private helpers, with distinct linkage for backend-failure injection. */
+namespace loader_test {
+#endif
+
 /* ================================================================== 6. load */
 /* Weights are filled according to the plan. The mover has already reserved every slot and
  * published each weight's address, so this copies this rank's shard of each declared weight from
@@ -2582,6 +2591,7 @@ void sweep_give(void* p, int64_t bytes) {
 }
 }  // namespace
 
+#ifndef RAD_LOADER_INTERNALS_TEST
 void sweep_buffers_keep(bool on) {
     std::map<int64_t, std::vector<void*>> drop;
     {
@@ -2592,6 +2602,8 @@ void sweep_buffers_keep(bool on) {
     for (auto& [bytes, v] : drop)
         for (void* p : v) rad_dev_free(p, RAD_MEM_HOST_PINNED);
 }
+#endif
+
 
 /* The parts of [dst, dst + n) inside the sorted, disjoint ranges `clip`, as (offset, bytes). */
 static std::vector<std::pair<int64_t, int64_t>> clip_parts(
@@ -2700,9 +2712,15 @@ public:
             if (!f.given || f.syncing) { cv_.wait(lk); continue; }
             f.syncing = true;
             const RadEvent ev = f.ev;
+            const int dev = f.dev;
             lk.unlock();
             const int rc = ev ? rad_event_sync(ev) : RAD_OK;
+            if (rc < 0) {
+                fence_upload(dev);
+                if (ev) rad_event_destroy(ev);
+            }
             lk.lock();
+            if (rc < 0) live_.front().ev = nullptr;
             if (rc < 0 && status_ == RAD_OK) status_ = rc;
             retire_front();
         }
@@ -2710,13 +2728,24 @@ public:
 
     /* Bytes [off, off + n) of `pc` up to `dst` on card `device`. */
     int send(Piece& pc, uint8_t* dst, int64_t off, int64_t n, int device) {
+        if (device < 0 || device >= n_dev_) return RAD_E_INVAL;
         RAD_TRY(rad_dev_set(device));
         Uplink& u = up_[(size_t)device];
         std::lock_guard<std::mutex> lk(u.mu);
         if (!u.st) RAD_TRY(rad_stream_create(&u.st, 0));
-        RAD_TRY(rad_memcpy_async(dst, pc.p + off, n, u.st));
-        std::lock_guard<std::mutex> lk2(mu_);
-        live_at(pc.slot).dev = device;
+        {
+            std::lock_guard<std::mutex> lk2(mu_);
+            live_at(pc.slot).dev = device; // preserve ownership even if submission reports failure
+        }
+        if (const int rc = rad_memcpy_async(dst, pc.p + off, n, u.st); rc < 0) {
+            /* Ordinary copies belong to this stream, including any prefix submitted before
+             * an error. Do not call fence_upload here: this thread already holds u.mu. */
+            if (rad_stream_sync(u.st) < 0)
+                fatal("load: failed upload did not drain; refusing to recycle its staging");
+            std::lock_guard<std::mutex> lk2(mu_);
+            if (status_ == RAD_OK) status_ = rc;
+            return rc;
+        }
         return RAD_OK;
     }
 
@@ -2725,30 +2754,39 @@ public:
         if (!pc) return RAD_OK;
         int dev = -1;
         RadEvent ev = nullptr;
+        int rc = RAD_OK;
         {
             std::lock_guard<std::mutex> lk(mu_);
             dev = live_at(pc.slot).dev;
             if (dev >= 0) {
                 if (free_ev_[(size_t)dev].empty()) {
                     RadEvent e = nullptr;
-                    rad_dev_set(dev);
-                    if (const int rc = rad_event_create(&e); rc < 0) return rc;
-                    free_ev_[(size_t)dev].push_back(e);
+                    rc = rad_dev_set(dev);
+                    if (rc >= 0) rc = rad_event_create(&e);
+                    if (rc >= 0) free_ev_[(size_t)dev].push_back(e);
                 }
-                ev = free_ev_[(size_t)dev].back();
-                free_ev_[(size_t)dev].pop_back();
+                if (rc >= 0) {
+                    ev = free_ev_[(size_t)dev].back();
+                    free_ev_[(size_t)dev].pop_back();
+                }
             }
         }
-        int rc = RAD_OK;
         if (ev) {
             Uplink& u = up_[(size_t)dev];
             std::lock_guard<std::mutex> lk(u.mu);
             rc = rad_event_record(ev, u.st);
         }
+        if (rc < 0) {
+            /* Resolve the piece and wake takers even when no event could be made. A missing or
+             * failed event is never permission to reuse bytes still read by the upload stream. */
+            fence_upload(dev);
+            if (ev) rad_event_destroy(ev);
+            ev = nullptr;
+        }
         std::lock_guard<std::mutex> lk(mu_);
         Live& l = live_at(pc.slot);
-        l.ev = rc < 0 ? nullptr : ev;
-        if (rc < 0 && ev) free_ev_[(size_t)dev].push_back(ev);
+        l.ev = ev;
+        if (rc < 0 && status_ == RAD_OK) status_ = rc;
         l.given = true;
         cv_.notify_all();
         pc = {};
@@ -2765,9 +2803,15 @@ public:
             if (!f.given || f.syncing) { cv_.wait(lk); continue; }
             f.syncing = true;
             const RadEvent ev = f.ev;
+            const int dev = f.dev;
             lk.unlock();
             const int rc = ev ? rad_event_sync(ev) : RAD_OK;
+            if (rc < 0) {
+                fence_upload(dev);
+                if (ev) rad_event_destroy(ev);
+            }
             lk.lock();
+            if (rc < 0) live_.front().ev = nullptr;
             if (rc < 0 && status_ == RAD_OK) status_ = rc;
             retire_front();
         }
@@ -2789,6 +2833,19 @@ private:
         bool     given;     /* its worker is done with it */
         bool     syncing;   /* a taker waits for its event */
     };
+
+    /* Called without mu_: send takes the upload lock before the ring lock. Only a completed
+     * stream can replace the completion proof an event failed to provide. */
+    void fence_upload(int device) {
+        if (device < 0 || device >= n_dev_)
+            fatal("load: an upload has no completion stream; refusing to recycle its staging");
+        Uplink& u = up_[(size_t)device];
+        std::lock_guard<std::mutex> lk(u.mu);
+        const int selected = rad_dev_set(device);
+        const int synced = u.st ? rad_stream_sync(u.st) : RAD_E_STATE;
+        if (selected < 0 || synced < 0)
+            fatal("load: upload stream did not drain; refusing to recycle its staging");
+    }
 
     Live& live_at(int64_t slot) { return live_[(size_t)(slot - seq0_)]; }
     /* Under the lock: the front piece's copies have run. */
@@ -3789,6 +3846,17 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * against 1998 tok/s on a 24k prompt). */
     file->drop_blob_cache();
     /* Drain before freeing: a sweep that failed part-way may have copies outstanding. */
+    if (rc < 0) {
+        int fence = RAD_OK;
+        for (size_t k = 0; k < nr; ++k) if (st[k]) {
+            const int selected = rad_dev_set(devices[k]);
+            const int synced = rad_stream_sync(st[k]);
+            if (fence >= 0 && (selected < 0 || synced < 0))
+                fence = selected < 0 ? selected : synced;
+        }
+        if (fence < 0)
+            fatal("load: failed sweep streams did not drain; refusing to recycle their pinned windows");
+    }
     for (int b = 0; b < kWin; ++b) pool->drain(b);
     for (int b = 0; b < kWin; ++b) sweep_give(buf[b], window + 2 * kBlk);
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
@@ -3800,6 +3868,9 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 /* Read one rank's share of a checkpoint weight's selected planes from the mapped tensors into
  * `in` at the pool's offsets: whole rows in one read, a column share a block of rows at a time.
  * A reshaped whole plane has the same bytes, so it is read in the checkpoint's rows. */
+#ifdef RAD_LOADER_INTERNALS_TEST
+} /* namespace loader_test */
+#else
 static int fill_from_checkpoint(const CkptWeight& cw, const std::vector<PlaneShare>& shares,
                                 const std::vector<int>& sel, const std::vector<int64_t>& offs,
                                 const std::string& name, uint8_t* in) {
@@ -4290,12 +4361,23 @@ void Engine::warm_ngram_table(const std::vector<std::pair<int64_t, int64_t>>& ra
         }
         return;
     }
+    /* Brilliance (ngram-warm-tune): BRILLIANCE_NGRAM_WARM_IO sets how it reads, for a measurement
+     * (format/table_warm.h); unset, the default. A bad value is said and the default kept. */
+    TableWarmOpts wo;
+    if (const char* e = std::getenv("BRILLIANCE_NGRAM_WARM_IO"); e && *e) {
+        std::string bad;
+        if (table_warm_opts_parse(e, &wo, &bad) != RAD_OK) {
+            RAD_WARN("BRILLIANCE_NGRAM_WARM_IO='%s' ignored: %s", e, bad.c_str());
+            wo = TableWarmOpts{};
+        }
+    }
     RAD_INFO("placement: --ngram-warm: reading the n-gram table (%s) into the OS file cache before "
-             "serving: %s", humanb(f.table_bytes).c_str(), p.why.c_str());
+             "serving (%s): %s", humanb(f.table_bytes).c_str(), table_warm_opts_str(wo).c_str(),
+             p.why.c_str());
     int64_t bytes = 0;
     double secs = 0;
     std::string why;
-    const int rc = table_warm_read(*file_, rg, &bytes, &secs, &why);
+    const int rc = table_warm_read(*file_, rg, &bytes, &secs, &why, wo);
     if (rc != RAD_OK) {
         RAD_WARN("--ngram-warm: reading the n-gram table into the file cache stopped after %s in "
                  "%.1f s (%s); serving goes on, and rows not read are read from the drive when "
@@ -5436,7 +5518,7 @@ int Engine::start() {
      * model holds, backs the stripes on every rank, and the followers take the new mark. A
      * refusal is RAD_E_FULL, and the request waits as on a full cache. */
     if (!lending_ && broker_ && ranks_[0]->kv.flex())
-        ranks_[0]->kv.set_reclaim([this](int64_t tokens) -> int {
+        ranks_[0]->kv.set_fleet_reclaim([this](int64_t tokens, bool* waiting_for_fleet) -> int {
             KVManager& k0 = ranks_[0]->kv;
             const int64_t cur = k0.loan_tokens();
             if (tokens >= cur) return RAD_OK;
@@ -5447,15 +5529,21 @@ int Engine::start() {
             const std::vector<int> cards = rank_devices();
             if (!broker_->flex_grow(cards, (cur - to) * tb)) {
                 to = tokens;
-                if (!broker_->flex_grow(cards, (cur - to) * tb)) return RAD_E_FULL;
+                if (!broker_->flex_grow(cards, (cur - to) * tb)) {
+                    if (waiting_for_fleet) *waiting_for_fleet = true;
+                    return RAD_E_FULL;
+                }
             }
             struct Landed { VramBroker* b; ~Landed() { b->flex_done(); } } landed{ broker_ };
             for (auto& r : ranks_) {
-                if (rad_dev_set(r->device) < 0 || r->kv.flex_back(cur, to) < 0) {
+                int status = rad_dev_set(r->device);
+                if (status >= 0) status = r->kv.flex_back(cur, to);
+                if (status < 0) {
                     for (auto& q : ranks_)
-                        if (rad_dev_set(q->device) >= 0) (void)q->kv.flex_unback_above(cur);
+                        if (rad_dev_set(q->device) < 0 || q->kv.flex_unback_above(cur) < 0)
+                            fatal("flex growth rollback failed; retained mappings cannot be reused");
                     (void)rad_dev_set(ranks_[0]->device);
-                    return RAD_E_FULL;
+                    return status;
                 }
             }
             for (size_t i = 1; i < ranks_.size(); ++i) (void)ranks_[i]->kv.set_loan(tokens);
@@ -5705,5 +5793,7 @@ int Engine::build_vocab_view() {
              humanb((int64_t)gi.bytes).c_str());
     return RAD_OK;
 }
+
+#endif /* !RAD_LOADER_INTERNALS_TEST */
 
 }  /* namespace rad */

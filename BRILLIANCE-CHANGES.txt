@@ -4,14 +4,15 @@ Brilliance is a fork of Radiance (https://codeberg.org/StillDeadcode/radiance), 
 Apache License 2.0 (LICENSE; NOTICE credits Radiance's authors). This tree is upstream's
 commit b6b8751cccb0e834a13ae9e5afca824ee9a487aa plus the Windows port.
 As section 4(b) of the licence asks, this file states which of upstream's files Brilliance
-has changed: the 317 listed under "Modified" carry changes made for Brilliance. Files under
+has changed: the 330 listed under "Modified" carry changes made for Brilliance. Files under
 "Added" are Brilliance's own. Every other file is upstream's, unchanged.
 
-Modified (317)
+Modified (330)
 
   .gitignore
   CMakeLists.txt
   README.md
+  abi/rad_abi.h
   arch/CMakeLists.txt
   cmake/RadAddPlugin.cmake
   cmake/radiance-config.cmake.in
@@ -46,6 +47,8 @@ Modified (317)
   core/hf_model.cpp
   core/kld.cpp
   core/main.cpp
+  core/mem/kv.cpp
+  core/mem/kv.h
   core/mem/pools.cpp
   core/mm/media.cpp
   core/mm/media.h
@@ -57,15 +60,20 @@ Modified (317)
   core/plugin/loader.cpp
   core/rad_core.h
   core/rad_internal.h
+  core/runtime/ctx.cpp
   core/runtime/ctx.h
   core/runtime/issue.cpp
   core/runtime/wtab.hip
   core/runtime/xprefetch.hip
   core/sched/advance.hip
+  core/sched/mem_iface.h
+  core/sched/scheduler.cpp
+  core/sched/scheduler.h
   core/server/adapters.h
   core/server/admin.cpp
   core/server/audio_gen.cpp
   core/server/dashboard.cpp
+  core/server/dashboard_page.h
   core/server/front.cpp
   core/server/http.cpp
   core/server/http.h
@@ -77,6 +85,8 @@ Modified (317)
   core/util/json.h
   core/util/rad_util.cpp
   core/util/stallwatch.cpp
+  dashboard/src/lib/ui.ts
+  dashboard/src/pages/model.tsx
   data/kernels_moe.rkb
   docs/GUIDE.md
   libavx/avx_bench.cpp
@@ -272,6 +282,7 @@ Modified (317)
   libr4d/r4d_selftest.cpp
   libr4d/r4d_ssd.hip
   libr4d/r4d_vsa.hip
+  tests/ARTIFACTS
   tests/CMakeLists.txt
   tests/build_test.cpp
   tests/checkpoint_test.cpp
@@ -304,6 +315,7 @@ Modified (317)
   tests/rad_test.h
   tests/runtime_test.cpp
   tests/sched_fakes.h
+  tests/sched_test.cpp
   tests/server_test.cpp
   tests/shape_test.cpp
   tests/spark25_validation.py
@@ -316,6 +328,7 @@ Modified (317)
   tests/util_test.cpp
   tests/videos_test.cpp
   tests/work_counter.h
+  tools/CMakeLists.txt
   tools/iface.cpp
   tools/kbench_core.cpp
   tools/kbench_timer.cpp
@@ -327,21 +340,28 @@ Modified (317)
   vendor/llama/common/json-partial.cpp
   vendor/llama/src/unicode.cpp
 
-Added (175)
+Added (203)
 
   .gitattributes
   RADIANCE-README.md
   core/format/table_warm.cpp
   core/format/table_warm.h
   core/server/terms.cpp
+  dashboard/src/components/chat.tsx
+  dashboard/src/pages/sandbox.tsx
   docs/img/banner.png
   libr4d/r4d_ar_wide_host.h
   libr4d/r4d_ar_wide_host.hip
   libr4d/r4d_ar_wide_rs.hip
   libr4d/r4d_ar_wide_ts.hip
   libr4d/r4d_ar_wide_x.h
+  libr4d/r4d_log.h
+  tests/ar_bytes_test.cpp
+  tests/loader_transfer_test.cpp
   tests/ngram_warm_test.cpp
+  tests/paging_fence_test.cpp
   tests/terms_test.cpp
+  tools/rad_warm_bench.cpp
   vendor/patches/0023-unicode-a-16-bit-wchar_t-keeps-one-unit-per-codepoint.patch
   win/PREVIEW.md
   win/SERVICE.md
@@ -356,6 +376,7 @@ Added (175)
   win/cmake/windows-rocm.cmake
   win/compat/include/arpa/inet.h
   win/compat/include/brl_compat.h
+  win/compat/include/brl_path.h
   win/compat/include/brl_prelude.h
   win/compat/include/dirent.h
   win/compat/include/dlfcn.h
@@ -383,8 +404,10 @@ Added (175)
   win/compat/src/compat_spawn.cpp
   win/device/coll_trace.cpp
   win/device/coll_trace.h
+  win/device/hip_copy.hip
   win/device/hipnative.cpp
   win/device/pin_ledger.h
+  win/device/stall_watch.h
   win/device/stream_card.h
   win/diag/sysinfo_win32.cpp
   win/env.ps1
@@ -454,24 +477,37 @@ Added (175)
   win/os/service.h
   win/os/service_win32.cpp
   win/package.ps1
+  win/profiles/flashnext-2card-fast.yaml
   win/profiles/flashnext-2card.yaml
   win/profiles/flashnext-4card.yaml
   win/profiles/gemma4-12b-1card.yaml
   win/profiles/gemma4-31b-1card.yaml
+  win/profiles/minicpm5-2b-1card.yaml
   win/profiles/qwen-image-1card.yaml
   win/profiles/qwen27-8k-plain.yaml
   win/profiles/qwen27-iq8r-1card.yaml
   win/profiles/qwen27-iq8r-2card.yaml
   win/profiles/qwen27-preview.yaml
   win/profiles/qwen36-35b-2card.yaml
+  win/profiles/sandbox.yaml
   win/serve.ps1
   win/setup.ps1
   win/tests/CMakeLists.txt
+  win/tests/fetch_launch_test.ps1
+  win/tests/gate_lib_test.ps1
+  win/tests/hub_stub.py
   win/tests/pin_limit_test.cpp
+  win/tests/rad_export_cmd_test.ps1
+  win/tests/selftest_ref_path_test.cpp
+  win/tests/serve_launcher_test.ps1
+  win/tests/serve_sandbox_test.ps1
   win/tests/serve_service_test.ps1
   win/tests/service_win_test.cpp
+  win/tests/stall_watch_card_test.cpp
+  win/tests/stall_watch_test.cpp
   win/tests/terms_check.ps1
   win/tools/api_check.py
+  win/tools/bench_selftest.py
   win/tools/build-log.ps1
   win/tools/capture_proxy.py
   win/tools/check-yaml.ps1
@@ -479,6 +515,7 @@ Added (175)
   win/tools/docs_check.py
   win/tools/fixtures/opencode-disk-after-tool.json
   win/tools/fleet_check.py
+  win/tools/gate-lib.ps1
   win/tools/llp64_sweep.py
   win/tools/logprob_batched.py
   win/tools/logprob_repeat.py
@@ -487,10 +524,13 @@ Added (175)
   win/tools/openwebui_check.py
   win/tools/package-check.ps1
   win/tools/package_audit.py
+  win/tools/prefill-bench.md
+  win/tools/prefill_bench.py
   win/tools/qualify_api.py
   win/tools/reload-server.ps1
   win/tools/replay_chat.py
   win/tools/sampler_fidelity.py
+  win/tools/sandbox_profile.py
   win/tools/scan_catch_funclets.py
   win/tools/serve-bg.ps1
   win/tools/soak-sample.ps1
@@ -503,4 +543,5 @@ Added (175)
   win/tools/template_hf_compare.py
   win/tools/test-each.ps1
   win/tools/test-log.ps1
+  win/tools/ttft_probe.py
   win/tools/vm-mirror.ps1

@@ -1,7 +1,7 @@
 # Brilliance profile: Qwen3.8-27B IQ8R-V4 on one Radeon AI PRO R9700.
 # 16K tokens of context, four requests at once, DFlash2 speculation from the container, an int8 KV
 # cache: the 26.67 GiB of weights leave about 3 GiB of the card for the cache. Soak-clean
-# since 2026-11-17 (SUPPORT.md).
+# (SUPPORT.md).
 #
 #   .\serve.ps1 qwen27-iq8r-1card -Bus 6
 #   bin\radiance.exe --config profiles\qwen27-iq8r-1card.yaml

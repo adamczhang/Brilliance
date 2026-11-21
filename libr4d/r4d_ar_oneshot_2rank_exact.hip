@@ -19,6 +19,7 @@
 //    fabric, so system-scope release/acquire skip the L2 writeback. The drain/acq fences are
 //    selectable (default drain=1/acq=0 on fine-grained).
 #include "r4d.h"
+#include "r4d_log.h"       // Brilliance: W lines through the host's logger
 #include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include "r4d_ar_hc.h"      // the gather word and the hc write word, shared with the rotated wire
@@ -1491,10 +1492,9 @@ unsigned int r4d_ar_inj_pick(long long drain64, unsigned int op, int nb, int n16
   char pr[48] = "";
   if (mode == R4D_AR_INJ_PAIR) std::snprintf(pr, sizeof pr, ", its line copied into block %d",
                                              r4d_ar_inj_partner(blk, nb));
-  std::fprintf(stderr, "W r4d: fault injection (BRILLIANCE_AR_INJECT): %s into %s on device %d, "
-               "block %d of %d (words %d-%d of %d), whole line %d of the block%s; injection %llu\n",
-               k_inj_mode[mode], k_inj_op[op], dev, blk, nb, start, end - 1, n16, off, pr, ord + 1ull);
-  std::fflush(stderr);
+  r4d_log(1, "r4d: fault injection (BRILLIANCE_AR_INJECT): %s into %s on device %d, "
+          "block %d of %d (words %d-%d of %d), whole line %d of the block%s; injection %llu",
+          k_inj_mode[mode], k_inj_op[op], dev, blk, nb, start, end - 1, n16, off, pr, ord + 1ull);
   return r4d_ar_inj_word(mode, (unsigned int)blk, (unsigned int)off);
 }
 

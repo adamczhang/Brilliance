@@ -45,6 +45,12 @@ add_library(rad_tokref STATIC ${CMAKE_CURRENT_SOURCE_DIR}/tokref.cpp)
 target_link_libraries(rad_tokref PUBLIC rad_core)
 target_include_directories(rad_tokref PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
 
+# Brilliance: rad-warm-bench times --ngram-warm's read alone (ngram-warm-tune); core only.
+add_executable(rad-warm-bench rad_warm_bench.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp)
+target_link_libraries(rad-warm-bench PRIVATE rad_core)
+target_include_directories(rad-warm-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/core)
+set_target_properties(rad-warm-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # rad-tokcheck needs neither plugins nor the declare phase, so it links the core plainly.
 add_executable(rad-tokcheck rad_tokcheck.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.cpp)
 target_link_libraries(rad-tokcheck PRIVATE rad_tokref rad_core)

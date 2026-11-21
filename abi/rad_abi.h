@@ -516,6 +516,14 @@ const RadKernelInfo* rad_kernel_at(int i);
 typedef int  (*RadPluginOpenFn) (void);
 typedef void (*RadPluginCloseFn)(void);
 
+/* Brilliance. Optional, symbol `rad_plugin_set_log`: the loader hands the plugin the host's logger
+ * before rad_plugin_open. `level` is 0 E, 1 W, 2 I, 3 D, 4 T; `line` is the text without its level
+ * tag ("r4d: ..."). Through it a plugin's lines are level-filtered and tagged like the core's, and
+ * its W lines count into the startup report's FINDINGS. A plugin never handed one (a tool that
+ * dlopens it itself) prints to stderr as before. Not a change of shape (see RAD_ABI_VERSION). */
+typedef void (*RadLogFn)(int level, const char* line);
+typedef void (*RadPluginSetLogFn)(RadLogFn log);
+
 /* Optional, symbol `rad_plugin_freed`. The core has freed the device memory [base, base + bytes)
  * and nothing launched against it runs any more. A kernel library that keeps state keyed by an
  * operand's address (a counter block per output buffer, made at the first launch and replayed by
