@@ -29703,6 +29703,7 @@ struct ArPatternRun {
     const char* dtype; std::vector<int64_t> sizes; int oop;
     std::vector<int> pieces = {};      /* per size, as ArPattern::pieces */
     int form = -1;                     /* as ArPattern::form */
+    int overlap = 0;                  /* as ArPattern::overlap */
 };
 
 /* Starts one ArPattern thread a rank, the ranks sharing a barrier when they share a card. */
@@ -29726,7 +29727,7 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
     std::vector<ArPattern> t((size_t)world);
     for (ArPattern& x : t) {
         x.row = row; x.dtype = run.dtype; x.sizes = run.sizes; x.out_of_place = run.oop;
-        x.pieces = run.pieces; x.form = run.form;
+        x.pieces = run.pieces; x.form = run.form; x.overlap = run.overlap;
     }
     ar_pattern_run(t, devs);
     const std::string what = name + " " + run.dtype;
@@ -37300,6 +37301,17 @@ static void device_phase(const Plugin& pl) {
             }
         }
     }
+    /* Flash-Next TP2: one full piece, a ragged tail, and another full piece on the same
+     * protected mailbox. Check the exact BF16 sum on both ranks after each slot reuse. */
+    const char* tp2_lane = "ar_oneshot_2rank_exact_lane_host";
+    if (sel(tp2_lane)) {
+        const auto* row = find(pl, tp2_lane);
+        if (!row) ok(tp2_lane, false, "row absent");
+        else if (devs.size() < 2) skip(tp2_lane, "needs two gfx1201 cards");
+        else ar_pattern_check(row, devs, tp2_lane, 2,
+                              {"bf16", {2048 * 2560, 171 * 2560, 2048 * 2560}, -1, {}, -1, 1});
+    }
+
     /* The four-rank two-shot's lane row and its host twin, plain and coded (ar_lane_forms). */
     for (const char* n : { "ar_twoshot_4rank_exact_lane", "ar_twoshot_4rank_exact_lane_host" }) {
         if (!sel(n)) continue;

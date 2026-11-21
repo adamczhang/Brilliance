@@ -121,6 +121,7 @@ public:
                               const rad_weight* w, int n_w);
     int         op_resolved  (rad_op h) const;
     int         op_declared  (const char* op) const;
+    int         device_p2p() const;
     int         decl_name_map(const RadNameMap* m);
     int         declare_logits(rad_buf b);
     int         declare_scores(rad_buf hidden, rad_weight table);

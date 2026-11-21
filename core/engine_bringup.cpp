@@ -7,6 +7,7 @@
 #include "engine_priv.h"
 #include "rad_internal.h"
 #include "engine_hostmem.h"
+#include "place/host_admit.h"
 #include "kld.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
@@ -587,7 +588,8 @@ static void log_table_room_refusal(const char* opt, const std::string& table, co
  * stops the server. There is no disk tier: the lookup writes device-domain activations.
  *
  * Encoder towers: Vram by default; Ram pins them beside the pool (Config::tower_host_mib), read
- * over the link once per image.
+ * over the link once per image. Brilliance: the default moves them to Ram when the card cannot
+ * hold them beside a KV pool and the host can pin them; a named placement is kept.
  *
  * N-gram table: Vram where a device kernel gathers it and it fits; Ram as a copy (pinned for the
  * device kernel, or locked for the host gather); Disk in the container, read by the host gather.
@@ -685,8 +687,56 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     for (const WeightFootprint& wf : wfs) tower_bytes.push_back(tower_pin_bytes(wf, emb));
     int64_t tower_max = 0;
     for (int64_t b : tower_bytes) tower_max = std::max(tower_max, b);
-    const TablePlacement tw = cfg_.tower_placement;
-    if (tw == TablePlacement::Ram) {
+    TablePlacement tw = cfg_.tower_placement;
+    /* Brilliance: towers left to their default go to host memory when the card cannot hold them
+     * beside a KV pool for one --max-model-len sequence (at least a MiB: the pools refuse an empty
+     * one), and the host can pin them. LTX-2.5's Gemma text encoder (14 GiB) and its DiT fill a
+     * 32 GB card with nothing left for the cache, so a profile with only `model:` stopped at
+     * start (2026-11-20); upstream's GUIDE has its users name `vision-tower-placement: ram`. A
+     * placement the operator named is kept, and in a fleet the claim was sized before this (with
+     * the towers where they were asked), so there the resolver's refusal names the flag instead. */
+    std::string tw_why;
+    if (tw == TablePlacement::Vram && !cfg_.tower_placement_given && tower_max > 0 && !broker_) {
+        std::vector<VramFacts> with = facts;
+        int64_t fixed = 0;
+        for (size_t i = 0; i < with.size(); ++i) {
+            if (emb == TablePlacement::Ram) with[i].statics -= emb_bytes[i];
+            fixed = std::max(fixed, with[i].statics);
+        }
+        VramBudget tb;
+        const int tst = vram_budget_trial(cfg_, with, &tb);
+        const int64_t kv_need = std::max<int64_t>(kv_floor, MiB);
+        /* The trial refuses an empty KV share itself (RAD_E_NOMEM, its split still filled in),
+         * which is exactly the case this moves the towers for. A card the fixed costs overrun
+         * before any weight (claimable <= 0) is not helped by moving them. */
+        const bool judged = (tst == RAD_OK || tst == RAD_E_NOMEM) && tb.claimable > 0;
+        const bool over = judged && fixed >= tb.claimable;
+        const bool no_kv = judged && !over && tb.kv < kv_need;
+        if (over || no_kv) {
+            const std::string card_why =
+                over ? fmt("on the card the fixed weights want %s of the %s it can give, which "
+                           "leaves the KV cache nothing", humanb(fixed).c_str(),
+                           humanb(tb.claimable).c_str())
+                     : fmt("on the card they leave the KV pool %s, short of the %s it needs",
+                           humanb(tb.kv).c_str(), humanb(kv_need).c_str());
+            std::string why;
+            const int64_t pin = (int64_t)cfg_.tp * align_up(tower_max, (int64_t)MiB);
+            const int64_t tower_still = pools_still + (int64_t)cfg_.tp * cfg_.embedding_host_mib * MiB;
+            const std::vector<HostPart> parts = still_parts(true, false);
+            if (lockable_room(pin, tower_still, host_margin_bytes(), false, &why, &parts)) {
+                tw = TablePlacement::Ram;
+                tw_why = card_why + ", so they are pinned in host memory and read over the link "
+                                    "once a request (set --vision-tower-placement vram to keep "
+                                    "them on the card)";
+            } else {
+                /* Kept on the card: the resolver then refuses with the split and the fix. */
+                RAD_WARN("placement: the encoder towers (%s a rank) stay on the card: %s, and the "
+                         "host cannot pin them: %s", humanb(tower_max).c_str(), card_why.c_str(),
+                         why.c_str());
+            }
+        }
+    }
+    if (tw == TablePlacement::Ram && tw_why.empty()) {
         if (tower_max == 0) {
             if (cfg_.mm_max_patches == 0)
                 RAD_ERR("--vision-tower-placement ram: --mm-max-patches 0 asked for no media, so "
@@ -869,11 +919,13 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
     if (tower_max > 0)
         RAD_INFO("placement: encoder towers (%s a rank) %s%s", humanb(tower_max).c_str(),
                  table_placement_name(tw),
-                 tw == TablePlacement::Ram ? ": pinned in host memory, read over the link once an "
-                                             "image, their VRAM the KV cache's"
-                                           : " (default)");
+                 !tw_why.empty()            ? (" (default): " + tw_why).c_str()
+                 : tw == TablePlacement::Ram ? ": pinned in host memory, read over the link once an "
+                                               "image, their VRAM the KV cache's"
+                                             : " (default)");
     decide("--vision-tower-placement", tower_max > 0 ? table_placement_name(tw) : "n/a",
-           tower_max > 0 ? fmt("the towers are %s a rank", humanb(tower_max).c_str())
+           tower_max > 0 ? fmt("the towers are %s a rank%s", humanb(tower_max).c_str(),
+                               tw_why.empty() ? "" : (": " + tw_why).c_str())
                          : std::string("this server declares no encoder tower"));
     has_ngram_ = ngram_bytes > 0;
     decide("--ngram-placement", ngram_bytes > 0 ? table_placement_name(ng) : "n/a",
@@ -1907,6 +1959,55 @@ static int declare_ring_windows(KVManager& kv, const Program& prog) {
     return RAD_OK;
 }
 
+/* Brilliance: the host admission for the routed-expert file and RAM tiers (place/host_admit.h),
+ * measured now. `ram_store` is every rank's RAM store; `pins` every rank's pinned pool. Logs the
+ * verdict either way and returns RAD_E_NOMEM on a refusal. */
+static int expert_tier_admission(const Config& cfg, int64_t pins, int64_t ram_store,
+                                 int64_t relay_scratch, const char* when) {
+    HostAdmitIn in;
+#if defined(_WIN32)
+    const os::MemInfo m = os::mem_info();
+    in.avail = m.avail;
+    in.commit_avail = m.commit_avail;
+#else
+    in.avail = meminfo_bytes("MemAvailable");
+#endif
+    bool lifted = false;
+    in.pin_cap = amdgpu_pin_cap(&lifted);
+    int64_t pinned = 0, mapped = 0;
+    rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+    rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+    in.pinned_now = pinned + mapped;
+    in.pins = pins;
+    in.ram_store = ram_store;
+    in.relay_scratch = relay_scratch;
+    in.misc = kHostMiscAllowance + cfg.prefix_cache_mib * ((int64_t)1 << 20);
+    const HostAdmitOut o = host_admit(in);
+    if (!o.ok) {
+        RAD_ERR("host admission (%s): refused: %s. Nothing was allocated for it.", when,
+                o.why.c_str());
+        return RAD_E_NOMEM;
+    }
+    RAD_INFO("host admission (%s): admitted: peak %s (pinned pools %s, expert RAM %s, relayout "
+             "inputs %s, loader and system %s) of %s available leaves %s, floor %s; pins %s held "
+             "+ %s to come of a %s cap", when, host_admit_gib(o.peak).c_str(),
+             host_admit_gib(in.pins).c_str(), host_admit_gib(in.ram_store).c_str(),
+             host_admit_gib(in.relay_scratch).c_str(), host_admit_gib(in.misc).c_str(),
+             host_admit_gib(in.avail).c_str(), host_admit_gib(o.left).c_str(),
+             host_admit_gib(in.floor).c_str(), host_admit_gib(in.pinned_now).c_str(),
+             host_admit_gib(in.pins).c_str(),
+             in.pin_cap > 0 ? host_admit_gib(in.pin_cap).c_str() : "no");
+    return RAD_OK;
+}
+
+/* The relayout threads' inputs at most, every rank's: a thread's input never exceeds one read
+ * window (the planner's bound on a relaid weight's planes). */
+static int64_t relay_scratch_bound(int tp) {
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int64_t threads = std::max(1u, std::min(8u, hw / 2));
+    return (int64_t)std::max(tp, 1) * threads * RAD_PLACE_FILE_WINDOW_BYTES;
+}
+
 int Engine::plan() {
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
@@ -2348,6 +2449,45 @@ int Engine::plan() {
         }
     }
 
+    /* Brilliance, a test knob: BRILLIANCE_DEBUG_WEIGHTS_MIB lowers every rank's weights pool to N
+     * MiB after the budget is resolved, so a model that fits the card can be made to spill its
+     * routed experts to the pool and the file tier (an equivalence test of those tiers against the
+     * resident placement). The pools and the planner both read the lowered split. It only ever
+     * lowers, and says so. */
+    if (const char* e = std::getenv("BRILLIANCE_DEBUG_WEIGHTS_MIB"); e && *e) {
+        const long long cap = std::atoll(e);
+        for (size_t i = 0; i < rank_cfg_.size(); ++i)
+            if (cap > 0 && rank_cfg_[i].vram_weights_mib > cap) {
+                RAD_WARN("BRILLIANCE_DEBUG_WEIGHTS_MIB: rank %zu's weights pool lowered from %lld to "
+                         "%lld MiB (a test knob)", i, (long long)rank_cfg_[i].vram_weights_mib, cap);
+                rank_cfg_[i].vram_weights_mib = cap;
+            }
+    }
+
+    /* Brilliance: with routed experts kept off the cards by the file or RAM tier, the host must
+     * hold every rank's pinned pool, the RAM store and the relayout inputs beside 24 GiB free.
+     * Checked from the budgets before any pool is pinned (the store's budget bounds what the plan
+     * will hold), and again from the plans before the store is filled (load_weights). */
+    const bool expert_tiers = cfg_.weights_file_relayout || cfg_.expert_ram_mib > 0;
+    if (expert_tiers && !cfg_.weights_disk_tier) {
+        RAD_ERR("%s reads routed experts through the file tier, which --weights-disk-tier turns on",
+                cfg_.expert_ram_mib > 0 ? "--expert-ram-mib" : "--weights-file-relayout");
+        return RAD_E_INVAL;
+    }
+    if (expert_tiers || cfg_.plan_only) {
+        int64_t pins = 0;
+        for (const Config& rc : rank_cfg_) pins += rc.host_pool_total_mib() * ((int64_t)1 << 20);
+        const int64_t ram = (int64_t)cfg_.tp * cfg_.expert_ram_mib * ((int64_t)1 << 20);
+        const int rc = expert_tier_admission(cfg_, pins, ram,
+                                             expert_tiers ? relay_scratch_bound(cfg_.tp) : 0,
+                                             "before the pools");
+        if (rc < 0) {
+            if (cfg_.plan_only) RAD_ERR("--plan-only: stopped before loading: the host admission "
+                                        "refused the budgets");
+            return rc;
+        }
+    }
+
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
         /* This rank's own split: cfg_ field for field unless the block above re-split it. */
@@ -2360,12 +2500,15 @@ int Engine::plan() {
         rad_dev_props(r->device, &props);
 
         /* Every pool is budgeted explicitly, with no profiling pass or utilisation fraction
-         * (spec §6). Pools refuses by name and amount rather than shrinking anything. */
-        int s = r->pools.configure(rc, props.vram_bytes);
-        RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
-        if (s < 0) {
-            report_pool_refusal(r->index, r->device, r->pools, rc);
-            return s;
+         * (spec §6). Pools refuses by name and amount rather than shrinking anything.
+         * Brilliance: --plan-only plans against the same split without allocating it. */
+        if (!cfg_.plan_only) {
+            int s = r->pools.configure(rc, props.vram_bytes);
+            RAD_INFO("pools:\n%s", r->pools.fit_report().c_str());
+            if (s < 0) {
+                report_pool_refusal(r->index, r->device, r->pools, rc);
+                return s;
+            }
         }
 
         /* Under TP the placement unit is a weight shard, so each rank plans against its own
@@ -2404,12 +2547,14 @@ int Engine::plan() {
         in.container = file_ != nullptr;
         in.host_backend = device_is_host();
         Planner planner(in);
-        s = planner.plan(&r->plan);
-        if (cfg_.debug_placement || s < 0)
+        const int s = planner.plan(&r->plan);
+        if (cfg_.debug_placement || cfg_.plan_only || s < 0)
             fputs(r->plan.report(r->program).c_str(), stderr);
         if (s < 0) return s;
+        /* Brilliance: where this rank's routed experts are, tier by tier. */
+        RAD_INFO("%s", r->plan.tier_line().c_str());
         /* The planner's slab must match the weights pool the mover fills. */
-        RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
+        if (!cfg_.plan_only) RAD_TRY(plan_check_weights_pool(r->plan, r->pools.weights().bytes()));
         if (r->index == 0) {
             decide("--placement", strategy_name(r->plan.strategy),
                    r->plan.strategy_why.empty() ? std::string("as asked") : r->plan.strategy_why);
@@ -2434,6 +2579,19 @@ int Engine::plan() {
             RAD_INFO("kv: rank %d's weights all fit its grown weights pool, so its pinned host pool "
                      "holds no weights; its %lld MiB (its share of --host-pool-mib) stay allocated, as on "
                      "every rank", r->index, (long long)cfg_.host_pool_mib);
+    }
+    /* Brilliance: --plan-only stops here, every rank planned and nothing allocated or read. The
+     * admission is run again from the plans, as load_weights runs it before filling the store. */
+    if (cfg_.plan_only) {
+        int64_t ram = 0;
+        for (const auto& r : ranks_) ram += r->plan.ram_bytes;
+        int64_t pins = 0;
+        for (const Config& rc : rank_cfg_) pins += rc.host_pool_total_mib() * ((int64_t)1 << 20);
+        const int rc = expert_tier_admission(cfg_, pins, ram,
+                                             expert_tiers ? relay_scratch_bound(cfg_.tp) : 0,
+                                             "from the plans");
+        RAD_INFO("--plan-only: stopped before loading (%s)", rc < 0 ? "refused" : "admitted");
+        return RAD_E_CANCELLED;
     }
 #if defined(_WIN32)
     /* Brilliance (2026-11-19, the owner's rule): the two-rank and four-rank host mailboxes' data
@@ -4018,6 +4176,20 @@ int Engine::load_weights() {
          * holds nearly all its experts gets the idle ones back as residents. */
         mc.turnover_adaptive = true;
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
+        /* Brilliance: a file-tier weight the kernel relays is relaid on every read by the kernel's
+         * own relayout, as the relayout pool does once for a resident one. */
+        {
+            const Program* prog = &r->program;
+            r->mover.set_file_relayout([prog](const WeightInfo& w, const RadTensor* planes,
+                                              void* dst, int64_t dst_bytes) {
+                const RadKernelInfo* ki = weight_layout_kernel(*prog, w);
+                if (!ki || !ki->relayout) return (int)RAD_E_STATE;
+                const Resolved& rs =
+                    prog->ops[(size_t)w.lay_op].bands[(size_t)w.lay_band].dom[w.lay_dom];
+                return ki->relayout(rs.geom.params(), rs.geom.n_params(), w.lay_operand, &w.enc,
+                                    w.sel, planes, w.n_sel, dst, dst_bytes);
+            });
+        }
         /* What the mover took, before the first copy. Its slabs are allocated in init, so the pool
          * is as full as it will get; a load stopping with zero free is a placement failure, not
          * a loader one. */
@@ -4092,7 +4264,35 @@ int Engine::load_weights() {
             w.site        = r->plan.weight[i].site;
             w.slab_slot   = r->plan.weight[i].slab_slot;
             w.file_offset = e ? file_->plane(*e, w.sel[0]).offset : 0;
+            /* Brilliance: every selected plane's extent, which a weight relaid on the read takes
+             * its planes from (Mover::read_relaid). An unsharded weight's planes are whole. */
+            if (e)
+                for (int k = 0; k < w.n_sel && k < RAD_ENC_MAX_PLANES; ++k) {
+                    const RadFilePlane& pk = file_->plane(*e, w.sel[k]);
+                    w.file_plane_offset[k] = pk.offset;
+                    w.file_plane_bytes[k] = (int64_t)pk.bytes;
+                }
             const bool direct = weight_file_direct(w, cfg_.tp);
+            const int32_t wu = i < r->plan.unit_of_weight.size() ? r->plan.unit_of_weight[i] : -1;
+            const bool relaid = w.tier == Tier::SSD && e && wu >= 0 &&
+                                r->plan.units[(size_t)wu].file_relaid &&
+                                weight_file_relaid(r->program, w, cfg_.tp);
+            if (relaid) {
+                /* The read takes each plane's dense extent from its start; the container must
+                 * hold at least that, or the relayout would read the next plane's bytes. */
+                RadTensor pt[RAD_ENC_MAX_PLANES];
+                weight_planes(w, pt);
+                for (int k = 0; k < w.n_sel; ++k) {
+                    const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+                    if (w.file_plane_bytes[k] < len) {
+                        RAD_ERR("rank %d: '%s' is relaid on the file tier's reads, and its plane %d "
+                                "holds %lld bytes where the relayout reads %lld", r->index,
+                                w.name.c_str(), k, (long long)w.file_plane_bytes[k], (long long)len);
+                        return RAD_E_FORMAT;
+                    }
+                }
+                continue;      /* no address until the file stager reads it, as a direct one */
+            }
             if ((w.tier == Tier::Mapped || w.tier == Tier::SSD) && (!direct || !e)) {
                 RAD_ERR("rank %d: '%s' was placed on the %s tier, which reads the container where "
                         "it lies, and its stored form is not the container's (%s)", r->index,
@@ -4329,6 +4529,29 @@ int Engine::load_weights() {
                  cfg_.tp > 1 ? " (summed over ranks, which map the same file: the resident bytes "
                                "are that divided by --tp)" : "",
                  humanb(mapped_kept).c_str());
+    /* Brilliance: the RAM store, after the sweep so the loader's transients are gone. The
+     * admission runs again from the plans' exact bytes, with the pools now pinned (so no pins are
+     * still to come), before any of the store is allocated. */
+    {
+        int64_t ram = 0;
+        for (const auto& r : ranks_) ram += r->plan.ram_bytes;
+        if (ram > 0) {
+            RAD_TRY(expert_tier_admission(cfg_, 0, ram, relay_scratch_bound(cfg_.tp),
+                                          "before the RAM store"));
+            for (auto& r : ranks_) {
+                LogRank lr(r->index);
+                int64_t held = 0;
+                RAD_TRY(r->mover.build_ram_store(&held));
+            }
+#if defined(_WIN32)
+            const int64_t rss = os::process_rss();
+#else
+            const int64_t rss = -1;
+#endif
+            RAD_INFO("expert ram: %s held in ordinary RAM across %d rank(s); process working set "
+                     "%s", humanb(ram).c_str(), cfg_.tp, rss >= 0 ? humanb(rss).c_str() : "unknown");
+        }
+    }
     /* Brilliance: after the sweep, not beside it. Both read the same drive, which is the limit,
      * so overlapping them saves little; and read last, the table's pages are the newest in the
      * file cache, so the sweep's own reads are what memory pressure takes back first. */

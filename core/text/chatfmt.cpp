@@ -779,13 +779,24 @@ G optspace(const std::string& tag) {
 }
 
 /* The reasoning block as the vendored generator builds it. */
-G reasoning_expr(const ChatFormat& f, const std::vector<std::string>& breaks) {
+G reasoning_expr(const ChatFormat& f, const std::vector<std::string>& breaks,
+                  bool closed_stops_at_breaks = false) {
     const std::string end = trim_ws(f.reasoning_close);
     if (!breaks.empty()) {
         std::vector<std::string> stops{ end };
         stops.insert(stops.end(), breaks.begin(), breaks.end());
         G unclosed = seq({ wrap(leaf(until_pattern(stops))), eps() });
-        G closed = seq({ wrap(leaf(until_pattern({ end }))), optspace(f.reasoning_close) });
+        /* Brilliance: under a required call, a closed block stops at a break too. The parser
+         * ends the reasoning where a break (the call opener) begins (chatparse.h), so a block
+         * that went on past one to its close was read as a call in the reasoning, the rest of
+         * the block as content and its close as a stray one: the "left the reply format"
+         * warning, and a second call, on a Qwen3.6 reply that wrote its call inside its thinking
+         * under tool_choice "required" (2026-11-20). There the opener in the reasoning can only
+         * begin the call. The response-format grammar keeps upstream's form, which is the
+         * vendored grammar's text (the_generated_grammar_is_the_vendored_grammar). */
+        G closed = seq({ wrap(leaf(until_pattern(closed_stops_at_breaks ? stops
+                                                                         : std::vector<std::string>{ end }))),
+                         optspace(f.reasoning_close) });
         if (!f.reasoning_open.empty())
             return opt(alt({ seq({ optspace(f.reasoning_open), unclosed }),
                              seq({ optspace(f.reasoning_open), closed }) }));
@@ -839,14 +850,14 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
 
             /* A grammar that is the whole reply starts where the generation prompt does, so the
              * prompt's assistant prefix and the reasoning block come first. */
-            auto whole_reply = [&]() {
+            auto whole_reply = [&](bool closed_stops_at_breaks = false) {
                 std::string gp = req.generation_prompt;
                 if (f.has_reasoning() && !f.reasoning_open.empty()) {
                     const size_t at = gp.find(f.reasoning_open);
                     if (at != std::string::npos) gp = gp.substr(0, at);
                 }
                 std::vector<G> root{ gp.empty() ? eps() : lit(gp), space() };
-                if (f.has_reasoning() && req.extract_reasoning) root.push_back(reasoning_expr(f, breaks));
+                if (f.has_reasoning() && req.extract_reasoning) root.push_back(reasoning_expr(f, breaks, closed_stops_at_breaks));
                 root.push_back(space());
                 return root;
             };
@@ -981,7 +992,7 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
             if (req.require_call) {
                 /* Nothing after the calls: a complete grammar admits only the end of the turn,
                  * so the reply stops at the last call's closer. */
-                std::vector<G> root = whole_reply();
+                std::vector<G> root = whole_reply(true);
                 root.push_back(rule_ref("tool-call"));
                 b.add_rule("root", render(seq(std::move(root))));
             } else {

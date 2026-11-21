@@ -67,6 +67,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include "rad_kv_fp8.h"
 #include "r4d_plugin.h"
 
 #include "rad_sample.h"
@@ -2290,3 +2291,7 @@ extern "C" int r4d_shape_dflash_markov_f32(const RadParam* p, int n_p, int opera
     if (rc == RAD_OK && operand == 0) out->dtype = RAD_F32;
     return rc;
 }
+
+#include "r4d_ds41_elem_shapes.inc"
+#include "r4d_ds41_sparse_shapes.inc"
+#include "r4d_ds41_ggml_shapes.inc"

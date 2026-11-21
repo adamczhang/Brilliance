@@ -105,8 +105,11 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0, Mandatory)][string]$Profile,
-  [string]$Bus = '',      # comma-separated PCI bus numbers (decimal, as Windows shows them)
-  [string]$Device = '',   # comma-separated HIP indices
+  # Comma-separated PCI bus numbers (decimal, as Windows shows them) and HIP indices. Typed in a
+  # PowerShell window, -Bus 3,9 arrives as an array; through powershell -File, as one string "3,9".
+  # Both are taken, and joined below.
+  [string[]]$Bus = @(),
+  [string[]]$Device = @(),
   [string]$Listen = '',
   [int]$Port = 0,
   [string]$ApiKey = '',
@@ -133,6 +136,8 @@ param(
   [switch]$Fetch,
   [string]$ModelDir = ''
 )
+$Bus = $Bus -join ','
+$Device = $Device -join ','
 $ErrorActionPreference = 'Stop'
 
 $service = $Install -or $Uninstall
@@ -150,7 +155,8 @@ if ($ModelDir -and -not $Fetch) { throw '-ModelDir is where -Fetch stores a mode
 
 # The service's name: the profile's, unless one is given. Letters, digits, '.', '_' and '-' only, so
 # it is the same word in sc.exe, the registry and the file names below.
-$stem = [IO.Path]::GetFileNameWithoutExtension($Profile)
+# Only a .yaml or .yml extension comes off: a profile named with a dot (ltx-2.5-1card) keeps it.
+$stem = [IO.Path]::GetFileName($Profile) -replace '\.ya?ml$', ''
 if (-not $Name) { $Name = 'Brilliance-' + ($stem -replace '[^A-Za-z0-9._-]', '-') }
 if ($service -and $Name -notmatch '^[A-Za-z0-9._-]{1,200}$') { throw "-Name '$Name': a service name here is letters, digits, '.', '_' and '-'" }
 
@@ -523,8 +529,13 @@ for ($d = 0; $d -lt $n; $d++) {
   $env:BRL_SERVE_HIP_WHOLE = $(if ($Whole) { '1' } else { $null })
   try {
     $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
+    # 'Continue': a stderr line from the probe is text to read, not a terminating error (5.1).
+    $ErrorActionPreference = 'Continue'
     $o = & $self -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $enc 2>&1 | ForEach-Object { "$_" }
-  } finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
+  } finally {
+    $ErrorActionPreference = 'Stop'
+    foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
+  }
   $devs = @(); $count = -1
   foreach ($l in $o) {
     if ($l -match '^error (.*)$') { throw "the HIP runtime answered $($Matches[1])" }
@@ -959,9 +970,16 @@ if ($Install) {
 
 $exe = $exePath
 if ($Check) {
+  # radiance's stderr as plain lines: under Windows PowerShell 5.1 a caller's 2>&1 (serve.ps1 ...
+  # -Check 2>&1) turns each stderr line of a native command into an ErrorRecord, which this script's
+  # 'Stop' made a terminating NativeCommandError at radiance's first line. The exit code is
+  # $LASTEXITCODE's, never $?'s.
   Set-RunEnv
-  try { & $exe --config $yaml --check; $rc = $LASTEXITCODE }
-  finally { Restore-RunEnv }
+  try {
+    $ErrorActionPreference = 'Continue'
+    & $exe --config $yaml --check 2>&1 | ForEach-Object { "$_" }
+    $rc = $LASTEXITCODE
+  } finally { Restore-RunEnv; $ErrorActionPreference = 'Stop' }
   exit $rc
 }
 # radiance reads the profile itself, and rereads it on a reload.
@@ -1014,12 +1032,21 @@ if ($Background) {
   New-Item -ItemType Directory -Force ([IO.Path]::GetDirectoryName($Log)) | Out-Null
   [IO.File]::WriteAllText($Log, (($head -join "`r`n") + "`r`n"))
   Set-RunEnv
-  try { & $self -NoProfile -ExecutionPolicy Bypass -File $bgScript -Bin $bin -Config $yaml -Log $Log -Append; $rc = $LASTEXITCODE }
-  finally { Restore-RunEnv }
+  try {
+    $ErrorActionPreference = 'Continue'
+    & $self -NoProfile -ExecutionPolicy Bypass -File $bgScript -Bin $bin -Config $yaml -Log $Log -Append
+    $rc = $LASTEXITCODE
+  } finally { Restore-RunEnv; $ErrorActionPreference = 'Stop' }
   exit $rc
 }
 Write-Host "serve: $exe --config $yaml"
+# 'Continue' for the server's run: with a caller's 2>&1 (serve.ps1 ... 2>&1 | Tee-Object) its stderr
+# lines arrive as ErrorRecords, and 'Stop' would end this script at the first one while radiance
+# runs on. Without a redirect radiance writes to the console directly, as before.
 Set-RunEnv
-try { & $exe --config $yaml; $rc = $LASTEXITCODE }
-finally { Restore-RunEnv }
+try {
+  $ErrorActionPreference = 'Continue'
+  & $exe --config $yaml
+  $rc = $LASTEXITCODE
+} finally { Restore-RunEnv; $ErrorActionPreference = 'Stop' }
 exit $rc

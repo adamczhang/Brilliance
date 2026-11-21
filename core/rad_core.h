@@ -220,6 +220,12 @@ struct WeightInfo {
     void*          ptr = nullptr;
     void*          host_ptr = nullptr;
     uint64_t       file_offset = 0;
+    /* Brilliance: every selected plane's place in the container, by `sel` position, set at load
+     * beside file_offset (which is plane 0's). The file tier reads a weight it relays on the read
+     * (weight_file_relaid) from these: each plane is one whole range, and the read takes their
+     * span. `file_plane_bytes[k]` is plane k's length as the container records it. */
+    uint64_t       file_plane_offset[RAD_ENC_MAX_PLANES] = {0};
+    int64_t        file_plane_bytes[RAD_ENC_MAX_PLANES] = {0};
 
     /* First and last op index that read the weight. Prefetch runs off these, so layer offload is
      * scheduling rather than prediction (spec §5). */
@@ -551,6 +557,39 @@ public:
     OpInfo*     op(rad_op h)         { return h && h < ops.size()     ? &ops[h] : nullptr; }
 
 };
+
+/* Brilliance: the kernel whose relayout produces `w`'s stored form (the one at lay_op, lay_band,
+ * lay_dom), or null when the weight is stored as it lies or the slot names nothing. */
+inline const RadKernelInfo* weight_layout_kernel(const Program& prog, const WeightInfo& w) {
+    if (w.lay_op < 0 || w.lay_band < 0 || w.lay_dom < 0 || w.lay_dom >= RAD_N_DOMAINS ||
+        (size_t)w.lay_op >= prog.ops.size())
+        return nullptr;
+    const OpInfo& op = prog.ops[(size_t)w.lay_op];
+    if ((size_t)w.lay_band >= op.bands.size()) return nullptr;
+    const KernelRow* row = op.bands[(size_t)w.lay_band].dom[w.lay_dom].row;
+    return row ? row->info : nullptr;
+}
+
+/* Brilliance: the plane span a relaid weight reads from the container -- the sum of its selected
+ * planes' dense extents ([rows, cols] in the plane's own dtype), which the read covers in one
+ * range. Zero when the weight selects no plane. */
+inline int64_t weight_plane_bytes(const WeightInfo& w) {
+    int64_t n = 0;
+    for (int k = 0; k < w.n_sel && k < RAD_ENC_MAX_PLANES; ++k)
+        n += w.sel_rows[k] * (int64_t)rad_dtype_bytes(w.enc.plane[w.sel[k]].dtype, w.sel_cols[k]);
+    return n;
+}
+
+/* Brilliance: whether the file tier can serve `w` by reading its planes and relaying them on the
+ * read, as the load relays a resident weight once (Mover::read_relaid). Only a whole, unsharded
+ * weight whose stored form a kernel relayout produces losslessly from its planes: a widening or
+ * narrowing is the loader's, not a kernel's, and a column shard is not one container range. */
+inline bool weight_file_relaid(const Program& prog, const WeightInfo& w, int world_size) {
+    if (w.identity || w.widen || w.narrow || w.n_sel <= 0) return false;
+    if (w.decl.shard != RAD_SHARD_NONE && world_size > 1) return false;
+    const RadKernelInfo* ki = weight_layout_kernel(prog, w);
+    return ki && ki->relayout;
+}
 
 /* ================================================================== requests */
 
@@ -913,6 +952,21 @@ struct Config {
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk
      * paces the step, so an accidental spill makes the server orders of magnitude slower. */
     bool    weights_disk_tier = false;
+    /* Brilliance: the file tier also takes a routed expert whose stored form a kernel relayout
+     * makes from its container planes (rad_core.h, weight_file_relaid): its planes are read and
+     * relaid on every read (Mover::read_relaid). Needs weights_disk_tier. Off by default; on with
+     * --weights-file-relayout, or with --expert-ram-mib. */
+    bool    weights_file_relayout = false;
+    /* Brilliance: --expert-ram-mib, a rank's share of ordinary host RAM (not pinned, not locked)
+     * that keeps routed experts on the file tier in the stored form their kernel reads, read and
+     * relaid once at load (Mover::build_ram_store). A read then copies a held expert from RAM into
+     * the pinned read windows instead of reading the drive; the experts past it stay on the drive.
+     * Like --host-pool-mib the option states all ranks' together and config_parse divides it by
+     * --tp. 0 is off. Needs weights_disk_tier and implies weights_file_relayout. */
+    int64_t expert_ram_mib = 0;
+    /* Brilliance: --plan-only: plan placement and run the host admission, print both, and stop
+     * before any pool is allocated or weight read (Engine::plan). */
+    bool    plan_only = false;
 
     std::string placement = "auto";    /* all_vram | layer_offload | expert_tiered | auto */
     /* --embedding-placement and --ngram-placement as given (see TablePlacement), and their
@@ -947,6 +1001,10 @@ struct Config {
      * on top of host_pool_mib like the embedding; the encoder reads it over the link once per
      * image, and its VRAM goes to the KV cache. */
     TablePlacement tower_placement = TablePlacement::Vram;
+    /* Brilliance: whether the operator named --vision-tower-placement. Left to its default, the
+     * towers go to host memory when the card cannot hold them beside a KV pool
+     * (Engine::resolve_table_placement); named, the placement is kept as given. */
+    bool           tower_placement_given = false;
     TablePlacement tower_resolved  = TablePlacement::Vram;
     int64_t        tower_host_mib  = 0;
     /* The pinned host pool one rank allocates: --host-pool-mib and the tables placed beside it. */

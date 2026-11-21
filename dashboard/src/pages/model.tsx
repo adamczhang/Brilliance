@@ -21,7 +21,7 @@ function kindOf(c: Record<string, unknown> | undefined): [Kind, string] {
 const DOES: [string, string][] = [["chat", "Chat"], ["tools", "Tools"], ["reasoning", "Reasoning"], ["image", "Reads images"], ["video", "Reads video"], ["audio", "Reads audio"], ["embedding", "Embeddings"],
   ["image_generation", "Makes images"], ["image_edit", "Edits images"], ["audio_generation", "Makes audio"], ["video_generation", "Makes video"], ["shape_generation", "Makes meshes"]]
 
-export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: FleetModel | undefined }) {
+export function ModelPage({ id, tab, model, models, local }: { id: string; tab: Tab; model: FleetModel | undefined; models: FleetModel[]; local: boolean }) {
   const scope = useScope(modelScope(id))
   const [kind, noun] = kindOf(model?.capabilities)
   const tabs: [Tab, string][] = kind === "chat" ? [["performance", "Performance"], ["requests", "Requests"], ["sessions", "Sessions"], ["details", "Details"]] : [["performance", "Performance"], ["details", "Details"]]
@@ -54,7 +54,7 @@ export function ModelPage({ id, tab, model }: { id: string; tab: Tab; model: Fle
           </div>
         </div>}
       </div>
-      {sandbox ? <Sandbox id={id} model={model} />
+      {sandbox ? <Sandbox id={id} model={model} models={models} local={local} />
         : !model ? <Empty>This process serves no model named {id}</Empty>
         : shown === "performance" ? (
           <>

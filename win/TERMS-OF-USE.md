@@ -41,6 +41,7 @@ The full text of each licence is at `/terms/licenses` on this server.
 | Gemma 4 31B and 12B | Apache 2.0 | None |
 | Qwen3.6-35B-A3B | Apache 2.0 | None |
 | Qwen-Image 2.1 (pictures) | Qwen RESEARCH LICENSE AGREEMENT | Yes, below: non-commercial use only |
+| DeepSeek-V4.1-Flash-1017 | MIT | None |
 
 ## LTX-2.5 (video)
 

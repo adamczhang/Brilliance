@@ -117,7 +117,10 @@ diag::RunFacts Engine::run_facts(bool failed) const {
         const int64_t host = p.totals.bytes[(int)Tier::HostPinned] +
                              p.totals.bytes[(int)Tier::HostPageable] - p.forced_host_used;
         r.host_weight_bytes = std::max(r.host_weight_bytes, std::max<int64_t>(host, 0));
-        r.file_weight_bytes = std::max(r.file_weight_bytes, p.totals.bytes[(int)Tier::SSD]);
+        /* Brilliance: the RAM store's units are on the file tier but read from RAM. */
+        r.ram_weight_bytes = std::max(r.ram_weight_bytes, p.ram_bytes);
+        r.file_weight_bytes = std::max(r.file_weight_bytes,
+                                       std::max<int64_t>(p.totals.bytes[(int)Tier::SSD] - p.ram_bytes, 0));
     }
     for (const TableCopy& t : table_copies_) r.locked_bytes += (int64_t)t.bytes;
     r.ngram_placement   = has_ngram_ ? table_placement_name(cfg_.ngram_resolved) : "";

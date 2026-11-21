@@ -717,6 +717,49 @@ TEST(the_smallest_card_binds_and_a_short_one_refuses_by_name) {
     CHECK(b2.report.find("short by") != std::string::npos);
 }
 
+/* Brilliance: a generator (no cache for one sequence, kv_one 0) whose fixed weights fill the card
+ * is refused by the resolver with the split and the fix, not passed on with an empty KV share for
+ * the pools to call a resolver that "did not run" (LTX-2.5 on one 32 GB card, 2026-11-20: a 21 GiB
+ * DiT and a 14 GiB text encoder after a 9 GiB arena). Without the encoder the same card serves. */
+TEST(a_generator_whose_weights_fill_the_card_is_refused_by_name) {
+    constexpr int64_t MiB = 1 << 20;
+    auto ltx = [&](int64_t statics) {
+        VramFacts f{};
+        f.capacity = 32624 * MiB;
+        f.free = f.capacity - 1065 * MiB;
+        f.arena = 9431 * MiB;
+        f.statics = statics;
+        f.kv_ceiling = 210 * MiB;
+        f.kv_one = 0;
+        return f;
+    };
+    {
+        Config c = derive_config();
+        c.vram_weights_mib = 0; c.vram_kv_mib = 0;
+        VramBudget b, t;
+        CHECK_EQ(vram_budget_trial(c, { ltx(35940 * MiB) }, &t), RAD_E_NOMEM);
+        CHECK(t.claimable > 0);
+        CHECK_EQ(t.kv, (int64_t)0);
+        int rc = 0;
+        const std::string err =
+            stderr_of([&] { rc = vram_budget_resolve(c, { ltx(35940 * MiB) }, &b); });
+        CHECK_EQ(rc, RAD_E_NOMEM);
+        CHECK(has(b.report, "The KV cache gets nothing"));
+        CHECK(has(b.report, "vision-tower-placement: ram"));
+        CHECK(has(err, "35.10 GiB"));                    /* the warning names the unclamped want */
+        CHECK(!has(err, "every expert streams"));        /* a dense model has no expert */
+    }
+    {
+        Config c = derive_config();
+        c.vram_weights_mib = 0; c.vram_kv_mib = 0;
+        VramBudget b;
+        int rc = 0;
+        stderr_of([&] { rc = vram_budget_resolve(c, { ltx(21606 * MiB) }, &b); });
+        CHECK_OK(rc);
+        CHECK(c.vram_kv_mib > 0);
+    }
+}
+
 /* ================================================================== group sizing */
 
 TEST(group_sizing_wastes_nothing) {

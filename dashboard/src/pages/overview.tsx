@@ -43,6 +43,10 @@ export function Overview() {
   const waiting = f.models.reduce((a, m) => a + (m.waiting ?? 0), 0)
   const returns = f.models.reduce((a, m) => a + (m.restores ?? 0), 0)
   const power = f.cards.reduce((a, c) => a + (fin(c.power_w) ? c.power_w : 0), 0)
+  // A server on Windows names the figures its cards' driver cannot give (Windows' own GPU counters
+  // do not see HIP's work); the page says so instead of drawing a dash.
+  const noPower = f.cards.length > 0 && f.cards.every((c) => c.unreported?.includes("power_w"))
+  const somePower = f.cards.filter((c) => fin(c.power_w)).length
   const [cv, cu] = bytesParts(onCards)
   const [hv, hu] = bytesParts(hostBytes)
 
@@ -60,7 +64,8 @@ export function Overview() {
         <Kpi label="Parked" value={fNum(parked.length)} detail={parked.length ? parked.map((m) => m.id).join(", ") : "none"} />
         <Kpi label="Host memory in use" value={hv} unit={hu} detail={(fin(f.host?.budget_bytes) ? `of ${fBytes(f.host.budget_bytes)} allowed` : "") + (copies > 0 ? ` · ${fBytes(copies)} parked copies` : "")} />
         <Kpi label="Restores" value={fNum(returns)} detail={cold.length ? `${cold.length} not loaded` : "from parked to loaded"} />
-        <Kpi label="Power draw" value={power > 0 ? fNum(power) : "–"} unit={power > 0 ? "W" : undefined} detail={`across ${f.cards.length} accelerator${f.cards.length === 1 ? "" : "s"}`} />
+        <Kpi label="Power draw" value={noPower ? "n/a" : power > 0 ? fNum(power) : "–"} unit={!noPower && power > 0 ? "W" : undefined}
+          detail={noPower ? UNREPORTED : somePower < f.cards.length && somePower > 0 ? `across ${somePower} of ${f.cards.length} accelerators` : `across ${f.cards.length} accelerator${f.cards.length === 1 ? "" : "s"}`} />
       </div>
 
       <div className="grid gap-3 xl:grid-cols-2">
@@ -134,8 +139,8 @@ function CardPanel({ fleet: f, card, hueOf, data, version, range }: { fleet: Fle
         <PartBar parts={parts} total={c.vram_bytes} className="h-3" />
         <PartLegend parts={parts} className="content-start xl:min-h-10" />
         <div className="grid grid-cols-3 gap-2">
-          <Gauge label="Busy" value={fin(c.busy) ? Math.round(c.busy * 100) + "%" : "–"} data={data} k={`busy${card}`} max={1} />
-          <Gauge label="Power" value={fin(c.power_w) ? Math.round(c.power_w) + " W" : "–"} data={data} k={`power${card}`} />
+          <Gauge label="Busy" value={fin(c.busy) ? Math.round(c.busy * 100) + "%" : "–"} none={c.unreported?.includes("busy")} data={data} k={`busy${card}`} max={1} />
+          <Gauge label="Power" value={fin(c.power_w) ? Math.round(c.power_w) + " W" : "–"} none={c.unreported?.includes("power_w")} data={data} k={`power${card}`} />
           <Gauge label="Temperature" value={fin(c.temp_c) ? Math.round(c.temp_c) + " °C" : "–"} data={data} k={`temp${card}`} />
         </div>
         <Chart data={data} version={version} lines={lines} range={range} fmt={fBytes} stack bytes height={170} max={c.vram_bytes} />
@@ -144,8 +149,18 @@ function CardPanel({ fleet: f, card, hueOf, data, version, range }: { fleet: Fle
   )
 }
 
-/** A figure with its last five minutes drawn beside it. */
-function Gauge({ label, value, data, k, max }: { label: string; value: string; data: Series; k: string; max?: number }) {
+const UNREPORTED = "not available on Windows"
+
+/** A figure with its last five minutes drawn beside it; `none` when the server says it cannot read it here. */
+function Gauge({ label, value, none, data, k, max }: { label: string; value: string; none?: boolean; data: Series; k: string; max?: number }) {
+  if (none) return (
+    <div className="flex items-center rounded-lg border bg-background/40 px-3 py-2">
+      <div className="min-w-0">
+        <div className="truncate text-xs text-muted-foreground">{label}</div>
+        <div className="text-xs leading-tight text-muted-foreground">{UNREPORTED}</div>
+      </div>
+    </div>
+  )
   const col = data.col(k) ?? []
   const lo = data.firstAfter(data.end - 300)
   const pts = col.slice(lo)

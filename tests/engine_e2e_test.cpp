@@ -67,6 +67,20 @@ std::vector<std::string> engine_env(const std::vector<std::string>& more = {}) {
     return e;
 }
 
+/* Brilliance: whether the build made libavx, for a case's libavx block. On Windows the file is
+ * libavx.dll where radiance names libavx.so; rad_test.h's brl_artifact_readable takes the one for
+ * the other, as NEED_ARTIFACT and the compat dlopen do. A block left out says so. */
+bool have_libavx(const char* block) {
+    const std::string so = std::string(RAD_E2E_HOME) + "/kernels/libavx.so";
+#if defined(_WIN32)
+    const bool ok = brl_artifact_readable(so);
+#else
+    const bool ok = ::access(so.c_str(), R_OK) == 0;
+#endif
+    if (!ok) fprintf(stderr, "    no %s: %s left out\n", so.c_str(), block);
+    return ok;
+}
+
 /* libref alone unless the arguments name other libraries. An op resolving to a reference library
  * is refused without the debug flag, so it is passed whenever libref is loaded; a list without
  * libref runs as a deployment does, and the gate holds it to that. */
@@ -553,6 +567,40 @@ struct Server {
     std::string output() {
         std::lock_guard<std::mutex> lk(mu);
         return log;
+    }
+
+    /* A server that ends by itself (a device fault): waits up to `timeout_s` for its output to end,
+     * then its exit status; 124 if it was still running, and it is ended hard. */
+    int wait_exit(int timeout_s) {
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait_for(lk, std::chrono::seconds(timeout_s), [&] { return eof; });
+        }
+#if defined(_WIN32)
+        if (child.c.pid() <= 0) return exit_status;
+        bool late = false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            late = !eof;
+        }
+        if (late) child.c.kill();
+        if (drain.joinable()) drain.join();
+        child.c.close_read();
+#else
+        if (child.pid <= 0) return exit_status;
+        bool late = false;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            late = !eof;
+        }
+        if (late) kill(child.pid, SIGKILL);
+        if (drain.joinable()) drain.join();
+        close(child.fd);
+        child.fd = -1;
+#endif
+        std::string rest;
+        exit_status = child.wait(&rest);
+        return late ? 124 : exit_status;
     }
 
     ~Server() {
@@ -1061,7 +1109,7 @@ TEST(the_coupling_flag_refuses_what_it_cannot_serve_at_startup) {
     /* The reference gate is not relaxed: with a production library for the model's ops and the
      * spechub library beside it on a machine with no card, the only coupled row left is the host
      * oracle, and the start must be refused naming the coupled op. */
-    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+    if (have_libavx("the reference gate's libavx,spechub start")) {
         std::string gate_log;
         const int gate = tiny::run(serving_argv(w.qwen35, { "--kernels", "libavx,spechub",
                                                             "--draft-coupling", "on" }),
@@ -1202,7 +1250,7 @@ TEST(runtime_lora_scores_as_the_merged_checkpoint_does) {
                           score(tp2, { "RADIANCE_HOST_DEVICES=2" }));
 #if defined(__x86_64__)
     /* libavx alone serves the adapter ops too, as it serves every other op. */
-    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+    if (have_libavx("runtime LoRA on libavx")) {
         std::vector<std::string> avx = { "--kernels", "libavx" };
         avx.insert(avx.end(), ad.begin(), ad.end());
         check_within_rounding("runtime LoRA on libavx against the merged checkpoint",
@@ -2387,6 +2435,72 @@ TEST(several_models_in_one_process_answer_as_they_do_alone) {
     }
 }
 
+/* Brilliance: the dashboard Sandbox's Start loads with ?hold=1, and the model then stays until an
+ * admin unload (its Stop), as a pinned one does: a plain request for another model that needs its
+ * room is refused, naming the hold, rather than evicting it. Two models that cannot share the
+ * host backend's fake card (512 MiB less the 96 MiB headroom, 400 MiB claimed each): without the
+ * hold the second request moves the first off the card; with it the first stays and keeps
+ * answering, and the refusal a loopback caller reads says why. */
+TEST(a_held_model_stays_until_its_unload) {
+    REQUIRE(world().ok);
+    const json req = completion({ 1, 2, 3, 4, 5 }, 6);
+    const std::string yaml =
+        "server: {host: 127.0.0.1, port: 0, http-threads: 4, kernels: libref,\n"
+        "         debug-accept-reference-kernels: true}\n"
+        "scheduler: {warm-up: false}\n"
+        "defaults: {max-num-seqs: 4, gpu-memory-mib: 400}\n"
+        "models:\n  a: {model: " + world().qwen35 + "}\n  b: {model: " + world().qwen35 + "}\n";
+    auto fleet_model = [](int port, const std::string& id) -> json {
+        Call c;
+        std::string out;
+        if (!c.send(port, "GET", "/admin/fleet", "") || c.read(&out) != 200) return json();
+        const json f = json::parse(out, nullptr, false);
+        if (f.is_object() && f.contains("models"))
+            for (const json& m : f["models"])
+                if (m.value("id", "") == id) return m;
+        return json();
+    };
+    auto named = [&](const char* m) { json r = req; r["model"] = m; return r; };
+    Server s;
+    REQUIRE(s.start_yaml(yaml));
+    int st = 0;
+
+    /* The control: a loaded without a hold leaves the card for b's request. */
+    post(s.port, "/admin/models/a/load", json::object(), &st);
+    CHECK_EQ(st, 200);
+    post(s.port, "/completion", named("b"), &st);
+    CHECK_EQ(st, 200);
+    CHECK(fleet_model(s.port, "a").value("state", "") != "resident");
+    CHECK(!fleet_model(s.port, "a").contains("held"));
+    post(s.port, "/admin/models/b/unload", json::object(), &st);
+    CHECK_EQ(st, 200);
+
+    /* Held: b's request is refused with the reason, and a stays and answers. */
+    post(s.port, "/admin/models/a/load?hold=1", json::object(), &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(fleet_model(s.port, "a").value("held", false), true);
+    const json refused = post(s.port, "/completion", named("b"), &st);
+    CHECK_EQ(st, 503);
+    const std::string msg = refused.is_object() && refused.contains("error")
+                                ? refused["error"].value("message", "") : std::string();
+    if (msg.find("held by an admin load") == std::string::npos)
+        fprintf(stderr, "    the refusal: %s\n", refused.dump().c_str());
+    CHECK(msg.find("held by an admin load") != std::string::npos);
+    CHECK_EQ(fleet_model(s.port, "a").value("state", ""), std::string("resident"));
+    post(s.port, "/completion", named("a"), &st);
+    CHECK_EQ(st, 200);
+
+    /* The unload (the Sandbox's Stop) ends the hold, and b loads in its place once the refusal's
+     * Retry-After (the fleet's 15 s for a load that found no room) has passed. */
+    post(s.port, "/admin/models/a/unload", json::object(), &st);
+    CHECK_EQ(st, 200);
+    CHECK(!fleet_model(s.port, "a").contains("held"));
+    std::this_thread::sleep_for(std::chrono::seconds(16));
+    post(s.port, "/completion", named("b"), &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(s.stop(), 0);
+}
+
 /* --checkpoint-slots auto, the default, sizes the snapshot store from --max-num-seqs and what the
  * retention policy keeps for a --max-model-len session (the tiny hybrid's 4096 tokens are two
  * 2048-token intervals: 2 snapshots, 3 a sequence), says so on its startup line and reports the
@@ -2500,6 +2614,142 @@ TEST(a_requests_last_step_issues_no_step_ahead) {
     CHECK_EQ(decode, 62.0);
     CHECK_EQ(ahead, 62.0);
     CHECK_EQ(plain.stop(), 0);
+}
+
+/* ================================================================== collective faults (Brilliance)
+ *
+ * A collective that gives up waiting for its peer records a fault, and the engine fails the step's
+ * requests and stops before any of the step's tokens goes out; the process exits 70
+ * (coll_fault_check). A prompt longer than a step is prefilled in chunks, and only its last one
+ * samples a row: an intermediate chunk has no wait, so it reads the records without one, and a
+ * fault in an interior chunk fails the request there, not at the prompt's last chunk with every
+ * chunk between computed on a sum known to be wrong (pp-tp2.faultpoll). The host backend keeps no
+ * records, so BRILLIANCE_TEST_COLL_FAULT stands in for one: latched when step <k> is issued, or
+ * with ":late" once its collection has looked, as a record that lands after the host's poll.
+ *
+ * The prompt is 200 tokens at 64 a step, chunks 64 + 64 + 64 + 8, steps 0 to 3 of a fresh server,
+ * with step 3 the one that samples. RADIANCE_LOG_STEPS logs each step as it starts, so the log
+ * shows which ran. */
+namespace {
+
+const std::vector<std::string> kChunked = { "--num-speculative-tokens", "0", "--no-prefix-cache",
+                                            "--max-num-batched-tokens", "64",
+                                            "--max-num-seqs", "1" };
+
+struct FaultRun {
+    int status = 0;          /* the request's HTTP status */
+    json reply;
+    int exit = -1;           /* the server's exit status */
+    std::string log;
+};
+
+FaultRun fault_run(const std::string& inject, int n_predict, bool expect_exit = true) {
+    FaultRun r;
+    Server s;
+    std::vector<std::string> env = { "RADIANCE_LOG_STEPS=1" };
+    if (!inject.empty()) env.push_back("BRILLIANCE_TEST_COLL_FAULT=" + inject);
+    if (!s.start(world().lfm2, kChunked, env)) return r;
+    r.reply = post(s.port, "/completion", completion(prompt_ids(41, 200), n_predict), &r.status);
+    r.exit = expect_exit ? s.wait_exit(60) : s.stop();
+    r.log = s.output();
+    return r;
+}
+
+bool step_ran(const std::string& log, int step) {
+    return has(log, "step " + std::to_string(step) + " prefill") ||
+           has(log, "step " + std::to_string(step) + " decode") ||
+           has(log, "step " + std::to_string(step) + " MIXED");
+}
+
+}  /* namespace */
+
+/* The steps the cases below count on: four prefill chunks, steps 0 to 3. */
+TEST(a_chunked_prompt_runs_the_steps_the_fault_cases_count_on) {
+    REQUIRE(world().ok);
+    const FaultRun r = fault_run("", 1, /*expect_exit=*/false);
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(tokens_of(r.reply).size(), (size_t)1);
+    for (int k = 0; k <= 3; ++k) CHECK(step_ran(r.log, k));
+    CHECK(has(r.log, "step 0 prefill n_seq=1 n_tok=64"));
+    CHECK(has(r.log, "step 3 prefill n_seq=1 n_tok=8"));
+    CHECK(!step_ran(r.log, 4));
+    /* The three chunks with no row read the records without a wait; the engine's last line says
+     * what that cost. */
+    CHECK(has(r.log, "collective fault poll on steps with no sampled row (final): 3 poll(s)"));
+    CHECK_EQ(r.exit, 0);
+    if (r.exit != 0 || !step_ran(r.log, 3)) fprintf(stderr, "%s\n", tail(r.log, 30).c_str());
+}
+
+/* The fault in interior chunk 1 fails the request at step 1: no token, the collective named, no
+ * later chunk run, exit 70. Before the poll it surfaced at step 3, the sampled one. */
+TEST(a_collective_fault_in_an_interior_prefill_chunk_fails_the_request_there) {
+    REQUIRE(world().ok);
+    const FaultRun r = fault_run("1", 8);
+    CHECK(r.status != 200);
+    CHECK(tokens_of(r.reply).empty());
+    CHECK(has(r.log, "step 1: a collective gave up waiting for its peer and recorded a fault"));
+    CHECK(has(r.log, "seen by the poll of a step with no sampled row"));
+    CHECK(has(r.log, "latched in step 1"));
+    CHECK(!step_ran(r.log, 2));
+    CHECK(!has(r.log, "step 3: a collective gave up"));
+    CHECK_EQ(r.exit, 70);
+    if (r.exit != 70 || step_ran(r.log, 2)) fprintf(stderr, "%s\n", tail(r.log, 30).c_str());
+}
+
+/* A record that lands after interior chunk 1's poll fails the request at the next step's, chunk 2,
+ * also without a row. */
+TEST(a_collective_fault_landing_after_a_chunks_poll_fails_the_request_at_the_next_chunk) {
+    REQUIRE(world().ok);
+    const FaultRun r = fault_run("1:late", 8);
+    CHECK(r.status != 200);
+    CHECK(tokens_of(r.reply).empty());
+    CHECK(has(r.log, "step 2: a collective gave up waiting for its peer and recorded a fault"));
+    CHECK(has(r.log, "seen by the poll of a step with no sampled row"));
+    CHECK(!step_ran(r.log, 3));
+    CHECK_EQ(r.exit, 70);
+    if (r.exit != 70) fprintf(stderr, "%s\n", tail(r.log, 30).c_str());
+}
+
+/* The last chunk samples a row and waits for it: unchanged, the fault named at step 3 after the
+ * wait, no token. */
+TEST(a_collective_fault_in_the_sampled_chunk_fails_the_request_after_its_wait) {
+    REQUIRE(world().ok);
+    const FaultRun r = fault_run("3", 8);
+    CHECK(r.status != 200);
+    CHECK(tokens_of(r.reply).empty());
+    CHECK(has(r.log, "step 3: a collective gave up waiting for its peer and recorded a fault"));
+    CHECK(!has(r.log, "seen by the poll of a step with no sampled row"));
+    CHECK(!step_ran(r.log, 4));
+    CHECK_EQ(r.exit, 70);
+    if (r.exit != 70) fprintf(stderr, "%s\n", tail(r.log, 30).c_str());
+}
+
+/* A record no later step looks at -- here one landing after the request's only sampled step, as a
+ * fault of a request cancelled between an interior chunk and its next row does -- is not left for
+ * the next request: the idle engine stops on it, naming it and no request, and exits 70. */
+TEST(a_collective_fault_no_step_looked_at_stops_the_idle_engine) {
+    REQUIRE(world().ok);
+    const FaultRun r = fault_run("3:late", 1);
+    CHECK_EQ(r.status, 200);
+    CHECK_EQ(tokens_of(r.reply).size(), (size_t)1);
+    CHECK(has(r.log, "idle after the last step: a collective gave up waiting for its peer"));
+    CHECK(has(r.log, "No request is running, so none fails with it"));
+    CHECK_EQ(r.exit, 70);
+    if (r.exit != 70) fprintf(stderr, "%s\n", tail(r.log, 30).c_str());
+}
+
+/* With no fault the poll changes nothing: the same tokens as a server without the stand-in. */
+TEST(the_no_row_fault_poll_changes_no_token_of_a_clean_run) {
+    REQUIRE(world().ok);
+    const FaultRun a = fault_run("", 16, /*expect_exit=*/false);
+    const FaultRun b = fault_run("100000", 16, /*expect_exit=*/false);
+    CHECK_EQ(a.status, 200);
+    CHECK_EQ(b.status, 200);
+    CHECK_EQ(tokens_of(a.reply).size(), (size_t)16);
+    CHECK(tokens_of(a.reply) == tokens_of(b.reply));
+    CHECK(!has(b.log, "a collective gave up"));
+    CHECK_EQ(a.exit, 0);
+    CHECK_EQ(b.exit, 0);
 }
 
 /* Decoding a token runs the recurrent kernels over one row; prefilling it runs the chunked ones

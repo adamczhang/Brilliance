@@ -1108,11 +1108,15 @@ int64_t now_ms() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-/* A reported stall that progress ended: k is its kick's time (StallWatch::progress). */
+/* A reported stall that progress ended: k is its kick's time (StallWatch::progress). Only the
+ * timing is known here. The markers may have made HIP submit held work, or the stall may have
+ * ended on its own (a held stream let go, a slow step finishing, a driver reset); the watch
+ * cannot tell which, so the line names no cause (2026-11-20, the held-stream test: let go about
+ * 0.15 s after the kick, the line then claimed unsubmitted work). */
 void say_resumed(int64_t k, int64_t t) {
     if (k > 0)
-        RAD_WARN("device: the device resumed %lld ms after the stall watch's markers: the stall was "
-                 "work HIP had queued and not submitted (the streams named above)",
+        RAD_WARN("device: the device resumed %lld ms after the stall watch's markers (the streams "
+                 "named above); the watch does not know what ended the stall",
                  (long long)(t - k));
 }
 

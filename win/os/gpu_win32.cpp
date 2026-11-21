@@ -1,27 +1,40 @@
-/* gpu_win32.cpp -- Brilliance: os::gpu_samples (win/os/os.h), what the graphics kernel reports of
- * each hardware GPU, for the dashboard's per-card figures (core/fleet/fleet.cpp, card_telemetry).
+/* gpu_win32.cpp -- Brilliance: os::gpu_samples (win/os/os.h), what the driver reports of each
+ * hardware GPU, for the dashboard's per-card figures (core/fleet/fleet.cpp, card_telemetry).
  *
  * WHERE THE FIGURES COME FROM. Linux reads the amdgpu driver's sysfs: gpu_busy_percent, hwmon power
- * and the junction temperature. Windows has no sysfs. The vendor's own telemetry API (AMD's ADLX)
- * reads all three exactly, but its SDK licence forbids redistributing its headers in source form and
- * asks for a restrictive end-user licence (reviewed 2026-11-16), which a source-distributed port of
- * an open-source engine cannot carry. So this reads what Windows itself offers for every WDDM 2.4+
- * adapter, through D3DKMT (the Windows SDK's d3dkmthk.h, gdi32): the adapter's performance data
- * (temperature, fan, memory clock, power as a share of its rated power) and each engine node's clock.
+ * and the junction temperature, all three the card's own power-management firmware (SMU) metrics.
+ * Windows has no sysfs. Two sources, both readable without admin rights:
  *
- * WHAT IT DOES NOT REPORT, and why, so a dashboard never shows a plausible wrong number:
+ * - AMD's ADL (AMD Display Library), whose runtime atiadlxx.dll the AMD driver installs in
+ *   System32. Its performance-metrics log (ADL2_New_QueryPMLogData_Get) is the same SMU metrics
+ *   Linux reads: board power in watts, GFX activity in percent, and the hotspot (junction)
+ *   temperature. It is the source for those three on an AMD card. ADL's SDK headers are MIT
+ *   (win/licenses/adl-sdk.LICENSE); the few declarations it needs are below, and nothing of AMD's
+ *   is shipped -- the DLL is the driver's, loaded at run time from System32 only (never from the
+ *   application directory or PATH, so no planted copy is loaded), and a machine without it simply
+ *   reports less.
+ *   AMD's newer ADLX is NOT used: its SDK licence (reviewed 2026-11-16, again 2026-11-21) allows
+ *   distribution only in object code under an end-user licence that forbids redistribution and
+ *   reverse engineering, which an open-source engine cannot carry.
+ * - Windows itself, for every WDDM 2.4+ adapter, through D3DKMT (the Windows SDK's d3dkmthk.h,
+ *   gdi32): the adapter's performance data (temperature, fan, memory clock, power as a share of a
+ *   rating it does not name) and each engine node's clock. Vendor-neutral; the temperature where
+ *   ADL gives none.
+ *
+ * WHAT IS NOT TAKEN FROM WINDOWS, and why, so a dashboard never shows a plausible wrong number:
  * - busy: the per-engine running time Windows accounts (Task Manager's GPU Engine counters) reads
- *   0% for a HIP kernel spinning on an R9700 for 15 s (measured 2026-11-16):
- *   HIP's compute work is not seen by that accounting, so a busy figure from it would say idle
- *   while the card works.
+ *   0% for a HIP kernel spinning on an R9700 for 15 s (measured 2026-11-16): HIP's compute work is
+ *   not seen by that accounting. Busy comes from ADL's GFX activity, the firmware's own count,
+ *   or is not reported.
+ * - watts: D3DKMT reports power as tenths of a percent of a rating it does not report, so
+ *   power_frac stays a fraction; watts come from ADL or are not reported.
  * - vram_used: the engine reports its own residency per card already.
- * - watts: the adapter reports power as tenths of a percent of its rated power, not watts; the
- *   rating it is a share of is not reported, so power_frac stays a fraction.
  *
- * Matching: the adapter's PCI address (KMTQAITYPE_ADAPTERADDRESS) against the engine's spelling of
- * the card's address ("0000:03:00.0", core/device/hip.cpp d_pci_address). Adapters are enumerated
- * once; their handles live for the process. Queries take microseconds and allocate nothing but the
- * returned vector. */
+ * Matching: the adapter's PCI address (D3DKMT's KMTQAITYPE_ADAPTERADDRESS, ADL's AdapterInfo bus,
+ * device and function) against the engine's spelling of the card's address ("0000:03:00.0",
+ * core/device/hip.cpp d_pci_address). Adapters are enumerated once; their handles and the ADL
+ * context live for the process. A D3DKMT query takes microseconds; an ADL metrics read 1-4 ms a
+ * card (measured on the test machine's R9700s), so an ADL reading is kept for kAdlKeepMs and reused. */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -29,7 +42,9 @@
 #include <winternl.h>
 #include <d3dkmthk.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -42,14 +57,118 @@ namespace rad {
 namespace os {
 namespace {
 
+/* ---- ADL: the declarations this file needs, from AMD's ADL SDK (MIT; adl_sdk.h, adl_defines.h,
+ * adl_structures.h at GPUOpen-LibrariesAndSDKs/display-library 84c881cb). Copyright (c) 2016 - 2022
+ * Advanced Micro Devices, Inc. The licence text is win/licenses/adl-sdk.LICENSE. */
+constexpr int kAdlMaxPath = 256;            /* ADL_MAX_PATH */
+struct AdlAdapterInfo {                     /* AdapterInfo, its Windows layout */
+    int  iSize;
+    int  iAdapterIndex;
+    char strUDID[kAdlMaxPath];
+    int  iBusNumber;
+    int  iDeviceNumber;
+    int  iFunctionNumber;
+    int  iVendorID;
+    char strAdapterName[kAdlMaxPath];
+    char strDisplayName[kAdlMaxPath];
+    int  iPresent;
+    int  iExist;
+    char strDriverPath[kAdlMaxPath];
+    char strDriverPathExt[kAdlMaxPath];
+    char strPNPString[kAdlMaxPath];
+    int  iOSDisplayIndex;
+};
+struct AdlSensor { int supported; int value; };   /* ADLSingleSensorData */
+constexpr int kAdlMaxSensors = 256;                /* ADL_PMLOG_MAX_SENSORS */
+struct AdlPmLog { int size; AdlSensor sensors[kAdlMaxSensors]; };   /* ADLPMLogDataOutput */
+/* ADL_PMLOG_SENSORS: the three read here. */
+constexpr int kAdlActivityGfx = 19;   /* ADL_PMLOG_INFO_ACTIVITY_GFX, percent */
+constexpr int kAdlHotspot     = 27;   /* ADL_PMLOG_TEMPERATURE_HOTSPOT, degrees C */
+constexpr int kAdlBoardPower  = 73;   /* ADL_PMLOG_BOARD_POWER, watts */
+typedef void* (__stdcall* AdlMalloc)(int);              /* ADL_MAIN_MALLOC_CALLBACK */
+typedef int (*AdlCreate)(AdlMalloc, int, void**);       /* ADL2_Main_Control_Create */
+typedef int (*AdlCount)(void*, int*);                   /* ADL2_Adapter_NumberOfAdapters_Get */
+typedef int (*AdlInfo)(void*, AdlAdapterInfo*, int);    /* ADL2_Adapter_AdapterInfo_Get */
+typedef int (*AdlQuery)(void*, int, AdlPmLog*);         /* ADL2_New_QueryPMLogData_Get */
+constexpr int kAdlOk = 0;                               /* ADL_OK */
+/* ---- end of the ADL declarations */
+
+/* ADL hands back what it allocates through this; it is never freed (one adapter list a process). */
+void* __stdcall adl_alloc(int n) { return std::malloc(n > 0 ? (size_t)n : 1); }
+
+constexpr int64_t kAdlKeepMs = 500;   /* an ADL reading is reused for this long */
+
 struct Adapter {
     D3DKMT_HANDLE handle = 0;
-    std::string   bdf;    /* "0000:bb:dd.f", the engine's spelling */
+    std::string   bdf;        /* "0000:bb:dd.f", the engine's spelling */
+    int           adl = -1;   /* its ADL adapter index, -1 when ADL does not know it */
+    /* The last ADL reading and when it was taken (steady clock, ms; -1 before the first). */
+    int64_t       adl_at_ms = -1;
+    double        adl_busy = -1, adl_power_w = -1, adl_temp_c = -1;
 };
 
 std::mutex           g_mu;
 bool                 g_enumerated = false;
 std::vector<Adapter> g_adapters;
+void*                g_adl = nullptr;   /* the ADL context, null without ADL */
+AdlQuery             g_adl_query = nullptr;
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* ADL's index for each adapter, by PCI address, when the AMD driver's ADL is installed. Under g_mu,
+ * once. A failure anywhere leaves ADL unused, and the D3DKMT figures stand alone. */
+void adl_open() {
+    HMODULE h = LoadLibraryExW(L"atiadlxx.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!h) return;
+    const auto create = (AdlCreate)(void*)GetProcAddress(h, "ADL2_Main_Control_Create");
+    const auto count  = (AdlCount)(void*)GetProcAddress(h, "ADL2_Adapter_NumberOfAdapters_Get");
+    const auto info   = (AdlInfo)(void*)GetProcAddress(h, "ADL2_Adapter_AdapterInfo_Get");
+    const auto query  = (AdlQuery)(void*)GetProcAddress(h, "ADL2_New_QueryPMLogData_Get");
+    void* ctx = nullptr;
+    if (!create || !count || !info || !query || create(adl_alloc, 1, &ctx) != kAdlOk || !ctx) return;
+    int n = 0;
+    if (count(ctx, &n) != kAdlOk || n <= 0) return;
+    std::vector<AdlAdapterInfo> ai((size_t)n);
+    for (AdlAdapterInfo& a : ai) a.iSize = (int)sizeof a;
+    if (info(ctx, ai.data(), (int)(sizeof(AdlAdapterInfo) * ai.size())) != kAdlOk) return;
+    /* One GPU has an ADL index per display output; the first for its address serves. */
+    for (Adapter& ad : g_adapters)
+        for (const AdlAdapterInfo& a : ai) {
+            char bdf[32];
+            std::snprintf(bdf, sizeof bdf, "0000:%02x:%02x.%x", a.iBusNumber & 0xff, a.iDeviceNumber & 0x1f,
+                          a.iFunctionNumber & 0x7);
+            if (ad.bdf == bdf) { ad.adl = a.iAdapterIndex; break; }
+        }
+    g_adl = ctx;
+    g_adl_query = query;
+}
+
+/* The ADL figures of `ad` into `s`, each only when the card reports it. Under g_mu. */
+void adl_read(Adapter& ad, GpuSample& s) {
+    if (!g_adl || ad.adl < 0) return;
+    const int64_t t = now_ms();
+    if (ad.adl_at_ms < 0 || t - ad.adl_at_ms >= kAdlKeepMs) {
+        AdlPmLog pm{};
+        pm.size = (int)sizeof pm;
+        ad.adl_busy = ad.adl_power_w = ad.adl_temp_c = -1;
+        if (g_adl_query(g_adl, ad.adl, &pm) == kAdlOk) {
+            const AdlSensor& act = pm.sensors[kAdlActivityGfx];
+            const AdlSensor& pw  = pm.sensors[kAdlBoardPower];
+            const AdlSensor& hot = pm.sensors[kAdlHotspot];
+            if (act.supported && act.value >= 0 && act.value <= 100) ad.adl_busy = act.value / 100.0;
+            if (pw.supported && pw.value >= 0) ad.adl_power_w = pw.value;
+            /* A sensor that reads 0 C is not reading. */
+            if (hot.supported && hot.value > 0) ad.adl_temp_c = hot.value;
+        }
+        ad.adl_at_ms = t;
+    }
+    if (ad.adl_busy >= 0) s.busy = ad.adl_busy;
+    if (ad.adl_power_w >= 0) s.power_w = ad.adl_power_w;
+    if (ad.adl_temp_c > 0) s.temp_c = ad.adl_temp_c;
+}
 
 /* One query of adapter `h`; false when the driver does not answer it. */
 template <class T>
@@ -83,8 +202,12 @@ void enumerate() {
         char bdf[32];
         std::snprintf(bdf, sizeof bdf, "0000:%02x:%02x.%x", a.BusNumber & 0xff, a.DeviceNumber & 0x1f,
                       a.FunctionNumber & 0x7);
-        g_adapters.push_back(Adapter{ info[i].hAdapter, bdf });
+        Adapter ad;
+        ad.handle = info[i].hAdapter;
+        ad.bdf = bdf;
+        g_adapters.push_back(std::move(ad));
     }
+    adl_open();
 }
 
 bool wanted(const std::vector<std::string>* only, const std::string& bdf) {
@@ -100,7 +223,7 @@ std::vector<GpuSample> gpu_samples(const std::vector<std::string>* only) {
     std::lock_guard<std::mutex> lk(g_mu);
     enumerate();
     std::vector<GpuSample> out;
-    for (const Adapter& ad : g_adapters) {
+    for (Adapter& ad : g_adapters) {
         if (!wanted(only, ad.bdf)) continue;
         GpuSample s;
         s.bdf = ad.bdf;
@@ -124,6 +247,8 @@ std::vector<GpuSample> gpu_samples(const std::vector<std::string>* only) {
                 s.gfx_max_mhz = (double)nd.MaxFrequency / 1e6;
             }
         }
+        /* After D3DKMT: ADL's junction temperature, where it has one, replaces the adapter's. */
+        adl_read(ad, s);
         out.push_back(std::move(s));
     }
     return out;

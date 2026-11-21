@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -237,6 +238,9 @@ public:
      * file-tier unit stalls until the read returns. This is the cost the plan accepted by putting
      * the cold tail on disk; frequent reads call for a different plan, not a change here. */
     int  read(uint64_t offset, int64_t bytes, void* pinned_dst, int64_t dst_cap);
+    /* Brilliance: the container's size, cached at open; -1 before. A read reaching past it is a
+     * short read and RAD_E_IO (read). */
+    int64_t size() const { return size_; }
 
     /* RadFileEntry offsets are RAD_ALIGN_UNIT-aligned (rad_format.h), which is DirectFile's
      * alignment, so the mover's reads need no bounce buffer -- except the container's final unit,
@@ -387,6 +391,11 @@ struct MoverStats {
      * nulled again with the staged units). Counted per read: a later slice of the layer's rows
      * that reads some of them counts the rest again. */
     uint64_t ssd_skipped_units = 0, ssd_skipped_bytes = 0;
+    /* Brilliance: the file tier's other two sources. `ram_*`: weights a read copied out of the RAM
+     * store (Mover::build_ram_store) into the read windows instead of reading the drive.
+     * `relaid_*`: weights read from the drive as planes and relaid into the windows on the read
+     * (Mover::read_relaid). `relay_ns`: host time spent filling windows either way. */
+    uint64_t ram_weights = 0, ram_bytes = 0, relaid_weights = 0, relaid_bytes = 0, relay_ns = 0;
 };
 
 /* MoverStats as the mover counts it on its rank thread, readable from the HTTP thread (Relaxed,
@@ -398,7 +407,8 @@ struct MoverCounters {
                       staged_units, staged_bytes, stage_overflow, stage_copies, ssd_staging_bytes,
                       ssd_promotions, ssd_promoted_bytes, ssd_deposits, ssd_deposit_bytes,
                       pool_evictions, ssd_layers, ssd_units, ssd_read_bytes, ssd_preads,
-                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes;
+                      ssd_read_ns, ssd_wait_ns, ssd_skipped_units, ssd_skipped_bytes,
+                      ram_weights, ram_bytes, relaid_weights, relaid_bytes, relay_ns;
 
     MoverStats snapshot() const {
         MoverStats s;
@@ -438,6 +448,11 @@ struct MoverCounters {
         s.ssd_wait_ns        = ssd_wait_ns;
         s.ssd_skipped_units  = ssd_skipped_units;
         s.ssd_skipped_bytes  = ssd_skipped_bytes;
+        s.ram_weights        = ram_weights;
+        s.ram_bytes          = ram_bytes;
+        s.relaid_weights     = relaid_weights;
+        s.relaid_bytes       = relaid_bytes;
+        s.relay_ns           = relay_ns;
         return s;
     }
 };
@@ -708,6 +723,36 @@ public:
      * would ever read it again. Called once, at the stager's bring-up. */
     void  cover_file_units(const std::vector<int32_t>& more);
 
+    /* ---- Brilliance: relaid experts and the RAM store -----------------------------------------
+     *
+     * set_file_relayout  how a file-tier weight whose stored form is not its container planes
+     *                    (MoveUnit::file_relaid) is made: the kernel's own relayout, the one the
+     *                    load runs for a resident weight. Set before the first read; without it a
+     *                    relaid weight's read is RAD_E_STATE.
+     * build_ram_store    reads every MoveUnit::ram_held unit once, relaying where its weights are
+     *                    relaid, into one block of ordinary RAM (not pinned, not locked), each unit
+     *                    at the stager's packing in the plan's rank order. Exactly Plan::ram_bytes,
+     *                    or RAD_E_STATE. Call after the load has set every weight's file offsets
+     *                    (WeightInfo::file_plane_offset) and before the first step. A failed read
+     *                    (a short read, a refused relayout) frees the block and fails the load.
+     *                    From then on stage_file_units copies a held unit out of RAM into the read
+     *                    windows where it would read the drive; the rest are read as before.
+     * ram_of             a held weight's stored bytes, or null.
+     *
+     * Units neither held nor stored as they lie are read as planes from the drive and relaid
+     * into the windows on the read, a weight at a time, on up to relay_threads() threads. Every
+     * other step of a read (publication before the H2D copies, the window events, `done`, the
+     * caller's wait, retirement behind the consuming ops) is the direct read's. */
+    using RelayoutFn =
+        std::function<int(const WeightInfo& w, const RadTensor* planes, void* dst, int64_t dst_bytes)>;
+    void set_file_relayout(RelayoutFn f) { relayout_ = std::move(f); }
+    int  build_ram_store(int64_t* bytes = nullptr);
+    const uint8_t* ram_of(rad_weight w) const {
+        return (size_t)w < ram_at_.size() ? ram_at_[(size_t)w] : nullptr;
+    }
+    int64_t ram_store_bytes() const { return ram_bytes_; }
+    int     relay_threads() const { return relay_threads_; }
+
     /* A snapshot by value: the counters are atomics read while the rank thread writes them. */
     MoverStats stats() const { return stats_.snapshot(); }
     std::string report() const;
@@ -881,8 +926,15 @@ private:
         char*   dst = nullptr;
         bool    hot = false;
         bool    deposit = false;
+        /* Brilliance: set for a weight not read as it lies -- held in the RAM store, or relaid
+         * from its planes -- which goes through the relay windows (stage_relay), not a pread. */
+        const WeightInfo* w = nullptr;
+        rad_weight        h = 0;
     };
     std::vector<FileExt>    fext_;
+    std::vector<FileExt>    frel_;         /* Brilliance: the relay windows' weights */
+    /* One weight's extent for a read: the direct pread's, or the relay's. */
+    void add_ext(const MoveUnit& mu, size_t k, char* dst, bool hot, bool deposit);
     std::vector<int64_t>    fat_;          /* the staged units' buffer offsets */
     std::vector<char*>      fbase_;        /* the hot-cache units' slot bases */
     std::vector<int32_t>    frec_;         /* move records whose copies this read issues */
@@ -900,6 +952,25 @@ private:
     struct VictimRank { int at = -1; std::vector<std::pair<float, int32_t>> by_heat; };
     std::vector<VictimRank> victims_;
     int32_t pick_victim(int32_t klass, const int32_t* protect, int n_protect, float below);
+
+    /* Brilliance: relaid weights and the RAM store (see set_file_relayout). `RelayIn` is one
+     * thread's aligned input buffer for a relaid weight's planes, grown on demand to the largest
+     * span read. `file_mu_` serialises the one read that is not on the aligned fast path (the
+     * container's last bytes, where DirectFile bounces through its single buffer). */
+    struct RelayIn { uint8_t* p = nullptr; int64_t cap = 0; };
+    RelayoutFn               relayout_;
+    std::vector<RelayIn>     relay_in_;
+    int                      relay_threads_ = 1;
+    std::mutex               file_mu_;
+    uint8_t*                 ram_ = nullptr;
+    int64_t                  ram_bytes_ = 0;
+    std::vector<const uint8_t*> ram_at_;   /* by rad_weight: the held stored bytes, or null */
+    int  read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
+    int  read_held(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in);
+    int  read_aligned(int64_t off, int64_t bytes, RelayIn* in, int64_t* skew);
+    /* Fills the read windows with frel_'s weights and copies each to its destination on the
+     * mover's stream, each window's event recorded behind its copies. */
+    int  stage_relay();
 
     /* The lead gate's ring: one event a dispatch, and a host wait on the one from
      * max_lead_dispatches ago. */

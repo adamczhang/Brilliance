@@ -14397,6 +14397,248 @@ TEST(flashnext_a_spanned_prefill_runs_a_pass_at_a_time_with_its_all_reduces_besi
         }
 }
 
+#if defined(_WIN32)
+namespace {
+struct Tp2PipelineEnv {
+    const std::string saved = [] {
+        const char* v = std::getenv("BRILLIANCE_TP2_PIPELINE");
+        return std::string(v ? v : "");
+    }();
+    ~Tp2PipelineEnv() { set(saved.c_str()); }
+    static void set(const char* value) { _putenv_s("BRILLIANCE_TP2_PIPELINE", value); }
+};
+
+void free_q4_pipe_bounds(qwen4exp_fp8::Model& m) {
+    if (m.pipe_cu_h) rad_dev_free(m.pipe_cu_h, RAD_MEM_HOST_PINNED);
+    m.pipe_cu_h = nullptr;
+    m.pipe_cu_tried = false;
+}
+}  /* namespace */
+
+TEST(flashnext_tp2_host_pipeline_keeps_the_wide_mixer_and_reduces_then_writes_each_slice) {
+    const Tp2PipelineEnv env;
+    env.set("1");
+    MetaKV mk = q4_small();
+    std::vector<Fnv> rank_traces(3);
+    for (int rank : {0, 1}) {
+        RadBuilder b;
+        b.device_p2p = 0;
+        b.encs = {{ "draft_head", u2_head() }};
+        RadBuildCtx ctx = q4_ctx(rank, 2);
+        ctx.max_tok = 6144;
+        ctx.max_mixed_tok = 2048;
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, mk.meta(), &ctx); }),
+                   RAD_OK);
+        auto& m = qwen4exp_fp8::g_model[rank];
+        REQUIRE(m.tp2_host_pipe);
+        const int64_t d = m.g.n_embd, h = m.hccfg.hc, piece = 2048;
+        for (rad_buf buf : {m.a_x.x, m.b_h, m.b_inj})
+            CHECK(std::find(b.concurrent.begin(), b.concurrent.end(), buf) != b.concurrent.end());
+
+        auto check_bounds = [&](const RadBuilder& graph, int64_t whole, int64_t slice) {
+            int narrow = 0;
+            for (const auto& op : graph.ops)
+                if (op.op == "all_reduce" && pint(&op, "overlap") == 1) {
+                    ++narrow;
+                    REQUIRE(param(&op, "numel"));
+                    CHECK_EQ(param(&op, "numel")->ihi, slice * d);
+                    CHECK_EQ(pint(&op, "exact"), 1);
+                }
+            CHECK_EQ(narrow, 2 * (int)m.layers.size());
+            REQUIRE(param(graph.op_of(m.op_embed_ar), "numel"));
+            CHECK_EQ(param(graph.op_of(m.op_embed_ar), "numel")->ihi, whole * d);
+        };
+        check_bounds(b, 6144, piece);
+        auto shape_ctx = ctx;
+        shape_ctx.max_tok = 1024;
+        shape_ctx.shape_probe = 1;
+        RadBuilder shape;
+        shape.encs = b.encs;
+        /* The sizing builder has no topology fact of its own. */
+        REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&shape, mk.meta(), &shape_ctx); }),
+                   RAD_OK);
+        check_bounds(shape, 1024, 1024);
+
+        int shape_index = 0;
+        for (int t : {6144, 4096, 4275}) {
+            const auto pf = kit(b, {}, {t}, 6144);
+            if (t == 6144) pf->b.n_out = 0;  /* interior chunk, no sampling */
+            auto v = run_passes(b, qwen4exp_fp8::step, {pf.get()}, rank, 2);
+            CHECK_PASSES(b, v);
+            const RadCtx& c = *v[0];
+            REQUIRE(!c.joins.empty());
+            const int pieces = (t + (int)piece - 1) / (int)piece;
+            std::vector<int> order;
+            for (int part = 0; part < pieces; ++part) {
+                if (part == 0) order.push_back(0);            /* mixer 0 */
+                if (part + 1 < pieces) order.push_back(part + 1);
+                order.push_back(pieces + part);              /* FFN part */
+            }
+            int reductions = 0, writes = 0, gathers = 0, wide_gdn = 0;
+            Fnv trace;
+            for (size_t j = 0; j < c.issues.size(); ++j) {
+                const auto& issue = c.issues[j];
+                const RecOp* op = b.op_of(issue.op);
+                REQUIRE(op);
+                CHECK(op->op != "ar_hc_write" && op->op != "ar_gather_hc_write");
+                if (op->op == "gdn_conv_prep" && (issue.n == RAD_N_BATCH || issue.n == t))
+                    ++wide_gdn;
+                if (op->op == "moe_gather" || op->op == "moe_gather_inv") {
+                    CHECK_EQ(issue.lane, 0);
+                    ++gathers;
+                }
+                if (issue.lane == 0) {
+                    CHECK(op->op != "all_reduce");
+                    continue;
+                }
+                for (const auto& operand : issue.opd)
+                    if (operand.kind == RAD_OPK_BUF)
+                        CHECK(operand.handle == m.a_x.x || operand.handle == m.b_h ||
+                              operand.handle == m.b_inj);
+                trace.s(op->op).i(issue.n);
+                for (const auto& operand : issue.opd) trace.i(operand.offset).i(operand.rows);
+                if (issue.op == m.op_embed_ar) {
+                    CHECK(j > 0);
+                    CHECK_EQ(reductions, 0);
+                    CHECK_EQ(issue.n, t * d);
+                    CHECK_EQ(pint(op, "exact"), 1);
+                    ++reductions;
+                    continue;
+                }
+                if (op->op == "hc_write") continue;  /* checked with its preceding reduction */
+                REQUIRE(op->op == "all_reduce");
+                REQUIRE(reductions > 0);
+                const int at = reductions - 1;
+                const int layer = at / (2 * pieces), part = order[at % (2 * pieces)];
+                REQUIRE(layer < (int)m.layers.size());
+                const auto& lay = m.layers[layer];
+                const bool mixer = part < pieces;
+                const auto& hc = mixer ? lay.hc_mix : lay.hc_ffn;
+                const int64_t first = (part % pieces) * piece;
+                const int64_t rows = std::min(piece, t - first);
+                CHECK_EQ(pint(op, "overlap"), 1);
+                CHECK_EQ(pint(op, "exact"), 1);
+                CHECK_EQ(issue.op, mixer ? (lay.full ? lay.attn.op_ar_ov : lay.gdn.op_ar_ov)
+                                         : lay.mlp.op_ar_ov);
+                CHECK_EQ(issue.n, rows * d);
+                CHECK_EQ(issue.opd[0].offset, first * d);
+                CHECK_EQ(issue.opd[0].rows, rows);
+
+                REQUIRE(j + 1 < c.issues.size());
+                const auto& write = c.issues[j + 1];
+                CHECK_EQ(write.lane, 1);
+                CHECK_EQ(write.op, hc.op_write);
+                CHECK_EQ(write.n, rows);
+                REQUIRE(write.opd.size() == 3);
+                CHECK_EQ(write.opd[0].offset, first * d);
+                CHECK_EQ(write.opd[1].offset, first * h);
+                CHECK_EQ(write.opd[2].offset, first * h * d);
+                for (const auto& operand : write.opd) CHECK_EQ(operand.rows, rows);
+                ++reductions;
+                ++writes;
+            }
+            const int layers = (int)m.layers.size();
+            CHECK(wide_gdn > 0);
+            CHECK_EQ(reductions, 1 + 2 * pieces * layers);
+            CHECK_EQ(writes, 2 * pieces * layers);
+            CHECK_EQ(gathers, pieces * layers);
+            CHECK(c.joins.front().at > 0);
+            CHECK_EQ(c.joins.front().from, 0);
+            CHECK_EQ(c.joins.front().to, 1);
+            CHECK_EQ(c.joins.back().from, 1);
+            CHECK_EQ(c.joins.back().to, 0);
+            CHECK(c.issues[c.joins.back().at - 1].lane == 1);
+            for (const auto& join : c.joins)
+                trace.i((int64_t)join.at).i(join.from).i(join.to);
+            if (rank == 0) rank_traces[shape_index] = trace;
+            else CHECK_EQ(rank_traces[shape_index].h, trace.h);
+            ++shape_index;
+        }
+        for (bool select : {true, false}) {
+            auto pf = kit(b, {}, {6144}, 6144);
+            RadCtx c{};
+            c.b = &b;
+            c.batch = &pf->b;
+            c.rank = rank;
+            c.world = 2;
+            c.fail_lane_select = select;
+            c.fail_lane_join = !select;
+            qwen4exp_fp8::step(&c, &pf->b);
+            CHECK(c.step_fail.find("could not order") != std::string::npos);
+            for (const auto& issue : c.issues) CHECK_EQ(issue.lane, 0);
+        }
+        free_q4_pipe_bounds(m);
+    }
+}
+
+TEST(flashnext_tp2_host_pipeline_preserves_serial_fallbacks_and_other_deployments) {
+    const Tp2PipelineEnv env;
+    MetaKV mk = q4_small();
+    struct Deployment { int world, p2p, shared, step_pass; };
+    for (const Deployment dep : {Deployment{1, 0, 2048, 0}, {2, 1, 2048, 0}, {2, -1, 2048, 0},
+                                 {2, 0, 4096, 0}, {2, 0, 2048, 1}, {4, 0, 2048, 0},
+                                 {2, 0, 2048, 0}}) {
+        for (int rank = 0; rank < dep.world; ++rank) {
+            const bool host_pipe = dep.world == 2 && dep.p2p == 0 && dep.shared == 2048 &&
+                                   dep.step_pass == 0;
+            uint64_t declared = 0;
+            uint64_t fallback_issues = 0;
+            for (const char* flag : {"0", "1"}) {
+                env.set(flag);
+                RadBuilder b;
+                b.device_p2p = dep.p2p;
+                b.encs = {{ "draft_head", u2_head() }};
+                auto ctx = q4_ctx(rank, dep.world);
+                ctx.max_tok = 6144;
+                ctx.max_mixed_tok = dep.shared;
+                ctx.span_pass_step = dep.step_pass;
+                REQUIRE_EQ(stderr_of_rc([&] { return qwen4exp_fp8::declare(&b, mk.meta(), &ctx); }),
+                           RAD_OK);
+                auto& m = qwen4exp_fp8::g_model[rank];
+                const bool enabled = flag[0] == '1';
+                CHECK_EQ(m.tp2_host_pipe, enabled && host_pipe);
+                if (!enabled) declared = graph_hash(b);
+                else if (!host_pipe) CHECK_EQ(graph_hash(b), declared);
+
+                auto wide = kit(b, {}, {6144}, 6144);
+                auto short_pf = kit(b, {}, {2048}, 0);
+                auto mixed = kit(b, {1}, {2047}, 6144);
+                auto decode = kit(b, {4}, {});
+                decode->b.n_spec = 3;
+                auto history = history_pass(b, *short_pf);
+                auto cut = kit(b, {}, {6144}, 6144);
+                const int32_t cut_cu[] = {0, 2048, 6144};
+                cut->b.ckpt_cut = cut_cu[1];
+                cut->b.ckpt_cu = cut_cu;
+                auto steered = kit(b, {}, {6144}, 6144);
+                steered->b.control_vector = 1;
+                auto rope = kit(b, {}, {6144}, 6144);
+                rope->b.rope_mixed = 1;
+                std::vector<const Kit*> batches = {short_pf.get(), mixed.get(), decode.get(),
+                                                   history.get()};
+                if (!host_pipe) batches.push_back(wide.get());
+                else {
+                    batches.push_back(cut.get());
+                    batches.push_back(steered.get());
+                    batches.push_back(rope.get());
+                    /* Media/rotary metadata is rank independent even when no tower is declared. */
+                    wide->b.n_mm_rows = 1;
+                    batches.push_back(wide.get());
+                    for (const Kit* k : batches)
+                        CHECK(!qwen4exp_fp8::pipelined(m, &k->b));
+                }
+                auto v = run_passes(b, qwen4exp_fp8::step, batches, rank, dep.world);
+                REQUIRE(steps_ok(v));
+                const auto hash = issue_hash(b, v, batches);
+                if (!enabled) fallback_issues = hash;
+                else CHECK_EQ(hash, fallback_issues);
+                free_q4_pipe_bounds(m);
+            }
+        }
+    }
+}
+#endif
+
 /* --prefill-span-pass step (RadBuildCtx::span_pass_step): where a spanned step runs serially, at
  * one and two ranks, the routed block takes the whole step in one pass -- one router launch a
  * routed block instead of one a piece, over planes a step tall -- while the connection reads and

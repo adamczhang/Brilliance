@@ -164,7 +164,8 @@ struct HyperConn {
     int  declare_gather(RadBuilder* b, const GatherSrc& src);
 
     void read (RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
-    void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const;
+    /* With reduce=false the caller has already gathered and reduced this slice. */
+    void write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool reduce = true) const;
     /* The read over rows [0, T), in pieces of Config::read_rows where it is set; one read
      * otherwise. The read's down product splits K by how many row tiles it is handed
      * (hc_down_kchunk in libr4d), so one read over twice the rows sums in a different order than
@@ -498,9 +499,10 @@ struct HcProject {
 /* The block's output `y` is read from `w.x.x`, the buffer the read wrote the block's input to:
  * every block leaves its delta in the activation its norm produced, and the input is dead by
  * then. */
-inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) const {
+inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
+                             bool reduce) const {
     if (!op_write) return;
-    if (takes_gather(T)) {
+    if (reduce && takes_gather(T)) {
         const int64_t k = gsrc.top_k;
         const bool shared = gsrc.sh && gsrc.sg;
         const rad_op op = ar_exact_write_takes(g, T) ? op_ar_gather_write : op_ar_gather_write6;
@@ -514,7 +516,7 @@ inline void HyperConn::write(RadCtx* c_, int64_t T, int64_t r0, int64_t rows) co
                     brow_slice(w.h, r0, rows, hn()));
         return;
     }
-    RAD_ISSUE_N(c_, takes_ar(T) ? ar_write(T) : op_write, rows,
+    RAD_ISSUE_N(c_, reduce && takes_ar(T) ? ar_write(T) : op_write, rows,
                 brow_slice(w.x.x, r0, rows, g.n_embd),
                 brow_slice(w.inj, r0, rows, c.hc),
                 brow_slice(w.h, r0, rows, hn()));

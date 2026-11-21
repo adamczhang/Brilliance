@@ -141,6 +141,16 @@ static const Flag g_flags[] = {
     "                                    container on disk (O_DIRECT) -- the file tier, units on\n"
     "                                    Tier::SSD; a routed expert is read a layer at\n"
     "                                    a time, so a step is paced by the drive" },
+    { "--weights-file-relayout", nullptr, "with --weights-disk-tier, let the file tier take a routed\n"
+    "                                    expert whose kernel relays its container planes: read and\n"
+    "                                    relaid on every read (one whole, unsharded expert at a time)" },
+    { "--expert-ram-mib",     "N",      "with --weights-disk-tier, keep up to N MiB (all ranks together)\n"
+    "                                    of the routed experts the cards and the host pool cannot\n"
+    "                                    hold in ordinary RAM, read and relaid once at load; a step\n"
+    "                                    copies them through the pinned read windows, and the rest\n"
+    "                                    stay on the drive. Refused unless 24 GiB of RAM stays free" },
+    { "--plan-only",          nullptr,  "plan placement and check host memory and pins, print both,\n"
+    "                                    and stop before allocating any pool or reading a weight" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -663,6 +673,7 @@ static bool plain_name(const char* s) {
 /* Returns 0 on success, 1 for --help (caller exits 0), negative on a bad argument. An unknown flag
  * is an error, not a warning, since a mistyped budget flag changes the plan. */
 int config_parse(int argc, char** argv, Config* c) {
+    bool ram_all = false;    /* Brilliance: --expert-ram-mib was given: a total, split likewise */
     bool pool_all = false;   /* --host-pool-mib was given: a total, split among the ranks at the end */
     /* --help wins from anywhere on the line, even after an otherwise fatal argument. */
     for (int i = 1; i < argc; ++i)
@@ -853,9 +864,13 @@ int config_parse(int argc, char** argv, Config* c) {
                 return RAD_E_INVAL;
             }
             c->tower_placement = p;
+            c->tower_placement_given = true;
         }
         else if (S("--ngram-warm"))            { c->ngram_warm = true; }
         else if (S("--weights-disk-tier"))     { c->weights_disk_tier = true; }
+        else if (S("--weights-file-relayout")) { c->weights_file_relayout = true; }
+        else if (S("--expert-ram-mib"))        { if (!num(0, INT64_MAX, &c->expert_ram_mib)) return RAD_E_INVAL; ram_all = true; }
+        else if (S("--plan-only"))             { c->plan_only = true; }
         else if (S("--prefix-cache-mib"))      { if (!num(0, INT32_MAX, &c->prefix_cache_mib)) return RAD_E_INVAL; }
         else if (S("--prefix-cache-ttl"))      { if (!num(0, INT32_MAX, &c->prefix_cache_ttl)) return RAD_E_INVAL; }
         else if (S("--lora")) {
@@ -1725,6 +1740,12 @@ int config_parse(int argc, char** argv, Config* c) {
     /* --host-pool-mib is what the model pins for its weights in all; Config::host_pool_mib is a
      * rank's share of it, whichever of the two options came first. */
     if (pool_all) c->host_pool_mib /= std::max(c->tp, 1);
+    /* Brilliance: --expert-ram-mib is all ranks' RAM for held experts, as --host-pool-mib is their
+     * pinned pool; each rank holds its share. It holds relaid experts, so it turns file relayout
+     * on. Both read through the file tier; bring-up refuses them without --weights-disk-tier
+     * (Engine::plan), so each option still parses on its own. */
+    if (ram_all) c->expert_ram_mib /= std::max(c->tp, 1);
+    if (c->expert_ram_mib > 0) c->weights_file_relayout = true;
 
     return RAD_OK;
 }
@@ -1808,6 +1829,10 @@ const ShowRow kShow[] = {
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },
     { "--ngram-warm",         [](const Config& c) { return onoff(c.ngram_warm); } },
     { "--weights-disk-tier",  [](const Config& c) { return onoff(c.weights_disk_tier); } },
+    { "--weights-file-relayout", [](const Config& c) { return onoff(c.weights_file_relayout); } },
+    { "--expert-ram-mib",     [](const Config& c) {
+          return c.expert_ram_mib ? num(c.expert_ram_mib * std::max(c.tp, 1)) : std::string("0 (off)"); } },
+    { "--plan-only",          [](const Config& c) { return onoff(c.plan_only); } },
     { "--prefix-cache-mib",   [](const Config& c) {
           return c.prefix_cache_mib ? num(c.prefix_cache_mib) : std::string("0 (off)"); } },
     { "--prefix-cache-ttl",   [](const Config& c) {

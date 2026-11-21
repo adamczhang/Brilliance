@@ -18,6 +18,13 @@ function Check([bool]$ok, [string]$what) {
   $script:checks++
   if (-not $ok) { $script:failed++; Write-Host "  FAIL $what" }
 }
+# The caller's HIP device masks are not this test's: a gate shell's HIP_VISIBLE_DEVICES=-1 ("GPUs
+# hidden") would leave serve.ps1 no card and meet the refusal that keeps a start without -Cpu off the
+# CPU. BRILLIANCE_SERVE_TEST_DEVICES (CMakeLists.txt) is the device table; a case that wants a mask
+# sets it in its own Serve call. Process scope: the caller's shell keeps its own.
+foreach ($k in 'HIP_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL') {
+  [Environment]::SetEnvironmentVariable($k, $null, 'Process')
+}
 # serve.ps1 in a PowerShell of its own, as a person runs it; its output and exit code.
 function Serve([string[]]$a, [hashtable]$envSet = @{}) {
   $saved = @{}

@@ -34,7 +34,11 @@ function Check([bool]$ok, [string]$what) {
 $red = '0:33:1,1:6:0,2:3:0,3:9:0,4:32:0'
 # serve.ps1 in a PowerShell of its own, as a person runs it; its output and exit code. Every call
 # gets a device table (default: the test machine's) and clean server variables unless it says otherwise.
-function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '') {
+# -InSession runs it as a person types `serve.ps1 ... 2>&1` at a Windows PowerShell 5.1 prompt: the
+# redirect in the same session as the script, where a native command's stderr lines become
+# ErrorRecords. (A separate powershell.exe -File never shows that: there the redirect is the
+# process's.) Each ErrorRecord that reaches the caller is marked 'ERRORRECORD '.
+function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '', [switch]$InSession) {
   $all = @{ BRILLIANCE_SERVE_TEST_DEVICES = $red; HIP_VISIBLE_DEVICES = $null
             BRILLIANCE_SERVER_HOST = $null; BRILLIANCE_SERVER_PORT = $null; BRILLIANCE_SERVER_API_KEY = $null
             BRILLIANCE_DEVICE = $null; BRILLIANCE_SERVER_KERNELS = $null; BRILLIANCE_MODEL_SPECULATION = $null
@@ -46,7 +50,15 @@ function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '') {
   try {
     if ($cwd) { Set-Location -LiteralPath $cwd }
     $ErrorActionPreference = 'Continue'
-    $o = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $serve @a 2>&1 | ForEach-Object { "$_" }
+    if ($InSession) {
+      # An option name stays bare, so it binds as the parameter; every value is quoted.
+      $q = @($a | ForEach-Object { if ($_ -match '^-[A-Za-z]+$') { $_ } else { "'" + ($_ -replace "'", "''") + "'" } }) -join ' '
+      $cmd = "& '$($serve -replace "'", "''")' $q 2>&1 | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { 'ERRORRECORD ' + `$_ } else { `"`$_`" } }; exit `$LASTEXITCODE"
+      $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
+      $o = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $enc 2>&1 | ForEach-Object { "$_" }
+    } else {
+      $o = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $serve @a 2>&1 | ForEach-Object { "$_" }
+    }
     return [pscustomobject]@{ Out = ($o -join "`n"); Rc = $LASTEXITCODE }
   } finally {
     Set-Location $here
@@ -123,6 +135,22 @@ try {
   Check (Has $o "radiance reads $p1 itself: to change a model while it runs, edit that file and run tools\reload-server.ps1") "the start says which file a reload reads:`n$o"
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe)
   Check ((Has $r.Out "--config `"$p1`"") -and -not (Has $r.Out 'brilliance-layout')) "-WhatIf runs the profile itself, no Temp copy:`n$($r.Out)"
+
+  # ======================================================================= a caller's 2>&1 (5.1)
+  # serve.ps1 ... -Check 2>&1 at a 5.1 prompt: radiance writes its lines to stderr, which used to
+  # stop the script at the first one with a NativeCommandError (the alpha.4 walkthrough). Now its
+  # lines arrive as text, and the exit code is radiance's.
+  $r = Serve @($p1, '-Check', '-Exe', $Exe) -InSession
+  Check ($r.Rc -eq 0) "-Check 2>&1 in the caller's session exits 0:`n$($r.Out)"
+  Check ((Has $r.Out "I $($p1): model a = $model") -and -not (Has $r.Out 'ERRORRECORD') -and -not (Has $r.Out 'NativeCommandError')) "-Check 2>&1: radiance's lines as text, no error record:`n$($r.Out)"
+  $r = Serve @((Join-Path $tmp 'not there.yaml'), '-Check', '-Exe', $Exe) -InSession
+  Check ($r.Rc -ne 0 -and -not (Has $r.Out 'NativeCommandError')) "-Check 2>&1 on a refused profile exits nonzero with radiance's words:`n$($r.Out)"
+  # A start under the same redirect: a server's stderr line no longer ends the launcher while the
+  # server runs on; its later lines and its exit code come through.
+  $stub2 = Join-Path $stubDir 'radiance-stderr.cmd'
+  [IO.File]::WriteAllText($stub2, "@echo first line, on stderr 1>&2`r`n@echo second line, on stdout`r`n@echo third line, on stderr 1>&2`r`n@exit /b 7`r`n")
+  $r = Serve @($p1, '-Exe', $stub2, '-Bus', '3') -InSession
+  Check ($r.Rc -eq 7 -and (Has $r.Out 'second line, on stdout') -and (Has $r.Out 'third line, on stderr') -and -not (Has $r.Out 'NativeCommandError')) "a start under 2>&1 runs radiance to its end and returns its status:`n$($r.Out)"
   # -Install: the service runs a copy of the profile as it is, overrides in its environment
   $r = Serve @($p1, '-Install', '-WhatIf', '-Exe', $Exe, '-Name', 'Brl-LaunchTest', '-Bus', '9', '-Listen', '0.0.0.0', '-ApiKey', 'off') @{ BRILLIANCE_HF_CACHE = $null }
   $o = $r.Out
@@ -130,6 +158,12 @@ try {
   foreach ($l in ($layouts['block, commented'].TrimEnd("`n") -split "`n")) { Check (Has $o "| $l") "the service's YAML is the profile ('$l'):`n$o" }
   Check (Has $o "-Name Environment -Type MultiString -Value @('HIP_VISIBLE_DEVICES=3', 'BRILLIANCE_SERVER_HOST=0.0.0.0', 'BRILLIANCE_SERVER_API_KEY=off')") "the card and the overrides in the service environment:`n$o"
   Check (Has $o 'the service will listen on 0.0.0.0 port 18371 (host from environment (BRILLIANCE_SERVER_HOST), port from server.port), no API key') "-Install says what radiance will listen on:`n$o"
+  # A profile named with a dot keeps all of its name in the service's (ltx-2.5-1card, not ltx-2).
+  # Given bare, as `serve.ps1 ltx-2.5-1card` is; here a file of that name in the current folder.
+  $dotted = Join-Path $tmp 'ltx-2.5-1card'
+  Copy-Item $p1 $dotted
+  $r = Serve @('ltx-2.5-1card', '-Install', '-WhatIf', '-Exe', $Exe) @{ BRILLIANCE_HF_CACHE = $null } $tmp
+  Check ($r.Rc -eq 0 -and (Has $r.Out 'create Brilliance-ltx-2.5-1card ') -and -not (Has $r.Out 'Brilliance-ltx-2 ')) "a dotted profile name is the service's whole:`n$($r.Out)"
   $r = Serve @($withKey, '-Install', '-WhatIf', '-Exe', $Exe, '-ApiKey', 'off')
   Check ($r.Rc -ne 0 -and (Has $r.Out 'holds an API key itself')) "a profile with a key is refused for a service even with -ApiKey off (the copy would hold it):`n$($r.Out)"
 

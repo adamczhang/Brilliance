@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <queue>
+#include <thread>
 #include <unordered_map>
 
 namespace rad {
@@ -40,6 +42,16 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
      * calls that short read an error. Clamp to the file, which sends the tail through read_at's
      * bounce path (it tolerates an EOF short read) instead of the exact fast path. */
     int64_t want = direct_align(bytes);
+    /* Brilliance: bytes past the container's end are a short read, never a partial success: the
+     * clamp below would otherwise read fewer bytes than asked and return RAD_OK, and the copy out
+     * of the buffer would hand a kernel whatever the buffer held before. */
+    if (size_ >= 0 && (int64_t)offset + bytes > size_) {
+        RAD_ERR("file tier: a %s read at offset %llu runs %s past the container's end (%s): the "
+                "container is shorter than its directory says", humanb(bytes).c_str(),
+                (unsigned long long)offset, humanb((int64_t)offset + bytes - size_).c_str(),
+                humanb(size_).c_str());
+        return RAD_E_IO;
+    }
     if (size_ >= 0 && (int64_t)offset + want > size_) want = size_ - (int64_t)offset;
     if (want > dst_cap) {
         RAD_ERR("file tier: a %s read needs a %s aligned buffer, the staging slot is %s",
@@ -48,6 +60,26 @@ int FileTier::read(uint64_t offset, int64_t bytes, void* dst, int64_t dst_cap) {
     }
     RAD_TRY(f_.read_at(dst, (int64_t)offset, want));
     return RAD_OK;
+}
+
+/* Brilliance: ordinary aligned host memory, for the RAM store and the relayout inputs. */
+static void* host_alloc(int64_t align, int64_t bytes) {
+    if (bytes <= 0) return nullptr;
+#if defined(_WIN32)
+    return os::aligned_alloc((size_t)align, (size_t)bytes);
+#else
+    void* p = nullptr;
+    return posix_memalign(&p, (size_t)align, (size_t)bytes) == 0 ? p : nullptr;
+#endif
+}
+
+static void host_free(void* p) {
+    if (!p) return;
+#if defined(_WIN32)
+    os::aligned_free(p);
+#else
+    std::free(p);
+#endif
 }
 
 /* ------------------------------------------------------------------ residency */
@@ -98,6 +130,9 @@ Mover::~Mover() {
     /* The pageable region is always ours: Pools has no pageable pool, since pageable memory is
      * not a device-visible budget and nothing else contends for it. */
     if (pageable_) rad_dev_free(pageable_, RAD_MEM_HOST);
+    /* Brilliance: the RAM store and the relayout inputs are ordinary host memory of our own. */
+    host_free(ram_);
+    for (RelayIn& in : relay_in_) host_free(in.p);
 }
 
 /* The one place the mover asks for memory. Device and pinned memory come out of the resolved
@@ -269,6 +304,11 @@ int Mover::init(const Program& prog, const Plan& plan, const MoverConfig& cfg, P
             return RAD_E_INVAL;
         }
         RAD_TRY(file_.open(cfg_.container_path));
+        /* Brilliance: threads that relay planes or copy held experts into a read window. Half the
+         * cores, at most eight: two ranks fill windows at once, and the copies out of a window
+         * pace a step as much as the fill. */
+        const unsigned hw = std::thread::hardware_concurrency();
+        relay_threads_ = (int)std::max(1u, std::min(8u, hw / 2));
         /* Staging slots are sized by the widest unit actually on the file tier, not the widest
          * class. The widest class is usually the embedding table (gigabytes, and never on the
          * file tier), and sizing on it would reserve pinned memory for a weight that never
@@ -798,6 +838,7 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     /* The layout in `dst`, unit by unit in the order given after what earlier calls for the
      * layer packed, and every weight's extent. */
     fext_.clear();
+    frel_.clear();
     fat_.clear();
     fbase_.clear();
     frec_.clear();
@@ -844,12 +885,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 us.hot = true;
                 heat_->set_busy(u, true);
                 ++stats_.ssd_promotions;
-                for (size_t k = 0; k < mu.weights.size(); ++k) {
-                    const WeightInfo& w = prog_->weights[mu.weights[k]];
-                    if (w.stored_bytes <= 0) continue;  /* nothing to read, nothing to place */
-                    fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                             base + mu.offset[k], true, false });
-                }
+                for (size_t k = 0; k < mu.weights.size(); ++k)
+                    add_ext(mu, k, base + mu.offset[k], true, false);
                 rd->promoted.push_back(u);
                 fbase_.push_back(base);
                 frec_.push_back((int32_t)rec);
@@ -916,12 +953,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                 heat_->set_busy(u, true);
                 ++stats_.ssd_deposits;
                 char* const slot = (char*)cp.pool_base + g * cp.stride;
-                for (size_t k = 0; k < mu.weights.size(); ++k) {
-                    const WeightInfo& w = prog_->weights[mu.weights[k]];
-                    if (w.stored_bytes <= 0) continue;   /* nothing to read, nothing to place */
-                    fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                             slot + mu.offset[k], false, true });
-                }
+                for (size_t k = 0; k < mu.weights.size(); ++k)
+                    add_ext(mu, k, slot + mu.offset[k], false, true);
                 for (size_t k = 0; k < mu.weights.size(); ++k)
                     res_.publish(mu.weights[k],
                                  (char*)cp.pool_dev + g * cp.stride + mu.offset[k]);
@@ -935,12 +968,8 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
                     "the plan sized for the largest one", humanb(cap).c_str());
             return RAD_E_SCRATCH;
         }
-        for (size_t k = 0; k < mu.weights.size(); ++k) {
-            const WeightInfo& w = prog_->weights[mu.weights[k]];
-            if (w.stored_bytes <= 0) continue;          /* nothing to read, and nothing to place */
-            fext_.push_back(FileExt{ (int64_t)w.file_offset, w.stored_bytes,
-                                     dst + off + mu.offset[k], false, false });
-        }
+        for (size_t k = 0; k < mu.weights.size(); ++k)
+            add_ext(mu, k, dst + off + mu.offset[k], false, false);
         rd->staged.push_back(u);
         fat_.push_back(off);
         off += need;
@@ -976,9 +1005,12 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
             res_.publish(mu.weights[j], fbase_[k - promoted0] + mu.offset[j]);
         stats_.ssd_read_bytes += (uint64_t)unit_[(size_t)u].bytes;
     }
-    if (fext_.empty()) return RAD_OK;
+    if (fext_.empty() && frel_.empty()) return RAD_OK;
     /* Container order, so a window is one long run of the drive rather than a seek per weight. */
     std::stable_sort(fext_.begin(), fext_.end(),
+                     [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
+    /* Brilliance: the relay windows likewise, so a relaid weight's planes are read in drive order. */
+    std::stable_sort(frel_.begin(), frel_.end(),
                      [](const FileExt& a, const FileExt& b) { return a.foff < b.foff; });
 
     /* The dashboard's SSD panel and /stats ssd_reads read these: the file tier's container
@@ -986,16 +1018,19 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
      * its own link reads here; the file stager's were invisible, so the panels showed zero
      * however much the drive streamed. */
     stats_.ssd_reads += (uint64_t)fext_.size();
-    for (const FileExt& e : fext_) {
-        stats_.ssd_bytes += (uint64_t)e.bytes;
-        /* The copies below move the same bytes from the windows to their destination, which
-         * crosses the link either way: into the layer buffer when the unit is discarded at the
-         * next layer (ssd_staging_bytes), into a hot-cache or host-pool slot when it stays
-         * (ssd_promoted_bytes and ssd_deposit_bytes, the kept-copy half of the split). */
-        if (e.hot) stats_.ssd_promoted_bytes += (uint64_t)e.bytes;
-        else if (e.deposit) stats_.ssd_deposit_bytes += (uint64_t)e.bytes;
-        else       stats_.ssd_staging_bytes += (uint64_t)e.bytes;
-    }
+    for (const FileExt& e : fext_) stats_.ssd_bytes += (uint64_t)e.bytes;
+    for (const std::vector<FileExt>* v : { &fext_, &frel_ })
+        for (const FileExt& e : *v) {
+            /* The copies below move the same bytes from the windows to their destination, which
+             * crosses the link either way: into the layer buffer when the unit is discarded at the
+             * next layer (ssd_staging_bytes), into a hot-cache or host-pool slot when it stays
+             * (ssd_promoted_bytes and ssd_deposit_bytes, the kept-copy half of the split). The
+             * relay windows' bytes (Brilliance) split the same way; their source is counted in
+             * ram_bytes or relaid_bytes, not ssd_bytes. */
+            if (e.hot) stats_.ssd_promoted_bytes += (uint64_t)e.bytes;
+            else if (e.deposit) stats_.ssd_deposit_bytes += (uint64_t)e.bytes;
+            else       stats_.ssd_staging_bytes += (uint64_t)e.bytes;
+        }
 
     if (after) RAD_TRY(rad_event_wait(mover_, after));
 
@@ -1064,6 +1099,9 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
         RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
         win_rec_[(size_t)w] = 1;
     }
+    /* Brilliance: the weights held in RAM or relaid from their planes, through the same windows,
+     * before `done`, so the one wait covers them too. */
+    if (!frel_.empty()) RAD_TRY(stage_relay());
     RAD_TRY(rad_event_record(done, mover_));
     /* The hot-cache admissions and deposits are copies like the staged units': their records
      * land behind them, so retire() finishes a move when its bytes are in its slot. */
@@ -1073,6 +1111,288 @@ int Mover::stage_file_units(const std::vector<int32_t>& units, char* dst, int64_
     ++stats_.ssd_layers;
     stats_.ssd_units += (uint64_t)((rd->staged.size() - staged0) + (rd->promoted.size() - promoted0));
     stats_.h2d_bytes += (uint64_t)(off - used0 + hot_bytes);
+    return RAD_OK;
+}
+
+/* ---- Brilliance: relaid experts and the RAM store (see Mover::set_file_relayout) ----------- */
+
+/* A weight stored as it lies goes to the direct preads; one held in RAM, or relaid from its
+ * planes, to the relay windows. */
+void Mover::add_ext(const MoveUnit& mu, size_t k, char* dst, bool hot, bool deposit) {
+    const rad_weight h = mu.weights[k];
+    const WeightInfo& w = prog_->weights[h];
+    if (w.stored_bytes <= 0) return;                  /* nothing to read, and nothing to place */
+    FileExt e{ (int64_t)w.file_offset, w.stored_bytes, dst, hot, deposit, nullptr, h };
+    if (ram_of(h) || !weight_file_direct(w, prog_->ctx.world_size)) {
+        e.w = &w;
+        frel_.push_back(e);
+    } else {
+        fext_.push_back(e);
+    }
+}
+
+/* Container bytes [off, off + bytes) into `in`, through one aligned read: the span is widened to
+ * the O_DIRECT block on both sides, `*skew` is where `off` landed in the buffer. Each thread has its
+ * own input, so reads on the aligned fast path run at once; the container's last bytes, which
+ * DirectFile reads through its single bounce buffer, are read one thread at a time. */
+int Mover::read_aligned(int64_t off, int64_t bytes, RelayIn* in, int64_t* skew) {
+    if (!in || off < 0 || bytes <= 0) return RAD_E_INVAL;
+    const int64_t A = DirectFile::alignment();
+    const int64_t a0 = off / A * A;
+    const int64_t n = align_up(off + bytes - a0, A);
+    if (in->cap < n) {
+        host_free(in->p);
+        in->p = (uint8_t*)host_alloc(A, n);
+        in->cap = in->p ? n : 0;
+        if (!in->p) {
+            RAD_ERR("file tier: no %s of host memory for a relayout's input", humanb(n).c_str());
+            return RAD_E_NOMEM;
+        }
+    }
+    *skew = off - a0;
+    const int64_t size = file_.size();
+    if (size >= 0 && a0 + n > size) {
+        std::lock_guard<std::mutex> lk(file_mu_);
+        return file_.read((uint64_t)a0, off + bytes - a0, in->p, in->cap);
+    }
+    return file_.read((uint64_t)a0, off + bytes - a0, in->p, in->cap);
+}
+
+/* One weight relaid on the read: its selected planes, whole ranges of the container
+ * (WeightInfo::file_plane_offset), read as one span into this thread's input, then the kernel's
+ * relayout writes the stored form to `dst`. A weight the RAM store holds is copied from there. */
+int Mover::read_relaid(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("file tier: '%s' relays to %s and the window has %s for it", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    const auto h = (size_t)(&w - prog_->weights.data());
+    if (h < ram_at_.size() && ram_at_[h]) {
+        std::memcpy(dst, ram_at_[h], (size_t)w.stored_bytes);
+        return RAD_OK;
+    }
+    if (weight_file_direct(w, prog_->ctx.world_size)) {
+        /* Stored as it lies, in a unit with relaid weights: read and copied out. */
+        int64_t skew = 0;
+        RAD_TRY(read_aligned((int64_t)w.file_offset, w.stored_bytes, in, &skew));
+        std::memcpy(dst, in->p + skew, (size_t)w.stored_bytes);
+        return RAD_OK;
+    }
+    if (!relayout_ || w.n_sel <= 0) {
+        RAD_ERR("file tier: '%s' (%s) is relaid on the read and the mover was given no relayout",
+                w.name.c_str(), w.layout_tag.c_str());
+        return RAD_E_STATE;
+    }
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    int64_t lo = INT64_MAX, hi = 0;
+    for (int k = 0; k < w.n_sel; ++k) {
+        const int64_t len = pt[k].shape[0] * rad_dtype_bytes(pt[k].dtype, pt[k].shape[1]);
+        /* The container's record of the plane must cover the extent the relayout reads: a
+         * shorter plane would relay bytes of the next one. */
+        if (len <= 0 || w.file_plane_bytes[k] < len) {
+            RAD_ERR("file tier: '%s' plane %d is %lld bytes in the container and the relayout "
+                    "reads %lld", w.name.c_str(), k, (long long)w.file_plane_bytes[k],
+                    (long long)len);
+            return RAD_E_FORMAT;
+        }
+        lo = std::min(lo, (int64_t)w.file_plane_offset[k]);
+        hi = std::max(hi, (int64_t)w.file_plane_offset[k] + len);
+    }
+    if (hi - lo > RAD_PLACE_FILE_WINDOW_BYTES) {
+        RAD_ERR("file tier: '%s' reads its planes from a %s span, more than the %s the planner "
+                "admitted", w.name.c_str(), humanb(hi - lo).c_str(),
+                humanb(RAD_PLACE_FILE_WINDOW_BYTES).c_str());
+        return RAD_E_SCRATCH;
+    }
+    int64_t skew = 0;
+    RAD_TRY(read_aligned(lo, hi - lo, in, &skew));
+    for (int k = 0; k < w.n_sel; ++k)
+        pt[k].data = in->p + skew + ((int64_t)w.file_plane_offset[k] - lo);
+    const int st = relayout_(w, pt, dst, w.stored_bytes);
+    if (st < 0)
+        RAD_ERR("file tier: relaying '%s' (%s) on the read failed: %s", w.name.c_str(),
+                w.layout_tag.c_str(), rad_strerror(st));
+    return st;
+}
+
+/* What build_ram_store keeps of a weight: the bytes a stage would have read -- the container's
+ * where it is stored as it lies, the relayout's where it is not. ram_at_ is empty while the store
+ * fills, so nothing is copied from a half-filled block. */
+int Mover::read_held(const WeightInfo& w, void* dst, int64_t dst_cap, RelayIn* in) {
+    if (w.stored_bytes > dst_cap) {
+        RAD_ERR("expert ram: '%s' holds %s and its place has %s", w.name.c_str(),
+                humanb(w.stored_bytes).c_str(), humanb(dst_cap).c_str());
+        return RAD_E_SCRATCH;
+    }
+    return read_relaid(w, dst, dst_cap, in);
+}
+
+int Mover::build_ram_store(int64_t* bytes) {
+    if (bytes) *bytes = 0;
+    if (!plan_ || !prog_ || ram_) return RAD_E_STATE;
+    if (plan_->ram_units <= 0) return RAD_OK;
+    if (!file_.ok()) {
+        RAD_ERR("expert ram: the plan holds %lld units in RAM and the container is not open for "
+                "the file tier", (long long)plan_->ram_units);
+        return RAD_E_STATE;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+
+    /* The layout: each held unit at the stager's packing, every weight at its offset in the
+     * unit, in plan order. */
+    struct Job { const WeightInfo* w; rad_weight h; int64_t off, cap; };
+    std::vector<Job> jobs;
+    int64_t at = 0, units = 0;
+    for (const MoveUnit& mu : plan_->units) {
+        if (!mu.ram_held) continue;
+        if (mu.tier != Tier::SSD || !mu.file_direct) {
+            RAD_ERR("expert ram: a held unit of layer %d is not one the file tier reads",
+                    (int)mu.layer);
+            return RAD_E_STATE;
+        }
+        const int64_t need = align_up(mu.bytes, RAD_ALIGN_UNIT);
+        for (size_t k = 0; k < mu.weights.size(); ++k) {
+            const WeightInfo& w = prog_->weights[mu.weights[k]];
+            if (w.stored_bytes <= 0) continue;
+            if (mu.offset[k] + w.stored_bytes > need) {
+                RAD_ERR("expert ram: '%s' (%s at %s in its unit) runs past the unit's %s",
+                        w.name.c_str(), humanb(w.stored_bytes).c_str(),
+                        humanb(mu.offset[k]).c_str(), humanb(need).c_str());
+                return RAD_E_STATE;
+            }
+            jobs.push_back(Job{ &w, mu.weights[k], at + mu.offset[k], need - mu.offset[k] });
+        }
+        at += need;
+        ++units;
+    }
+    /* Exactly what the planner charged and the host admission counted. */
+    if (at != plan_->ram_bytes || units != plan_->ram_units) {
+        RAD_ERR("expert ram: the plan charged %s for %lld units and they take %s for %lld",
+                humanb(plan_->ram_bytes).c_str(), (long long)plan_->ram_units, humanb(at).c_str(),
+                (long long)units);
+        return RAD_E_STATE;
+    }
+    ram_ = (uint8_t*)host_alloc(RAD_ALIGN_UNIT, at);
+    if (!ram_) {
+        RAD_ERR("expert ram: no %s of host memory for --expert-ram-mib", humanb(at).c_str());
+        return RAD_E_NOMEM;
+    }
+
+    if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
+    std::atomic<size_t> next_job{ 0 };
+    std::atomic<int> failed{ RAD_OK };
+    auto work = [&](int t) {
+        for (size_t j; failed.load() == RAD_OK && (j = next_job.fetch_add(1)) < jobs.size();) {
+            const Job& jb = jobs[j];
+            const int rc = read_held(*jb.w, ram_ + jb.off, jb.cap, &relay_in_[(size_t)t]);
+            if (rc < 0) failed.store(rc);
+        }
+    };
+    std::vector<std::thread> th;
+    for (int t = 1; t < relay_threads_ && (size_t)t < jobs.size(); ++t) th.emplace_back(work, t);
+    work(0);
+    for (std::thread& x : th) x.join();
+    if (failed.load() != RAD_OK) {
+        host_free(ram_);
+        ram_ = nullptr;
+        return failed.load();
+    }
+    ram_at_.assign(prog_->weights.size(), nullptr);
+    for (const Job& jb : jobs) ram_at_[(size_t)jb.h] = ram_ + jb.off;
+    ram_bytes_ = at;
+    if (bytes) *bytes = at;
+    RAD_INFO("expert ram: rank %d holds %lld routed units (%zu weights), %s of ordinary RAM, read "
+             "and relaid in %.1f s on %d threads; a read copies them into the pinned windows",
+             plan_->rank, (long long)units, jobs.size(), humanb(at).c_str(),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             std::min<int>(relay_threads_, (int)std::max<size_t>(jobs.size(), 1)));
+    return RAD_OK;
+}
+
+/* The relay windows: frel_'s weights packed into the pinned read windows at their alignment (at
+ * least 256 bytes), each window filled on up to relay_threads_ threads -- a memcpy from the RAM
+ * store, or a read and a relayout -- then copied to the weights' destinations on the mover's
+ * stream with the window's event recorded behind the copies. A window comes round again only
+ * after its copies drained, as for the direct preads. */
+int Mover::stage_relay() {
+    const int64_t W = RAD_PLACE_FILE_WINDOW_BYTES;
+    if (!windows_ || n_windows_ <= 0) return RAD_E_STATE;
+    if ((int)relay_in_.size() < relay_threads_) relay_in_.resize((size_t)relay_threads_);
+    const auto t_all = std::chrono::steady_clock::now();
+    struct Job { size_t r; int64_t wo; };
+    std::vector<Job> jobs;
+    size_t i = 0;
+    while (i < frel_.size()) {
+        const int w = win_next_;
+        win_next_ = (win_next_ + 1) % n_windows_;
+        char* win = windows_ + (int64_t)w * W;
+        if (win_rec_[(size_t)w]) {
+            const auto t0 = std::chrono::steady_clock::now();
+            RAD_TRY(rad_event_sync(win_ev_[(size_t)w]));
+            stats_.ssd_wait_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - t0).count();
+            win_rec_[(size_t)w] = 0;
+        }
+        jobs.clear();
+        int64_t used = 0, held_bytes = 0;
+        bool all_held = true;
+        while (i < frel_.size()) {
+            const FileExt& e = frel_[i];
+            const int64_t a = std::max<int64_t>(e.w->align > 0 ? e.w->align : RAD_ALIGN_UNIT, 256);
+            const int64_t wo = align_up(used, a);
+            if (wo + e.bytes > W) break;
+            jobs.push_back(Job{ i, wo });
+            used = wo + e.bytes;
+            if (ram_of(e.h)) held_bytes += e.bytes;
+            else all_held = false;
+            ++i;
+        }
+        if (jobs.empty()) {
+            RAD_ERR("file tier: '%s' is %s, more than a %s read window", frel_[i].w->name.c_str(),
+                    humanb(frel_[i].bytes).c_str(), humanb(W).c_str());
+            return RAD_E_SCRATCH;
+        }
+        std::vector<int> rc(jobs.size(), RAD_OK);
+        std::atomic<size_t> next{ 0 };
+        auto work = [&](int t) {
+            for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
+                const Job& jb = jobs[j];
+                rc[j] = read_relaid(*frel_[jb.r].w, win + jb.wo, W - jb.wo, &relay_in_[(size_t)t]);
+            }
+        };
+        /* A few held experts copy faster than a thread starts; a read, a relayout or a full
+         * window is worth the threads. */
+        const int nt = all_held && held_bytes < ((int64_t)16 << 20)
+                           ? 1 : (int)std::min<size_t>((size_t)relay_threads_, jobs.size());
+        std::vector<std::thread> th;
+        for (int t = 1; t < nt; ++t) th.emplace_back(work, t);
+        work(0);
+        for (std::thread& x : th) x.join();
+        for (size_t j = 0; j < jobs.size(); ++j) RAD_TRY(rc[j]);
+        for (const Job& jb : jobs) {
+            const FileExt& e = frel_[jb.r];
+            dev_page_invalidate(e.dst, e.bytes);
+            RAD_TRY(rad_memcpy_async(e.dst, win + jb.wo, e.bytes, mover_));
+            if (ram_of(e.h)) {
+                ++stats_.ram_weights;
+                stats_.ram_bytes += (uint64_t)e.bytes;
+            } else {
+                ++stats_.relaid_weights;
+                stats_.relaid_bytes += (uint64_t)e.bytes;
+                /* A drive read like a direct one: the expert SSD traffic ssd_reads names. Its
+                 * bytes are what the drive gave, the planes (or the stored form as it lies). */
+                ++stats_.ssd_reads;
+                stats_.ssd_bytes += (uint64_t)(weight_file_direct(*e.w, prog_->ctx.world_size)
+                                                   ? e.w->stored_bytes : weight_plane_bytes(*e.w));
+            }
+        }
+        RAD_TRY(rad_event_record(win_ev_[(size_t)w], mover_));
+        win_rec_[(size_t)w] = 1;
+    }
+    stats_.relay_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - t_all).count();
     return RAD_OK;
 }
 
@@ -2084,6 +2404,12 @@ std::string Mover::report() const {
         s += fmt("  file tier: %llu demand reads (%.2f GiB), each a blocking pread in the middle "
                  "of a dispatch. Raise --host-pool-mib.\n",
                  (unsigned long long)stats_.ssd_reads, (double)stats_.ssd_bytes * gib);
+    if (stats_.ram_weights || stats_.relaid_weights)
+        s += fmt("  expert ram: %llu weights copied from RAM (%.2f GiB) and %llu relaid from the "
+                 "drive (%.2f GiB) into the read windows, %.2f s filling them\n",
+                 (unsigned long long)stats_.ram_weights, (double)stats_.ram_bytes * gib,
+                 (unsigned long long)stats_.relaid_weights, (double)stats_.relaid_bytes * gib,
+                 (double)stats_.relay_ns * 1e-9);
     if (stats_.ssd_promotions)
         s += fmt("  hot cache: %llu expert units read into VRAM slots (%.2f GiB) and left there; "
                  "they stream no more\n",

@@ -87,6 +87,7 @@ struct RecJoin  { size_t at = 0; int from = 0, to = 0; };
 using namespace rad_fake;
 
 struct RadBuilder {
+    int        device_p2p = -1;
     rad_buf    score_hidden = 0;   /* rad_declare_scores */
     rad_weight score_table = 0;
     std::vector<RecWeight> weights;
@@ -179,6 +180,7 @@ struct RadCtx {
     std::string           step_fail;
     int                   lane = 0;     /* where the next issue goes */
     std::vector<RecJoin>  joins;
+    bool                  fail_lane_select = false, fail_lane_join = false;
     /* Device copies into a buffer (rad_memcpy_async to a rad_buf_ptr address): the buffer and the
      * issue number the copy came before. The step lint counts each as a write there. */
     std::vector<std::pair<size_t, rad_buf>> copies;
@@ -308,6 +310,10 @@ extern "C" int rad_decl_name_map(RadBuilder* b, const RadNameMap* m) {
     }
     b->maps.push_back(r);
     return RAD_OK;
+}
+
+extern "C" int rad_build_device_p2p(RadBuilder* b) {
+    return b ? b->device_p2p : -1;
 }
 
 extern "C" void rad_note(RadBuilder* b, const char* fmt, ...) {
@@ -516,11 +522,13 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {
     if (lane != 0 && lane != 1) return RAD_E_INVAL;
+    if (c->fail_lane_select) return RAD_E_STATE;
     c->lane = lane;
     return RAD_OK;
 }
 extern "C" int rad_lane_join(RadCtx* c, int from, int to) {
     if (from < 0 || from > 1 || to < 0 || to > 1) return RAD_E_INVAL;
+    if (c->fail_lane_join) return RAD_E_STATE;
     c->joins.push_back({ c->issues.size(), from, to });
     return RAD_OK;
 }

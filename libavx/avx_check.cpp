@@ -704,21 +704,45 @@ int main(int argc, char** argv) {
     /* ---- 2. coverage
      *
      * Any op libref implements and libavx lacks is a failure. For another library every gap is
-     * listed. */
-    int missing = 0, device_only = 0;
+     * listed.
+     *
+     * The one named exception: DeepSeek V4.1's text ops (arch/deepseek41), which run on the card
+     * (libr4d) and have no CPU row yet, so that model has no CPU mode. Each is still checked
+     * against its own description by ref_test and on the card by libr4d's tests. Listed by name,
+     * not by a rule, so any other op without a CPU row still fails; and the list is consulted only
+     * when libavx lacks the row, so an op that gains one is checked like any other. */
+    static const char* const kNoCpuRowYet[] = {
+        "mhc_mix", "mhc_collapse", "router_scored_topk", "ds41_rope_rows", "quant_roundtrip",
+        "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk",
+        "entry_store", "token_map", "stream_gate_add", "embed_lookup_planes", "gemm_nt_ggml",
+        "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml",
+    };
+    int missing = 0, device_only = 0, pending = 0;
     std::vector<std::string> gaps;
     for (int i = 0, n = ref.kernel_count(); i < n; ++i) {
         const RadKernelInfo* kr = ref.kernel_at(i);
         if (!kr || !kr->op) continue;
         if (lib.host_row(kr->op)) continue;
+        if (ck.own) {
+            bool listed = false;
+            for (const char* op : kNoCpuRowYet) listed = listed || !std::strcmp(op, kr->op);
+            if (listed) {
+                if (ck.verbose)
+                    std::printf("COVER   %-24s device only (DeepSeek V4.1): no CPU row yet\n", kr->op);
+                ++pending;
+                continue;
+            }
+        }
         if (lib.row(kr->op)) ++device_only;
         if (ck.own) std::printf("COVER   %-24s libref implements it, %s does not\n", kr->op, who);
         ++missing;
         gaps.push_back(kr->op);
     }
     if (ck.own) {
-        std::printf("coverage: libref %d rows, %s %d rows, %d op(s) missing\n",
-                    ref.kernel_count(), who, lib.kernel_count(), missing);
+        std::printf("coverage: libref %d rows, %s %d rows, %d op(s) missing", ref.kernel_count(),
+                    who, lib.kernel_count(), missing);
+        if (pending) std::printf(", %d device-only op(s) with no CPU row yet (DeepSeek V4.1)", pending);
+        std::printf("\n");
     } else {
         std::printf("coverage: libref %d rows, %s %d rows; %d of libref's ops have no host row "
                     "here (%d a device row only)", ref.kernel_count(), who, lib.kernel_count(),

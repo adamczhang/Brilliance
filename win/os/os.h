@@ -370,16 +370,17 @@ void        log_os_line(int level, const char* fmt, ...) __attribute__((format(p
 void        sleep_us(int64_t us);
 
 /* ----------------------------------------------------------------------------- GPU telemetry
- * What the graphics kernel reports of every hardware GPU, from its adapter performance data
- * (D3DKMT, WDDM 2.4+; win/os/gpu_win32.cpp): engine and memory clocks, temperature, fan, and power
- * as a share of the adapter's rating. Vendor-neutral: the same on an R9700, an iGPU or another
- * vendor's card. -1 is "not reported" -- a driver that fills none of the performance data leaves
- * all of it at -1, never 0.
+ * What the driver reports of every hardware GPU (win/os/gpu_win32.cpp). From the graphics kernel's
+ * adapter performance data (D3DKMT, WDDM 2.4+), for any vendor: engine and memory clocks,
+ * temperature, fan, and power as a share of the adapter's rating. From AMD's ADL, where the AMD
+ * driver installs it: board power in watts, GFX activity (busy) and the junction temperature, the
+ * firmware metrics Linux reads from sysfs. -1 is "not reported" -- a driver that fills none of it
+ * leaves all of it at -1, never 0.
  *
- * NOT REPORTED (busy and vram_used stay -1): Windows' per-engine running time reads 0% for a HIP
- * kernel spinning on an R9700 (measured 2026-11-16), so a utilisation from it would show a working
- * card idle; and the engine accounts its own VRAM. The vendor API that reads them exactly (ADLX)
- * cannot ship with an open-source engine under its SDK licence (gpu_win32.cpp).
+ * NEVER FROM WINDOWS' COUNTERS: Windows' per-engine running time reads 0% for a HIP kernel
+ * spinning on an R9700 (measured 2026-11-16), so busy is ADL's or -1. vram_used stays -1: the
+ * engine accounts its own VRAM. AMD's newer ADLX is not used: its SDK licence does not fit an
+ * open-source engine (gpu_win32.cpp).
  *
  * Cards are named by PCI address as the engine spells them (dev_pci_address). `only`, when given,
  * names the cards wanted: the others are neither returned nor asked. Thread-safe; microseconds a
@@ -387,13 +388,14 @@ void        sleep_us(int64_t us);
 struct GpuSample {
     std::string bdf;                   /* "0000:03:00.0" */
     std::string name;                  /* the adapter's description */
-    double  busy        = -1;          /* 0..1; not reported on Windows (see above) */
+    double  busy        = -1;          /* 0..1, ADL's GFX activity; -1 without ADL (see above) */
     double  gfx_mhz     = -1;          /* engine 0's clock now, and the driver's "max" -- the R9700's */
     double  gfx_max_mhz = -1;          /* is its 2350 MHz game clock, which it boosts well past */
     double  mem_mhz     = -1;          /* memory clock now, and its ceiling */
     double  mem_max_mhz = -1;
     double  temp_c      = -1;
     double  power_frac  = -1;          /* 0..1 of the adapter's rated power */
+    double  power_w     = -1;          /* board power in watts, ADL's; -1 without ADL */
     double  fan_rpm     = -1;
     int64_t vram_used   = -1;          /* not reported on Windows (see above) */
 };

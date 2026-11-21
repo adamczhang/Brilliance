@@ -611,6 +611,10 @@ int rad_op_resolved(RadBuilder* b, rad_op h);
  * library defines, and emits the chain when the answer is 0. Additive export. */
 int rad_op_declared(RadBuilder* b, const char* op);
 
+/* The per-engine device.p2p fact: 1 for peer access, 0 for a host link, -1 if unknown
+ * (including a builder without a device probe, e.g. a conversion tool). */
+int rad_build_device_p2p(RadBuilder* b);
+
 /* ================================================================== checkpoint name map */
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component

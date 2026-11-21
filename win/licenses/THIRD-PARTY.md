@@ -9,9 +9,9 @@ them, with the licence each is used under and the file that carries its text.
   `amd_comgr.LICENSE.txt` (from the ROCm SDK).
 - **What is not here.** The engine's own third-party code (cpp-httplib, yyjson, llama.cpp and the
   rest) is named in `NOTICE`, one directory up, and its texts are beside this file too.
-- **The texts are upstream's, unedited**, taken at the commit or tag the table gives. Two files
-  are extracts: `elfio.NOTICE` is the licence comment at the top of an upstream header (the tree
-  has no licence file there), and `llvm-openmp.LICENSE` is LLVM's entry in Visual Studio's
+- **The texts are upstream's, unedited**, taken at the commit or tag the table gives. Three files
+  are extracts: `elfio.NOTICE` and `adl-sdk.LICENSE` are the licence comments at the top of an
+  upstream header (neither tree has a licence file), and `llvm-openmp.LICENSE` is LLVM's entry in Visual Studio's
   ThirdPartyNotices. Each file keeps upstream's bytes, so a text that refers to `COPYING` or
   `LICENSES/...` means the file the table lists under that upstream name.
 - **Collected 2026-11-17**; the FFmpeg rows 2026-11-18, from the build of Brilliance's own
@@ -123,6 +123,17 @@ Notes on single rows:
   for a party that sues over the format. `libwebp.PATENTS` is Google's grant for WebP.
 - **No GPL library is linked**, and no LGPL-3.0 one: FFmpeg is configured without
   `--enable-gpl`, `--enable-nonfree` and `--enable-version3`.
+
+## Built into radiance.exe: AMD's ADL declarations
+
+`win\os\gpu_win32.cpp` declares the few structures, constants and function types of AMD's ADL
+(AMD Display Library) it needs to read each AMD card's board power, GFX activity and junction
+temperature for the dashboard. They are taken from the ADL SDK's headers (`adl_sdk.h`,
+`adl_defines.h`, `adl_structures.h`; GPUOpen-LibrariesAndSDKs/display-library commit
+`84c881cb2136f04287eb3af12de00a9e2867aa9e`), which are MIT: `adl-sdk.LICENSE`, Copyright (c)
+2016 - 2022 Advanced Micro Devices, Inc. The package ships no ADL code or DLL: the runtime,
+`atiadlxx.dll`, comes with the AMD driver and is loaded at run time from System32. AMD's newer
+ADLX is not used; its SDK licence does not allow an open-source engine to carry it.
 
 ## Attribution these licences ask for in the documentation
 
@@ -261,12 +272,13 @@ the `rocm_sdk_core` 10.1.0 wheel, unmodified. Their source and build recipe:
 
 ## Where each text was fetched
 
-18 files. The SHA-256 is of the upstream file as fetched; every file here except the extract
-(`elfio.NOTICE`) has that hash. `llvm-openmp.LICENSE` and `msvc-runtime.NOTICE` come from Visual
+19 files. The SHA-256 is of the upstream file as fetched; every file here except the extracts
+(`elfio.NOTICE`, `adl-sdk.LICENSE`) has that hash. `llvm-openmp.LICENSE` and `msvc-runtime.NOTICE` come from Visual
 Studio Build Tools, not from a fetch.
 
 | File | Fetched from | SHA-256 of the upstream file |
 |---|---|---|
+| `adl-sdk.LICENSE` | https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/display-library/84c881cb2136f04287eb3af12de00a9e2867aa9e/include/adl_sdk.h (whole header; the file here is its leading comment, with LF line ends) | `1d0141f0ff0d8ce11c40b1e37174827f6e0536620365b20d24b55f19adf97d63` |
 | `amdgpu-windows-interop.EULA` | https://raw.githubusercontent.com/ROCm/rocm-systems/7da43026e4f2ef7600433c38c820732f7a205d22/shared/amdgpu-windows-interop/LICENSE | `154bdf053ef72a3cbf01d0065cfcbc0188745de81b914f744f90a0bb8015d18a` |
 | `amf.LICENSE` | https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/AMF/v1.5.2/LICENSE.txt (downloaded by vcpkg's `amd-amf` port) | `eb297397aaa455b5668ab67d216b83828466152dab123fa92384c6ec16b74170` |
 | `dav1d.LICENSE` | `dav1d-1.5.3/COPYING` in `videolan-dav1d-1.5.3.tar.gz` (https://github.com/videolan/dav1d/archive/1.5.3.tar.gz, SHA-256 `cbe212b02faf8c6eed5b6d55ef8a6e363aaab83f15112e960701a9c3df813686`) | `dd92c3c2247c5651606fc23a5e2d6a1ebc5ace9a3e49cbde0e12f05ad1cb1ee5` |

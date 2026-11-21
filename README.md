@@ -18,9 +18,9 @@ Plugins are built for Windows from a source build's SDK.
 - **Brilliance 0.2.2 is archived** at its original address,
   [codeberg.org/Dad_Vibes/Brilliance](https://codeberg.org/Dad_Vibes/Brilliance). Its `.rad` containers do
   not load in this version ([from 0.2.2](#from-brilliance-022)).
-- **Brilliance 0.3.0-alpha.4 is this fork's current release: the fourth alpha preview of 0.3.0**
-  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.4-<sha>-win64.zip`,
-  is on the [v0.3.0-alpha.4 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.4).
+- **Brilliance 0.3.0-alpha.5 is this fork's current release: the fifth alpha preview of 0.3.0**
+  (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-alpha.5-<sha>-win64.zip`,
+  is on the [v0.3.0-alpha.5 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.5).
   Expect rough edges: what is qualified and what is not is listed below and in
   [win/SUPPORT.md](win/SUPPORT.md).
 
@@ -34,21 +34,27 @@ Upstream's own README is kept unchanged as [RADIANCE-README.md](RADIANCE-README.
 - **Its dashboard, at `http://<host>:<port>/` in a browser, is for watching it:** each model's
   Monitoring tab has its speed, requests, sessions and details. A model's **Sandbox** tab is for a
   quick check that the model works: Start and Stop load and unload it (from a browser on the
-  server's own machine), and a plain chat box streams its replies. It keeps nothing.
+  server's own machine), and a plain chat box streams its replies. It keeps nothing. Start holds the
+  model until Stop: a request for another model that needs its cards is refused meanwhile, rather
+  than moving it. From another
+  machine, a server without an API key shows every model's own pages and Sandbox (not the
+  overview), and its chat works with a model that is loaded.
 - **For everyday chat in a browser, use Open WebUI; for coding, OpenCode.** Both connect as in
   [Connect a client](#connect-a-client).
 
 ## Status
 
-Alpha preview (0.3.0-alpha.4). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
+Alpha preview (0.3.0-alpha.5). What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
 
 - **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean); Gemma 4 31B a4 and Gemma 4
   12B i8g, qualified (chat, tools, pictures and video; audio too on the 12B).
 - **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4); Qwen3.6-35B-A3B
-  IQ8R qualified, every expert on the cards.
+  IQ8R qualified, every expert on the cards. DeepSeek-V4.1-Flash-1017 runs as a preview with the experts
+  that do not fit held in host memory; its greedy text can differ from four cards'.
 - **Four cards:** Qwen3.8-Flash-Next IQR-V4, supported with every expert on the cards (soaked at 32K on
   its earlier settings, 2026-11-17; its profile's tuned 256K settings pass the injection, stop and
-  serving checks; a soak on them has not run yet).
+  serving checks; a soak on them has not run yet). DeepSeek-V4.1-Flash-1017 (bakon3's uncensored
+  container) runs as a preview, every routed expert on the cards, not yet qualified.
 - **Model switching on one card** by parking, with HIP virtual memory.
 - **Embeddings** (`/v1/embeddings`) with EmbeddingGemma 2.
 - **Transcription and realtime** (`/v1/audio/transcriptions`, `/v1/realtime`) with Qwen3-ASR 1.7B, and
@@ -67,10 +73,11 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
 - **Flash-Next's output can change when requests share a step:** identical requests sent together can get
   different next-token distributions. On the tested prompts this came from rounding, not wrong data, as
   upstream documents for batched requests. Compare repeats of one request from the same cache state: in
-  alpha.3's two-card checks, a long prompt sent again and resumed from the prefix cache changed its
+  the two-card checks, a long prompt sent again and resumed from the prefix cache changed its
   reasoning text, with the same final answer.
-- **Video generation works on one card and is not yet qualified** (LTX-2.5 distilled IQ8R). It writes H.264
-  only through AMD's or Windows' licensed encoders, on Brilliance's own FFmpeg ([H.264](#h264)).
+- **Video generation works on one card and is not yet qualified** (LTX-2.5 distilled IQ8R, profile
+  `ltx-2.5-1card`). It writes H.264 only through AMD's or Windows' licensed encoders, on Brilliance's own
+  FFmpeg ([H.264](#h264)).
 - **Speech synthesis (TTS) is not supported** in 0.3.0, and **music generation is not served**:
   `/v1/audio/speech`, which both use, answers 501, "not supported in this build", for every model.
   A request for something the loaded model does not do (chat on an image model, say) answers 501 with the
@@ -98,6 +105,10 @@ Check your hardware before you download anything:
     leaves about 3 GiB of KV cache.
   - Qwen3.8-Flash-Next IQR-V4 (113 GiB) does not fit one card's memory; four cards hold every expert.
     Upstream also serves it on one card with experts in host memory; that layout is not run on Windows.
+  - DeepSeek-V4.1-Flash-1017 (a 251 GiB file, the largest) runs on four cards with every routed expert on
+    them; its 103 GiB Engram table is read from the file, so keep the file on a fast local drive. On two
+    cards the experts that do not fit are held in host memory: about 61 GiB less is available while it
+    serves, and it refuses to start when it would leave less than 24 GiB.
   - A process can pin about the shared-memory budget (half of RAM or more), divided by the cards it sees,
     less 2 GiB. Multi-card exchanges go through that pinned memory.
 - **Disk** for the models you serve.
@@ -108,8 +119,8 @@ Check your hardware before you download anything:
 
 ### 2. Get the package
 
-Download `Brilliance-0.3.0-alpha.4-<sha>-win64.zip` from the
-[v0.3.0-alpha.4 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.4), check it
+Download `Brilliance-0.3.0-alpha.5-<sha>-win64.zip` from the
+[v0.3.0-alpha.5 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.5), check it
 against the `.sha256` beside it (`Get-FileHash <zip>` in PowerShell), and unzip it anywhere; a path with spaces
 works. You can also [build it from source](#building-from-source). With no usable GPU, the same package serves
 on the CPU: `serve.ps1 -Cpu` ([Serving on the CPU](#serving-on-the-cpu)). A CPU-only package
@@ -163,6 +174,8 @@ Every container is on Hugging Face:
 | `gemma4-12b-i8g.rad` | [`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g) | 13.79 GiB | `gemma4-12b-1card` |
 | `qwen3.6-35b-a3b-iq8r.rad` | [`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r) | 35.04 GiB | `qwen36-35b-2card` |
 | `qwen-image-2.1-iq8r.rad` | [`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r) | 16.13 GiB | `qwen-image-1card` |
+| `ltx-2.5-distilled-iq8r.rad` | [`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-iq8r) (gated: accept its licence with your own account) | 36.86 GiB | `ltx-2.5-1card` |
+| `deepseek-v4.1-flash-1017-uncensored.rad` | [`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad) (six parts to join, as its `RUNNING.md` says; `-Fetch` does not join them) | 251.13 GiB | `deepseek41-4card`, `deepseek41-2card` |
 
 Each profile's comment has its file's SHA-256 (`qwen3.8-27b-iq4r-l-v4.rad`:
 `d57d1428218e20a4cd578c3e286f30a2e566e589c832bf5004f49e164cb48ae4`). The other models in
@@ -210,8 +223,9 @@ Steps 1 to 4 can be one command. `-Fetch` fetches the file a profile names in it
   and each file's size in bytes.
 - The destination is `<dir>\<owner>\<repo>`. `<dir>` is `-ModelDir` if given, else `BRILLIANCE_HF_CACHE`,
   else `%LOCALAPPDATA%\radiance\hf`: the same store as a repository named as `model:` (below).
-- A whole copy is kept with no transfer. A cut transfer resumes when the command runs again. Each file is
-  checked against its SHA-256 before it is kept, and the verified file is what the server is given.
+- A whole copy is kept with no transfer. A cut transfer is tried again from where it stopped, up to six
+  times, and resumes when the command runs again. Each file is checked against its SHA-256 before it is
+  kept, and the verified file is what the server is given.
 - With no network, a copy a complete fetch left is served, and the output says so.
 - The profile's `model:` line is not read and the file is not changed. `-Model <path>` does the same for a
   file you fetched yourself. In a profile of several models, `-ModelName` says which one.
@@ -350,6 +364,9 @@ Select-String -Path .\radiance-qwen27-preview.log -Pattern 'listening on'   # pr
 | `gemma4-12b-1card` | Gemma 4 12B i8g | 1 | **Qualified** | 32K | 4 | MTP, depth 3 | bf16 |
 | `qwen36-35b-2card` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | **Qualified** | 32K | 4 | MTP, depth 3 | int8 |
 | `qwen-image-1card` | Qwen-Image 2.1 IQ8R (pictures) | 1 | **Qualified** for generation; edits: known issue 13 | Pictures to 2048x2048, the default | - | off | - |
+| `ltx-2.5-1card` | LTX-2.5 distilled IQ8R (video with sound) | 1 | **Runs, not yet qualified** | Videos to 6.7 s, 960x544 by default | 1 | off | - |
+| `deepseek41-4card` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 4 (TP4), every routed expert on the cards | **Runs, not yet qualified** (preview) | 4K | 1 | off | bf16 |
+| `deepseek41-2card` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 2 (TP2), experts that do not fit held in host memory | **Runs, not yet qualified** (preview); greedy text can differ from four cards' ([known issue 14](win/SUPPORT.md#known-issues)) | 4K | 1 | off | bf16 |
 
 - **Context and requests at once are limits, not a promise that all of them fit at full length.** Context is
   the longest one request may be; requests at once is how many the scheduler runs together. All of them
@@ -540,9 +557,9 @@ shell is open. [SERVICE.md](win/SERVICE.md) has the steps.
 - A failure nobody asked for restarts it once, after 2 minutes. A later failure restarts nothing until a day
   has passed with no failure, when Windows resets the count (`-NoRestart`: never restart).
 - `-Uninstall` stops it with the drain and removes it.
-- A service installed from alpha.3 keeps running alpha.3: remove it and install it again from this
-  package, as [SERVICE.md](win/SERVICE.md) "Moving an alpha.3 service to alpha.4" describes (not yet run
-  in an elevated shell).
+- A service keeps running the release it was installed from: remove it and install it again from
+  this package, as [SERVICE.md](win/SERVICE.md) "Moving a service to a new release" describes (not yet
+  run in an elevated shell).
 
 ### Serving on the CPU
 
@@ -571,7 +588,7 @@ card's speed. This was checked with MiniCPM5-2B IQ8R and EmbeddingGemma 2, and i
 - **Bugs and questions about the Windows build:** open an issue at
   [github.com/adamczhang/Brilliance/issues](https://github.com/adamczhang/Brilliance/issues). Check
   [win/SUPPORT.md](win/SUPPORT.md)'s known issues first.
-- **Include:** the release (`0.3.0-alpha.4`, or the `MANIFEST.json` commit), the Adrenalin driver version, the
+- **Include:** the release (`0.3.0-alpha.5`, or the `MANIFEST.json` commit), the Adrenalin driver version, the
   cards and the `-Bus` you gave, the profile and anything you changed in it, the exact command (with any key
   removed), and the server's log from its start to the failure.
 - **A server that stopped making progress:** read it with `bin\brl-stacks.exe` before stopping it
@@ -651,15 +668,16 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | Qwen3-ASR 1.7B bf16 (`Qwen/Qwen3-ASR-1.7B-hf` as it ships, 4.09 GB) | **Qualified**: `/v1/audio/transcriptions` (5 formats, 4 response forms) and `/v1/realtime`, 16 sequences | - | - |
 | Nemotron 3.5 Rerank 8B BF16 (`nvidia/Nemotron-3.5-Rerank-8B-BF16` as it ships, 16.78 GB) | **Qualified**: `/rerank` and `/v1/rerank`, text and picture documents, 32,768 tokens a pair | - | - |
 | SDXL base 1.0 bf16 (`stabilityai/stable-diffusion-xl-base-1.0`, the single-file checkpoint converted with `rad-convert`, 6.39 GiB) | **Qualified**: `/v1/images/generations`; PNG, JPEG and WebP; about 5.4 s at 1024x1024, 28 steps | - | - |
-| LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`) | **Runs, not yet qualified**: `/v1/videos`, text and image to video, MP4 | - | - |
+| LTX-2.5 distilled IQ8R ([`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-iq8r), 36.86 GiB; gated, LTX-2.x Community License) | **Runs, not yet qualified**: `/v1/videos`, text and image to video, MP4 (H.264 and AAC). Its text encoder is pinned in host memory (about 15.9 GiB pinned in all). Profile: `ltx-2.5-1card` | - | - |
 | Gemma 4 31B a4 ([`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4), 19.95 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 2, bf16 KV, MTP. Audio is refused with a 501 | Not run | Not run |
 | Gemma 4 12B i8g ([`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g), 13.79 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures, audio and video; 32K x 4, bf16 KV, MTP | - | - |
 | Qwen3.6-35B-A3B IQ8R ([`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r), 35.04 GiB) | - | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 4, int8 KV, MTP; every expert on the cards. It thinks before answering by default. Audio is refused with a 501 | Not run |
 | Qwen-Image 2.1 IQ8R ([`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r), 16.13 GiB; non-commercial licence) | **Qualified** for generation: `/v1/images/generations`, PNG, JPEG and WebP; a seed repeats its picture byte for byte; sizes from 512x512 to the default 2048x2048. Edits work for most seeds ([known issue 13](win/SUPPORT.md#known-issues)) | Not run | - |
+| DeepSeek-V4.1-Flash-1017, bakon3's uncensored container ([`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad), 251.13 GiB; MIT) | - | **Runs, not yet qualified** (preview): experts that do not fit the cards held in host memory (about 61 GiB less available while it serves); its greedy text can differ from four cards' ([known issue 14](win/SUPPORT.md#known-issues)). Profile: `deepseek41-2card` | **Runs, not yet qualified** (preview): text, chat with thinking on and off; 4K x 1, bf16 KV, no drafting; every routed expert on the cards, the 103 GiB Engram table read from the file. Send `temperature` with each request. Profile: `deepseek41-4card` |
 | Other upstream models | Not run on Windows. The package carries many of upstream's architecture plugins, but no other model has been checked. Speech-synthesis and music models cannot be served by this build | | |
 
 **The profiles** cover the Qwen3.8 layouts above that are **Qualified** or **Soak-clean**, two that are
-**Supported**, four more **Qualified** models, and one that runs, not yet qualified ([step 4](#4-start-a-server) has their settings):
+**Supported**, four more **Qualified** models, and four that run, not yet qualified ([step 4](#4-start-a-server) has their settings):
 
 - MiniCPM5-2B IQ8R, 1 card, **Runs, not yet qualified**: `minicpm5-2b-1card` (32K x 4), the small first run.
 - Qwen3.8-27B IQ4R-L-V4, 1 card, **Qualified**: `qwen27-preview` (32K x 4) and `qwen27-8k-plain` (8K, one request).
@@ -671,7 +689,8 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
   Its known issues: when requests share a step, rounding can change the output, so sampling is looser than
   asked; and one hard lock, seen once, when it was stopped during a long prefill beside a large build.
 - Qwen3.8-Flash-Next IQR-V4, 2 cards, **Supported**: `flashnext-2card`, upstream's two-card settings, tuned,
-  on the exact wire; a lost write is re-sent. An 8-hour soak has not been run on it yet.
+  on the exact wire; a lost write is re-sent. An 8-hour soak has not been run on it yet. A faster prefill
+  for long prompts is opt-in (`-Env BRILLIANCE_TP2_PIPELINE=1`), exact on the exact wire.
 - Gemma 4 31B a4, 1 card, **Qualified**: `gemma4-31b-1card` (32K x 2).
 - Gemma 4 12B i8g, 1 card, **Qualified**: `gemma4-12b-1card` (32K x 4).
 - Qwen3.6-35B-A3B IQ8R, 2 cards, **Qualified**: `qwen36-35b-2card` (32K x 4). It thinks
@@ -679,10 +698,18 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 - Qwen-Image 2.1 IQ8R, 1 card, **Qualified** for generation: `qwen-image-1card`. Some of its edits
   come out with colour noise ([known issue 13](win/SUPPORT.md#known-issues)), and its licence allows
   non-commercial use only ([Licence and credits](#licence-and-credits)).
+- LTX-2.5 distilled IQ8R, 1 card, **Runs, not yet qualified**: `ltx-2.5-1card`, video with sound from text
+  or a first frame. Its text encoder and token embedding are pinned in host memory (about 15.9 GiB), and
+  its licence carries use restrictions you must pass on ([Licence and credits](#licence-and-credits)).
+- DeepSeek-V4.1-Flash-1017, 4 cards, **Runs, not yet qualified** (preview): `deepseek41-4card` (4K, one
+  request), every routed expert on the cards. Rank 0 follows the runtime's device order.
+- DeepSeek-V4.1-Flash-1017, 2 cards, **Runs, not yet qualified** (preview): `deepseek41-2card`, the experts
+  that do not fit the cards held in host memory. Its greedy text can differ from the four-card profile's
+  ([known issue 14](win/SUPPORT.md#known-issues)).
 
 **Brilliance 0.2.2's containers do not load.** Radiance 2.2 does not read the 0.2.2-era formats: whole-model
-FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash MXFP4, DeepSeek-V4.1 and Gemma 4 FP8. Use the current
-containers above.
+FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash MXFP4, Brilliance 0.2.2's DeepSeek-V4.1 containers and
+Gemma 4 FP8. Use the current containers above.
 
 ## Feature parity
 
@@ -709,10 +736,10 @@ Radiance 2.2's features, and where each stands on Windows, from [win/SUPPORT.md]
 | Speculation: DFlash2, MTP | **Yes** | |
 | Drafting options (`draft-coupling`, `draft-verify`, `draft-depth: adaptive`, `draft-suffix`) | **Yes** | Checked on Qwen3.8-Flash-Next, two cards (2026-11-19), not qualified: greedy text identical to the uncoupled base. Coupling and the traversal verify also on Qwen3.8-27B's DFlash2. A model that cannot take an option is refused at start, naming why |
 | Control vectors | **Yes** | Checked on Qwen3.8-Flash-Next with the shipped vector, two cards (2026-11-19), not qualified: the per-request field, the `MODEL:NAME` variant, `/admin/control-vector`. Only Flash-Next's architecture applies them |
-| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory on the exact wire (a lost write is re-sent; no 8-hour soak run yet). The Flash-Next fastest profile runs with the same protection on lossy wht6 |
-| Tensor parallel, 4 cards | **Partial** | Flash-Next supported with every expert on the cards: soaked at 32K on its earlier settings, before the four-card re-send and stop; with them, a lost write is re-sent as on two cards, and its tuned settings pass the injection, stop and serving checks (a soak on them has not run yet); 3 and 8 cards not run |
+| Tensor parallel, 2 cards | **Partial** | Soak-clean when the weights fit the cards; supported when experts are read from host memory on the exact wire (a lost write is re-sent; no 8-hour soak run yet). The Flash-Next fastest profile runs with the same protection on lossy wht6. Flash-Next's faster prefill is opt-in (`BRILLIANCE_TP2_PIPELINE=1`). DeepSeek-V4.1 runs, not yet qualified, with experts in host memory (known issue 14) |
+| Tensor parallel, 4 cards | **Partial** | Flash-Next supported with every expert on the cards: soaked at 32K on its earlier settings, before the four-card re-send and stop; with them, a lost write is re-sent as on two cards, and its tuned settings pass the injection, stop and serving checks (a soak on them has not run yet). DeepSeek-V4.1 runs, not yet qualified, every routed expert on the cards; 3 and 8 cards not run |
 | Peer-to-peer between cards | **Not on Windows** | The driver gives no peer access, so collectives go through pinned host memory with `p2p: auto` (the default); `p2p: on` refuses to start ([step 4](#4-start-a-server)) |
-| Dashboard | **Partial** | Per card it shows temperature, not load or power |
+| Dashboard | **Yes** | Per card: load (GFX activity), board power and junction temperature, read from the AMD driver's ADL; a card whose driver has no ADL shows its temperature and says the rest is not available on Windows |
 | Diagnose mode | **Yes** | The busy-host warning reads the CPUs' load over a quarter second |
 | `rad-convert` | **Partial** | CPU only, by decision; `--gpus` is refused. A real model converted: SDXL, 9.6 s on the CPU |
 | `rad-export` (finetune to container) | **Yes** | With Python 3 (`bin\rad-export.cmd`), which runs the package's converter and recipes ([What you need to run it](#what-you-need-to-run-it)) |

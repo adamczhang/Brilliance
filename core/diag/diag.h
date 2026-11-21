@@ -172,6 +172,9 @@ struct RunFacts {
     int64_t     pinned_bytes = -1;       /* every pinned host allocation the process made */
     int64_t     host_weight_bytes = 0;   /* weights a rank reads from the pinned host pool */
     int64_t     file_weight_bytes = 0;   /* and from the container on disk */
+    /* Brilliance: file-tier weights a rank holds in ordinary RAM (--expert-ram-mib), which a read
+     * copies from RAM, not the disk; not counted in file_weight_bytes. */
+    int64_t     ram_weight_bytes = 0;
     int64_t     locked_bytes = 0;        /* memory locked for a host gather (an n-gram copy) */
     std::string ngram_placement;         /* where an n-gram table went, "" for a model without one */
     bool        reference_kernels = false;

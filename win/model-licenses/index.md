@@ -18,6 +18,7 @@ operator has replaced them).
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | `/terms/licenses/openmdw-1.1`; NVIDIA's notice: `/terms/licenses/nemotron-3.5-rerank-notice` |
 | Gemma 4 31B and 12B | Apache 2.0 | `/terms/licenses/apache-2.0`; Google's licence page for Gemma: https://ai.google.dev/gemma/docs/gemma_4_license |
 | Qwen3.6-35B-A3B | Apache 2.0 | `/terms/licenses/apache-2.0` |
+| DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container) | MIT License, Copyright (c) 2023 DeepSeek; the container's repository states MIT for the original and for its modifications | `/terms/licenses/deepseek-mit` (from `deepseek-ai/DeepSeek-V4.1-Flash-1017`; the container's repository has no licence file of its own) |
 | Qwen-Image 2.1 (pictures) | Qwen RESEARCH LICENSE AGREEMENT, Hangzhou Tongyi Laboratory Technology Co., Ltd. (non-commercial) | `/terms/licenses/qwen-research`. Its notice: "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved." The container is a modified copy: its linear weights are re-encoded as rotated int8 |
 
 The texts are copied from each model's repository on Hugging Face. Apache 2.0 is the Apache

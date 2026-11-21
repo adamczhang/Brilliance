@@ -774,6 +774,12 @@ Engine::Readback::~Readback() {
 
 Engine::~Engine() {
     depth_log_stats("final");
+    /* Brilliance: what the fault poll on steps with no sampled row added to them (collect_step). */
+    if (nowait_polls_ > 0)
+        RAD_INFO("collective fault poll on steps with no sampled row (final): %lld poll(s), "
+                 "mean %.2f us, max %.2f us", (long long)nowait_polls_,
+                 (double)nowait_poll_ns_ / 1000.0 / (double)nowait_polls_,
+                 (double)nowait_poll_max_ns_ / 1000.0);
     /* The control vector's per-rank direction copies. Uploaded at declare, outside any arena, so
      * nothing else frees them; each rank's copy is freed with that rank's device bound, since the
      * allocator is per device. */
@@ -1326,6 +1332,24 @@ int Engine::step_loop() {
         return fail_loop(RAD_E_UNSUPPORTED);
     }
     const bool t_on = (int)log_level() >= (int)Log::Debug;
+    /* Brilliance: the fault poll's test stand-in (test_fault_step_), on the host backend only, so a
+     * card's run never carries it. */
+    if (const char* v = std::getenv("BRILLIANCE_TEST_COLL_FAULT"); v && *v) {
+        char* end = nullptr;
+        const long k = std::strtol(v, &end, 10);
+        const bool late = end && std::strcmp(end, ":late") == 0;
+        if (!device_is_host())
+            RAD_WARN("BRILLIANCE_TEST_COLL_FAULT=%s is for the host backend's tests; ignored on a "
+                     "card", v);
+        else if (end == v || k < 0 || (*end && !late))
+            RAD_WARN("BRILLIANCE_TEST_COLL_FAULT=%s: expected <step> or <step>:late; ignored", v);
+        else {
+            test_fault_step_ = (int)k;
+            test_fault_late_ = late;
+            RAD_WARN("BRILLIANCE_TEST_COLL_FAULT: a stand-in collective fault is latched in step "
+                     "%d%s", test_fault_step_, late ? ", after its collection looks" : "");
+        }
+    }
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     if (std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT")) {
         sched_.set_kv_rollback_test_hook([this](uint64_t seq, int proposals, int accepted,
@@ -1367,6 +1391,11 @@ int Engine::step_loop() {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
+            /* Brilliance: a fault of a step no later collection looked at -- its request was
+             * cancelled between an interior chunk and its next sampled row -- stops the engine
+             * here, not in the next request's first step (coll_fault_check, kIdle). */
+            if (const int fs = coll_fault_check(-1, nullptr, FaultLook::kIdle); fs < 0)
+                return fail_loop(fs);
             drain_completed();
             sched_.publish(/*idle=*/true);
             /* Work is waiting only on the encoder: loop immediately. */
@@ -1612,6 +1641,7 @@ int Engine::step_loop() {
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
+        if (b->step == test_fault_step_ && !test_fault_late_) test_fault_latched_ = true;
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
@@ -1620,6 +1650,7 @@ int Engine::step_loop() {
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
         if (st < 0) return fail_loop(st);
+        if (b->step == test_fault_step_ && test_fault_late_) test_fault_latched_ = true;
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
@@ -1920,24 +1951,60 @@ int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
  * and the step's requests and returns RAD_E_DEVICE, which the step loop takes to fail_loop (every
  * request fails, the engine stops). Not recovered in-process (the owner's decision, stage 9): the
  * fleet frees the engine and ends the process, as spec §17 has a device fault do (Fleet::reap).
- * Healthy, a few loads of pinned host memory. */
-static int coll_fault_check(int step, const StepPlan& plan, std::string* exit_why) {
+ * Healthy, a few loads of pinned host memory.
+ *
+ * Brilliance (pp-tp2.faultpoll): read at three places (FaultLook). After a sampled step's wait, as
+ * above. On a step with no sampled row (an intermediate prefill chunk), which does not wait: the
+ * records are pinned host memory, so the read costs no synchronisation, and a collective that gave
+ * up in an interior chunk fails the request at the first collection after its record lands,
+ * instead of at the prompt's last chunk with every chunk between computed on a sum known to be
+ * wrong. And while idle, so a fault of a step whose request was cancelled before any later step
+ * looked stops the engine there, naming it, instead of failing the next request. */
+int Engine::coll_fault_poll(std::string* why) const {
+    const int n = dev_coll_fault_poll(why);
+    if (n > 0 || !test_fault_latched_) return n;
+    if (why)
+        *why = fmt("test fault (BRILLIANCE_TEST_COLL_FAULT): the host backend's stand-in for a "
+                   "collective's fault record, latched in step %d%s", test_fault_step_,
+                   test_fault_late_ ? " after its collection looked" : "");
+    return 1;
+}
+
+int Engine::coll_fault_check(int step, const StepPlan* plan, FaultLook look) {
     std::string why;
-    if (dev_coll_fault_poll(&why) <= 0) return RAD_OK;
+    if (coll_fault_poll(&why) <= 0) return RAD_OK;
     /* The process does not survive it (stage 9, the owner's decision): the fleet ends it once the
      * engine has stopped and freed its cards (Fleet::reap), with this as its last line. */
-    *exit_why = fmt("step %d: a collective gave up waiting for its peer and recorded a fault -- %s",
-                    step, why.c_str());
+    const std::string at = look == FaultLook::kIdle ? std::string("idle after the last step")
+                                                    : fmt("step %d", step);
+    fault_exit_ = fmt("%s: a collective gave up waiting for its peer and recorded a fault -- %s",
+                      at.c_str(), why.c_str());
     std::set<unsigned long long> ids;
-    for (const StepEntry& e : plan.e)
-        if (e.req) ids.insert((unsigned long long)e.req->id);
+    if (plan)
+        for (const StepEntry& e : plan->e)
+            if (e.req) ids.insert((unsigned long long)e.req->id);
     std::string list;
     for (unsigned long long id : ids) list += (list.empty() ? "" : ", ") + std::to_string(id);
-    RAD_ERR("step %d: a collective gave up waiting for its peer and recorded a fault -- %s. The "
-            "step's output is wrong and none of it is sent: request(s) %s fail with it, and the "
-            "engine stops as for any device fault (a card's write to host memory was lost; "
-            "SUPPORT.md, known issue 1)",
-            step, why.c_str(), list.empty() ? "(none)" : list.c_str());
+    const char* seen =
+        look == FaultLook::kNoWait
+            ? " (seen by the poll of a step with no sampled row, which does not wait for the card: "
+              "the give-up is in this step, one the card ran before it, or the step issued ahead)"
+        : look == FaultLook::kIdle
+            ? " (seen while idle: the step it was in produced no sampled row before its request "
+              "ended or was cancelled)"
+            : "";
+    if (look == FaultLook::kIdle)
+        RAD_ERR("%s: a collective gave up waiting for its peer and recorded a fault -- %s%s. No "
+                "request is running, so none fails with it; the engine stops as for any device "
+                "fault, so the next request does not run on its wrong state (a card's write to "
+                "host memory was lost; SUPPORT.md, known issue 1)",
+                at.c_str(), why.c_str(), seen);
+    else
+        RAD_ERR("%s: a collective gave up waiting for its peer and recorded a fault -- %s%s. The "
+                "step's output is wrong and none of it is sent: request(s) %s fail with it, and "
+                "the engine stops as for any device fault (a card's write to host memory was "
+                "lost; SUPPORT.md, known issue 1)",
+                at.c_str(), why.c_str(), seen, list.empty() ? "(none)" : list.c_str());
     return RAD_E_DEVICE;
 }
 
@@ -1950,7 +2017,7 @@ int Engine::collect_pooled(const RadBatch* b, StepOut& so) {
     so.eos.assign(plan.e.size(), 1);
     if (plan.e.empty()) return RAD_OK;
     RAD_TRY(rad_event_sync(step_end_));
-    RAD_TRY(coll_fault_check(b->step, plan, &fault_exit_));
+    RAD_TRY(coll_fault_check(b->step, &plan, FaultLook::kWaited));
     if ((int64_t)plan.e.size() != (int64_t)b->n_seq) {
         RAD_ERR("an embedding step planned %zu sequences and its batch carries %lld",
                 plan.e.size(), (long long)b->n_seq);
@@ -2291,7 +2358,17 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     so.eos.assign(plan.e.size(), 0);
     so.lp.clear();
     so.path.clear();
-    if (so.n_rows <= 0) return RAD_OK;
+    if (so.n_rows <= 0) {
+        /* Brilliance: no row, so no wait; read the fault records without one (coll_fault_check,
+         * kNoWait), timed for the engine's final line. */
+        const uint64_t t0 = rad_mono_ns();
+        const int st = coll_fault_check(b->step, &plan, FaultLook::kNoWait);
+        const uint64_t dt = rad_mono_ns() - t0;
+        ++nowait_polls_;
+        nowait_poll_ns_ += dt;
+        nowait_poll_max_ns_ = std::max(nowait_poll_max_ns_, dt);
+        return st;
+    }
 
     so.rows.resize((size_t)so.n_rows);
     /* Wait on an event, not the stream: a step issued ahead is queued behind it. With early ids
@@ -2299,7 +2376,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
     RAD_TRY(rad_event_sync(so.early ? tok_end_ : step_end_));
     /* Every collective the step's tokens depend on has finished on this rank by now, and the other
      * rank's are ordered before them (r4d_ar_fault_note's fence), so its fault is on record. */
-    RAD_TRY(coll_fault_check(b->step, plan, &fault_exit_));
+    RAD_TRY(coll_fault_check(b->step, &plan, FaultLook::kWaited));
     std::memcpy(so.rows.data(), so.rb, (size_t)so.n_rows * sizeof(int32_t));
     so.rb = nullptr;
     RAD_TRY(collect_scored_rows());
@@ -3485,6 +3562,9 @@ int Engine::run_server() {
                 s.link.d2h_bytes      += (int64_t)rms.d2h_bytes;
                 s.link.ssd_reads      += (int64_t)rms.ssd_reads;
                 s.link.ssd_bytes      += (int64_t)rms.ssd_bytes;
+                s.link.ram_weights    += (int64_t)rms.ram_weights;
+                s.link.ram_bytes      += (int64_t)rms.ram_bytes;
+                s.link.relaid_weights += (int64_t)rms.relaid_weights;
                 s.link.ssd_staging_bytes += (int64_t)rms.ssd_staging_bytes;
                 s.link.ssd_promoted_bytes += (int64_t)rms.ssd_promoted_bytes;
                 s.link.ssd_deposits    += (int64_t)rms.ssd_deposits;

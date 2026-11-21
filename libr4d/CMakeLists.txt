@@ -207,6 +207,10 @@ set(R4D_UNITS
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
   "r4d_rowtopk_bf16|"
+  # DeepSeek V4.1 text operations and native GGML blocks.
+  "r4d_ds41_elem|"
+  "r4d_ds41_sparse|"
+  "r4d_ds41_ggml|"
   # The vocab-sharded draft head's cross-rank top-1, one id a row.
   "r4d_pair_argmax_f32|"
   # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
@@ -258,11 +262,23 @@ rad_simd_level_objects(r4d_hsimd ${CMAKE_CURRENT_SOURCE_DIR}/r4d_hsimd_kernels.c
                        DEFINE R4D_HSIMD_LEVEL INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
 list(APPEND R4D_DECLARATION ${R4D_HSIMD_OBJS})
 
+set(R4D_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${R4D_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND R4D_DECLARATION r4d_ds41_ggml_layout.cpp
+       ${R4D_GGML_DIR}/lq_ggml_planes.cpp ${R4D_GGML_DIR}/lq_ggml_dequant.cpp
+       ${R4D_GGML_DIR}/lq_ggml_tables.cpp)
+  set(R4D_HAVE_GGML ON)
+endif()
+
 rad_add_plugin(libr4d kernels
   SOURCES     ${R4D_DECLARATION}
   HIP_SOURCES ${R4D_SRC}
   GPU_TARGETS ${R4D_GPU_TARGETS}
   INCLUDES    ${CMAKE_CURRENT_SOURCE_DIR})
+if(R4D_HAVE_GGML)
+  target_compile_definitions(libr4d PRIVATE R4D_HAVE_GGML=1)
+  target_include_directories(libr4d PRIVATE ${R4D_GGML_DIR})
+endif()
 
 # Catalogue dump: prints every row and, on a card, calls each launch with a minimal valid input, to
 # catch transcription errors in the constraint table. It dlopens the plugin so an undefined symbol

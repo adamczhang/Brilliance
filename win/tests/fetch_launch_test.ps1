@@ -3,8 +3,9 @@
 .SYNOPSIS
   Brilliance: libexec\hfget.ps1 and serve.ps1 -Fetch against a stand-in hub on loopback -- the plan
   printed before a transfer, a fresh destination, a warm cache that transfers nothing, a transfer
-  cut short and resumed, a repo of several containers that needs a choice, and the verified file
-  served without an edit to the profile. No card, no network beyond 127.0.0.1, fixture bytes only.
+  cut short and resumed (by the next run, and by each try within a run, from the byte it reached),
+  a repo of several containers that needs a choice, and the verified file served without an edit to
+  the profile. No card, no network beyond 127.0.0.1, fixture bytes only.
 .DESCRIPTION
   ctest runs it (win\tests\CMakeLists.txt) with the radiance.exe of the build tree:
     powershell -File win\tests\fetch_launch_test.ps1 -Exe build-win\hip\bin\radiance.exe
@@ -44,6 +45,8 @@ function Start-Hub([int]$drop = 0) {
 function Stop-Hub { if ($script:hubProc -and -not $script:hubProc.HasExited) { Stop-Process -Id $script:hubProc.Id -Force; $script:hubProc.WaitForExit(5000) | Out-Null } }
 function HubLog { $p = Join-Path $tmp 'log'; if (Test-Path -LiteralPath $p) { [IO.File]::ReadAllText($p) } else { '' } }
 function Transfers([string]$file) { @((HubLog) -split "`n" | Where-Object { $_ -match "^GET /\S+/resolve/\S+/$([regex]::Escape($file)) " }).Count }
+# The Range of each transfer of a file since the hub started, in order ('-' for none), comma-joined.
+function Ranges([string]$file) { @((HubLog) -split "`n" | Where-Object { $_ -match "^GET /\S+/resolve/\S+/$([regex]::Escape($file)) " } | ForEach-Object { ($_.Trim() -split ' ')[2] }) -join ',' }
 function Run([string]$script, [string[]]$a) {
   $ErrorActionPreference = 'Continue'
   $o = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script @a 2>&1 | ForEach-Object { "$_" }
@@ -88,8 +91,10 @@ try {
   Check ((Transfers 'm.rad') -eq $before) "a warm cache transfers nothing"
 
   # ======================================================================= a transfer cut short
-  # Every response for the first six (one try and curl's five retries) stops half way; the run ends
-  # incomplete with a partial file, and the next run resumes from where it stopped.
+  # Every response for the first six (one try and five more) stops half way; the run ends incomplete
+  # with a partial file, and the next run resumes from where it stopped. Each try within the run
+  # resumes too: it asks for the bytes after those it has, never byte 0 again (curl's own --retry
+  # did, 2026-11-20). Half of what was asked arrives each time: 512 KiB, then 256, 128, 64, 32, 16.
   Stop-Hub; Start-Hub 6
   $cut = Join-Path $tmp 'dest cut'
   $r = Run $hfget @('brl-test/one', $cut, 'main', 'm.rad')
@@ -97,10 +102,24 @@ try {
   $len = if (Test-Path -LiteralPath $part) { (Get-Item -LiteralPath $part).Length } else { -1 }
   Check ($r.Rc -ne 0 -and $r.Rc -ne 3 -and (Has $r.Out 'incomplete -- re-run to resume')) "a cut transfer fails as incomplete:`n$($r.Out)"
   Check ($len -gt 0 -and $len -lt 1048576 -and -not (Test-Path -LiteralPath (Join-Path $cut '.hfget-manifest-m.rad'))) "a partial file and no manifest ($len bytes)"
+  $rs = Ranges 'm.rad'
+  Check ($rs -eq '-,bytes=524288-,bytes=786432-,bytes=917504-,bytes=983040-,bytes=1015808-' -and $len -eq 1032192) "each try in the run resumed where the one before stopped ($len bytes):`n$rs"
+  Check ((Has $r.Out 'm.rad: curl exit 18 at byte 524288 of 1048576; try 2 of 6 resumes there') -and (Has $r.Out 'try 6 of 6')) "each new try is announced with its byte:`n$($r.Out)"
   $r = Run $hfget @('brl-test/one', $cut, 'main', 'm.rad')
   Check ($r.Rc -eq 0 -and (Has $r.Out "to resume at byte $len") -and (Has $r.Out "resuming at $len of 1048576")) "the next run resumes:`n$($r.Out)"
   Check ((HubLog) -match "resolve/$commit/m.rad bytes=$len-") "it asked for the rest only (Range bytes=$len-)"
   Check ((Sha $part) -eq (Sha $src) -and (Test-Path -LiteralPath (Join-Path $cut '.hfget-manifest-m.rad'))) "the resumed file is whole and verified"
+
+  # ======================================================================= cut twice, one run
+  # Two cuts and tries left: the same run finishes the file, each try from where the last stopped,
+  # so the hub sends the file's bytes once in all (512 KiB + 256 KiB + 256 KiB).
+  Stop-Hub; Start-Hub 2
+  $twice = Join-Path $tmp 'dest twice'
+  $r = Run $hfget @('brl-test/one', $twice, 'main', 'm.rad')
+  Check ($r.Rc -eq 0 -and (Has $r.Out "hfget: verified $(Join-Path $twice 'm.rad')")) "two cuts within tries: one run completes:`n$($r.Out)"
+  $rs = Ranges 'm.rad'
+  Check ($rs -eq '-,bytes=524288-,bytes=786432-') "the second and third tries resumed (no byte 0 again):`n$rs"
+  Check ((Sha (Join-Path $twice 'm.rad')) -eq (Sha $src)) "the file resumed within the run is whole"
   Stop-Hub; Start-Hub
 
   # ======================================================================= several containers

@@ -175,6 +175,9 @@ struct MoeFP8 {
         /* GLM routing (GlmRouter): sigmoid scores with a correction bias, top-k, `route_scale` on
          * the kept weights, which are then f32 in `ew`. */
         int     sigmoid_router = 0;
+        /* With `sigmoid_router`: the score function by name instead of the sigmoid
+         * (GlmRouter::Config::score, router_scored_topk); null keeps the sigmoid. */
+        const char* router_score = nullptr;
         /* With `sigmoid_router`: the selection, the scatter and an ungated shared arm's gate fill in
          * one launch (`router_sigmoid_topk_scatter`) wherever the pass fits the sort's one
          * workgroup; the separate ops otherwise. Byte-identical either way. */
@@ -270,6 +273,10 @@ struct MoeFP8 {
          * reads it against the rotated int8 activations (dtype `i8a8h`, libr4d's moe_gemm_iqr).
          * Set with `expert_rot`. */
         int     expert_iqr   = 0;
+        /* llama.cpp's blocks (a GGUF's experts, imported as their type's planes; rad_ggml.h):
+         * whole experts like bf16, read by moe_gemm_ggml. The type is each layer's and
+         * projection's own (declare reads it), since a GGUF mixes them. Format 13. */
+        int     expert_ggml  = 0;
         /* Plain bf16 experts (no quantising recipe). Both GEMMs are `moe_gemm` over one table of
          * whole experts with `silu_mul` between, and the shared arm follows the trunk
          * (Geom::w_bf16). Not sliced by parity: each expert is served whole on its rank, which
@@ -346,6 +353,11 @@ struct MoeFP8 {
         const char* router      = nullptr;   /* mlp.gate.weight, [n_expert, n_embd] bf16 */
         const char* router_bias = nullptr;   /* GLM noaux_tc correction bias */
         const char* experts     = nullptr;   /* prefix; ".<e>.{gate,up,down}_proj.weight" */
+        /* The per-expert tensors' names under `experts` (".<e>.<name>.weight"): Hugging Face's
+         * spelling unless a family ships its own (DeepSeek's release: w1, w3, w2). */
+        const char* expert_gate = "gate_proj";
+        const char* expert_up   = "up_proj";
+        const char* expert_down = "down_proj";
         const char* shared      = nullptr;   /* prefix; ".{gate,up,down}_proj.weight" */
         /* Stacked checkpoints (recent releases) store all experts in two tensors:
          * `mlp.experts.gate_up_proj` [n_expert, 2*n_ff, n_embd] and `mlp.experts.down_proj`
@@ -513,16 +525,22 @@ struct MoeFP8 {
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
      * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 rotated int8, 11 the rotated
      * computed trellis under one f32 scale a row (an IQR weight an expert), 12 the codebook's
-     * six-bit form per 64; RAD_E_DTYPE otherwise. */
+     * six-bit form per 64, 13 llama.cpp's blocks of any GGUF type moe_gemm_ggml reads (named only
+     * in a plugin built with RAD_ARCH_HAVE_GGML: rad_ggml.h); RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings against an E4M3 activation, and
      * against an int8 one (null: the format has no such row). Int8 experts read int8 only. */
-    static constexpr const char* kServed[13] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+    static constexpr const char* kServed[14] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
                                                 "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8",
-                                                "fp8a8f32", nullptr, nullptr, "w6nl64a8h" };
-    static constexpr const char* kServed8[13] = { nullptr, nullptr, "w4a8i8h", nullptr, nullptr,
+                                                "fp8a8f32", nullptr, nullptr, "w6nl64a8h", "ggml" };
+    static constexpr const char* kServed8[14] = { nullptr, nullptr, "w4a8i8h", nullptr, nullptr,
                                                  "w4nl64a8i8h", "w4nl32a8i8h", nullptr, nullptr,
-                                                 nullptr, "i8a8h", "i8a8h", nullptr };
+                                                 nullptr, "i8a8h", "i8a8h", nullptr, nullptr };
+    /* Per projection (gate_up, down), the GGUF type and its block along K of this layer's experts
+     * under expert_ggml (13 names the family; moe_gemm_ggml takes the type itself). */
+    const char* ggml_ty[2] = { nullptr, nullptr };
+    int64_t     ggml_blk[2] = { 0, 0 };
+    bool act_bf16() const { return c.expert_bf16 || c.expert_ggml; }
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -533,12 +551,24 @@ struct MoeFP8 {
      * expert's rows before the checkpoint are then a run of their own, as a step ending there
      * gives them (moe_gemm_iqr's packed map), so they take the same paths. */
     mutable const int32_t* split_tok = nullptr;
+    /* Opt-in: work the caller issues inside the block, behind the first pass's routed gate_up and
+     * the shared arm's gate_up, so a recorded pass can overlap it with those GEMMs
+     * (Ctx::haz_mark). It must touch nothing the block reads or writes. Without it (every other
+     * caller) the block issues exactly as before. */
+    struct Beside {
+        void (*fn)(RadCtx*, void*) = nullptr;
+        void* arg = nullptr;
+    };
+    void step(RadCtx* c, const RadBatch* batch, const Beside& beside) const;
     /* The block over the first `T` rows of its buffers, for passes that need fewer rows than the
      * batch (the MTP head's history pass reads its output only at drafting rows). */
-    void step_rows(RadCtx* c, int64_t T) const;
+    void step_rows(RadCtx* c, int64_t T, const Beside* beside = nullptr) const;
     /* One pass of at most `c.rows` tokens. `own_ar` false: the caller issues the pass's
-     * all-reduce itself (issue_ar), as GdnFP8::step describes. */
-    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true) const;
+     * all-reduce itself (issue_ar), as GdnFP8::step describes. With fused_gather=false
+     * the pass must gather into its output even if the following residual write could fuse it.
+     * `beside`: step()'s Beside, issued in the first pass. */
+    void pass(RadCtx* c, int64_t T, int64_t r0, int64_t rows, bool own_ar = true,
+              bool fused_gather = true, const Beside* beside = nullptr) const;
     /* The heat engine's handoff, after a step's last pass (step() says what it reports). */
     void route_report(RadCtx* c) const;
     bool issues_ar(int64_t T, int64_t rows) const {
@@ -557,6 +587,11 @@ struct MoeFP8 {
 };
 
 inline int MoeFP8::format_of(const RadEncoding& e) {
+    /* A GGUF import's llama.cpp blocks first: GGUF MXFP4 (ggml type 39) is such a type, served by
+     * moe_gemm_ggml, so it must not reach the retired-MXFP4 refusal below. ggml_type_of names a type
+     * only in a plugin built with RAD_ARCH_HAVE_GGML (deepseek41); in every other plugin it is null
+     * and this line changes nothing, so any other MXFP4 container is still refused. */
+    if (ggml_type_of(e)) return 13;
     if (linear_is_mxfp4(e)) return 8;
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return 3;
     /* The computed trellis under one f32 scale a row, rotated (IQR-V4's feed-forward form). */
@@ -641,9 +676,9 @@ inline int moe_map_gate_up(RadBuilder* b, Names& nm, const MoeFP8::Src& src, con
     if (src.experts_gate && src.experts_up)
         return map_slice_concat(b, guw, {src.experts_gate, src.experts_up}, (int)ge);
     /* Ungated experts (Nemotron-H) have no gate_proj: the first GEMM is up_proj alone. */
-    if (ungated) return map_copy(b, guw, nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge));
-    return map_concat(b, guw, {nm.ckpt("%s.%lld.gate_proj.weight", src.experts, ge),
-                                nm.ckpt("%s.%lld.up_proj.weight", src.experts, ge)});
+    if (ungated) return map_copy(b, guw, nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_up));
+    return map_concat(b, guw, {nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_gate),
+                                nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_up)});
 }
 
 inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, const char* guw,
@@ -651,7 +686,7 @@ inline int moe_map_expert(RadBuilder* b, Names& nm, const MoeFP8::Src& src, cons
     if (gate_up) RAD_ARCH_TRY(moe_map_gate_up(b, nm, src, guw, ge, src.cfg.ungated));
     if (src.experts_gate_up || src.experts_gate)
         return map_slice(b, dnw, src.experts_down, (int)ge);
-    return map_copy(b, dnw, nm.ckpt("%s.%lld.down_proj.weight", src.experts, ge));
+    return map_copy(b, dnw, nm.ckpt("%s.%lld.%s.weight", src.experts, ge, src.expert_down));
 }
 
 inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config* cfg) {
@@ -689,8 +724,10 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
                             "bf16; or the codebook at E4M3 scales a 64 or 32 of K under a fixed "
                             "f32, or its 32-entry five-bit form at a 64, or OCP MXFP4 "
                             "(fp4_e2m1*e8m0[1x32]), or rotated int8 (i8*bf16[1x128]/fwht128), or "
-                            "the rotated computed trellis under one f32 scale a row. Convert it "
-                            "with a recipe that makes one of them.\n", guw, en);
+                            "the rotated computed trellis under one f32 scale a row, or a GGUF's "
+                            "or llama.cpp blocks. Convert it with a recipe that "
+                            "makes one of them.\n",
+                    guw, en);
             return RAD_E_DTYPE;
         }
         if (known && (f == 0 || f == 8 || f == 9))
@@ -701,6 +738,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
     cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10 || f == 11 || f == 12) ? 1 : 0;
     cfg->expert_i8   = f == 10 ? 1 : 0;
     cfg->expert_iqr  = f == 11 ? 1 : 0;
+    cfg->expert_ggml = f == 13 ? 1 : 0;
     cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7 || f == 12) ? 1 : 0;
     cfg->expert_g64  = (f == 5 || f == 7 || f == 12) ? 2 : f == 6 ? 4 : 0;
     cfg->expert_w5   = f == 7 ? 1 : 0;
@@ -787,10 +825,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     /* The routed arm's activations (see `a8`), known before the layer's formats are resolved:
      * which forms may share a model depends on the codes they read. */
-    a8 = w.eff.q8_fed && !c.expert_bf16;
+    a8 = w.eff.q8_fed && !act_bf16();
     prot.clear();
     {
-        const int want = c.expert_iqr ? 11 : c.expert_i8 ? 10 : c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w6 ? 12 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
+        const int want = c.expert_iqr ? 11 : c.expert_i8 ? 10 : c.expert_ggml ? 13 : c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w6 ? 12 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
@@ -838,12 +876,30 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             int fe[2];
             const char* names[2];
             fmt_of(e, enc, fe, names);
+            if (fe[0] == 13 && fe[1] == 13 && want == 13) {
+                /* One GGUF type per projection across the layer's experts: the first expert's
+                 * sets it, every other must match (a table of experts takes one type). */
+                for (int i = 0; i < 2; ++i) {
+                    int64_t blk = 0;
+                    const char* t = ggml_type_of(enc[i], &blk);
+                    if (!ggml_ty[i]) {
+                        ggml_ty[i] = t;
+                        ggml_blk[i] = blk;
+                    } else if (!t || std::strcmp(t, ggml_ty[i]) != 0) {
+                        fprintf(stderr, "radiance: '%s' is GGUF %s and the layer's first expert %s; "
+                                        "one table of experts takes one type\n", names[i],
+                                t ? t : "?", ggml_ty[i]);
+                        return RAD_E_DTYPE;
+                    }
+                }
+                continue;
+            }
             /* A trellis layer is one code width a projection: the views are declared at it. */
             const bool same = fe[0] == fmt[0] && fe[1] == fmt[1] &&
                               (fmt[0] != 11 || enc[0].plane[0].dtype == fenc[0].plane[0].dtype) &&
                               (fmt[1] != 11 || enc[1].plane[0].dtype == fenc[1].plane[0].dtype);
             if (same) continue;
-            if (want != 3 && fe[0] == 3 && fe[1] == 3) { prot.push_back(e); continue; }
+            if (want != 3 && want != 13 && fe[0] == 3 && fe[1] == 3) { prot.push_back(e); continue; }
             const int i = fe[0] != fmt[0] ? 0 : 1;
             char en[256];
             rad_enc_format(&enc[i], en, sizeof en);
@@ -902,6 +958,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.rows = c.rows;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
+        rc.score = c.router_score;
         rc.groups = c.n_group;
         rc.topk_groups = c.topk_group;
         const GlmRouter::Wire wire{ c.router_k ? w.route : w.h.x, w.logits, w.ids, w.ew };
@@ -1093,8 +1150,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         return RAD_E_INVAL;
     }
     /* ---- The routed arm's activations (see `a8`). */
-    if ((c.expert_i8 || c.expert_iqr || fmt[0] == 10 || fmt[0] == 11 ||
-         fmt[1] == 10 || fmt[1] == 11) && !a8) {
+    if ((c.expert_i8 || c.expert_iqr || fmt[0] == 10 || fmt[0] == 11 || fmt[1] == 10 || fmt[1] == 11) && !a8) {
         fprintf(stderr, "radiance: layer %d's experts read int8 activations (int8, or an IQR weight); the "
                         "architecture declared the routed arm's codes E4M3\n", l);
         return RAD_E_UNSUPPORTED;
@@ -1142,40 +1198,75 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         return rad_weight_shard_span(b, h, qlo[q] / unit, qhi[q] / unit);
     };
     const bool rot = c.expert_rot != 0;
-    if (c.expert_bf16) {
+    if (act_bf16()) {
         /* ---- Plain bf16 experts: one table per projection of whole experts in expert order
          * (`moe_gemm`, expert e at entry e), so the two loops must not be merged. Each expert is
          * its own movement unit, and its container bytes are what the kernel reads, so the file
-         * tier can serve it directly. */
+         * tier can serve it directly.
+         *
+         * GGUF-block experts (expert_ggml) take the same tables declared at their codes' dtype and
+         * logical extents, every plane selected, and `moe_gemm_ggml` with the projection's type:
+         * the kernel's layout hook packs the planes into llama.cpp's blocks at load. A block's
+         * values run along K, so both projections' K must be whole blocks. */
+        const bool gg = c.expert_ggml != 0;
         if (split || rot || c.expert_w4) {
-            fprintf(stderr, "radiance: bf16 experts are whole on their rank (expert parallel, or "
+            fprintf(stderr, "radiance: %s experts are whole on their rank (expert parallel, or "
                             "one rank) and unrotated; this configuration %s\n",
+                    gg ? "GGUF-block" : "bf16",
                     split ? "slices every expert" : "rotates or packs them");
             return RAD_E_INVAL;
+        }
+        uint32_t edt[2] = { RAD_BF16, RAD_BF16 };
+        if (gg) {
+            const int64_t kk[2] = { g.n_embd, c.n_ff_exp };
+            for (int i = 0; i < 2; ++i) {
+                if (!ggml_ty[i] || ggml_blk[i] <= 0 || kk[i] % ggml_blk[i]) {
+                    fprintf(stderr, "radiance: layer %d's %s experts are GGUF %s, whose blocks cover "
+                                    "%lld of K, and K is %lld\n", l, i ? "down" : "gate_up",
+                            ggml_ty[i] ? ggml_ty[i] : "?", (long long)ggml_blk[i], (long long)kk[i]);
+                    return RAD_E_SHAPE;
+                }
+                RadEncoding e0{};
+                const long long ge = (long long)c.expert_base;
+                if (!weight_enc(b, i ? nm.f("blk.%d.ffn_down_exps.%lld.weight", l, ge)
+                                     : nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l, ge), &e0))
+                    return RAD_E_INVAL;
+                edt[i] = ggml_codes_dtype(e0);
+            }
         }
         for (int64_t e = 0; e < ne; ++e) {
             const int64_t parts[2] = { c.n_ff_exp, c.n_ff_exp };   /* gate, up (up alone: one) */
             w_gu[(size_t)e] = decl_w_n(b, nm.f("blk.%d.ffn_gate_up_exps.%lld.weight", l,
                                                (long long)(c.expert_base + e)),
-                                       RAD_BF16, {gu * c.n_ff_exp, g.n_embd}, RAD_ACCESS_CONDITIONAL,
+                                       edt[0], {gu * c.n_ff_exp, g.n_embd}, RAD_ACCESS_CONDITIONAL,
                                        sh_row, grp_expert_slot(l, (int)e, 0), 0, parts, n_parts);
             if (!w_gu[(size_t)e]) return RAD_E_INVAL;
         }
         for (int64_t e = 0; e < ne; ++e) {
             w_dn[(size_t)e] = decl_w(b, nm.f("blk.%d.ffn_down_exps.%lld.weight", l,
                                              (long long)(c.expert_base + e)),
-                                     RAD_BF16, {g.n_embd, c.n_ff_exp}, RAD_ACCESS_CONDITIONAL,
+                                     edt[1], {g.n_embd, c.n_ff_exp}, RAD_ACCESS_CONDITIONAL,
                                      sh_col, grp_expert_slot(l, (int)e, 1));
             if (!w_dn[(size_t)e]) return RAD_E_INVAL;
         }
         /* Row orders as for the quantised GEMMs (see `a_order` below): gate_up gathers token rows,
          * down reads sorted rows. */
-        op_gu = rw(b, rad_decl_op(b, "moe_gemm",
-                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", gu * c.n_ff_exp),
-                                     RAD_INT("K", g.n_embd), RAD_INT("n_expert", ne),
-                                     RAD_INT("top_k", c.top_k), RAD_STR("a_order", "token"),
-                                     RAD_STR("dtype", "bf16")),
-                          w_gu.data(), (int)ne),
+        auto grouped = [&](int i, int64_t N, int64_t K, const char* order, rad_weight* tab) {
+            if (!gg)
+                return rad_decl_op(b, "moe_gemm",
+                                   RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", N),
+                                              RAD_INT("K", K), RAD_INT("n_expert", ne),
+                                              RAD_INT("top_k", c.top_k), RAD_STR("a_order", order),
+                                              RAD_STR("dtype", "bf16")),
+                                   tab, (int)ne);
+            return rad_decl_op(b, "moe_gemm_ggml",
+                               RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", N),
+                                          RAD_INT("K", K), RAD_INT("n_expert", ne),
+                                          RAD_INT("top_k", c.top_k), RAD_STR("a_order", order),
+                                          RAD_STR("type", ggml_ty[i]), RAD_STR("dtype", "bf16")),
+                               tab, (int)ne);
+        };
+        op_gu = rw(b, grouped(0, gu * c.n_ff_exp, g.n_embd, "token", w_gu.data()),
                    {w.h.x, w.sorted, w.eoff}, {w.egu});
         /* silu(gate) * up into the bf16 plane the down GEMM reads, regardless of the trunk's format
          * (rad_fp8.h: GateQuantFP8). */
@@ -1183,12 +1274,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         gx.w_bf16 = true;
         RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
                                     true, false, c.swiglu_limit, c.swiglu_step != 0));
-        op_dn = rw(b, rad_decl_op(b, "moe_gemm",
-                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", g.n_embd),
-                                     RAD_INT("K", c.n_ff_exp), RAD_INT("n_expert", ne),
-                                     RAD_INT("top_k", c.top_k), RAD_STR("a_order", "sorted"),
-                                     RAD_STR("dtype", "bf16")),
-                          w_dn.data(), (int)ne),
+        op_dn = rw(b, grouped(1, g.n_embd, c.n_ff_exp, "sorted", w_dn.data()),
                    {w.eff.x, w.sorted, w.eoff}, {w.edn});
         if (!op_gu || !op_dn) return RAD_E_INVAL;
     } else {
@@ -1469,7 +1555,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         }
         /* Both K must be multiples of 128 (as `expert_rot` also requires). gram_accum needs only a
          * multiple of four, but 128 keeps each 64-wide output tile inside one scale group. */
-        if (!c.expert_bf16 && ((g.n_embd % RAD_FP8_BLOCK) || (c.n_ff_exp % RAD_FP8_BLOCK)))
+        if (!act_bf16() && ((g.n_embd % RAD_FP8_BLOCK) || (c.n_ff_exp % RAD_FP8_BLOCK)))
             return RAD_E_SHAPE;
         gram_gu_stem = nm.f("blk.%d.ffn_gate_up_exps", l);
         gram_dn_stem = nm.f("blk.%d.ffn_down_exps", l);
@@ -1480,7 +1566,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* bf16 experts read the model's activation and the tap sums that; quantised ones read
          * codes, rotated when the plane is; the files record which. */
         gram_domain = rot ? (uint32_t)RAD_FP8_BLOCK : 0u;
-        if (c.expert_bf16) {
+        if (act_bf16()) {
             op_gram_gu = rw(b, RAD_OP(b, "gram_accum",
                                RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                           RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
@@ -1512,7 +1598,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * Transient: it is copied to the host before the next op is issued. */
         b_gram_dne = decl_b(b, nm.f("blk.%d.gram_dn_experts", l), RAD_F32,
                             {c.n_expert * c.n_ff_exp, c.n_ff_exp});
-        if (c.expert_bf16)
+        if (act_bf16())
             op_gram_dne = rw(b, RAD_OP(b, "gram_accum",
                                 RAD_PARAMS(RAD_RANGE("M", 1, c.rows * c.top_k),
                                            RAD_INT("n", c.n_ff_exp),
@@ -1758,7 +1844,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     if (g.world > 1 && !c.no_reduce && ar_overlap > 0)
         op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
                           RAD_PARAMS(RAD_INT("world_size", g.world),
-                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                     RAD_RANGE("numel", g.n_embd,
+                                               (g.ar_overlap_rows ? g.ar_overlap_rows : g.max_tok)
+                                                   * g.n_embd),
                                      RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
                                      RAD_INT("min_bytes", g.wire_min_bytes),
                                      RAD_INT("overlap", ar_overlap)),
@@ -1773,7 +1861,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                     {w.x, w.h.x}, {w.x});
 
     /* The layer as the prefetch sees it, indexed by model expert number (what the router ranks). */
-    if (!c.sigmoid_router && !c.expert_bf16 && c.n_expert_all > 0 && n_reg > 0) {
+    if (!c.sigmoid_router && !act_bf16() && c.n_expert_all > 0 && n_reg > 0) {
         const int64_t na = c.n_expert_all;
         xp_parts.assign((size_t)(na * 4), 0);
         xp_count_at.assign((size_t)na, -1);
@@ -1827,7 +1915,8 @@ inline void MoeFP8::shared_up(RadCtx* c_, int64_t T, int64_t r0, int64_t rows,
  *
  * The expert buffers are addressed from zero, not `r0`: they are a pass tall and `sorted_tok` is
  * pass-relative. Only step-tall operands (residual stream, normed input) carry the offset. */
-inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar) const {
+inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool own_ar,
+                         bool fused_gather, const Beside* beside) const {
     /* `ne` is this rank's expert count, `ne_all` the model's: logits and top-k are model-wide,
      * everything after the scatter is this rank's slice. */
     const int64_t ne = c.n_expert, ne_all = c.n_expert_all, k = c.top_k;
@@ -1929,7 +2018,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     /* Apply the previous layer's prefetch prediction: substitute the copied experts into the
      * tables. */
     (void)rad_expert_prefetch_step(c_, layer);
-    if (c.expert_bf16)
+    if (act_bf16())
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
@@ -1959,6 +2048,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (shared && !sh_first)
         shared_up(c_, T, r0, rows,
                   (rfused && router_fused_gate) || (sfused && sigmoid_scatter_gate));
+    if (beside && beside->fn && r0 == 0) beside->fn(c_, beside->arg);
     gq_exp.step(c_, w.egu, rows * k, 0, rows * k);
     if (shared && !(op_sh_gated && rows <= sh_gated_rows)) gq_sh.step(c_, w.sgu, T, r0, rows);
     /* The shared arm's down projection in front of the routed down GEMM on a step of
@@ -1974,7 +2064,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
      * coupling, chain 1 / 2 / 3 (two / three / four rows): -0.28% / -0.21% / -0.25% a step. */
     const bool sh_dn_first = shared && T >= sh_down_first_lo && T <= sh_down_first_hi;
     if (sh_dn_first) sh_down.step(c_, w.sff, w.sout, T, r0, rows);
-    if (c.expert_bf16)
+    if (act_bf16())
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
     else if (ncls == 4) {
@@ -2024,7 +2114,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
             rad_memset_async(rad_buf_ptr(c_, b_gram_dn), 0,
                              c.n_ff_exp * c.n_ff_exp * 4, rad_stream(c_));
         }
-        if (c.expert_bf16) {
+        if (act_bf16()) {
             RAD_ISSUE_N(c_, op_gram_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE,
                         brows(b_gram_gu, g.n_embd));
             RAD_ISSUE_N(c_, op_gram_dn, rows * k, brows(w.eff.x, rows * k), RAD_NONE,
@@ -2063,7 +2153,7 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
 
     /* The gather last, since with the fold it reads the shared arm (`sout`, `sgate`); it writes
      * the block's delta into `h.x`. */
-    if (op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
+    if (!fused_gather || op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
                     gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
@@ -2119,7 +2209,7 @@ inline void MoeFP8::calib_experts_pass(RadCtx* c_, int64_t slots) const {
     for (int64_t e = 0; e < ne; ++e) {
         const int64_t r0 = off[(size_t)e], n = off[(size_t)e + 1] - r0;
         if (n <= 0) continue;
-        if (c.expert_bf16)
+        if (act_bf16())
             RAD_ISSUE_N(c_, op_gram_dne, n, brow_slice(w.eff.x, r0, n, K), RAD_NONE,
                         brow_slice(b_gram_dne, e * K, K, K));
         else
@@ -2155,10 +2245,14 @@ inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch) const {
     split_tok = nullptr;
 }
 
-inline void MoeFP8::step_rows(RadCtx* c_, int64_t T) const {
+inline void MoeFP8::step(RadCtx* c_, const RadBatch* batch, const Beside& beside) const {
+    step_rows(c_, batch->n_tok, &beside);
+}
+
+inline void MoeFP8::step_rows(RadCtx* c_, int64_t T, const Beside* beside) const {
     for (int64_t r0 = 0; r0 < T; r0 += c.rows) {
         const int64_t n = (T - r0 < c.rows) ? (T - r0) : c.rows;
-        pass(c_, T, r0, n);
+        pass(c_, T, r0, n, true, true, beside);
     }
     route_report(c_);
 }

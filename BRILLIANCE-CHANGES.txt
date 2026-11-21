@@ -4,19 +4,30 @@ Brilliance is a fork of Radiance (https://codeberg.org/StillDeadcode/radiance), 
 Apache License 2.0 (LICENSE; NOTICE credits Radiance's authors). This tree is upstream's
 commit b6b8751cccb0e834a13ae9e5afca824ee9a487aa plus the Windows port.
 As section 4(b) of the licence asks, this file states which of upstream's files Brilliance
-has changed: the 330 listed under "Modified" carry changes made for Brilliance. Files under
+has changed: the 376 listed under "Modified" carry changes made for Brilliance. Files under
 "Added" are Brilliance's own. Every other file is upstream's, unchanged.
 
-Modified (330)
+Modified (376)
 
   .gitignore
   CMakeLists.txt
   README.md
   abi/rad_abi.h
+  abi/rad_builder.h
   arch/CMakeLists.txt
+  arch/common/rad_arch.h
+  arch/common/rad_block_attn_gated_fp8.h
+  arch/common/rad_block_gdn_fp8.h
+  arch/common/rad_block_glm_router.h
+  arch/common/rad_block_hc.h
+  arch/common/rad_block_moe_fp8.h
+  arch/common/rad_fp8.h
+  arch/qwen4exp_fp8/qwen4exp_fp8.cpp
   cmake/RadAddPlugin.cmake
   cmake/radiance-config.cmake.in
   core/CMakeLists.txt
+  core/build/rad_build.h
+  core/build/rad_builder.cpp
   core/build/startup.cpp
   core/config.cpp
   core/cvec.cpp
@@ -50,14 +61,20 @@ Modified (330)
   core/mem/kv.cpp
   core/mem/kv.h
   core/mem/pools.cpp
+  core/mem/vram_budget.cpp
   core/mm/media.cpp
   core/mm/media.h
   core/mm/mp4.cpp
   core/mm/mp4.h
+  core/place/mover.cpp
+  core/place/mover.h
+  core/place/planner.cpp
+  core/place/planner.h
   core/place/stager.cpp
   core/place/stager.h
   core/place/xstats.cpp
   core/plugin/loader.cpp
+  core/plugin/registry.h
   core/rad_core.h
   core/rad_internal.h
   core/runtime/ctx.cpp
@@ -77,19 +94,25 @@ Modified (330)
   core/server/front.cpp
   core/server/http.cpp
   core/server/http.h
+  core/server/liveview.h
   core/server/oai.cpp
   core/server/server.cpp
   core/server/server.h
   core/server/speech_stream.cpp
   core/server/videos.cpp
+  core/text/chatfmt.cpp
   core/util/json.h
   core/util/rad_util.cpp
   core/util/stallwatch.cpp
+  dashboard/src/App.tsx
+  dashboard/src/lib/api.ts
   dashboard/src/lib/ui.ts
   dashboard/src/pages/model.tsx
+  dashboard/src/pages/overview.tsx
   data/kernels_moe.rkb
   docs/GUIDE.md
   libavx/avx_bench.cpp
+  libavx/avx_check.cpp
   libavx/avx_check_rows.cpp
   libavx/avx_common.h
   libavx/avx_dispatch.cpp
@@ -189,6 +212,10 @@ Modified (330)
   libhalo/halo_selftest.cpp
   libhalo/halo_ssd.hip
   libhalo/halo_vsa.hip
+  libquant/lq_ggml.cpp
+  libquant/lq_ggml_port.cpp
+  libquant/lq_ggml_port.h
+  libquant/lq_ggml_tables.cpp
   libr4d/CMakeLists.txt
   libr4d/isa/launchreg.hip
   libr4d/isa/wmmamix.hip
@@ -221,6 +248,7 @@ Modified (330)
   libr4d/r4d_attn_prefill_split.h
   libr4d/r4d_attn_vit_h72_bf16.hip
   libr4d/r4d_audio.hip
+  libr4d/r4d_bf16_gemm_rows.h
   libr4d/r4d_dequant_w4_bf16.hip
   libr4d/r4d_dflash_conv_body.h
   libr4d/r4d_dflash_markov_bf16.hip
@@ -229,6 +257,7 @@ Modified (330)
   libr4d/r4d_dsa.hip
   libr4d/r4d_encoder_bf16.hip
   libr4d/r4d_fp8_args.h
+  libr4d/r4d_fuse.cpp
   libr4d/r4d_fused_quant_fp8.hip
   libr4d/r4d_gated_had_quant_i8.hip
   libr4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
@@ -236,6 +265,7 @@ Modified (330)
   libr4d/r4d_gdn_gated_norm_had_quant_i8.hip
   libr4d/r4d_gdn_gated_rmsnorm_h128_bf16.hip
   libr4d/r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip
+  libr4d/r4d_gemm_args.h
   libr4d/r4d_gemm_bf16_nt_m64.hip
   libr4d/r4d_gemm_bf16_nt_tiled.hip
   libr4d/r4d_gemm_fp8a16_nt_m1.hip
@@ -265,6 +295,7 @@ Modified (330)
   libr4d/r4d_model_bf16.hip
   libr4d/r4d_moe_iqr.hip
   libr4d/r4d_nemotron_bf16.hip
+  libr4d/r4d_plugin.h
   libr4d/r4d_qk_norm_rope_gate.hip
   libr4d/r4d_qsa_block_key_bf16.hip
   libr4d/r4d_qsa_score_bf16.hip
@@ -280,11 +311,23 @@ Modified (330)
   libr4d/r4d_sample_ngram_f32.hip
   libr4d/r4d_sample_stages_f32.hip
   libr4d/r4d_selftest.cpp
+  libr4d/r4d_shapes.cpp
   libr4d/r4d_ssd.hip
   libr4d/r4d_vsa.hip
+  libref/CMakeLists.txt
+  libref/ref_attn.cpp
+  libref/ref_gemm.cpp
+  libref/ref_glm.cpp
+  libref/ref_mhc.cpp
+  libref/ref_ops.h
+  libref/ref_registry.cpp
+  libref/ref_shapes.cpp
   tests/ARTIFACTS
   tests/CMakeLists.txt
+  tests/arch_fakes.h
+  tests/arch_test.cpp
   tests/build_test.cpp
+  tests/chatparse_test.cpp
   tests/checkpoint_test.cpp
   tests/config_test.cpp
   tests/cvec_test.cpp
@@ -313,11 +356,13 @@ Modified (330)
   tests/r4d_emu/emu/hip/hip_runtime.h
   tests/rad_export_test.py
   tests/rad_test.h
+  tests/ref_test.cpp
   tests/runtime_test.cpp
   tests/sched_fakes.h
   tests/sched_test.cpp
   tests/server_test.cpp
   tests/shape_test.cpp
+  tests/shipped_plugins_test.cpp
   tests/spark25_validation.py
   tests/spark25_validation_test.py
   tests/speech_stream_test.cpp
@@ -329,6 +374,7 @@ Modified (330)
   tests/videos_test.cpp
   tests/work_counter.h
   tools/CMakeLists.txt
+  tools/dashboard_embed.py
   tools/iface.cpp
   tools/kbench_core.cpp
   tools/kbench_timer.cpp
@@ -340,23 +386,51 @@ Modified (330)
   vendor/llama/common/json-partial.cpp
   vendor/llama/src/unicode.cpp
 
-Added (203)
+Added (236)
 
   .gitattributes
   RADIANCE-README.md
+  abi/rad_kv_fp8.h
+  arch/common/rad_expert_split.h
+  arch/common/rad_ggml.h
+  arch/deepseek41/CMakeLists.txt
+  arch/deepseek41/CONTRACT.md
+  arch/deepseek41/deepseek41.cpp
   core/format/table_warm.cpp
   core/format/table_warm.h
+  core/place/host_admit.h
   core/server/terms.cpp
   dashboard/src/components/chat.tsx
   dashboard/src/pages/sandbox.tsx
   docs/img/banner.png
+  libquant/lq_ggml_dequant.cpp
+  libquant/lq_ggml_dequant.h
+  libquant/lq_ggml_planes.cpp
+  libquant/lq_ggml_planes.h
   libr4d/r4d_ar_wide_host.h
   libr4d/r4d_ar_wide_host.hip
   libr4d/r4d_ar_wide_rs.hip
   libr4d/r4d_ar_wide_ts.hip
   libr4d/r4d_ar_wide_x.h
+  libr4d/r4d_ds41_elem.h
+  libr4d/r4d_ds41_elem.hip
+  libr4d/r4d_ds41_elem.inc
+  libr4d/r4d_ds41_elem_shapes.inc
+  libr4d/r4d_ds41_ggml.h
+  libr4d/r4d_ds41_ggml.hip
+  libr4d/r4d_ds41_ggml.inc
+  libr4d/r4d_ds41_ggml_layout.cpp
+  libr4d/r4d_ds41_ggml_shapes.inc
+  libr4d/r4d_ds41_sparse.h
+  libr4d/r4d_ds41_sparse.hip
+  libr4d/r4d_ds41_sparse.inc
+  libr4d/r4d_ds41_sparse_shapes.inc
   libr4d/r4d_log.h
+  libref/ref_ggml.cpp
+  libref/ref_sparse_kv.cpp
   tests/ar_bytes_test.cpp
+  tests/deepseek41_hip_test.cpp
+  tests/deepseek41_test.cpp
   tests/loader_transfer_test.cpp
   tests/ngram_warm_test.cpp
   tests/paging_fence_test.cpp
@@ -440,6 +514,7 @@ Added (203)
   win/libexec/hfget.ps1
   win/libexec/rad-export.cmd
   win/licenses/THIRD-PARTY.md
+  win/licenses/adl-sdk.LICENSE
   win/licenses/amdgpu-windows-interop.EULA
   win/licenses/amf.LICENSE
   win/licenses/dav1d.LICENSE
@@ -463,6 +538,7 @@ Added (203)
   win/licenses/zstd.LICENSE
   win/model-licenses/apache-2.0.txt
   win/model-licenses/creativeml-openrail-pp-m.txt
+  win/model-licenses/deepseek-mit.txt
   win/model-licenses/index.md
   win/model-licenses/ltx-2.5-distilled-iq8r-notice.txt
   win/model-licenses/ltx-2.x-community-license.txt
@@ -477,11 +553,14 @@ Added (203)
   win/os/service.h
   win/os/service_win32.cpp
   win/package.ps1
+  win/profiles/deepseek41-2card.yaml
+  win/profiles/deepseek41-4card.yaml
   win/profiles/flashnext-2card-fast.yaml
   win/profiles/flashnext-2card.yaml
   win/profiles/flashnext-4card.yaml
   win/profiles/gemma4-12b-1card.yaml
   win/profiles/gemma4-31b-1card.yaml
+  win/profiles/ltx-2.5-1card.yaml
   win/profiles/minicpm5-2b-1card.yaml
   win/profiles/qwen-image-1card.yaml
   win/profiles/qwen27-8k-plain.yaml

@@ -94,7 +94,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "bailinghybrid", "gguf_ftype_7" }, { "bailinghybrid", "gguf_ftype_15" },
         { "bailinghybrid", "gguf_ftype_17" }, { "bailinghybrid", "gguf_ftype_18" },
         { "bailinghybrid", "gguf_ftype_25" },
-        { "clef", "fp8_e4m3" }, { "embeddinggemma2", "" },
+        { "clef", "fp8_e4m3" }, { "deepseek41", "" }, { "embeddinggemma2", "" },
         { "fishomni", "bsgemm-moe" }, { "flint", "" }, { "flux3", "" }, { "flux3distilled", "" },
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" },

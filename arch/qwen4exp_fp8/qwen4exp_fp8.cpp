@@ -253,6 +253,7 @@ struct Model {
      * from the real declare, so it declares the same ops. */
     bool      span_on = false;
     bool      pipe_on = false;
+    bool      tp2_host_pipe = false;  /* Brilliance: wide mixers, sliced mailbox reductions/write */
     /* The rows of a piece of a spanned step: one checkpoint interval's, what the routed block's
      * pass is without --prefill-span-pass step (`moecfg.rows`). The connections' reads, the
      * indexer's windows, the delta net's pieces and the pipelined step's pieces are a piece tall
@@ -336,6 +337,17 @@ static void block_slice(int64_t nb, int world, int64_t place, int64_t* lo, int64
     const int64_t b0 = place * base + std::min<int64_t>(place, extra);
     *lo = b0 * RAD_FP8_BLOCK;
     *hi = (b0 + base + (place < extra ? 1 : 0)) * RAD_FP8_BLOCK;
+}
+
+static bool tp2_pipe_ops(const Model& m) {
+    if (!m.op_embed_ar) return false;
+    for (const Layer& l : m.layers) {
+        if (!(l.full ? l.attn.op_ar_ov : l.gdn.op_ar_ov) || !l.mlp.op_ar_ov ||
+            !l.hc_mix.op_write || !l.hc_ffn.op_write || !l.mlp.op_gather ||
+            l.mlp.op_moe_ar || l.mlp.op_shared_ar)
+            return false;
+    }
+    return true;
 }
 
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
@@ -823,9 +835,11 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.b_h   = decl_b(b, nm.f("h_wide"), g.act_dtype, {T, HN});
     m.a_x.x = decl_b(b, nm.f("x"),      g.act_dtype, {T, g.n_embd});
     if (ctx->shape_probe) {
-        m.span_on   = g_model[rad_build_slot(ctx)].span_on;
-        m.pipe_on   = g_model[rad_build_slot(ctx)].pipe_on;
-        m.pass_step = g_model[rad_build_slot(ctx)].pass_step;
+        const Model& full = g_model[rad_build_slot(ctx)];
+        m.span_on       = full.span_on;
+        m.pipe_on       = full.pipe_on;
+        m.tp2_host_pipe = full.tp2_host_pipe;
+        m.pass_step     = full.pass_step;
     } else {
         m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < g.max_tok &&
                     g.max_tok > m.piece_rows;
@@ -833,6 +847,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
          * ranks the gated residual's fused write takes every step's (ar_exact_write_rows), so such
          * a step runs serially. */
         m.pipe_on = m.span_on && g.world > 1 && ar_exact_write_rows(g) < g.max_tok;
+#if defined(_WIN32)
+        if (const char* flag = std::getenv("BRILLIANCE_TP2_PIPELINE"); flag && g.world == 2) {
+            const char* reason = nullptr;
+            if (std::strcmp(flag, "1") != 0)             reason = "switch is not 1";
+            else if (rad_build_device_p2p(b) != 0)        reason = "no confirmed host link";
+            else if (!m.span_on || ctx->max_mixed_tok > m.piece_rows)
+                                                         reason = "no isolated wide span";
+            else if (ctx->span_pass_step != 0)           reason = "whole-step MoE pass requested";
+            else if (m.moecfg.calib || (ctx->calib_dir && *ctx->calib_dir) || dbg_resid_on())
+                                                         reason = "calibration or residual debug";
+            m.tp2_host_pipe = !reason;
+            m.pipe_on |= m.tp2_host_pipe;
+            if (g.rank == 0 && reason)
+                rad_note(b, "TP2 host-link prefill pipeline disabled (%s)", reason);
+        }
+#endif
         /* --prefill-span-pass step, where a spanned step runs serially: nothing there needs the
          * routed pass to be a piece (the pipelined step overlaps a piece's pass with the other
          * piece's all-reduce, and keeps them), and a pass over the whole step reads each expert's
@@ -855,9 +885,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * its level's, so a level holds one pass of its own rows. */
     if (m.pass_step) m.moecfg.rows = g.max_tok;
     const int64_t ER       = m.moecfg.rows * m.moecfg.top_k;
-    /* The pipelined step's all-reduces run on the second lane, in place over `x`, so it is the one
-     * buffer that lane touches; it is live over the whole program anyway. */
+    /* TP4 issues only in-place reductions on the second lane. TP2 also writes the wide stream. */
     if (m.pipe_on) RAD_ARCH_TRY(rad_buf_concurrent(b, m.a_x.x));
+    if (m.tp2_host_pipe) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_h));
     /* A transient although only its last entry changes per step: a persistent buffer sits in the
      * fixed region under every transient, and one more alignment unit there moves every
      * activation by 256 bytes, which on Flash-Next at four ranks slows the MoE gather by 73 % and
@@ -897,6 +927,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         m.a_x.q8_rot = true;
     }
     m.b_inj = decl_b(b, nm.f("hc_inj"), g.act_dtype, {T, m.hccfg.hc});
+    if (m.tp2_host_pipe) RAD_ARCH_TRY(rad_buf_concurrent(b, m.b_inj));
 
     m.b_qg     = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {T, g.n_head, 2 * g.head_dim});
     m.b_k      = decl_b(b, nm.f("attn_k"),   g.act_dtype, {T, kv_dim});
@@ -1147,6 +1178,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * its collective a second time at `overlap` 1, for the rows that leave the CUs to that work
      * (the lane rows of libr4d/r4d_rows.cpp). */
     const int pipe_overlap = m.pipe_on ? 1 : 0;
+    Geom trunk = g;
+    if (m.tp2_host_pipe) trunk.ar_overlap_rows = std::min(g.max_tok, m.piece_rows);
     /* GPTQ calibration of the trunk (rad_calib_full.h). A bf16 trunk is recorded at any rank count
      * from the bf16 inputs, a column-split one gathered to its whole width; an int8 trunk at one
      * rank from the codes the connections and the mixers write themselves, so each tap reads what
@@ -1269,7 +1302,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * call is idempotent. */
             if (g.attn_zero && m.kv_full) RAD_ARCH_TRY(rad_kv_group_zero(b, m.kv_full));
             lay.attn.ar_out_take = lay.hc_mix.ar_take();
-            RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as,
+            RAD_ARCH_TRY(lay.attn.declare(b, nm, trunk, (int)l, m.kv_full, m.n_rot, aw, as,
                                           false, false, kArNone, lay.hc_mix.op_ar_write != 0));
             /* The indexer, after the attention block so its ops sit where the sparse attention
              * reads them. It reads the same normed fp8 input as the projections
@@ -1302,7 +1335,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_state));
             RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_conv));
             lay.gdn.ar_out_take = lay.hc_mix.ar_take();
-            RAD_ARCH_TRY(lay.gdn.declare(b, nm, g, m.gcfg, (int)l, m.kv_state, m.kv_conv, gw, gs,
+            RAD_ARCH_TRY(lay.gdn.declare(b, nm, trunk, m.gcfg, (int)l, m.kv_state, m.kv_conv, gw, gs,
                                          false, false, kArNone, lay.hc_mix.op_ar_write != 0));
         }
 
@@ -1338,7 +1371,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
         lay.mlp.ar_out_take = lay.hc_ffn.ar_take();
         lay.mlp.hr_in = fcfg.rotate != 0;
-        RAD_ARCH_TRY(lay.mlp.declare(b, nm, g, (int)l, mw, ms, false, false, kArNone,
+        RAD_ARCH_TRY(lay.mlp.declare(b, nm, trunk, (int)l, mw, ms, false, false, kArNone,
                                      lay.hc_ffn.op_ar_write != 0));
         /* The write behind the block takes its gather where it can, declared after the block so
          * the buffers it reads are the block's outputs in declaration order. */
@@ -1649,6 +1682,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * arena with every buffer above. Its weight groups start past every text layer and the MTP
      * head. */
     if (m.media) RAD_ARCH_TRY(m.vit.declare(b, meta, ctx, nm, g.n_embd, (int)g.n_layer + 64));
+    if (m.tp2_host_pipe && !ctx->shape_probe && g.rank == 0) {
+        if (tp2_pipe_ops(m))
+            rad_note(b, "TP2 host-link prefill pipeline enabled (%s wire, %lld rows per piece)",
+                     g.wire_exact ? "exact" : "wht6 with exact fallback", (long long)m.piece_rows);
+        else
+            rad_note(b, "TP2 host-link prefill pipeline disabled (required ops unavailable)");
+    }
     return RAD_OK;
 }
 
@@ -1687,10 +1727,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
  * including the embedding's; none carries an arrival counter; and the one buffer it touches is out
  * of the sharing pool (declare). The collectives there are declared at `overlap` 1, whose rows
  * leave the CUs to the work beside them. */
-static bool pipelined(const Model& m, int64_t T) {
-    const int64_t R = m.piece_rows;
+static bool pipelined(const Model& m, const RadBatch* batch) {
+    const int64_t T = batch->n_tok, R = m.piece_rows;
     if (!m.pipe_on || R <= 0 || T <= R) return false;
     if (m.moecfg.calib || m.calib.on || dbg_resid_on() || !m.op_embed_ar) return false;
+    if (m.tp2_host_pipe) {
+        /* Use only batch metadata shared by every rank. These exceptional shapes keep the
+         * serial path and its whole-step fused residual writes. */
+        return batch->phase == RAD_PHASE_PREFILL && batch->n_seq == 1 &&
+               batch->n_tok_decode == 0 && batch->draft_pass == 0 && batch->n_spec == 0 &&
+               !batch->spec_parent && !(batch->ckpt_cut > 0 && batch->ckpt_cut < T) &&
+               batch->n_mm_rows == 0 && batch->n_bidi == 0 && !batch->rope_mixed &&
+               !batch->control_vector && tp2_pipe_ops(m);
+    }
     for (const Layer& l : m.layers) {
         if (!(l.full ? l.attn.issues_ar(T) : l.gdn.issues_ar(T))) return false;
         if (!l.mlp.issues_ar(T, R)) return false;
@@ -1703,14 +1752,25 @@ static bool pipelined(const Model& m, int64_t T) {
 struct MixAr {
     RadCtx*      c = nullptr;
     const Layer* l = nullptr;
+    bool         failed = false;
 };
+
+static bool pipe_order(RadCtx* c, int status) {
+    if (status == RAD_OK) return true;
+    rad_step_fail(c, "qwen4exp: could not order the prefill pipeline lanes");
+    return false;
+}
+
 static void mix_ar_piece(void* u, int64_t r0, int64_t n) {
-    const MixAr& s = *(const MixAr*)u;
-    rad_lane(s.c, 1);
-    rad_lane_join(s.c, 0, 1);
+    MixAr& s = *(MixAr*)u;
+    if (s.failed) return;
+    if (!pipe_order(s.c, rad_lane(s.c, 1)) || !pipe_order(s.c, rad_lane_join(s.c, 0, 1))) {
+        s.failed = true;
+        return;
+    }
     if (s.l->full) s.l->attn.issue_ar(s.c, r0, n);
     else           s.l->gdn.issue_ar(s.c, r0, n);
-    rad_lane(s.c, 0);
+    s.failed = !pipe_order(s.c, rad_lane(s.c, 0));
 }
 
 /* The bounds a step wider than a pass is cut by, on the card: {0, pass, T}. The first two are the
@@ -1743,7 +1803,7 @@ static const int32_t* pipe_bounds(RadCtx* c, const RadBatch* batch, Model& m) {
     return d;
 }
 
-static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
+static bool step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok, R = m.piece_rows;
     const int64_t K = (T + R - 1) / R;
@@ -1752,15 +1812,21 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     /* A collective on the second lane, ordered behind lane 0 where it reads what lane 0 just
      * wrote (a join to a lane not yet built is a no-op). */
     auto on1 = [&](bool behind0, auto&& issue) {
-        rad_lane(c, 1);
-        if (behind0) rad_lane_join(c, 0, 1);
+        if (!pipe_order(c, rad_lane(c, 1)) ||
+            (behind0 && !pipe_order(c, rad_lane_join(c, 0, 1)))) return false;
         issue();
-        rad_lane(c, 0);
+        return pipe_order(c, rad_lane(c, 0));
     };
-    auto wait1 = [&] { rad_lane_join(c, 1, 0); };
+    auto wait1 = [&] { return pipe_order(c, rad_lane_join(c, 1, 0)); };
+    const bool wide = m.tp2_host_pipe;
     if (!m.pipe_noted) {
         m.pipe_noted = true;
-        if (g.rank == 0)
+        if (g.rank == 0 && wide)
+            fprintf(stderr, "radiance: qwen4exp: TP2 host-link prefill pipeline (%s wire): "
+                            "%lld rows in %lld pieces of up to %lld, wide mixer\n",
+                    g.wire_exact ? "exact" : "wht6 with exact fallback",
+                    (long long)T, (long long)K, (long long)R);
+        else if (g.rank == 0)
             fprintf(stderr, "radiance: qwen4exp: prefill steps wider than a MoE pass are pipelined: "
                             "%lld rows in %lld pieces of %lld, all-reduces on the second lane\n",
                     (long long)T, (long long)K, (long long)R);
@@ -1769,8 +1835,9 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
-    on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE); });
-    wait1();
+    if (!on1(true, [&] {
+            RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE);
+        }) || !wait1()) return false;
     if (m.ple_layer >= 0) m.ple.ids(c, batch);
     m.enter.step(c, T);
     if (m.op_rope_cs && T <= qk_fuse_rows(g) && !rope_mixed(batch))
@@ -1798,35 +1865,41 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         MixAr ms{c, &l};
         ArPieces pc{};
         pc.rows = R; pc.done = mix_ar_piece; pc.u = &ms; pc.cu = gcu;
+        ArPieces* handoff = wide ? nullptr : &pc;
         if (l.full) {
             l.qsa.step(c, l.attn.w.h, batch, pcu, l.attn.qsa_use(batch), qsa_first);
             if (l.qsa.on()) qsa_first = false;
-            l.attn.step(c, batch, false, &pc);
+            l.attn.step(c, batch, false, handoff);
+        } else {
+            l.gdn.step(c, batch, false, handoff);
         }
-        else        l.gdn.step(c, batch, false, &pc);
+        if (ms.failed) return false;
         auto ar_mix = [&](int64_t p) {
             if (l.full) l.attn.issue_ar(c, r0(p), rn(p));
             else        l.gdn.issue_ar(c, r0(p), rn(p));
+            if (wide) l.hc_mix.write(c, T, r0(p), rn(p), false);
         };
         /* A block that handed nothing leaves the first piece's all-reduce to be issued here. */
-        if (pc.handed == 0) on1(true, [&] { ar_mix(0); });
-        wait1();
+        if (pc.handed == 0 && !on1(true, [&] { ar_mix(0); })) return false;
+        if (!wait1()) return false;
         int64_t issued = pc.handed > 0 ? pc.handed : 1;
         bool behind = pc.handed == 0;     /* lane 1 already behind the whole mixer */
         for (int64_t p = 0; p < K; ++p) {
             if (p + 1 < K && p + 1 >= issued) {
-                on1(!behind, [&] { ar_mix(p + 1); });
+                if (!on1(!behind, [&] { ar_mix(p + 1); })) return false;
                 behind = true;
                 issued = p + 2;
             }
-            l.hc_mix.write(c, T, r0(p), rn(p));
+            if (!wide) l.hc_mix.write(c, T, r0(p), rn(p));
             l.hc_ffn.read(c, T, r0(p), rn(p));
-            l.mlp.pass(c, T, r0(p), rn(p), false);
+            l.mlp.pass(c, T, r0(p), rn(p), false, !wide);
             /* Lane 0 waits here for the next piece's mixer all-reduce and the last piece's MoE
              * one, both issued before this pass; lane 1 then takes this piece's behind its
              * gather. */
-            wait1();
-            on1(true, [&] { l.mlp.issue_ar(c, r0(p), rn(p)); });
+            if (!wait1() || !on1(true, [&] {
+                    l.mlp.issue_ar(c, r0(p), rn(p));
+                    if (wide) l.hc_ffn.write(c, T, r0(p), rn(p), false);
+                })) return false;
         }
         l.mlp.route_report(c);
         /* The writes, and the next layer's reads beside the last piece's all-reduce. PLE adds into
@@ -1834,8 +1907,8 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
         const Layer* nx = li + 1 < n ? &m.layers[(size_t)li + 1] : nullptr;
         const bool ple_next = nx && li + 1 == m.ple_layer;
         for (int64_t p = 0; p < K; ++p) {
-            if (p == K - 1) wait1();
-            l.hc_ffn.write(c, T, r0(p), rn(p));
+            if (p == K - 1 && !wait1()) return false;
+            if (!wide) l.hc_ffn.write(c, T, r0(p), rn(p));
             /* The projection of this piece, before the next layer reads it. */
             l.proj.step(c, batch, r0(p), rn(p));
             if (nx && !ple_next) nx->hc_mix.read(c, T, r0(p), rn(p));
@@ -1845,6 +1918,7 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
             for (int64_t p = 0; p < K; ++p) nx->hc_mix.read(c, T, r0(p), rn(p));
         }
     }
+    return true;
 }
 
 /* A full-attention layer's indexer keys behind its attention's launches (QsaIndexer::deferrable,
@@ -1970,8 +2044,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
     }
 
     const int32_t* pcu = pipe_bounds(c, batch, m);
-    if (pipelined(m, T)) step_pipelined(c, batch, m, pcu);
-    else                 step_serial(c, batch, m, pcu);
+    if (pipelined(m, batch)) {
+        if (!step_pipelined(c, batch, m, pcu)) return;
+    } else {
+        step_serial(c, batch, m, pcu);
+    }
 
     m.mixer.read_pieces(c, T);
 
@@ -1996,6 +2073,9 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
     if (!c || !batch) return 0;
     if (batch->enc) return 1;
     Model& m = g_model[rad_slot(c)];
+    /* Native Windows HIP does not record passes. Keep the host-link lane schedule off the
+     * recorder even if a Windows backend gains tape support. */
+    if (m.tp2_host_pipe && pipelined(m, batch)) return 0;
     /* Which side of the indexer's exactness bound the step is on by the attention group's exact
      * host bound, by which the full-attention layers and the indexer decide whether the step
      * needs scores (AttnGatedFP8::qsa_within, qsa_exact_host). The core's key holds only the

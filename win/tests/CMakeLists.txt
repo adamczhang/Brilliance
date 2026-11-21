@@ -54,9 +54,10 @@ set_tests_properties(serve_sandbox_test PROPERTIES LABELS unit TIMEOUT 300
 
 # win\libexec\hfget.ps1 and serve.ps1 -Fetch against a stand-in hub on loopback (hub_stub.py,
 # Python's standard library; skipped, 77, without python.exe): the plan before a transfer, a fresh
-# destination, a warm cache, a cut transfer resumed, a repo of several containers, and the verified
-# file served with no edit to the profile. Fixture bytes only; radiance runs as --check. About 45 s,
-# most of it curl's retry delays on the cut transfer.
+# destination, a warm cache, a cut transfer resumed by the next run and, try by try, within a run, a
+# repo of several containers, and the verified file served with no edit to the profile. Fixture
+# bytes only; radiance runs as --check. About 60 s, most of it hfget's 5 s between tries on the cut
+# transfers.
 add_test(NAME fetch_launch_test
          COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
                  -File "${CMAKE_CURRENT_SOURCE_DIR}/fetch_launch_test.ps1" -Exe "$<TARGET_FILE:radiance>")

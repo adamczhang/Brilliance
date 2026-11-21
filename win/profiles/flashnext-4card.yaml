@@ -46,7 +46,8 @@
 #
 # The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out; with
 # exactly four, that is all of them. Name the four with -Bus (PCI buses) or -Device (HIP indices) on a
-# machine with more; rank 0 is the first named. Cards talk through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is
+# machine with more. Rank 0 follows the runtime's device order, not the order the cards are named in.
+# Cards talk through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is
 # off with more than one card visible, so the KV cache is sized whole at load.
 #
 # Loopback only and no key. To serve the local network: .\serve.ps1 flashnext-4card -Listen 0.0.0.0

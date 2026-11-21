@@ -124,6 +124,20 @@ BufferInfo make_buf(const char* name, int64_t bytes, int kind, int32_t lo, int32
     Registry reg;                                                                     \
     if (load(reg) < 0) ARTIFACT_MISSING("the test plugins in " + kernels_dir());
 
+TEST(builder_reports_only_its_registry_device_p2p_fact) {
+    Registry host, peer;
+    Builder a(host, make_meta(), make_ctx()), b(peer, make_meta(), make_ctx());
+    CHECK_EQ(rad_build_device_p2p(nullptr), -1);
+    CHECK_EQ(rad_build_device_p2p(&a), -1);
+    host.set_device_fact(RAD_FACT_P2P, 0);
+    peer.set_device_fact(RAD_FACT_P2P, 1);
+    CHECK_EQ(rad_build_device_p2p(&a), 0);
+    CHECK_EQ(rad_build_device_p2p(&b), 1);
+    peer.set_device_fact(RAD_FACT_P2P, -1);
+    CHECK_EQ(rad_build_device_p2p(&b), -1);
+    CHECK_EQ(rad_build_device_p2p(&a), 0);
+}
+
 /* ================================================================== the bucket table */
 TEST(bucket_table_resolves_per_band) {
     NEED_PLUGIN(reg)

@@ -37,10 +37,14 @@ function Serve([string[]]$a) {
 }
 function Has([string]$text, [string]$part) { return $text.Contains($part) }
 # The copy radiance reads, from the launcher's "radiance reads <file>, the profile less those" line.
+# The path may hold spaces (a TEMP folder whose name has a space): everything up to the comma on that line.
 function DerivedOf([string]$out) {
-  if ($out -match 'radiance reads (\S+), the profile less those') { return $Matches[1] }
+  if ($out -match '(?m)radiance reads (.+?), the profile less those') { return $Matches[1] }
   return ''
 }
+# A path as serve.ps1's -WhatIf prints it on radiance's command line (its Quote-Arg): in double
+# quotes when it holds a space.
+function Quoted([string]$p) { if ($p -match '[\s"]') { return "`"$p`"" } return $p }
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("brl-serve-sandbox-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory $tmp | Out-Null
@@ -60,7 +64,7 @@ try {
     $t = [IO.File]::ReadAllText($d)
     Check (-not ($t -match '(?m)^  four:')) "two cards: the copy has no four:`n$t"
     Check (($t -match '(?m)^  one:') -and ($t -match '(?m)^  two:') -and ($t -match '(?m)^  plain:') -and (Has $t 'max-num-seqs: 2') -and (Has $t '# a comment inside an entry')) "two cards: the copy keeps the rest whole:`n$t"
-    Check (Has $r.Out "--config $d") "two cards: radiance is run on the copy:`n$($r.Out)"
+    Check (Has $r.Out "--config $(Quoted $d)")"two cards: radiance is run on the copy:`n$($r.Out)"
   }
   Check (Has $r.Out 'radiance reads the profile as: host 127.0.0.1') "two cards: radiance --check accepts the copy:`n$($r.Out)"
 
@@ -70,7 +74,7 @@ try {
 
   # Every discrete card (the iGPU hidden): nothing dropped, the profile itself is run.
   $r = Serve @($fleet, '-WhatIf', '-Exe', $Exe)
-  Check ($r.Rc -eq 0 -and -not (Has $r.Out 'dropped') -and (Has $r.Out "--config $fleet")) "four cards: nothing dropped, the profile itself:`n$($r.Out)"
+  Check ($r.Rc -eq 0 -and -not (Has $r.Out 'dropped') -and (Has $r.Out "--config $(Quoted $fleet)")) "four cards: nothing dropped, the profile itself:`n$($r.Out)"
 
   # The iGPU named beside a card is not a card the engine runs on.
   $r = Serve @($fleet, '-Bus', '33,3', '-WhatIf', '-Exe', $Exe)
@@ -111,10 +115,10 @@ try {
   Check ($r.Rc -eq 0 -and (Has $r.Out 'dropped flashnext-2card') -and (Has $r.Out 'dropped flashnext-4card') -and -not (Has $r.Out 'dropped minicpm5-2b-1card') -and
          (Has $r.Out 'model minicpm5-2b-1card: model from models.minicpm5-2b-1card.model, num-speculative-tokens 0 (environment (BRILLIANCE_MODEL_SPECULATION))')) "sandbox -Cpu: the one-card entries stay, drafting off:`n$($r.Out)"
 
-  # The shipped sandbox profile on the two-card pair: only the four-card entry goes.
+  # The shipped sandbox profile on the two-card pair: only the four-card entries go.
   $r = Serve @('sandbox', '-Bus', '3,9', '-WhatIf', '-Exe', $Exe)
-  $dropped = @([regex]::Matches($r.Out, 'dropped (\S+):') | ForEach-Object { $_.Groups[1].Value })
-  Check ($r.Rc -eq 0 -and ($dropped -join ',') -eq 'flashnext-4card') "sandbox on buses 3 and 9: only flashnext-4card dropped (got '$($dropped -join ',')'):`n$($r.Out)"
+  $dropped = @([regex]::Matches($r.Out, 'dropped (\S+):') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
+  Check ($r.Rc -eq 0 -and ($dropped -join ',') -eq 'deepseek41-4card,flashnext-4card') "sandbox on buses 3 and 9: only the four-card entries dropped (got '$($dropped -join ',')'):`n$($r.Out)"
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

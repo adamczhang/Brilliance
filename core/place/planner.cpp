@@ -398,7 +398,16 @@ void Planner::build_units(const Program& prog, Plan* p) {
         mu.weights.push_back(w);
         mu.offset.push_back(at);
         mu.bytes = at + weight_bytes(wi);
-        if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
+        /* Brilliance: a weight relaid on the read keeps the unit readable by the file tier when
+         * --weights-file-relayout is on, its stored form and its planes each fit a read window
+         * (the relayout writes one weight into one window), and the unit turns out to be a routed
+         * expert (checked below, once the unit's access class is known). */
+        const bool relaid = in_.container && in_.config && in_.config->weights_file_relayout &&
+                            weight_file_relaid(prog, wi, prog.ctx.world_size) &&
+                            weight_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES &&
+                            weight_plane_bytes(wi) <= RAD_PLACE_FILE_WINDOW_BYTES;
+        if (relaid) mu.file_relaid = true;
+        else if (!in_.container || !weight_file_direct(wi, prog.ctx.world_size)) mu.file_direct = false;
         /* The drafter's own weights (the "mtp." namespace) run on every draft pass of every
          * decode step; the expert fill pins them in the host pool ahead of everything ranked. */
         if (wi.name.rfind("mtp.", 0) == 0) mu.draft_head = true;
@@ -410,6 +419,14 @@ void Planner::build_units(const Program& prog, Plan* p) {
             mu.access = wi.decl.access;
         p->unit_of_weight[w] = u;
     }
+    /* Brilliance: only the file stager relays on the read, and it reads routed experts. A relaid
+     * unit that is not one (a scheduled unit's Plan::prefetch preads its bytes as they lie) stays
+     * off the file tier. */
+    for (MoveUnit& mu : p->units)
+        if (mu.file_relaid && (mu.access != RAD_ACCESS_CONDITIONAL || mu.expert < 0 || mu.layer < 0)) {
+            mu.file_relaid = false;
+            mu.file_direct = false;
+        }
 
     /* Warm start from the profile: it only decides which experts begin resident (spec §5.3). It is
      * worth about a point of hit rate, since imatrix popularity is not decode popularity and heat
@@ -1239,7 +1256,39 @@ int Planner::plan(Plan* out) {
     /* After the strategy: it has put the hot set in VRAM, and pinning marks those resident. */
     pin_hot(cfg, out);
     finish(prog, out);
+    out->ram_budget = cfg.expert_ram_mib * 1024 * 1024;
+    hold_in_ram(out);
     return hrc < 0 ? hrc : rc;
+}
+
+/* The RAM store holds the file tier's routed units hottest first, each at the stager's packing
+ * (RAD_ALIGN_UNIT), until the budget is spent; the rest stay on the drive. Ranked like residency,
+ * from the container's profile and the unit's identity alone, so every rank decides alike. */
+void Planner::hold_in_ram(Plan* p) const {
+    p->ram_bytes = p->ram_units = p->disk_bytes = p->disk_units = 0;
+    p->relaid_units = p->relay_input_max = 0;
+    std::vector<int32_t> order;
+    rank_units(p, &order);
+    for (int32_t ui : order) {
+        MoveUnit& mu = p->units[(size_t)ui];
+        mu.ram_held = false;
+        if (mu.tier != Tier::SSD || mu.access != RAD_ACCESS_CONDITIONAL || mu.layer < 0) continue;
+        const int64_t need = align_up(mu.bytes, RAD_ALIGN_UNIT);
+        if (mu.file_relaid) {
+            ++p->relaid_units;
+            for (rad_weight w : mu.weights)
+                p->relay_input_max = std::max(p->relay_input_max,
+                                              weight_plane_bytes(in_.program->weights[w]));
+        }
+        if (p->ram_budget > 0 && mu.file_direct && p->ram_bytes + need <= p->ram_budget) {
+            mu.ram_held = true;
+            p->ram_bytes += need;
+            ++p->ram_units;
+        } else {
+            p->disk_bytes += need;
+            ++p->disk_units;
+        }
+    }
 }
 
 int Planner::assign(Plan* p) {
@@ -1288,6 +1337,25 @@ int Planner::assign(Plan* p) {
         case Strategy::ExpertTiered: return assign_expert_tiered(p);
         default:                     return RAD_E_INVAL;
     }
+}
+
+std::string Plan::tier_line() const {
+    int64_t n[4] = {0}, b[4] = {0};   /* VRAM, pinned pool, RAM store, drive */
+    for (const MoveUnit& mu : units) {
+        if (mu.access != RAD_ACCESS_CONDITIONAL || mu.expert < 0) continue;
+        const int t = mu.tier == Tier::VRAM ? 0
+                    : mu.tier == Tier::HostPinned ? 1
+                    : mu.tier == Tier::SSD ? (mu.ram_held ? 2 : 3) : -1;
+        if (t < 0) continue;
+        ++n[t];
+        b[t] += mu.bytes;
+    }
+    return fmt("tiers: rank %d routed experts: VRAM %s (%lld), pinned pool %s (%lld), RAM store "
+               "%s (%lld of a %s budget), drive %s (%lld); file tier: %s pinned windows, %s VRAM "
+               "layer buffers", rank, humanb(b[0]).c_str(), (long long)n[0], humanb(b[1]).c_str(),
+               (long long)n[1], humanb(b[2]).c_str(), (long long)n[2], humanb(ram_budget).c_str(),
+               humanb(b[3]).c_str(), (long long)n[3], humanb(file_windows).c_str(),
+               humanb(file_stage_vram).c_str());
 }
 
 /* ------------------------------------------------------------------ the report (spec §16) */
@@ -1376,6 +1444,17 @@ std::string Plan::report(const Program& prog) const {
         s += fmt("  n-gram copy   %12s  %12s   (--ngram-placement ram, %s, filled at load)\n",
                  "-", humanb(ngram_copy_bytes).c_str(),
                  ngram_copy_card ? "pinned RAM the card reads" : "locked RAM");
+    /* Brilliance: where the file tier's routed units are read from. */
+    if (ram_budget > 0 || ram_units)
+        s += fmt("  expert ram    %12s  %12s   (%lld units in ordinary RAM, relaid once at load; "
+                 "--expert-ram-mib)\n", humanb(ram_budget).c_str(), humanb(ram_bytes).c_str(),
+                 (long long)ram_units);
+    if (disk_units)
+        s += fmt("  expert disk   %12s  %12s   (%lld units read from the drive when routed)\n", "-",
+                 humanb(disk_bytes).c_str(), (long long)disk_units);
+    if (relaid_units)
+        s += fmt("  relaid        %12s  %12lld   (units relaid from their planes on the read; the "
+                 "largest reads %s)\n", "-", (long long)relaid_units, humanb(relay_input_max).c_str());
     /* The file stager's two VRAM buffers, out of the weight budget but not among the residents. */
     if (file_stage_vram)
         s += fmt("  file buffers  %12s  %12s   (two of %s: the most one routed layer reads from "

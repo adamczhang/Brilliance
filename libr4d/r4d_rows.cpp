@@ -3153,6 +3153,12 @@ static const RadParamSpec pPixtralRope[] = { P_INT("M"), P_INT("head_dim"), P_IN
                                             P_F64("theta"), P_STR("dtype") };
 static const RadOperandSpec oPixtralRope[] = { { "qkv", RAD_OPD_INOUT, 0 }, { "coord", RAD_OPD_IN, 0 } };
 static const RadParamSpec pPixtralMerge[] = { P_INT("M"), P_INT("n"), P_INT("merge"), P_STR("dtype") };
+#define R4D_DS41_SPECS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_SPECS
+
 static const RadOperandSpec oPixtralMerge[] = { { "x", RAD_OPD_IN, 0 }, { "coord", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
 
 
@@ -3163,6 +3169,12 @@ static const RadOpSchema kSchemas[] = {
   "Ministral NeoX rotary with BF16 cos/sin and separately rounded products; V is unchanged." },
 { "pixtral_rope", ROW(pPixtralRope), ROW(oPixtralRope),
   "Pixtral axial rotary with interleaved height/width frequencies and BF16 product rounding." },
+#define R4D_DS41_SCHEMAS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_SCHEMAS
+
 { "pixtral_merge", ROW(pPixtralMerge), ROW(oPixtralMerge),
   "Pack full raster patch grids into channel-major spatial merge blocks, without mixing images." },
 { "position_scale", ROW(pPositionScale), ROW(oPositionScale),
@@ -4980,7 +4992,7 @@ static const RadConstraint cFp8F32Scale[] = {
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "fp8a8f32")
 };
 static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
-                                            C_GE("N", 1),         C_LE("N", 512),
+                                            C_GE("N", 1),         C_LE("N", 65536),
                                             C_GE("K", 1),         C_LE("K", 16384),
                                             C_IN("dtype", "bf16") };
 static const RadConstraint cDsaScore[] = {
@@ -5319,6 +5331,13 @@ static const RadConstraint cQsaWork[] = {
 
 static const RadConstraint cQsaTailStore[] = {
     C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "bf16"),
+};
+
+static const RadConstraint cQsaWorkF32[] = {
+    C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_GE("work", 1), C_IN("dtype", "f32"),
+};
+static const RadConstraint cQsaTailStoreF32[] = {
+    C_GE("n", 1), C_GE("ratio", 1), C_GE("seqs", 1), C_IN("dtype", "f32"),
 };
 
 /* No dtype: every operand is f32 or i32. */
@@ -6753,7 +6772,7 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_dsa_query, nullptr, nullptr, nullptr,
   r4d_shape_dsa_query },
 { "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
-  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  "N<=65536, K<=16384; pitched rows", "bf16 input, f32 weights and output",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_f32 },
@@ -6768,6 +6787,12 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_swiglu_step, nullptr, nullptr, nullptr,
   r4d_shape_silu_mul },
+#define R4D_DS41_ROWS
+#include "r4d_ds41_elem.inc"
+#include "r4d_ds41_sparse.inc"
+#include "r4d_ds41_ggml.inc"
+#undef R4D_DS41_ROWS
+
 { "swiglu_clamped_bf16", "swiglu_clamped", "elem",
   "asymmetrically clipped SwiGLU", "positive finite limit; pitched rows",
   "bf16 in and out, fp32 arithmetic", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -9197,6 +9222,23 @@ R4D_WIN_TREE_PAIR(512, 4) R4D_WIN_TREE_PAIR(512, 8)
   "bf16 keys in, an i32 position and an i32 cu_seqlens; the bf16 tail written in place",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQsaTailStore), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_tail_store },
+
+{ "qsa_work_f32", "qsa_work", "attn",
+  "qsa_work_bf16's gather over f32 planes: the same kernel at 32-bit elements",
+  "as qsa_work_bf16",
+  "f32 keys and an f32 tail in; an f32 staging plane out; the i32 operands as qsa_work_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaWorkF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_qsa_work, nullptr, nullptr, nullptr,
+  r4d_shape_qsa_work },
+{ "qsa_tail_store_f32", "qsa_tail_store", "attn",
+  "qsa_tail_store_bf16's store over f32 planes: the same kernel at 32-bit elements",
+  "as qsa_tail_store_bf16",
+  "f32 keys in, the f32 tail written in place; the i32 operands as qsa_tail_store_bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQsaTailStoreF32), NOTUNE,
   nullptr, nullptr, r4d_rad_qsa_tail_store, nullptr, nullptr, nullptr,
   r4d_shape_qsa_tail_store },
 

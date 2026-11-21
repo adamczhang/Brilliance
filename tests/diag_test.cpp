@@ -585,6 +585,18 @@ TEST(engine_findings) {
     for (const diag::Finding& x : found)
         if (x.id == "p2p-off") CHECK(x.fix.find("IOMMU in passthrough") == std::string::npos);
     CHECK(has(found, "experts-from-host", diag::Finding::Note));
+    /* Brilliance: experts the RAM store holds are a note about RAM, not a warning about the disk. */
+    CHECK(!has(found, "experts-from-ram"));
+    {
+        diag::RunFacts held = run;
+        held.ram_weight_bytes = (int64_t)9 << 30;
+        held.file_weight_bytes = 0;
+        const auto f2 = diag::check(f, held);
+        CHECK(has(f2, "experts-from-ram", diag::Finding::Note));
+        CHECK(!has(f2, "weights-from-disk"));
+        held.file_weight_bytes = (int64_t)1 << 30;
+        CHECK(has(diag::check(f, held), "weights-from-disk", diag::Finding::Warn));
+    }
     CHECK(has(found, "p2p-off", diag::Finding::Note));
     CHECK(has(found, "device-ignored", diag::Finding::Note));
     CHECK(has(found, "reference-kernels", diag::Finding::Warn));

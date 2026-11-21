@@ -576,6 +576,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             l["d2h_bytes"]      = s.link.d2h_bytes;
             l["ssd_reads"]      = s.link.ssd_reads;
             l["ssd_bytes"]      = s.link.ssd_bytes;
+            l["ram_weights"]    = s.link.ram_weights;
+            l["ram_bytes"]      = s.link.ram_bytes;
+            l["relaid_weights"] = s.link.relaid_weights;
             l["ssd_staging_bytes"] = s.link.ssd_staging_bytes;
             l["ssd_promoted_bytes"] = s.link.ssd_promoted_bytes;
             l["ssd_deposits"]      = s.link.ssd_deposits;

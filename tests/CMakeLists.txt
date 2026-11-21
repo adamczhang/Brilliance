@@ -187,11 +187,12 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 
 # shipped_plugins_test loads the shipped architecture plugins, which bind the plugin-facing C ABI
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
-set(RAD_TESTS_WHOLE_CORE shipped_plugins_test)
+set(RAD_TESTS_WHOLE_CORE shipped_plugins_test deepseek41_test deepseek41_hip_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
   list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/deepseek41_hip_test\\.cpp$")
 endif()
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
@@ -424,12 +425,18 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test)
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test deepseek41_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
       RAD_E2E_HOME="${RAD_PLUGIN_OUT}" RAD_E2E_RECIPES="${CMAKE_SOURCE_DIR}/data/recipes")
-    if(t STREQUAL "spark25_convert_test")
+    if(t STREQUAL "deepseek41_test")
+      target_sources(${t} PRIVATE ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                                  ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_dequant.cpp
+                                  ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
+      target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
+      add_dependencies(${t} radiance libref deepseek41)
+    elseif(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)
     elseif(t STREQUAL "clef_decision_test")
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
@@ -450,6 +457,16 @@ endforeach()
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
   set_tests_properties(engine_e2e_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET deepseek41_test)
+  set_tests_properties(deepseek41_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+if(TARGET deepseek41_hip_test)
+  target_sources(deepseek41_hip_test PRIVATE ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_planes.cpp
+                                             ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
+  target_include_directories(deepseek41_hip_test PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
+  add_dependencies(deepseek41_hip_test libr4d libref)
+  set_tests_properties(deepseek41_hip_test PROPERTIES LABELS gpu)
 endif()
 if(TARGET clef_decision_test)
   set_tests_properties(clef_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)

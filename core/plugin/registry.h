@@ -209,6 +209,7 @@ public:
      * Set before the first selection by whoever chose the devices; without a fact, a kernel
      * constrained on it is not selected. */
     void set_device_fact(std::string_view key, long long v) { device_facts_.set_i(key, v); }
+    bool device_fact(std::string_view key, long long* v) const { return device_facts_.get_i(key, v); }
 
     /* Fini this registry's instances and forget its selections. The last registry holding the
      * set also runs the plugins' close hooks, dlcloses them and forgets everything. */

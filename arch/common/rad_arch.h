@@ -757,6 +757,8 @@ struct Geom {
     int64_t n_ff       = 0;    /* per rank */
     int64_t n_ff_all   = 0;
     int64_t max_tok    = 0;
+    /* Limit only the overlap collective's row range, zero for a whole-step bound. */
+    int64_t ar_overlap_rows = 0;
     int64_t max_seqs   = 0;
     int64_t max_ctx    = 0;
     /* --kv-resident in tokens (RadBuildCtx::kv_resident_blocks), 0 when nothing streams: what
@@ -810,6 +812,11 @@ struct Geom {
      * setting because producers and consumers must agree; the plugin reads it off a trunk weight's
      * encoding and every linear checks its own against it. */
     bool    w_bf16 = false;
+    /* With w_bf16: a linear whose container stores it quantised (int8, rotated int8, the codebook
+     * forms LinearFP8 reads) takes its own form instead of being refused, for a family whose trunk
+     * mixes bf16 and quantised linears (DeepSeek V4.1). Off, every linear of a bf16 model must be
+     * plain bf16, as before. */
+    bool    w_bf16_mixed = false;
     /* The linears are rotated int8 (rad_fp8.h's linear_is_w8h: IQ8R, or the 128-group form) with
      * one activation scale per `w_i8_group` columns, for a plugin whose producers are declared away
      * from its probe: each then declares an int8 code pair (ActFP8::declare_pair). Model-wide as

@@ -620,7 +620,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kv-cache-dtype", { "i8" } },
         { "--state-cache-dtype", { "f16" } },
         { "--kv-resident", { "65536" } },
-        { "--host-pool-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
+        { "--host-pool-mib", { "1024" } }, { "--expert-ram-mib", { "1024" } }, { "--host-headroom-mib", { "2048" } },
         { "--embedding-placement", { "vram" } },
         { "--vision-tower-placement", { "ram" } }, { "--ngram-placement", { "disk" } },
         { "--debug-draft-oracle", { "/o.txt", "--spec-ngram", "4" } },
@@ -1883,6 +1883,23 @@ TEST(the_suffix_selector_parses_beside_adaptive_depth_and_traversal) {
     CHECK(!c.draft_verify_block);
     CHECK_EQ(c.n_spec, 5);
     CHECK_EQ(c.draft_suffix_max, 7);
+}
+
+/* Brilliance: --expert-ram-mib states all ranks' RAM, like --host-pool-mib, and implies the file
+ * relayout. Without --weights-disk-tier both still parse; bring-up refuses them (Engine::plan). */
+TEST(the_expert_ram_tier_needs_the_file_tier_and_splits_by_rank) {
+    Config c;
+    CHECK_EQ(parse({ "--tp", "2", "--weights-disk-tier", "--expert-ram-mib", "24576" }, &c), RAD_OK);
+    CHECK_EQ(c.expert_ram_mib, 12288ll);   /* a rank's share of the 24576 at --tp 2 */
+    CHECK(c.weights_file_relayout);
+    CHECK(!c.plan_only);
+    CHECK_EQ(parse_fresh({ "--expert-ram-mib", "1024" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--weights-file-relayout" }), RAD_OK);
+    Config d;
+    CHECK_EQ(parse({ "--weights-disk-tier", "--weights-file-relayout", "--plan-only" }, &d), RAD_OK);
+    CHECK(d.weights_file_relayout);
+    CHECK_EQ(d.expert_ram_mib, 0ll);
+    CHECK(d.plan_only);
 }
 
 RAD_TEST_MAIN()

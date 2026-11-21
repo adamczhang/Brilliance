@@ -374,6 +374,25 @@ FileStager::~FileStager() {
     if (scratch_) rad_dev_free(scratch_, RAD_MEM_HOST_PINNED);
 }
 
+std::string route_counts_check(const int32_t* c, int64_t n, int64_t n_local, int64_t rows,
+                               int64_t top_k) {
+    if (!c || n <= 0) return "no counts";
+    if (n != n_local)
+        return fmt("the source gave %lld counts and this rank holds %lld of the layer's experts, "
+                   "so they are not indexed by its local expert slot", (long long)n,
+                   (long long)n_local);
+    int64_t sum = 0;
+    for (int64_t e = 0; e < n; ++e) {
+        if (c[e] < 0)
+            return fmt("expert %lld has a negative count (%d)", (long long)e, (int)c[e]);
+        sum += c[e];
+    }
+    if (top_k > 0 && rows > 0 && sum > rows * top_k)
+        return fmt("they route %lld rows, more than the pass's %lld tokens at top-%lld",
+                   (long long)sum, (long long)rows, (long long)top_k);
+    return std::string();
+}
+
 int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
                      RouteCounts routes, void* routes_ud) {
     layers_.clear();
@@ -448,6 +467,19 @@ int FileStager::init(const Program& prog, const Plan& plan, Mover* mover,
     for (size_t i = 0; i < layers_.size(); ++i)
         if ((size_t)layers_[i].first_op < first_of_.size())
             first_of_[(size_t)layers_[i].first_op] = (int32_t)i;
+    /* Brilliance: each layer's experts on this rank, from every routed unit the plan gives it
+     * (resident, pooled or on the file tier), which route_counts_check holds the counts to. */
+    {
+        std::map<int32_t, int64_t> most;
+        for (const MoveUnit& mu : plan.units)
+            if (mu.access == RAD_ACCESS_CONDITIONAL && mu.layer >= 0 && mu.expert >= 0)
+                most[mu.layer] = std::max<int64_t>(most[mu.layer], (int64_t)mu.expert + 1);
+        n_local_.assign(layers_.size(), 0);
+        for (size_t i = 0; i < layers_.size(); ++i) n_local_[i] = most[layers_[i].layer];
+    }
+    top_k_ = prog.meta.n_expert_used;
+    route_fallbacks_ = 0;
+    route_noted_ = false;
     mover_ = mover;
     if (wide) {
         std::vector<int32_t> more;
@@ -475,6 +507,7 @@ bool FileStager::begin_pass(const RadBatch* b) {
     pass_kind_ = b->draft_pass;
     last_issued_ = -1;
     whole_ = whole_rows_ > 0 && b->n_tok >= whole_rows_;
+    rows_ = b->n_tok;
     return true;
 }
 
@@ -501,6 +534,20 @@ int FileStager::counts(int32_t li, RadStream s, const int32_t** ecnt, int32_t* n
     if (!dev || n <= 0 || n > scratch_n_) return RAD_OK;
     RAD_TRY(rad_memcpy_async(scratch_, dev, (size_t)n * sizeof(int32_t), s));
     RAD_TRY(rad_stream_sync(s));
+    /* Brilliance: counts that cannot be this rank's for this pass would skip a routed expert and
+     * hand its GEMM the zero region. Read the layer whole instead, and say so once. */
+    const std::string why = route_counts_check(scratch_, n, n_local_[(size_t)li], rows_, top_k_);
+    if (!why.empty()) {
+        ++route_fallbacks_;
+        if (!route_noted_) {
+            route_noted_ = true;
+            RAD_WARN("file stager: layer %d's routing counts are not usable (%s); its file-tier "
+                     "experts are read whole, and so is any other layer's that fails the same "
+                     "check (counted in route_fallbacks)", (int)layers_[(size_t)li].layer,
+                     why.c_str());
+        }
+        return RAD_OK;
+    }
     *ecnt = scratch_;
     *n_expert = (int32_t)n;
     return RAD_OK;

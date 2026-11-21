@@ -26,7 +26,7 @@ server:
 memory:
   gpu-headroom-mib: 160
 scheduler:
-  load-timeout: 600s
+  load-timeout: 1200s
   warm-up: false
 models:
   gemma4-12b-1card:              # profiles/gemma4-12b-1card.yaml (its model: gemma4-12b), 1 card
@@ -41,6 +41,10 @@ models:
     max-num-seqs: 2
     max-model-len: 32768
     chat-template-kwargs: {"enable_thinking": false}
+  ltx-2.5-1card:              # profiles/ltx-2.5-1card.yaml (its model: ltx-2.5), 1 card
+    model: D:/models/hf/StillDeadcode/radiance-ltx-2.5-distilled-iq8r/ltx-2.5-distilled-iq8r.rad
+    tp: 1
+    vision-tower-placement: ram
   minicpm5-2b-1card:              # profiles/minicpm5-2b-1card.yaml (its model: minicpm5-2b), 1 card
     model: D:/models/hf/StillDeadcode/minicpm5-2b-iq8r/minicpm5-2b-iq8r.rad
     tp: 1
@@ -69,6 +73,22 @@ models:
     tp: 1
     max-num-seqs: 4
     max-model-len: 32768
+  deepseek41-2card:              # profiles/deepseek41-2card.yaml (its model: deepseek-v4.1-flash), 2 cards
+    model: D:/models/hf/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad/deepseek-v4.1-flash-1017-uncensored.rad
+    tp: 2
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 40960
+    weights-disk-tier: true
+    expert-ram-mib: 24576
+    max-model-len: 4096
+    max-num-seqs: 1
+    max-num-batched-tokens: 512
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 0
+    ngram-placement: disk
+    deterministic: true
   flashnext-2card:              # profiles/flashnext-2card.yaml (its model: qwen3.8-next-flash), 2 cards
     model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
     tp: 2
@@ -81,8 +101,10 @@ models:
     checkpoint-slots: 8
     vision-tower-placement: ram
     # The drafting stack: up to 5 MTP drafts, coupled drafting, traversal verify, an
-    # adaptive depth that stops at 0.85 and backs off under load. Greedy output is unchanged; about 13%
-    # faster single-stream decode and 8% more eight-request throughput on two R9700s.
+    # adaptive depth that stops at 0.85 and backs off under load: about 13% faster single-stream
+    # decode and 8% more eight-request throughput on two R9700s. Its greedy text is that of a fixed
+    # depth of 3; against decoding without drafts it can differ where two tokens are almost tied,
+    # as it can when other requests share a step (SUPPORT.md, known issues 5 and 8).
     num-speculative-tokens: 5
     draft-coupling: on
     draft-verify: traversal
@@ -124,6 +146,20 @@ models:
     max-num-seqs: 4
     max-model-len: 32768
     kv-cache-dtype: i8
+  deepseek41-4card:              # profiles/deepseek41-4card.yaml (its model: deepseek-v4.1-flash), 4 cards
+    model: D:/models/hf/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad/deepseek-v4.1-flash-1017-uncensored.rad
+    tp: 4
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 16384
+    max-model-len: 4096
+    max-num-seqs: 1
+    max-num-batched-tokens: 512
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 0
+    ngram-placement: disk
+    deterministic: true
   flashnext-4card:              # profiles/flashnext-4card.yaml (its model: qwen3.8-next-flash), 4 cards
     model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
     tp: 4

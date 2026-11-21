@@ -6,7 +6,6 @@ import { Empty, StateBadge } from "@/components/bits"
 import { Chat } from "@/components/chat"
 import { Button } from "@/components/ui/button"
 import { HttpError, api, type FleetModel } from "@/lib/api"
-import { fleet, useScope } from "@/lib/store"
 import { hrefOf } from "@/lib/ui"
 
 const LOCAL_ONLY = "Start and Stop work only from a browser on the server's own machine"
@@ -14,19 +13,23 @@ const LOCAL_ONLY = "Start and Stop work only from a browser on the server's own 
 const HOLDS = new Set(["resident", "loading", "restoring", "parked", "waiting", "closing"])
 const cardsOf = (m: FleetModel) => Math.max(m.tp ?? 1, 1)
 
-export function Sandbox({ id, model }: { id: string; model: FleetModel | undefined }) {
-  const f = useScope(fleet)
+// `models` is every model the page knows of: the fleet's on the server's own machine, the public
+// model list's from elsewhere. `local` is false where the fleet's admin routes are refused (another
+// machine, no API key): Start and Stop are then off, and the list and the chat still work.
+export function Sandbox({ id, model, models, local }: { id: string; model: FleetModel | undefined; models: FleetModel[]; local: boolean }) {
+  const refused = !local
   const [busy, setBusy] = useState<"start" | "stop" | null>(null)
   const [note, setNote] = useState<string | null>(null)
   const base = location.protocol + "//" + location.host
-  const models = f.refused ? [] : (f.live?.models ?? [])
   const state = model?.state
   const caps = model?.capabilities
   // A model that has never been loaded has not told the server what it does yet: assume chat.
   const chats = !caps || !!caps.chat
 
+  // Start holds the model (hold=1): until its Stop, a request for another model is refused rather
+  // than moving it off its cards. Stop, an unload, ends the hold.
   async function admin(name: string, action: "load" | "unload") {
-    await api(`admin/models/${encodeURIComponent(name)}/${action}${action === "load" ? "?wait=0" : ""}`, { method: "POST" })
+    await api(`admin/models/${encodeURIComponent(name)}/${action}${action === "load" ? "?wait=0&hold=1" : ""}`, { method: "POST" })
   }
   async function run(what: "start" | "stop") {
     setBusy(what); setNote(null)
@@ -59,11 +62,12 @@ export function Sandbox({ id, model }: { id: string; model: FleetModel | undefin
             {models.map((m) => <option key={m.id} value={m.id} className="bg-background">{m.id} · {cardsOf(m)} card{cardsOf(m) > 1 ? "s" : ""}</option>)}
           </select>
         )}
-        <Button size="sm" disabled={f.refused || busy !== null || state === "resident" || state === "loading"} onClick={() => void run("start")}><Play />{busy === "start" ? "Starting…" : "Start"}</Button>
-        <Button size="sm" variant="outline" disabled={f.refused || busy !== null || !state || !HOLDS.has(state)} onClick={() => void run("stop")}><Square />{busy === "stop" ? "Stopping…" : "Stop"}</Button>
+        <Button size="sm" disabled={refused || busy !== null || state === "resident" || state === "loading"} onClick={() => void run("start")}><Play />{busy === "start" ? "Starting…" : "Start"}</Button>
+        <Button size="sm" variant="outline" disabled={refused || busy !== null || !state || !HOLDS.has(state)} onClick={() => void run("stop")}><Square />{busy === "stop" ? "Stopping…" : "Stop"}</Button>
         <StateBadge state={state} doing={model?.doing} />
       </div>
-      {(f.refused || note) && <div className="text-sm text-muted-foreground">{f.refused ? LOCAL_ONLY + "." : note}</div>}
+      {(refused || note) && <div className="text-sm text-muted-foreground">{refused ? LOCAL_ONLY + "." : note}</div>}
+      {model?.held && HOLDS.has(state ?? "") && <div className="text-sm text-muted-foreground">Held until Stop: requests for other models that need its cards are refused meanwhile.</div>}
       {!model ? <Empty>This process serves no model named {id}</Empty>
         : !chats ? <Empty>This model does not chat (it makes embeddings, pictures or other media), so there is nothing to try here</Empty>
         : <Chat model={id} ready={state === "resident"} hint={state === "loading" || state === "restoring" ? "Loading…" : "Start the model to chat with it"} />}

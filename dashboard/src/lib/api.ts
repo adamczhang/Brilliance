@@ -18,6 +18,8 @@ export interface HistoryBody<Live> {
 export interface FleetModel {
   id: string; state: string; file?: string; aliases?: string[]
   priority?: number; pinned?: boolean; tp?: number; ttl_ms?: number
+  /** Held by the Sandbox's Start (an admin load with hold=1) until its Stop: other models' requests do not move it. */
+  held?: boolean
   parks?: number; restores?: number; loads?: number; unloads?: number
   in_flight?: number; waiting?: number
   cards?: number[]; vram_bytes_per_card?: number; parked_bytes_per_card?: number
@@ -29,7 +31,11 @@ export interface FleetModel {
   capabilities?: Record<string, unknown>
   [k: string]: unknown
 }
-export interface FleetCard { card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number }
+export interface FleetCard {
+  card: number; name?: string; vram_bytes?: number; free_bytes?: number; busy?: number; power_w?: number; temp_c?: number; queues?: number; queues_idle?: number; queue_bytes?: number
+  /** The figures this card's driver cannot give on this system ("busy", "power_w"), named so the page says so rather than show a dash. */
+  unreported?: string[]
+}
 export interface Fleet {
   version: string; uptime_s: number
   models: FleetModel[]; cards: FleetCard[]

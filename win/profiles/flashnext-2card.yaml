@@ -33,6 +33,9 @@
 #
 #   .\serve.ps1 flashnext-2card -Bus 3,9
 #   .\serve.ps1 flashnext-2card -Bus 3,9 -WhatIf     what it would set and run
+#   .\serve.ps1 flashnext-2card -Bus 3,9 -Env BRILLIANCE_TP2_PIPELINE=1
+#                                 the faster prefill of a long prompt, opt-in (SUPPORT.md,
+#                                 "Models and card counts": the steps it applies to)
 #   bin\radiance.exe --config profiles\flashnext-2card.yaml   (set HIP_VISIBLE_DEVICES to the two first)
 #
 # The model file: StillDeadcode/qwen3.8-next-flash-iqr-v4 on Hugging Face (revision 679c9432),
@@ -40,8 +43,9 @@
 # 25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0. Point `model:` at where it is.
 # The timeout below allows a 10-minute load.
 #
-# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices); rank 0 is the first
-# named. Without -Bus the first two discrete cards HIP shows are used and the rest stay visible,
+# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Rank 0 follows the
+# runtime's device order, not the order the cards are named in. Without -Bus the first two discrete
+# cards HIP shows are used and the rest stay visible,
 # which lowers the pin limit (SUPPORT.md, known issue 3); name the two. Cards talk
 # through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is off with more
 # than one card visible, so the KV cache is sized whole at load. Four cards with every expert on
@@ -69,8 +73,10 @@ models:
     checkpoint-slots: 8
     vision-tower-placement: ram
     # The drafting stack: up to 5 MTP drafts, coupled drafting, traversal verify, an
-    # adaptive depth that stops at 0.85 and backs off under load. Greedy output is unchanged; about 13%
-    # faster single-stream decode and 8% more eight-request throughput on two R9700s.
+    # adaptive depth that stops at 0.85 and backs off under load: about 13% faster single-stream
+    # decode and 8% more eight-request throughput on two R9700s. Its greedy text is that of a fixed
+    # depth of 3; against decoding without drafts it can differ where two tokens are almost tied,
+    # as it can when other requests share a step (SUPPORT.md, known issues 5 and 8).
     num-speculative-tokens: 5
     draft-coupling: on
     draft-verify: traversal

@@ -1,0 +1,66 @@
+# Brilliance profile: DeepSeek-V4.1-Flash-1017 (bakon3's uncensored RAD2 file: IQ1_S and IQ2_XXS
+# routed experts) on four Radeon AI PRO R9700s, tensor parallel (TP4), every routed expert on the
+# cards. A short-context baseline: 4,096 tokens, one request, a bf16 KV cache, plain decoding.
+# Runs, not yet qualified: it loads, serves plain completions and chat with thinking on and off,
+# and stops cleanly on Ctrl-Break. No soak, stop or concurrency checks have run on it.
+#
+# What the settings do:
+#   placement: expert_tiered      each rank's 96 routed experts a layer go to its card first; one that
+#                                 fits neither the card nor the rank's share of the host pool makes
+#                                 the load refuse (no --weights-disk-tier). On the test machine all
+#                                 3,840 expert units a rank fit the card (26.8 GiB), so the host pool
+#                                 held nothing.
+#   host-pool-mib: 16384          the pinned host pool for weights, 4 GiB a rank, for a card with
+#                                 less free VRAM. It is allocated whole at load, used or not.
+#   max-model-len: 4096           one sequence of 4,096 tokens: about 39 MiB of cache a card.
+#   max-num-batched-tokens: 512   prefill steps of up to 512 tokens.
+#   tp-wire: exact                the collectives carry exact bf16 through pinned host memory
+#   p2p: off                      (no peer-to-peer on Windows).
+#   num-speculative-tokens: 0     the file's built-in drafter (DSpark) is not loaded; no prompt lookup.
+#   ngram-placement: disk         the 103 GiB Engram table stays in the container's file mapping;
+#                                 each step reads the rows it needs from it on the host.
+#   deterministic: true           placement is fixed at load.
+#   kernels: libr4d,libref        the card kernels, and the reference library for the host-side
+#                                 rows (libavx has no rows for this model's new ops yet).
+#
+# Memory on the test machine: about 29.7 GiB of VRAM a card held, and about 21 GiB less host
+# memory available while it served (the pinned pool and mailboxes; the Engram table's pages are
+# file cache). The load read 140 GiB from the file and took about 30 s.
+#
+# The checkpoint states no sampling of its own: a request that sends no sampler fields is sampled at
+# temperature 1 over the whole vocabulary. Send temperature (and top_p) with each request.
+#
+#   .\serve.ps1 deepseek41-4card
+#   bin\radiance.exe --config profiles\deepseek41-4card.yaml
+#
+# The model file: bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad on Hugging Face,
+# deepseek-v4.1-flash-1017-uncensored.rad, 269,650,269,832 bytes (251.13 GiB), reassembled from the
+# repository's six parts. Point `model:` at where it is. The separate Q8_0 DSpark sidecar beside it
+# is not used.
+#
+# The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out. Rank 0
+# follows the runtime's device order, not the order the cards are named in.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 deepseek41-4card -Listen 0.0.0.0
+# -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+  kernels: libr4d,libref
+scheduler:
+  load-timeout: 600s
+models:
+  deepseek-v4.1-flash:
+    model: D:/models/hf/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad/deepseek-v4.1-flash-1017-uncensored.rad
+    tp: 4
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 16384
+    max-model-len: 4096
+    max-num-seqs: 1
+    max-num-batched-tokens: 512
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 0
+    ngram-placement: disk
+    deterministic: true

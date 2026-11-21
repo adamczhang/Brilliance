@@ -128,6 +128,19 @@ test runs it, and the first step below.
   write to that folder can run code as SYSTEM. On a machine others use, install from a package
   unpacked under `C:\Program Files`; `-Install` says so when it is not.
 
+## Moving a service to a new release
+
+**Not yet run in an elevated shell.** A service runs the `radiance.exe` it was installed from, so it
+keeps running that release until it is installed again from the new one; `-Install` refuses a name
+that is already installed. From alpha.4 to alpha.5 nothing changes in how the service's YAML is
+written or read: record what the service has, remove it, and install it again from the new folder,
+as steps 0-8 of the next section describe, reading alpha.4 for alpha.3 and alpha.5 for alpha.4
+(the `server:` lines and `api-key:` notes of step 2 do not apply: alpha.4 already installed the
+profile as it is). One difference: a profile whose name has a dot (`ltx-2.5-1card`) now gives a
+service named after the whole name (`Brilliance-ltx-2.5-1card`); alpha.4 cut it at the dot
+(`Brilliance-ltx-2`), so pass `-Name` with the old name to `-Uninstall` such a service. From
+alpha.3, follow the next section, installing alpha.5 where it says alpha.4.
+
 ## Moving an alpha.3 service to alpha.4
 
 **Not yet run in an elevated shell.** These steps follow how `-Install` and `-Uninstall` work in

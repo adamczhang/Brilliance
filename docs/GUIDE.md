@@ -767,8 +767,12 @@ rather than bringing it back.
 The fleet's state is at `GET /admin/fleet`, with each model's `state` (MULTIMODEL.md §8.1): a model
 that is not serving and waits for room is `waiting`, and its `waiting_for` names what for,
 `accelerator` (memory on its cards) or `host memory` (memory to pin). The dashboard shows it as
-"Waiting for room". `POST /admin/models/NAME/{load,park,unload,pin,unpin}` moves one model, and
-`POST /admin/reload` or SIGHUP re-reads the file: changed models reload,
+"Waiting for room". `POST /admin/models/NAME/{load,park,unload,pin,unpin}` moves one model.
+`load?hold=1` (Brilliance; the dashboard Sandbox's Start) also holds the model, once loaded, as a
+pin would, until an `unload` or `park` of it: a request for another model that needs its room is
+refused with 503, naming the hold, instead of moving it; `/admin/fleet` and `/v1/models` show
+`held: true` meanwhile, and a failed load or any unload ends the hold. `POST /admin/reload` or
+SIGHUP re-reads the file: changed models reload,
 removed ones leave, added ones register, and a `server:` or `cards:` change needs a restart.
 Without an api key these answer loopback callers only. Every model on one card runs its own queues
 beside the others (MULTIMODEL.md §9 has the measurement against taking turns).

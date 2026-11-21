@@ -184,14 +184,19 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     }
 
     /* ---- the static weights come off the top, as a floor ------------------------------------ */
+    /* Brilliance: the warning names what the weights want before the clamp. Clamped, it read
+     * "21.30 GiB of the 21.30 GiB" for LTX-2.5's 35 GiB (2026-11-20), and its expert clause
+     * applied to no dense model. */
+    const int64_t statics_want = b.statics;
     b.statics = std::min(b.statics, b.claimable);
     if (b.statics >= b.claimable && b.claimable > 0) {
         /* Not fatal: the planner demotes what does not fit and the model serves slowly. Warn so
          * the slowdown is explained at startup. */
         if (log) RAD_WARN("the static (non-expert) weights alone want %s of the %s this card can "
-                          "give, so every expert streams from host memory and the KV cache gets "
-                          "nothing; use more cards or a smaller --max-num-batched-tokens",
-                          humanb(b.statics).c_str(), humanb(b.claimable).c_str());
+                          "give, so %sthe KV cache gets nothing; use more cards or a smaller "
+                          "--max-num-batched-tokens",
+                          humanb(statics_want).c_str(), humanb(b.claimable).c_str(),
+                          b.expert_ceiling > 0 ? "every expert streams from host memory and " : "");
     }
     /* An explicit --placement layer_offload keeps one --max-model-len sequence's cache ahead of the
      * static weights: the planner spills the layers that no longer fit to the pinned host pool and
@@ -407,12 +412,20 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
 
     /* Resident weights that fill everything the card gives after the arena leave the cache
      * nothing; with experts the planner streams them instead, so this is a model whose fixed
-     * weights alone fill the card. */
-    if (cfg.vram_kv_mib <= 0 && kv_one > 0) {
+     * weights alone fill the card.
+     *
+     * Brilliance: also refused for a model without experts whose one sequence needs no cache
+     * (kv_one 0, a generator): there the static weights are all that filled the card. Such an
+     * empty share used to pass here only for Pools::configure to refuse it as a resolver that "did
+     * not run" (LTX-2.5 with its 14 GiB text encoder on a 32 GB card, 2026-11-20), which named
+     * neither the cause nor the fix. A split with experts and kv_one 0 is left as upstream has
+     * it. */
+    if (cfg.vram_kv_mib <= 0 && (kv_one > 0 || b.expert_ceiling == 0)) {
         b.report += fmt(
             "The KV cache gets nothing: the static weights take all %s the card can give after the "
             "activation arena (%s) and the fixed costs. Keep fewer weights on the card (--placement "
-            "layer_offload, the towers in host memory), shrink the arena (--max-num-batched-tokens; "
+            "layer_offload, or the encoder towers in host memory with --vision-tower-placement ram, "
+            "vision-tower-placement: ram in a profile), shrink the arena (--max-num-batched-tokens; "
             "an image generator's --image-gen-max-pixels and --image-gen-max-refs), or use another "
             "card.\n",
             humanb(b.claimable).c_str(), humanb(b.arena).c_str());

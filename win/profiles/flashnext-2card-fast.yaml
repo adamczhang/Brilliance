@@ -13,6 +13,9 @@
 # off baseline, within run-to-run variation.
 #
 #   .\serve.ps1 flashnext-2card-fast -Bus 3,9
+#   .\serve.ps1 flashnext-2card-fast -Bus 3,9 -Env BRILLIANCE_TP2_PIPELINE=1
+#                                 the faster prefill of a long prompt, opt-in (SUPPORT.md,
+#                                 "Models and card counts": the steps it applies to)
 # The launcher applies the directive below at startup. For a direct radiance.exe launch, set
 # BRILLIANCE_SDMA=1 in the process environment as well as selecting the two cards.
 # brilliance-env: BRILLIANCE_SDMA=1

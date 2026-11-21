@@ -106,7 +106,9 @@ README_ALLOWED_LINKS = {"RADIANCE-README.md", "LICENSE", "NOTICE", "docs/", "doc
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)")
 TICK_RE = re.compile(r"`([^`\n]+)`")
 VAR_RE = re.compile(r"\bBRILLIANCE_[A-Z0-9_]+\b")
-PROFILE_RE = re.compile(r"serve\.ps1\s+([a-z0-9][a-z0-9-]*)|profiles[/\x5c]([a-z0-9-]+)\.yaml")
+# A profile name may hold a dot (ltx-2.5-1card) but not end in one: "serve.ps1 x." ends a sentence.
+PROFILE_RE = re.compile(r"serve\.ps1\s+([a-z0-9](?:[a-z0-9-]|\.(?=[a-z0-9]))*)"
+                        r"|profiles[/\x5c]([a-z0-9][a-z0-9.-]*)\.yaml")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
 
@@ -234,7 +236,7 @@ def check_tick(root, doc, n, tok, rep):
 
 def code_vars(root):
     found = set()
-    for top in ("core", "libr4d", "win", "tools", "plugins", "kernels"):
+    for top in ("core", "libr4d", "win", "tools", "plugins", "kernels", "arch"):  # arch: model code reads switches too (BRILLIANCE_TP2_PIPELINE)
         base = os.path.join(root, top)
         for d, dirs, files in os.walk(base):
             dirs[:] = [x for x in dirs if x not in ("investigations", "licenses", "ffmpeg")]

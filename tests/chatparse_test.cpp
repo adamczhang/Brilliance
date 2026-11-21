@@ -1109,6 +1109,76 @@ static RadChatFormat qwen_abi() {
     return c;
 }
 
+/* Brilliance: the whole-reply grammar (a required call) and the parser agree on a call opener in
+ * the reasoning. The parser ends an open block at a break (Qwen's "<tool_call>\n"), so the grammar
+ * must not admit one inside a block that goes on to its close: such a reply was read as a call in
+ * the reasoning, the rest of the block as content beside a second call, and left the format
+ * (Qwen3.6-35B, 2026-11-20). What it admits, the parser reads strictly. Needs no fixtures. */
+TEST(a_required_call_grammar_ends_the_reasoning_where_the_parser_does) {
+    log_set_level(Log::Error);
+    RadChatFormat c = qwen_abi();
+    ChatFormat f;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &f, &why));
+    const std::string gp = "<|im_start|>assistant\n<think>\n";
+    const json tools = json::parse(R"([{"type":"function","function":{"name":"get_weather",
+      "parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}])");
+    ChatGrammarRequest gq;
+    gq.tools = &tools;
+    gq.generation_prompt = gp;
+    gq.extract_reasoning = true;
+    gq.require_call = true;
+    ChatGrammar g;
+    CHECK_OK(chat_format_grammar(f, gq, &g, &why));
+    REQUIRE(!g.lazy);
+    static const SimpleVocab vocab = [] {
+        SimpleVocab v;
+        for (int ch = 32; ch < 127; ++ch) v.add(std::string(1, (char)ch));
+        v.add("\n");
+        return v;
+    }();
+    auto admits = [&](const std::string& reply) {
+        std::unique_ptr<GbnfGrammar> gr;
+        std::string err;
+        if (GbnfGrammar::create(g.text, "root", &vocab, false, {}, {}, &gr, &err) < 0) return -1;
+        if (gr->accept_str(gp) < 0 || gr->accept_str(reply) < 0) return 0;
+        return gr->complete() ? 1 : 0;
+    };
+    ReplyOptions ro;
+    ro.tools = &tools;
+    ro.generation_prompt = gp;
+    const auto p = parser_of(f, ro);
+    REQUIRE(p != nullptr);
+    const std::string call =
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nPerth\n</parameter>\n</function>\n"
+        "</tool_call>";
+
+    /* The block closed, then the call; and the block left open, ended by the call. */
+    for (const std::string& reply : { "The weather in Perth.\n</think>\n\n" + call,
+                                      "The weather in Perth.\n" + call }) {
+        CHECK_EQ(admits(reply), 1);
+        bool strict = false;
+        const ReplyMessage m = reply_parse(*p, reply, &strict);
+        CHECK(strict);
+        REQUIRE(m.calls.size() == 1);
+        CHECK_EQ(m.calls[0].arguments, std::string("{\"city\":\"Perth\"}"));
+        CHECK_EQ(m.reasoning, std::string("The weather in Perth.\n"));
+        CHECK(m.content.empty());
+    }
+    /* The call written in the thinking, which then goes on and closes: refused at the text after
+     * the call, where the reply could only end. The parser reads it leniently. */
+    const std::string inside = "The call would be:\n" + call +
+                               "\nThat is the format.\n</think>\n\n" + call;
+    CHECK_EQ(admits(inside), 0);
+    bool strict = true;
+    const ReplyMessage m = reply_parse(*p, inside, &strict);
+    CHECK(!strict);
+    CHECK_EQ(m.calls.size(), (size_t)2);
+    /* A mention of a tag that is not the opener stays in the reasoning. */
+    CHECK_EQ(admits("Write <function=get_weather> in a <tool_call>.\n</think>\n\n" + call), 1);
+    log_set_level(Log::Warn);
+}
+
 /* Where the reply starts relative to its reasoning block, read from the generation prompt as the
  * stream reads it: opened, opened and closed (thinking off), or not opened, with markers trimmed of
  * optional whitespace. The engine counts and closes the block by these, so a reply reported open

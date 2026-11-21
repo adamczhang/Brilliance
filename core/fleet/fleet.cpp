@@ -174,13 +174,22 @@ void card_telemetry(int card, json& o) {
     const std::string bdf = dev_pci_address(card);
     if (bdf.empty()) return;
 #if defined(_WIN32)
-    /* Brilliance: no sysfs on Windows. The graphics kernel's adapter data gives the temperature
-     * (os::gpu_samples, win/os/gpu_win32.cpp). Busy and watts are left out rather than shown wrong:
-     * Windows' engine accounting reads 0% for a working HIP kernel, and it reports power only as a
-     * share of a rating it does not name. */
+    /* Brilliance: no sysfs on Windows. os::gpu_samples (win/os/gpu_win32.cpp) reads the same
+     * firmware metrics through AMD's ADL where the driver installs it -- busy, board power, the
+     * junction temperature -- and the graphics kernel's temperature elsewhere. What it cannot read
+     * is left out rather than shown wrong (Windows' engine accounting reads 0% for a working HIP
+     * kernel), and `unreported` names it so the page can say so instead of showing a dash. */
     const std::vector<std::string> want{ bdf };
-    for (const os::GpuSample& g : os::gpu_samples(&want))
+    bool busy = false, power = false;
+    for (const os::GpuSample& g : os::gpu_samples(&want)) {
         if (g.temp_c >= 0) o["temp_c"] = g.temp_c;
+        if (g.busy >= 0) { o["busy"] = g.busy; busy = true; }
+        if (g.power_w >= 0) { o["power_w"] = g.power_w; power = true; }
+    }
+    json none = json::array();
+    if (!busy) none.push_back("busy");
+    if (!power) none.push_back("power_w");
+    if (!none.empty()) o["unreported"] = std::move(none);
 #else
     const std::string dev = "/sys/bus/pci/devices/" + bdf;
     if (const double busy = sysfs_number(dev + "/gpu_busy_percent"); busy >= 0) o["busy"] = busy / 100.0;
@@ -348,6 +357,12 @@ private:
         /* Loaded by the warm-up and named by no request since (§8.6): its load takes room only
          * from free memory and other such models, and gives up quietly where there is none. */
         std::atomic<bool>                  warm{ false };
+        /* Brilliance: held by an admin load with ?hold=1 (the dashboard's Sandbox Start) until an
+         * admin unload or park (its Stop): it stays as a pinned model does, so a plain request for
+         * another model cannot evict it. A failed load or any unload ends the hold. */
+        std::atomic<bool>                  held{ false };
+        /* Pinned in the file or held: another model's demand does not move it. */
+        bool kept() const { return entry.pin || held.load(); }
         uint64_t                           warm_uses = 0;      /* its uses (leases) when the warm-up began it */
         /* Between its engine's creation and its grant: a load waiting for the bring-up lock that
          * a granting load holds, so never something that grant may wait for. */
@@ -378,6 +393,9 @@ private:
         uint64_t    yield_ns = 0;         /* when it was last asked to yield */
         int64_t     loads = 0, unloads = 0, failures = 0, parks = 0, restores = 0;
         std::string error;
+        /* Brilliance: why the fleet's grant last refused this model's load (under mu_), so the
+         * failure a caller is told names it rather than "out of memory (see the log)". */
+        std::string room_why;
         bool        resident = false;    /* serving */
         bool        parked = false;      /* held, with part or all of it off the cards */
         std::map<int, int64_t> out;      /* parked: bytes off each card */
@@ -687,7 +705,7 @@ std::vector<Resident> Fleet::residents(const Model* except) {
         r.charge = r.charges.empty() ? 0 : r.charges[0];
         r.parked = m.parked;
         r.priority = m.entry.priority;
-        r.pin = m.entry.pin;
+        r.pin = m.kept();   /* Brilliance: a held model stays as a pinned one does */
         r.busy = a.leases > 0 || a.waiting > 0;
         r.keep = in_quantum(m, a, now);
         r.idle_s = a.last_used_ns && now > a.last_used_ns ? (double)(now - a.last_used_ns) * 1e-9 : 0;
@@ -988,6 +1006,13 @@ int Fleet::make_room(Model& m, const std::map<int, int64_t>& need, std::string* 
         return sh;
     };
     std::vector<size_t> forced = exclusive_victims(m);
+    /* Brilliance: an exclusive partner that is held does not leave for this one. */
+    for (size_t v : forced)
+        if (models_[v]->held.load()) {
+            *why = models_[v]->entry.name + " shares an exclusive group with it and is held by an "
+                   "admin load until it is unloaded";
+            return RAD_E_NOMEM;
+        }
     /* A warm load (§8.6) displaces only other warm models: a model a request has used stays. */
     const bool warm = m.warm.load();
     if (warm)
@@ -1012,8 +1037,11 @@ int Fleet::make_room(Model& m, const std::map<int, int64_t>& need, std::string* 
                        &plan, &w, &need)) {
             std::string staying;
             for (const Resident& r : res)
-                if (r.pin || r.keep || r.priority > m.entry.priority)
+                if (r.pin || r.keep || r.priority > m.entry.priority) {
                     staying += (staying.empty() ? "" : ", ") + models_[r.id]->entry.name;
+                    /* Brilliance: say why, so the refused caller knows what ends it. */
+                    if (models_[r.id]->held.load()) staying += " (held by an admin load until it is unloaded)";
+                }
             *why = "it needs " + std::to_string((worst + kMiB - 1) / kMiB) + " MiB on card(s) " +
                    cards_str(cards) + " and that much cannot be made free there" +
                    (staying.empty() ? std::string() : "; staying: " + staying);
@@ -1097,7 +1125,7 @@ int Fleet::make_room(Model& m, const std::map<int, int64_t>& need, std::string* 
 }
 
 bool Fleet::in_quantum(const Model& m, const server::Front::Activity& a, uint64_t now) const {
-    if (m.parked || !m.resident || !m.engine || m.entry.pin) return false;
+    if (m.parked || !m.resident || !m.engine || m.kept()) return false;
     /* A job with no open request (a video) cannot be parked mid-way, and unloading throws away
      * what it has done, minutes of work: the model stays until the job ends. */
     if (m.engine->background_jobs() > 0) return true;
@@ -1296,6 +1324,7 @@ int Fleet::park(Model& m, const std::map<int, int64_t>& want, const std::string&
 void Fleet::unload(Model& m, int64_t drain_ms, const std::string& why) {
     std::lock_guard<std::recursive_mutex> room(room_mu_);
     join_spill(m);
+    m.held.store(false);   /* Brilliance: any unload ends a hold (the Sandbox's Stop is one) */
     if (!m.engine) return;
     const auto t0 = std::chrono::steady_clock::now();
     RAD_INFO("model %s: unloading: %s", m.entry.name.c_str(), why.c_str());
@@ -1614,7 +1643,7 @@ bool Fleet::make_host_room(int64_t need, const Model* keep, bool force, bool unl
         const uint64_t now = rad_mono_ns();
         std::vector<Model*> idle, busy;
         for (auto& m : models_) {
-            if (m.get() == keep || !m->engine || m->parked || !m->resident || m->entry.pin ||
+            if (m.get() == keep || !m->engine || m->parked || !m->resident || m->kept() ||
                 m->op.load() != kIdle || (keep && m->entry.priority > keep->entry.priority))
                 continue;
             const auto a = front_.activity(m->entry.name);
@@ -1660,6 +1689,8 @@ int Fleet::grant(Model& m, const VramAsk& ask, int64_t* grant, std::string* why)
         if (claim < ask.need) {
             *why = "gpu-memory-mib " + std::to_string(cfg.gpu_memory_mib) + " is below the " +
                    std::to_string((ask.need + kMiB - 1) / kMiB) + " MiB it needs";
+            std::lock_guard<std::mutex> lk(mu_);
+            m.room_why = *why;   /* Brilliance: for load_op's failure */
             return RAD_E_NOMEM;
         }
     } else {
@@ -1696,6 +1727,7 @@ int Fleet::grant(Model& m, const VramAsk& ask, int64_t* grant, std::string* why)
     if (eng) eng->bringup_resume();
     if (wrc < 0) {
         std::lock_guard<std::mutex> lk(mu_);
+        m.room_why = *why;   /* Brilliance: for load_op's failure */
         for (const Reservation& r : reserved_)
             if (r.m != &m && r.claim > 0 && r.m->starting.load() && touches(r.cards, need))
                 m.room_retry.store(true);
@@ -1706,6 +1738,7 @@ int Fleet::grant(Model& m, const VramAsk& ask, int64_t* grant, std::string* why)
 }
 
 void Fleet::fail(Model& m, const std::string& why) {
+    m.held.store(false);   /* Brilliance: a load that failed holds nothing */
     /* A warm load that finds no room is not a failure: nobody asked for the model yet. */
     if (m.warm.exchange(false)) {
         {
@@ -1923,6 +1956,10 @@ void Fleet::restore_op(Model& m) {
 void Fleet::load_op(Model& m) {
     const std::string name = m.entry.name;
     const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        m.room_why.clear();   /* Brilliance: this load's refusal only */
+    }
     front_.loading(name);
     Config cfg = m.entry.cfg;
     if (cfg.proceed_incompatible) Engine::print_unsupported_banner();
@@ -2078,7 +2115,15 @@ void Fleet::load_op(Model& m) {
             demand(name);
             return;
         }
-        fail(m, std::string("startup failed with ") + rad_strerror(s) + " (see the log)");
+        /* Brilliance: a load the fleet found no room for says why (a pinned or held model
+         * staying, say); the operator reads it in the 503, a stranger does not (Front::lease). */
+        std::string room;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            room = m.room_why;
+        }
+        if (s == RAD_E_NOMEM && !room.empty()) fail(m, "the fleet has no room for it: " + room);
+        else fail(m, std::string("startup failed with ") + rad_strerror(s) + " (see the log)");
         return;
     }
     m.room_retries = 0;
@@ -2281,7 +2326,7 @@ void Fleet::xflex_tick() {
         for (auto& op : models_) {
             Model& o = *op;
             if (&o == &m || !o.engine || o.parked || !o.resident || o.op.load() != kIdle) continue;
-            if (o.entry.pin || o.entry.priority > m.entry.priority) continue;
+            if (o.kept() || o.entry.priority > m.entry.priority) continue;
             if (o.entry.park.ram == ParkSpec::Ram::Never) continue;
             if (std::find(partners.begin(), partners.end(), o.entry.name) != partners.end()) continue;
             if (o.yield_ns && now - o.yield_ns < 60000000000ull) continue;
@@ -2373,7 +2418,7 @@ void Fleet::ttl_tick() {
     const uint64_t now = rad_mono_ns();
     for (auto& mp : models_) {
         Model& m = *mp;
-        if (!m.engine || m.parked || m.entry.pin || m.entry.ttl_ms <= 0 || m.op.load() != kIdle) continue;
+        if (!m.engine || m.parked || m.kept() || m.entry.ttl_ms <= 0 || m.op.load() != kIdle) continue;
         const server::Front::Activity a = front_.activity(m.entry.name);
         if (a.leases > 0 || a.waiting > 0 || !a.last_used_ns ||
             (m.engine && m.engine->background_jobs() > 0)) continue;
@@ -2461,6 +2506,7 @@ std::string Fleet::describe(const std::string& name) {
         json j;
         j["priority"] = m.entry.priority;
         j["pinned"] = m.entry.pin;
+        if (m.held.load()) j["held"] = true;   /* Brilliance: ?hold=1 */
         j["tp"] = m.entry.cfg.tp;
         if (m.resident || m.parked) {
             j["cards"] = m.cards;
@@ -2805,6 +2851,12 @@ void Fleet::add_routes() {
         for (const std::string& n : front_.names()) known |= n == name;
         if (!known) return bad(q, 404, "no model '" + name + "' is configured");
         if (action == "load") {
+            /* Brilliance: ?hold=1 holds the model, once loaded, against other models' demand
+             * until an admin unload or park ends it (the Sandbox's Start and Stop). */
+            if (q.query.count("hold") && q.query.at("hold") == "1") {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (Model* m = find(name)) m->held.store(true);
+            }
             demand(name);
             /* Waits for the load unless ?wait=0. */
             if (q.query.count("wait") && q.query.at("wait") == "0")
@@ -2827,6 +2879,7 @@ void Fleet::add_routes() {
             const bool unl = action == "unload";
             const auto r = run_cmd([this, name, unl] {
                 Model* m = find(name);
+                if (m) m->held.store(false);   /* Brilliance: Stop ends a hold even before the load lands */
                 if (!m || !m->engine) return std::string(unl ? "" : "not loaded");
                 if (m->entry.pin) return std::string("pinned");
                 for (int i = 0; i < 6000 && m->op.load() != kIdle; ++i)
@@ -2835,7 +2888,10 @@ void Fleet::add_routes() {
                 if (!m->op.compare_exchange_strong(expect, unl ? kUnload : kEvict)) return std::string("busy");
                 std::string res;
                 if (unl) unload(*m, fc_.drain_timeout_ms, "asked by the admin route");
-                else if (!m->parked && park(*m, {}, "asked by the admin route") < 0) res = "could not park (see the log)";
+                else {
+                    m->held.store(false);   /* Brilliance: an asked-for park ends a hold too */
+                    if (!m->parked && park(*m, {}, "asked by the admin route") < 0) res = "could not park (see the log)";
+                }
                 m->op.store(kIdle);
                 return res;
             }, fc_.drain_timeout_ms + 120000);

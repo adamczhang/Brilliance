@@ -33,6 +33,8 @@
 
   Re-running resumes: a file whose local size matches the listing is skipped, and a short one of the
   version being fetched is continued with `curl -C -` and, once whole, checked against its LFS sha256.
+  Within a run, a transfer that fails is tried again up to five times, 5 s apart, each try a new
+  curl that resumes at the partial file's length (curl's own --retry asked for byte 0 again).
 
   A CHANGED FILE IS FETCHED AGAIN WHOLE, at any size: a complete run records each file's content key
   (the LFS sha256, or the size for a small file) in <dest>\.hfget-manifest, written only when every
@@ -409,14 +411,52 @@ foreach ($p in $stale) {
 Set-Content -LiteralPath $manTmp -Value $null -Encoding ASCII
 $running = New-Object System.Collections.Generic.List[object]
 
+# TRIES WITHIN A RUN RESUME TOO. curl's own --retry with -C - takes the offset once, when curl
+# starts, and asked every retry for the file from byte 0 (seen 2026-11-20: six tries, no Range), so
+# a flaky link lost a big file's progress inside one run. Each try here is a curl of its own with
+# -C -, which reads the partial file's length as it starts: one try and five more, 5 s apart, as
+# curl's --retry 5 --retry-delay 5 --retry-all-errors were.
+$tries = 6
+$retryDelay = 5
+function Start-Curl($job) {
+  # One command line, quoted here: ProcessStartInfo takes the arguments as a single string. The
+  # token goes on stdin (-K -), never here.
+  $cargs = @('-sSL', '--fail', '-C', '-')
+  if ($curlCfg) { $cargs += @('-K', '-') }
+  $cargs += @('-o', "`"$($job.Local)`"", "`"$($job.Url)`"")
+  # Not Start-Process: it cannot hand the child a pipe for stdin. The console and the standard
+  # output and error are inherited, as -NoNewWindow did.
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = $curl
+  $psi.Arguments = $cargs -join ' '
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardInput = [bool]$curlCfg
+  $proc = [System.Diagnostics.Process]::Start($psi)
+  if ($curlCfg) {
+    # A curl that has already died is reported by its exit status in Finish-One.
+    try { $proc.StandardInput.Write($curlCfg); $proc.StandardInput.Close() } catch { }
+  }
+  $job.Proc = $proc
+  $job.Try++
+}
+
+# $false when the job was started again (a failed try with tries left and the file still short),
+# $true when it is finished, kept or failed.
 function Finish-One($job) {
   $job.Proc.WaitForExit()
   $e = $job.Entry
   $got = if (Test-Path -LiteralPath $job.Local -PathType Leaf) { (Get-Item -LiteralPath $job.Local).Length } else { -1 }
+  if ($job.Proc.ExitCode -ne 0 -and $got -lt $e.Size -and $job.Try -lt $tries) {
+    $from = [Math]::Max([int64]0, $got)
+    [Console]::Error.WriteLine("hfget: $($e.Path): curl exit $($job.Proc.ExitCode) at byte $from of $($e.Size); try $($job.Try + 1) of $tries resumes there in $retryDelay s")
+    Start-Sleep -Seconds $retryDelay
+    Start-Curl $job
+    return $false
+  }
   if ($job.Proc.ExitCode -ne 0 -or $got -ne $e.Size) {
-    [Console]::Error.WriteLine("hfget: $($e.Path) is $got bytes, listing says $($e.Size) (curl exit $($job.Proc.ExitCode))")
+    [Console]::Error.WriteLine("hfget: $($e.Path) is $got bytes, listing says $($e.Size) (curl exit $($job.Proc.ExitCode), try $($job.Try) of $tries)")
     $script:failed = $true
-    return
+    return $true
   }
   # Every LFS file is checked against the sha256 the listing claims before it is kept: the size
   # alone would take a swapped file at the same length, and a resumed one at a spliced length. A
@@ -427,11 +467,20 @@ function Finish-One($job) {
       [Console]::Error.WriteLine("hfget: $($e.Path) hashes to $got, the listing claims $($e.Sha)")
       try { Remove-Item -LiteralPath $job.Local -Force -ErrorAction Stop } catch { }
       $script:failed = $true
-      return
+      return $true
     }
   }
   Add-Content -LiteralPath $manTmp -Value ("{0}`t{1}" -f $e.Key, $e.Path) -Encoding ASCII
   Add-Progress 'done' $e
+  return $true
+}
+
+# A job that has exited is finished or started again; with none, a short wait.
+function Reap-One {
+  $done = $null
+  foreach ($j in $running) { if ($j.Proc.HasExited) { $done = $j; break } }
+  if (-not $done) { Start-Sleep -Milliseconds 200; return }
+  if (Finish-One $done) { [void]$running.Remove($done) }
 }
 
 foreach ($p in $work) {
@@ -449,31 +498,12 @@ foreach ($p in $work) {
   Add-Progress 'part' $e
   [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($p.Local))
   $url = "$hub/$Repo/resolve/$at/$($e.Path)"
-  # One command line, quoted here: ProcessStartInfo takes the arguments as a single string. The
-  # token goes on stdin (-K -), never here.
-  $cargs = @('-sSL', '--fail', '--retry', '5', '--retry-delay', '5', '--retry-all-errors', '-C', '-')
-  if ($curlCfg) { $cargs += @('-K', '-') }
-  $cargs += @('-o', "`"$($p.Local)`"", "`"$url`"")
-  while ($running.Count -ge $jobs) {
-    $done = $null
-    foreach ($j in $running) { if ($j.Proc.HasExited) { $done = $j; break } }
-    if ($done) { Finish-One $done; [void]$running.Remove($done) } else { Start-Sleep -Milliseconds 200 }
-  }
-  # Not Start-Process: it cannot hand the child a pipe for stdin. The console and the standard
-  # output and error are inherited, as -NoNewWindow did.
-  $psi = New-Object System.Diagnostics.ProcessStartInfo
-  $psi.FileName = $curl
-  $psi.Arguments = $cargs -join ' '
-  $psi.UseShellExecute = $false
-  $psi.RedirectStandardInput = [bool]$curlCfg
-  $proc = [System.Diagnostics.Process]::Start($psi)
-  if ($curlCfg) {
-    # A curl that has already died is reported by its exit status in Finish-One.
-    try { $proc.StandardInput.Write($curlCfg); $proc.StandardInput.Close() } catch { }
-  }
-  $running.Add([pscustomobject]@{ Proc = $proc; Entry = $e; Local = $p.Local; Resumed = ($p.Act -eq 'resume') })
+  while ($running.Count -ge $jobs) { Reap-One }
+  $job = [pscustomobject]@{ Proc = $null; Entry = $e; Local = $p.Local; Url = $url; Try = 0; Resumed = ($p.Act -eq 'resume') }
+  Start-Curl $job
+  $running.Add($job)
 }
-foreach ($j in $running.ToArray()) { Finish-One $j; [void]$running.Remove($j) }
+while ($running.Count -gt 0) { Reap-One }
 
 if ($failed) {
   Remove-Item -LiteralPath $manTmp -Force

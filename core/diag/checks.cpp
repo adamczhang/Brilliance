@@ -401,6 +401,13 @@ void check_engine(const Facts& f, const RunFacts& r, std::vector<Finding>* out) 
             "is bounded by the link; decode reads the ones it routes to",
             "more VRAM for the experts: a shorter --max-model-len or fewer --max-num-seqs, "
             "--embedding-placement ram, --kv-cache-dtype i8, or more cards (--tp)");
+    if (r.ram_weight_bytes > 0)
+        add(out, Finding::Note, "experts-from-ram",
+            fmt("%s of routed experts a rank are held in ordinary RAM (--expert-ram-mib) and "
+                "copied to the card through pinned memory when a step routes to them",
+                humanb(r.ram_weight_bytes).c_str()),
+            "a step waits for those copies out of RAM; nothing is read from the disk for them",
+            "more VRAM or --host-pool-mib for the experts, or more cards (--tp)");
     if (r.file_weight_bytes > 0)
         add(out, Finding::Warn, "weights-from-disk",
             fmt("%s of weights a rank are read from the container on disk as they are needed",

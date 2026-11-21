@@ -843,6 +843,12 @@ int Builder::op_declared(const char* op) const {
     return op && reg_.schema(op) ? 1 : 0;
 }
 
+int Builder::device_p2p() const {
+    long long value = -1;
+    if (!reg_.device_fact(RAD_FACT_P2P, &value) || (value != 0 && value != 1)) return -1;
+    return (int)value;
+}
+
 int Builder::op_resolved(rad_op h) const {
     if (h == 0 || h >= prog_.ops.size()) return 0;
     const OpInfo& o = prog_.ops[h];
@@ -2801,6 +2807,10 @@ int rad_op_resolved(RadBuilder* b, rad_op h) {
 int rad_op_declared(RadBuilder* b, const char* op) {
     if (!b) return 0;
     return B(b)->op_declared(op);
+}
+
+int rad_build_device_p2p(RadBuilder* b) {
+    return b ? B(b)->device_p2p() : -1;
 }
 
 int rad_op_reads(RadBuilder* b, rad_op h, const rad_buf* bufs, int n) {

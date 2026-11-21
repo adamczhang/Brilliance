@@ -88,6 +88,7 @@
 
 #include <deque>
 #include <map>
+#include <string>
 #include <vector>
 
 namespace rad {
@@ -214,6 +215,23 @@ private:
     void retire(Place& p);
 };
 
+/* Brilliance: whether a routed layer's counts, as the file stager copied them back at its
+ * trigger, may decide which of its file-tier experts are read. "" when they may; otherwise why
+ * not, and the stager reads the layer whole instead (FileStager::route_fallbacks counts it).
+ *
+ *   `n`        how many counts the source gave; `n_local` the layer's experts on this rank (the
+ *              plan's highest expert number plus one). The counts are indexed by the rank's local
+ *              expert slot, as the plan's units are (Ctx::route_counts_device), so a source
+ *              giving the model's global count, or any other, would index the wrong experts.
+ *   `rows`     the pass's tokens; `top_k` the experts each routes to (0 when unknown). Across
+ *              the ranks a token has top_k routed destinations, and this rank owns from none to
+ *              all of them, so the local sum lies in [0, rows * top_k]: zero (no local routes)
+ *              and any skew between experts are valid, a negative count or a larger sum is not.
+ *              The bound is the pass's, not the rank's share: a per-rank equality check fell back
+ *              to whole-layer reads on every TP2 step in Brilliance 0.2.2. */
+std::string route_counts_check(const int32_t* c, int64_t n, int64_t n_local, int64_t rows,
+                               int64_t top_k);
+
 /* ---- the file stager: routed layers read from the container -------------------------------------
  *
  * A routed unit on the file tier (--weights-disk-tier) has no address of its own, and a grouped
@@ -306,6 +324,8 @@ public:
      * or 0 when every pass is read exactly (no routing source, or the model's top-k unknown). */
     int64_t whole_rows() const { return whole_rows_; }
     static constexpr int64_t kWholeRows = 64;
+    /* Brilliance: reads that took the layer whole because its counts failed route_counts_check. */
+    int64_t route_fallbacks() const { return route_fallbacks_; }
 
     bool begin_pass(const RadBatch* b) override;
     int  before_op(rad_op h, RadStream s, bool* resync) override;
@@ -343,6 +363,12 @@ private:
     std::map<int32_t, int32_t> pass_last_;   /* by draft_pass: the last op such a pass issued */
     int64_t  whole_rows_ = 0;
     bool     whole_ = false;                 /* this pass reads every layer whole (whole_rows) */
+    /* Brilliance: route_counts_check's inputs and its tally. */
+    std::vector<int64_t> n_local_;           /* by layers_ index: the layer's experts on this rank */
+    int64_t  rows_ = 0;                      /* the pass's tokens */
+    int64_t  top_k_ = 0;
+    int64_t  route_fallbacks_ = 0;
+    bool     route_noted_ = false;
 
     bool will_issue(int32_t li) const;
     /* Whether layer `li` is read with counts, at its own trigger; otherwise it is read whole,

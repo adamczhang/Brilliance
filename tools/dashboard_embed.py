@@ -87,7 +87,9 @@ def write():
     page = open(os.path.join(DASH, "dist", "index.html"), encoding="utf-8").read()
     # The licences of what the page bundles, as the build listed them, go where the header goes.
     notices = open(os.path.join(DASH, "dist", "THIRD-PARTY-LICENSES.txt"), encoding="utf-8").read()
-    with open(os.path.join(DASH, "THIRD-PARTY-LICENSES.txt"), "w", encoding="utf-8") as f:
+    # Brilliance: newline="\n" on both writes, so Windows writes LF as Linux does and the header
+    # keeps the committed bytes (tests/ARTIFACTS hashes them); text mode would write CRLF there.
+    with open(os.path.join(DASH, "THIRD-PARTY-LICENSES.txt"), "w", encoding="utf-8", newline="\n") as f:
         f.write(notices)
     if ")" + DELIM + '"' in page:
         sys.exit("the page contains the raw string's closing delimiter")
@@ -95,7 +97,7 @@ def write():
     step = 12000
     parts = [page[i:i + step] for i in range(0, len(page), step)]
     body = "\n".join('R"%s(%s)%s"' % (DELIM, p, DELIM) for p in parts)
-    with open(HEADER, "w", encoding="utf-8") as f:
+    with open(HEADER, "w", encoding="utf-8", newline="\n") as f:
         f.write("""/* core/server/dashboard_page.h -- the dashboard's page: one document with its script, style and
  * type inlined, so the engine serves it from memory with no asset directory and no fetch from
  * another origin (it runs on machines with no route to one).

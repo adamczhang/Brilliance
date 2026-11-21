@@ -1363,6 +1363,13 @@ TEST(op_vocabulary) {
         "position_scale", "embed_attn", "ministral_rope", "pixtral_rope", "pixtral_merge",
         /* LiLiCorr's candidate correlator (Nemotron-3.5-Bolt's drafter). */
         "lili_cand", "lili_attn", "lili_factor", "lili_walk",
+        /* DeepSeek-V4.1's text ops (arch/deepseek41): mHC's split halves, scored routing, the
+         * sparse latent attention and its indexer, block-scaled cache entries, Engram's lookups and
+         * llama.cpp's blocks. */
+        "mhc_mix", "mhc_collapse", "router_scored_topk", "ds41_rope_rows", "quant_roundtrip",
+        "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk",
+        "entry_store", "token_map", "stream_gate_add", "embed_lookup_planes", "gemm_nt_ggml",
+        "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -10715,6 +10722,41 @@ std::vector<Geo> geometries() {
                                                .d("route_scale", 2.5).s("dtype", "f32")),
         G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                          .d("route_scale", 2.5).s("dtype", "f32")),
+        /* DeepSeek-V4.1's text ops. */
+        G("mhc_mix", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("iterations", 20).d("eps", 1e-5)
+                             .d("hc_eps", 1e-6).s("dtype", "f32")),
+        G("mhc_collapse", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
+        G("router_scored_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
+                                        .d("route_scale", 1.5).s("score", "sqrtsoftplus")
+                                        .s("dtype", "f32")),
+        G("ds41_rope_rows", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 8).i("rot", 4)
+                                    .i("off", 4).s("mode", "gptj").i("inverse", 0)
+                                    .s("dtype", "f32")),
+        G("quant_roundtrip", "M", 3, a.i("M", R).i("n", 64).i("block", 32).s("format", "fp8_e4m3")
+                                     .s("scale", "ue8m0").s("dtype", "f32")),
+        G("softmax_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "f32")),
+        G("attn_sparse_sink", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("window", 4)
+                                      .i("ratio", 4).i("topk", 2).d("scale", 0.35)
+                                      .s("dtype", "f32")),
+        G("index_score", "M", 3, a.i("M", R).i("heads", 2).i("dim", 8).i("ratio", 4).i("width", 6)
+                                 .d("wscale", 0.5).s("dtype", "f32")),
+        G("index_candidates", "M", 3, a.i("M", R).i("width", 16).i("block", 4).i("topk_blocks", 2)
+                                      .i("ratio", 4)),
+        G("index_topk", "M", 3, a.i("M", R).i("width", 16).i("topk", 4).i("ratio", 4)),
+        G("entry_store", "M", 3, a.i("M", R).i("n", 8).i("block_size", 4).s("dtype", "f32")),
+        G("token_map", "M", 3, a.i("M", R).i("n_vocab", 20)),
+        G("stream_gate_add", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).d("eps", 1e-6)
+                                     .d("gate_eps", 1e-6).s("dtype", "f32")),
+        G("embed_lookup_planes", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20).i("group", 4)
+                                         .s("dtype", "f32")),
+        G("gemm_nt_ggml", "M", 3, a.i("M", R).i("N", 20).i("K", 64).s("type", "q8_0")
+                                  .s("dtype", "f32")),
+        G("moe_gemm_ggml", "M", 3, a.i("M", R).i("N", 16).i("K", 64).i("n_expert", 4).i("top_k", 2)
+                                   .s("a_order", "token").s("type", "q8_0").s("dtype", "f32")),
+        G("logits_gemm_ggml", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 64)
+                                      .s("type", "q8_0").s("dtype", "f32")),
+        G("embed_lookup_ggml", "M", 3, a.i("M", R).i("n_embd", 64).i("n_vocab", 20)
+                                       .s("type", "q8_0").s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
                             .s("dtype", "f32")),
         G("conv_t1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("stride", 2).s("dtype", "f32")),

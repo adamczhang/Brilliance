@@ -10,8 +10,9 @@
 # 27.58 GiB (29,618,270,208 bytes), SHA-256
 # 474cb9fc49714a56455a26c0ab3049bd029dc1abae31e4eb9cc66026f0edf04d. Point `model:` at where it is.
 #
-# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices); rank 0 is the first
-# named. Without -Bus the first two discrete cards HIP shows are used and the rest stay visible,
+# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Rank 0 follows the
+# runtime's device order, not the order the cards are named in. Without -Bus the first two discrete
+# cards HIP shows are used and the rest stay visible,
 # which lowers the pin limit (SUPPORT.md, known issue 3); name the two. Cards talk
 # through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is off with more
 # than one card visible, so the KV cache is sized whole at load.

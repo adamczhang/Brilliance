@@ -320,6 +320,7 @@ std::string to_json(const std::vector<ConfigRow>& config, const std::vector<Deci
     run["pinned_bytes"] = r.pinned_bytes;
     run["host_weight_bytes"] = r.host_weight_bytes;
     run["file_weight_bytes"] = r.file_weight_bytes;
+    run["ram_weight_bytes"] = r.ram_weight_bytes;
     o["hardware"] = { { "host", std::move(host) }, { "cards", std::move(cards) }, { "run", std::move(run) } };
     J fs = J::array();
     for (const Finding& x : findings)

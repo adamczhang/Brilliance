@@ -1,9 +1,9 @@
-# Brilliance 0.3.0-alpha.4 for Windows
+# Brilliance 0.3.0-alpha.5 for Windows
 
 A Windows build of [Radiance](https://codeberg.org/StillDeadcode/radiance) 2.2 on its native HIP
-backend, qualified on **one Radeon AI PRO R9700** with **Qwen3.8-27B IQ4R-L-V4**. This is an alpha
-preview of Brilliance 0.3.0: one qualified card count and model, more that run soak-clean or
-supported (`SUPPORT.md`), and the limits below. Expect rough edges.
+backend, for **Radeon AI PRO R9700** cards. This is an alpha preview of Brilliance 0.3.0: some
+models are qualified on one card and one on two, more run soak-clean, supported or not yet
+qualified (`SUPPORT.md` has the table), and the limits below apply. Expect rough edges.
 
 ## How you use it
 
@@ -13,7 +13,11 @@ supported (`SUPPORT.md`), and the limits below. Expect rough edges.
 - **Its dashboard, at `http://<host>:<port>/` in a browser, is for watching it:** each model's
   Monitoring tab has its speed, requests, sessions and details. A model's **Sandbox** tab is for a
   quick check that the model works: Start and Stop load and unload it (from a browser on the
-  server's own machine), and a plain chat box streams its replies. It keeps nothing.
+  server's own machine), and a plain chat box streams its replies. It keeps nothing. Start holds the
+  model until Stop: a request for another model that needs its cards is refused meanwhile, rather
+  than moving it. From another
+  machine, a server without an API key shows every model's own pages and Sandbox (not the
+  overview), and its chat works with a model that is loaded.
 - **For everyday chat in a browser, use Open WebUI; for coding, OpenCode.** Both connect as in
   "Connecting a client", below.
 
@@ -205,8 +209,8 @@ The profile is not edited, and its `model:` line is not read.
   destination and each file's size in bytes.
 - The destination is `<dir>\<owner>\<repo>`. `<dir>` is `-ModelDir` if given, else
   `BRILLIANCE_HF_CACHE`, else `%LOCALAPPDATA%\radiance\hf`.
-- A whole copy is kept with no transfer. A cut transfer resumes when the command runs again. Each
-  file is checked against its SHA-256 before it is kept, and the server is given the verified file.
+- A whole copy is kept with no transfer. A cut transfer is tried again from where it stopped, up to
+  six times, and resumes when the command runs again. Each file is checked against its SHA-256 before it is kept, and the server is given the verified file.
 - With no network, a copy a complete fetch left is served, and the output says so.
 - `-Model <path>` serves a file you fetched yourself the same way. In a profile of several models,
   `-ModelName` says which one.
@@ -302,7 +306,7 @@ and agents have not been checked; one that lets you set the base URL and model n
 
 Report bugs and ask questions about this Windows build in the issue tracker of
 github.com/adamczhang/Brilliance, after checking `SUPPORT.md`'s known issues. Include the release
-(`0.3.0-alpha.4`, or the commit in `MANIFEST.json`), the Adrenalin driver version, the cards and
+(`0.3.0-alpha.5`, or the commit in `MANIFEST.json`), the Adrenalin driver version, the cards and
 the `-Bus` you gave, the profile and anything you changed in it, the exact command (with any key
 removed) and the server's log from its start to the failure. For a server that stopped making
 progress, read it with `bin\brl-stacks.exe` first (`tools\STACKS.md`) and attach what it prints.
@@ -358,6 +362,9 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
 | `gemma4-12b-1card.yaml` | Gemma 4 12B i8g | 1 | Qualified | 32K | 4 | MTP, depth 3 | bf16 |
 | `qwen36-35b-2card.yaml` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | Qualified | 32K | 4 | MTP, depth 3 | int8 |
 | `qwen-image-1card.yaml` | Qwen-Image 2.1 IQ8R (pictures) | 1 | Qualified for generation; edits: `SUPPORT.md`, known issue 13 | Pictures to 2048x2048, the default | - | off | - |
+| `ltx-2.5-1card.yaml` | LTX-2.5 distilled IQ8R (video with sound) | 1 | Runs, not yet qualified | Videos to 6.7 s, 960x544 by default | 1 | off | - |
+| `deepseek41-4card.yaml` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 4 (TP4), every routed expert on the cards | Runs, not yet qualified (preview) | 4K | 1 | off | bf16 |
+| `deepseek41-2card.yaml` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 2 (TP2), experts that do not fit held in host memory | Runs, not yet qualified (preview); greedy text can differ from four cards' (`SUPPORT.md`, known issue 14) | 4K | 1 | off | bf16 |
 | `sandbox.yaml` | Every profile above, one model each, none loaded at start | What `-Bus` names | For the dashboard's Sandbox tab only: pick a model there and Start loads it | As each profile | As each profile | As each profile | As each profile |
 
 - **Context and requests at once are limits, not a promise that all of them fit at full length.**
@@ -402,6 +409,22 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
   prefill for 32K–128K prompts, with a small measured effect on next-token probabilities. Greedy text
   can change. SDMA prefill was unchanged and decode gains were inconclusive. Sandbox applies the fast
   entry's wht6 setting and uses the server's shared SDMA setting.
+- **A faster prefill for long prompts, opt-in:** add `-Env BRILLIANCE_TP2_PIPELINE=1` to either
+  Flash-Next two-card start. It overlaps a long prompt's two-card exchanges with its computation;
+  on the exact wire it gives the same greedy tokens as without it, and a lost write on its exchange
+  is re-sent as on the others (`SUPPORT.md`, "Models and card counts" and known issue 1).
+- **`deepseek41-4card`** serves DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container,
+  `deepseek-v4.1-flash-1017-uncensored.rad` in `bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`,
+  251.13 GiB, reassembled from the repository's six parts) on four cards, every routed expert on
+  the cards; its 103 GiB Engram table is read from the file as each step needs it. A preview: text
+  only, 4,096 tokens, one request at a time, no drafting; it runs and is not yet qualified. The
+  checkpoint sets no sampling of its own, so send `temperature` with each request. Rank 0 follows
+  the runtime's device order, not the order `-Bus` names the cards in.
+- **`deepseek41-2card`** serves the same file on two cards (`-Bus 3,9`): each card holds what fits,
+  then a 20 GiB pinned pool a card, and the rest of the experts (about 9 GiB a card) are read once
+  at load into ordinary RAM. About 61 GiB less host memory is available while it serves, and the
+  start refuses, before it allocates anything, when it would leave less than 24 GiB. Its greedy
+  text can differ from `deepseek41-4card`'s, which is the reference (`SUPPORT.md`, known issue 14).
 - The Flash-Next profiles are tuned: the model's full 256K context, prefill steps of up to 6,144
   tokens for a prompt alone in its step (`max-num-batched-tokens: 6144`, `prefill-span: 3`), eight
   linear-state snapshots and the picture and audio encoders in host memory. Each profile's comment
@@ -432,7 +455,7 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
 
 ## Known limits
 
-- **One card is qualified.** Qwen3.8-Flash-Next IQR-V4 runs on two cards and passes the same API
+- **Qualified on one card, and Qwen3.6-35B-A3B on two.** Qwen3.8-Flash-Next IQR-V4 runs on two cards and passes the same API
   checks, but with its production settings (experts in host memory, 8 sequences, speculation, prefix cache)
   a write to host memory is lost now and then (`SUPPORT.md`, known issue 1). The server re-sends
   it, at about 4% of single-stream decode, so Flash-Next on two cards is Supported; an 8-hour soak
@@ -447,7 +470,10 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
 - **Cards:** the build carries GPU code for gfx1201 only. The R9700 is the card it is tested on; the
   RX 9070 family shares the target but has not been run ("Before you start: your hardware", above).
 - **Generation endpoints:**
-  - **Video generation** works on one card with LTX-2.5 distilled IQ8R and is not yet qualified.
+  - **Video generation** works on one card with LTX-2.5 distilled IQ8R (`ltx-2.5-1card.yaml`) and
+    is not yet qualified. Its file is `ltx-2.5-distilled-iq8r.rad` in the gated repository
+    `StillDeadcode/radiance-ltx-2.5-distilled-iq8r` (36.86 GiB). Its text encoder and token
+    embedding are pinned in host memory, about 15.9 GiB, beside 30.3 GiB of the card.
     It writes H.264 only through AMD's (`h264_amf`), else Windows' (`h264_mf`) licensed encoders.
     `h264_amf` encodes on the first display adapter Windows lists: on a machine with an AMD
     integrated GPU, the integrated GPU, not the card that runs the model.
@@ -473,11 +499,13 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
   - The startup log says which, in a line that begins `device: HIP virtual memory is on` or
     `is off`. `BRILLIANCE_VMM=0` turns it off; `=1` forces it on and is not qualified with
     several devices.
-- **The dashboard shows each card's temperature, not its load or power.** Windows' own counters do
-  not see HIP's work, and AMD's telemetry library cannot ship with an open-source engine.
-- **DFlash2 and plain decoding can differ in greedy text** where two tokens are almost tied: the
-  verify pass and the single-token pass round differently. Both are the model's answer; neither is
-  a fault.
+- **The dashboard reads each card's load, power and temperature from the AMD driver's ADL**, the
+  same firmware figures Linux reads. Windows' own counters do not see HIP's work, so where ADL is
+  missing the page shows the temperature and says load and power are not available on Windows.
+- **Drafting (DFlash2, MTP) and plain decoding can differ in greedy text** where two tokens are
+  almost tied: the verify pass and the single-token pass round differently. Both are the model's
+  answer; neither is a fault. On Flash-Next, plain decoding's own text also changes when other
+  requests share its steps (SUPPORT.md, known issues 5 and 8).
 - **A model by repository id** (`model: owner/name`): when the model loads, the server fetches the
   whole repository with `libexec\brilliance\hfget.ps1` into `<dir>\<owner>\<name>`. `<dir>` is
   `download-dir:` under `server:` if set, else `BRILLIANCE_HF_CACHE`, else
@@ -590,6 +618,16 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
       Technology Co., Ltd. All Rights Reserved." `TERMS-OF-USE.md` passes the non-commercial limit
       on to the people you serve.
     - **The container** is a modified copy: its linear weights are re-encoded as rotated int8.
+  - **DeepSeek-V4.1-Flash-1017, bakon3's uncensored container**
+    (`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`, text): the **MIT License**, as DeepSeek's
+    `deepseek-ai/DeepSeek-V4.1-Flash-1017` (`LICENSE` there: "Copyright (c) 2023 DeepSeek";
+    `/terms/licenses/deepseek-mit`). The container's README states MIT for the original and for its
+    modifications, and neither repository is gated. No use restrictions to pass on; a copy passed
+    on keeps the copyright notice and the licence. The
+    container is a modified copy, not a DeepSeek release: its weights are re-encoded to GGML
+    types, its Engram table is generated from the tokenizer, and 18 attention-output projections
+    are edited to remove the model's refusal direction ("abliterated"), so it refuses less than
+    DeepSeek's model.
 - **H.264** (`THIRD-PARTY.md`, "H.264", has the whole of it):
   - This package ships no H.264 encoder implementation (no OpenH264, no x264). Its FFmpeg,
     Brilliance's own built with vcpkg, keeps only two thin wrappers over encoders their makers

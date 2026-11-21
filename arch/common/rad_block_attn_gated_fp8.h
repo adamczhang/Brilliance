@@ -573,7 +573,9 @@ inline int AttnGatedFP8::declare_out(RadBuilder* b, bool add_out) {
     if (g.world > 1 && ar_overlap > 0)
         op_ar_ov = rw(b, RAD_OP(b, "all_reduce",
                           RAD_PARAMS(RAD_INT("world_size", g.world),
-                                     RAD_RANGE("numel", g.n_embd, g.max_tok * g.n_embd),
+                                     RAD_RANGE("numel", g.n_embd,
+                                               (g.ar_overlap_rows ? g.ar_overlap_rows : g.max_tok)
+                                                   * g.n_embd),
                                      RAD_STR("dtype", g.dtype), RAD_INT("exact", g.wire_exact),
                                      RAD_INT("min_bytes", g.wire_min_bytes),
                                      RAD_INT("overlap", ar_overlap)),

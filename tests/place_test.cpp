@@ -12,6 +12,7 @@
 #include "mem/pools.h"
 #include "mem/vram_budget.h"
 #include "place/heat.h"
+#include "place/host_admit.h"
 #include "place/mover.h"
 #include "place/stager.h"
 #include "place/planner.h"
@@ -4827,6 +4828,610 @@ TEST(the_draft_floor_charges_only_the_trunk) {
     /* No drafter: the two floors agree. */
     wf.draft_experts = 0;
     CHECK_EQ(expert_vram_floor_draft_hosted(wf, 80), expert_vram_floor(wf, 80));
+}
+
+/* ================================================================== Brilliance: the RAM tier
+ *
+ * Routed experts whose stored form a kernel relays from their container planes (DeepSeek V4.1's
+ * IQ1_S and IQ2_XXS experts, repacked into GGML blocks), on the file tier: relaid on the read,
+ * or held relaid in a bounded store of ordinary RAM and copied through the pinned read windows.
+ * The relayout here is a stand-in that mixes both planes into every stored byte at offsets that
+ * differ from the planes', so a wrong plane, extent or offset changes the bytes. */
+namespace {
+
+int64_t plane_len(const RadTensor& t) { return t.shape[0] * rad_dtype_bytes(t.dtype, t.shape[1]); }
+
+int test_relayout(const RadParam*, int, int, const RadEncoding*, const int*,
+                  const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (n_planes != 2 || !planes[0].data || !planes[1].data || !dst) return RAD_E_INVAL;
+    const int64_t p0 = plane_len(planes[0]), p1 = plane_len(planes[1]);
+    const uint8_t* a = (const uint8_t*)planes[0].data;
+    const uint8_t* b = (const uint8_t*)planes[1].data;
+    uint8_t* o = (uint8_t*)dst;
+    for (int64_t i = 0; i < dst_bytes; ++i)
+        o[i] = (uint8_t)(a[i % p0] ^ b[(i * 7) % p1] ^ (uint8_t)(i * 13));
+    return RAD_OK;
+}
+
+/* Nonzero: the kernel's relayout refuses with it. */
+int g_relay_fail = 0;
+int test_relayout_hook(const RadParam* p, int n_p, int op, const RadEncoding* e, const int* sel,
+                       const RadTensor* planes, int n_planes, void* dst, int64_t dst_bytes) {
+    if (g_relay_fail) return g_relay_fail;
+    return test_relayout(p, n_p, op, e, sel, planes, n_planes, dst, dst_bytes);
+}
+RadKernelInfo g_relay_info;
+KernelRow     g_relay_row;
+
+/* `layers` routed layers of `n` experts as build_moe_layers declares them, every expert weight
+ * relaid by its op's kernel from two u8 planes: [64, c0] and [16, c1], together about 7/8 of the
+ * stored bytes, as IQ1_S planes are of the GGML blocks they repack into. */
+void build_relaid_layers(Fixture& f, int layers, int n, int64_t gu, int64_t dn) {
+    g_relay_info = g_dev_info;
+    g_relay_info.name = "fake_relay";
+    g_relay_info.relayout = &test_relayout_hook;
+    g_relay_row.info = &g_relay_info;
+    build_moe_layers(f, layers, n, gu, dn);
+    for (OpInfo& o : f.prog.ops) {
+        if (o.op != "moe_gemm") continue;
+        o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &g_relay_row;
+        for (rad_weight h : o.weights) {
+            WeightInfo& w = f.prog.weights[h];
+            const int64_t s = w.logical_bytes;
+            w.identity = false;
+            w.layout_tag = "test_relay";
+            w.lay_op = o.index;
+            w.lay_band = 0;
+            w.lay_dom = RAD_DOMAIN_DEVICE;
+            w.lay_operand = 0;
+            w.enc = RadEncoding{};
+            w.enc.n_planes = 2;
+            w.enc.plane[0].dtype = RAD_U8;
+            w.enc.plane[1].dtype = RAD_U8;
+            w.n_sel = 2;
+            w.sel[0] = 0;
+            w.sel[1] = 1;
+            w.sel_rows[0] = 64;
+            w.sel_cols[0] = (s * 5 / 8) / 64 + 3;
+            w.sel_rows[1] = 16;
+            w.sel_cols[1] = (s / 4) / 16 + 5;
+        }
+    }
+}
+
+/* The container: every weight on RAD_ALIGN_UNIT with a 2 MiB hole between layers, a relaid
+ * weight's two planes one after the other with the second on a 256-byte boundary only (a plane is
+ * RAD_ALIGN_SUB-aligned, not block-aligned, so a read widens to the block). Bytes are
+ * container_byte(offset). `cut`, when positive, truncates the file there. Empty when the working
+ * directory has no O_DIRECT. */
+std::vector<uint8_t> write_relaid_container(Fixture& f, const std::string& path, int64_t cut = 0) {
+    int64_t off = 4 * (int64_t)RAD_ALIGN_UNIT;
+    int32_t prev = -1;
+    for (rad_weight h = 1; (size_t)h < f.prog.weights.size(); ++h) {
+        WeightInfo& w = f.prog.weights[h];
+        if (prev >= 0 && w.decl.group.layer != prev) off += 2 * MiB;
+        prev = w.decl.group.layer;
+        w.stored_bytes = w.logical_bytes;
+        w.file_offset = (uint64_t)off;
+        if (w.identity) {
+            off = align_up(off + w.stored_bytes, RAD_ALIGN_UNIT);
+            continue;
+        }
+        RadTensor pt[RAD_ENC_MAX_PLANES];
+        weight_planes(w, pt);
+        int64_t at = off;
+        for (int k = 0; k < w.n_sel; ++k) {
+            at = align_up(at, 256);
+            w.file_plane_offset[k] = (uint64_t)at;
+            w.file_plane_bytes[k] = plane_len(pt[k]);
+            at += plane_len(pt[k]);
+        }
+        off = align_up(at, RAD_ALIGN_UNIT);
+    }
+    std::vector<uint8_t> img((size_t)off);
+    for (int64_t i = 0; i < off; ++i) img[(size_t)i] = container_byte(i);
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return {};
+    const size_t n = cut > 0 ? (size_t)std::min<int64_t>(cut, off) : img.size();
+    const bool wrote = std::fwrite(img.data(), 1, n, fp) == n;
+    std::fclose(fp);
+    DirectFile probe;
+    if (!wrote || probe.open(path.c_str(), RAD_DIO_READ) < 0) {
+        std::remove(path.c_str());
+        return {};
+    }
+    return img;
+}
+
+/* What a relaid weight's stored bytes are, from the container image. */
+std::vector<uint8_t> relaid_bytes(const WeightInfo& w, const std::vector<uint8_t>& img) {
+    RadTensor pt[RAD_ENC_MAX_PLANES];
+    weight_planes(w, pt);
+    for (int k = 0; k < w.n_sel; ++k) pt[k].data = (void*)(img.data() + w.file_plane_offset[k]);
+    std::vector<uint8_t> out((size_t)w.stored_bytes);
+    if (test_relayout(nullptr, 0, 0, &w.enc, w.sel, pt, w.n_sel, out.data(), w.stored_bytes) < 0)
+        out.clear();
+    return out;
+}
+
+/* Whether weight `h` is published, holding exactly `want`. */
+bool published_equals(Mover& m, rad_weight h, const std::vector<uint8_t>& want, RadStream s) {
+    const WeightSlot* slot = m.residency()->lookup(h);
+    if (!slot || !slot->ptr || want.empty()) return false;
+    std::vector<uint8_t> got(want.size());
+    rad_stream_sync(m.transfer_stream());
+    if (rad_memcpy_async(got.data(), slot->ptr, (int64_t)got.size(), s) < 0) return false;
+    rad_stream_sync(s);
+    return got == want;
+}
+
+void use_kernel_relayout(Mover& m) {
+    m.set_file_relayout([](const WeightInfo& w, const RadTensor* planes, void* dst, int64_t n) {
+        return test_relayout_hook(nullptr, 0, w.lay_operand, &w.enc, w.sel, planes, w.n_sel, dst, n);
+    });
+}
+
+/* Three routed layers of four relaid experts: 0 and 2 resident, 1 and 3 on the file tier, 1
+ * ranked above 3 by the profile; the host pool is the file tier's staging and nothing more, and
+ * the RAM store's budget is `ram_units` and a half units. */
+struct RelaidPlan {
+    Fixture f;
+    Plan    p;
+    int64_t stride = 0;
+    static constexpr int L = 3;
+    static constexpr int64_t gu = 5 * MiB + 1000, dn = 3 * MiB + 24;
+
+    int plan(double ram_units, bool relayout = true) {
+        build_relaid_layers(f, L, 4, gu, dn);
+        return replan(ram_units, relayout);
+    }
+    int replan(double ram_units, bool relayout = true) {
+        stride = align_up(align_up(gu, RAD_ALIGN_UNIT) + dn, RAD_ALIGN_UNIT);
+        prof.clear();
+        for (int l = 0; l < L; ++l)
+            for (int e = 0; e < 4; ++e)
+                prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f
+                                                    : e == 1 ? 0.02f : 0.01f, 0.0f});
+        c = base_config();
+        c.placement = "expert_tiered";
+        c.deterministic = true;
+        /* The embedding, six residents and the two file buffers (two units each), with less
+         * than a unit to spare, so exactly 0 and 2 of every layer are resident. */
+        c.vram_weights_mib = (1 * MiB + 10 * stride + RAD_ALIGN_UNIT + stride / 2) / MiB + 1;
+        c.host_pool_mib = (RAD_PLACE_FILE_STAGE_SLOTS * stride +
+                           RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+        c.weights_disk_tier = true;
+        c.weights_file_relayout = relayout;
+        c.expert_ram_mib = (int64_t)(ram_units * (double)stride) / MiB;
+        PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+        p = Plan{};
+        return Planner(in).plan(&p);
+    }
+    Config c;
+    std::vector<RadFileProfile> prof;
+};
+
+}  /* namespace */
+
+/* The planner takes a relaid routed expert onto the file tier only under --weights-file-relayout,
+ * and the RAM store holds the file tier's units hottest first while they fit its budget; a relaid
+ * weight that is not a routed expert stays off the file tier whatever the flag. */
+TEST(the_planner_holds_relaid_experts_in_ram_within_the_budget) {
+    RelaidPlan rp;
+    /* Without the flag nothing can read a relaid expert off the card: the plan refuses. */
+    CHECK(rp.plan(0, false) < 0);
+    CHECK(!rp.p.unfit.empty());
+    for (const MoveUnit& mu : rp.p.units) CHECK(!mu.file_relaid);
+
+    REQUIRE_EQ(rp.replan(3.5), RAD_OK);
+    int ssd = 0;
+    for (const MoveUnit& mu : rp.p.units) {
+        if (mu.expert < 0) continue;
+        const bool off = mu.expert & 1;
+        CHECK(mu.tier == (off ? Tier::SSD : Tier::VRAM));
+        CHECK(mu.file_relaid);
+        CHECK(mu.file_direct);
+        /* Expert 1 outranks 3, so the three units the budget takes are every layer's 1. */
+        CHECK_EQ(mu.ram_held, mu.expert == 1);
+        if (off) ++ssd;
+    }
+    CHECK_EQ(ssd, 6);
+    CHECK_EQ(rp.p.ram_units, (int64_t)3);
+    CHECK_EQ(rp.p.disk_units, (int64_t)3);
+    CHECK(rp.p.ram_bytes <= rp.p.ram_budget);
+    CHECK_EQ(rp.p.ram_bytes, 3 * align_up(rp.p.units[(size_t)unit_at(rp.p, 0, 1)].bytes,
+                                          RAD_ALIGN_UNIT));
+    CHECK_EQ(rp.p.relaid_units, (int64_t)6);
+    CHECK(rp.p.relay_input_max > 0 && rp.p.relay_input_max <= RAD_PLACE_FILE_WINDOW_BYTES);
+    const std::string line = rp.p.tier_line();
+    CHECK(line.find("RAM store") != std::string::npos);
+    const std::string rep = rp.p.report(rp.f.prog);
+    CHECK(rep.find("expert ram") != std::string::npos);
+    CHECK(rep.find("expert disk") != std::string::npos);
+
+    /* No budget: everything on the file tier is read from the drive. */
+    REQUIRE_EQ(rp.replan(0), RAD_OK);
+    CHECK_EQ(rp.p.ram_units, (int64_t)0);
+    CHECK_EQ(rp.p.disk_units, (int64_t)6);
+
+    /* A relaid weight a dense op reads every token is not a routed expert: it stays off the
+     * file tier even with the flag, since only the file stager relays. */
+    Fixture d;
+    build_dense(d, 2, 4 * MiB, false);
+    g_relay_info = g_dev_info;
+    g_relay_info.relayout = &test_relayout_hook;
+    g_relay_row.info = &g_relay_info;
+    for (OpInfo& o : d.prog.ops) {
+        if (o.op != "gemm") continue;
+        o.bands[0].dom[RAD_DOMAIN_DEVICE].row = &g_relay_row;
+        for (rad_weight h : o.weights) {
+            WeightInfo& w = d.prog.weights[h];
+            w.identity = false;
+            w.lay_op = o.index;
+            w.lay_band = 0;
+            w.lay_dom = RAD_DOMAIN_DEVICE;
+            w.n_sel = 1;
+            w.enc.plane[0].dtype = RAD_U8;
+            w.sel_rows[0] = 1;
+            w.sel_cols[0] = 4 * MiB;
+        }
+    }
+    Config dc = base_config();
+    dc.placement = "layer_offload";
+    dc.vram_weights_mib = 6;
+    dc.host_pool_mib = 4 * 4 + (RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    dc.weights_disk_tier = true;
+    dc.weights_file_relayout = true;
+    PlannerInput din{&d.prog, &dc, 0, 1, nullptr, 0};
+    Plan dp;
+    (void)Planner(din).plan(&dp);
+    for (const MoveUnit& mu : dp.units) {
+        CHECK(!mu.file_relaid);
+        if (mu.layer >= 0) CHECK(!mu.file_direct);
+    }
+}
+
+/* Read/pack exactness and slot reuse. The RAM store holds every layer's expert 1, relaid once at
+ * load; expert 3 is read as planes from the drive and relaid on every read. Over three passes
+ * (six layer reads through four windows, so every window comes round again behind its event)
+ * every file-tier weight is published with exactly the relayout of its container planes, the
+ * drive is never pread directly, and the store's bytes do not change. */
+TEST(the_file_stager_relays_planes_and_copies_held_experts_exactly) {
+    RelaidPlan rp;
+    const std::string path = "place_test_relaid.rad";
+    build_relaid_layers(rp.f, RelaidPlan::L, 4, RelaidPlan::gu, RelaidPlan::dn);
+    const std::vector<uint8_t> img = write_relaid_container(rp.f, path);
+    if (img.empty()) {
+        std::printf("  SKIP the working directory has no O_DIRECT\n");
+        return;
+    }
+    REQUIRE_EQ(rp.replan(3.5), RAD_OK);
+    Plan& p = rp.p;
+    const Program& prog = rp.f.prog;
+
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    REQUIRE_EQ(m.init(prog, p, mc), RAD_OK);
+    use_kernel_relayout(m);
+    int64_t held = 0;
+    REQUIRE_EQ(m.build_ram_store(&held), RAD_OK);
+    CHECK_EQ(held, p.ram_bytes);
+    CHECK_EQ(m.ram_store_bytes(), p.ram_bytes);
+    /* Held exactly where the plan says, in the stored form. */
+    std::vector<std::vector<uint8_t>> want(prog.weights.size());
+    for (const MoveUnit& mu : p.units) {
+        if (mu.tier != Tier::SSD) continue;
+        for (rad_weight h : mu.weights) {
+            want[(size_t)h] = relaid_bytes(prog.weights[h], img);
+            const uint8_t* r = m.ram_of(h);
+            CHECK_EQ(r != nullptr, mu.ram_held);
+            if (r) CHECK(std::memcmp(r, want[(size_t)h].data(), want[(size_t)h].size()) == 0);
+        }
+    }
+
+    RadStream s = nullptr;
+    REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+    REQUIRE_EQ(m.bind_compute_stream(s), RAD_OK);
+    FileStager fs;
+    REQUIRE_EQ(fs.init(prog, p, &m), RAD_OK);
+    REQUIRE_EQ(fs.n_layers(), (size_t)RelaidPlan::L);
+    auto exact = [&](int l) {
+        bool ok = true;
+        for (int e : { 1, 3 })
+            for (rad_weight h : p.units[(size_t)unit_at(p, l, e)].weights)
+                ok = ok && published_equals(m, h, want[(size_t)h], s);
+        return ok;
+    };
+    for (int pass = 0; pass < 3; ++pass) {
+        RadBatch b{};
+        CHECK(fs.begin_pass(&b));
+        bool resync = false;
+        CHECK_OK(fs.before_op(0, s, &resync));          /* layer 0, read whole at the first op */
+        CHECK_OK(fs.before_op(1, s, &resync));          /* layer 0 starts; layer 1 read ahead */
+        CHECK(exact(0) && exact(1));
+        CHECK_OK(fs.before_op(2, s, &resync));
+        CHECK_OK(fs.before_op(3, s, &resync));          /* layer 1 starts; layer 2 read ahead */
+        CHECK(exact(1) && exact(2));
+        CHECK_OK(fs.before_op(4, s, &resync));
+        CHECK_OK(fs.before_op(5, s, &resync));
+        CHECK(exact(2));
+        CHECK_OK(fs.before_op(6, s, &resync));
+        CHECK_OK(fs.end_pass(s));
+    }
+    rad_stream_sync(m.transfer_stream());
+    const MoverStats st = m.stats();
+    /* Three passes of three layers, each with one held and one relaid unit of two weights. */
+    CHECK_EQ(st.ssd_layers, (uint64_t)9);
+    CHECK_EQ(st.ram_weights, (uint64_t)18);
+    CHECK_EQ(st.relaid_weights, (uint64_t)18);
+    CHECK_EQ(st.ssd_preads, (uint64_t)0);              /* nothing went the direct way */
+    CHECK_EQ(st.ssd_reads, (uint64_t)18);              /* the relaid weights read the drive */
+    CHECK(m.report().find("expert ram") != std::string::npos);
+    /* The store is read, never written, by the reads. */
+    for (const MoveUnit& mu : p.units)
+        if (mu.ram_held)
+            for (rad_weight h : mu.weights)
+                CHECK(std::memcmp(m.ram_of(h), want[(size_t)h].data(), want[(size_t)h].size()) == 0);
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+/* The refusals, each a bounded error with nothing published from a bad read: no relayout given;
+ * a relayout that refuses; a container cut short inside a held expert (the store is not built)
+ * and inside a drive-read one (the layer's read fails); and a plane shorter than the relayout
+ * reads. */
+TEST(a_relaid_read_refuses_short_reads_and_bad_planes) {
+    RelaidPlan rp;
+    build_relaid_layers(rp.f, RelaidPlan::L, 4, RelaidPlan::gu, RelaidPlan::dn);
+    const std::string path = "place_test_relaid_refusals.rad";
+    const std::vector<uint8_t> img = write_relaid_container(rp.f, path);
+    if (img.empty()) {
+        std::printf("  SKIP the working directory has no O_DIRECT\n");
+        return;
+    }
+    REQUIRE_EQ(rp.replan(3.5), RAD_OK);
+    const Program& prog = rp.f.prog;
+    const Plan& p = rp.p;
+    auto mover = [&](Mover& m) {
+        MoverConfig mc;
+        mc.container_path = path;
+        return m.init(prog, p, mc);
+    };
+    {
+        Mover m;
+        REQUIRE_EQ(mover(m), RAD_OK);
+        CHECK_EQ(m.build_ram_store(), RAD_E_STATE);      /* no relayout given */
+        CHECK_EQ(m.ram_store_bytes(), (int64_t)0);
+    }
+    {
+        Mover m;
+        REQUIRE_EQ(mover(m), RAD_OK);
+        use_kernel_relayout(m);
+        g_relay_fail = RAD_E_SHAPE;
+        CHECK_EQ(m.build_ram_store(), RAD_E_SHAPE);
+        g_relay_fail = 0;
+        CHECK_EQ(m.ram_store_bytes(), (int64_t)0);
+        for (const MoveUnit& mu : p.units)
+            for (rad_weight h : mu.weights) CHECK(m.ram_of(h) == nullptr);
+    }
+
+    /* Cut inside layer 2's expert 1, which the store holds: the store is refused. */
+    const MoveUnit& held2 = p.units[(size_t)unit_at(p, 2, 1)];
+    const WeightInfo& h2 = prog.weights[held2.weights.back()];
+    std::remove(path.c_str());
+    REQUIRE(!write_relaid_container(rp.f, path, (int64_t)h2.file_plane_offset[1] + 100).empty());
+    {
+        Mover m;
+        REQUIRE_EQ(mover(m), RAD_OK);
+        use_kernel_relayout(m);
+        CHECK_EQ(m.build_ram_store(), RAD_E_IO);
+        CHECK_EQ(m.ram_store_bytes(), (int64_t)0);
+    }
+
+    /* Cut inside layer 2's expert 3, the container's last weight, read from the drive: the store
+     * builds, layers 0 and 1 read, and layer 2's read fails at its trigger. */
+    const MoveUnit& disk2 = p.units[(size_t)unit_at(p, 2, 3)];
+    const WeightInfo& d2 = prog.weights[disk2.weights.back()];
+    std::remove(path.c_str());
+    REQUIRE(!write_relaid_container(rp.f, path, (int64_t)d2.file_plane_offset[1] + 100).empty());
+    {
+        Mover m;
+        REQUIRE_EQ(mover(m), RAD_OK);
+        use_kernel_relayout(m);
+        REQUIRE_EQ(m.build_ram_store(), RAD_OK);
+        RadStream s = nullptr;
+        REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+        REQUIRE_EQ(m.bind_compute_stream(s), RAD_OK);
+        FileStager fs;
+        REQUIRE_EQ(fs.init(prog, p, &m), RAD_OK);
+        RadBatch b{};
+        CHECK(fs.begin_pass(&b));
+        bool resync = false;
+        CHECK_OK(fs.before_op(0, s, &resync));
+        CHECK_OK(fs.before_op(1, s, &resync));
+        CHECK_OK(fs.before_op(2, s, &resync));
+        CHECK_EQ(fs.before_op(3, s, &resync), RAD_E_IO);   /* layer 2, read ahead here, is short */
+        rad_stream_sync(m.transfer_stream());
+        rad_stream_destroy(s);
+    }
+
+    /* A plane the container records shorter than the relayout reads. */
+    std::remove(path.c_str());
+    REQUIRE(!write_relaid_container(rp.f, path).empty());
+    WeightInfo& bad = rp.f.prog.weights[disk2.weights.front()];
+    bad.file_plane_bytes[0] -= 1;
+    {
+        Mover m;
+        REQUIRE_EQ(mover(m), RAD_OK);
+        use_kernel_relayout(m);
+        REQUIRE_EQ(m.build_ram_store(), RAD_OK);
+        RadStream s = nullptr;
+        REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+        REQUIRE_EQ(m.bind_compute_stream(s), RAD_OK);
+        FileStager fs;
+        REQUIRE_EQ(fs.init(prog, p, &m), RAD_OK);
+        RadBatch b{};
+        CHECK(fs.begin_pass(&b));
+        bool resync = false;
+        CHECK_OK(fs.before_op(0, s, &resync));
+        CHECK_OK(fs.before_op(1, s, &resync));
+        CHECK_OK(fs.before_op(2, s, &resync));
+        CHECK_EQ(fs.before_op(3, s, &resync), RAD_E_FORMAT);
+        rad_stream_sync(m.transfer_stream());
+        rad_stream_destroy(s);
+    }
+    bad.file_plane_bytes[0] += 1;
+    std::remove(path.c_str());
+}
+
+/* Route counts are the rank's local slots: zero local routes and any skew are valid; a source in
+ * another numbering (the model's global count), a negative count or more routes than the pass
+ * has rows times top-k are not. */
+TEST(route_counts_are_checked_against_the_ranks_local_experts) {
+    const int32_t none[4] = { 0, 0, 0, 0 };
+    const int32_t skew[4] = { 6, 0, 0, 0 };
+    const int32_t neg[4]  = { 1, -1, 0, 0 };
+    const int32_t many[4] = { 4, 4, 0, 0 };
+    const int32_t glob[8] = { 0, 1, 0, 1, 0, 0, 0, 0 };
+    CHECK(route_counts_check(none, 4, 4, 1, 6).empty());      /* this rank owns none of them */
+    CHECK(route_counts_check(skew, 4, 4, 1, 6).empty());      /* all six on one local expert */
+    CHECK(route_counts_check(many, 4, 4, 2, 6).empty());      /* 8 of 12 */
+    CHECK(!route_counts_check(many, 4, 4, 1, 6).empty());     /* 8 of 6 */
+    CHECK(route_counts_check(many, 4, 4, 1, 0).empty());      /* top-k unknown: no bound */
+    CHECK(!route_counts_check(neg, 4, 4, 1, 6).empty());
+    CHECK(!route_counts_check(glob, 8, 4, 1, 6).empty());     /* global numbering */
+    CHECK(!route_counts_check(nullptr, 4, 4, 1, 6).empty());
+
+    /* The stager reads a layer whole when its counts fail, and counts the fallback. */
+    Fixture f;
+    const int L = 3;
+    build_moe_layers(f, L, 4, 2 * MiB + 1000, MiB + 24);
+    f.prog.meta.n_expert = 8;          /* room for the global-numbered source below */
+    f.prog.meta.n_expert_used = 2;
+    const std::string path = "place_test_route_check.rad";
+    const std::vector<uint8_t> img = write_container(f, path);
+    if (img.empty()) {
+        std::printf("  SKIP the working directory has no O_DIRECT\n");
+        return;
+    }
+    std::vector<RadFileProfile> prof;
+    for (int l = 0; l < L; ++l)
+        for (int e = 0; e < 4; ++e)
+            prof.push_back(RadFileProfile{l, e, e == 0 ? 0.5f : e == 2 ? 0.4f : 0.01f, 0.0f});
+    const int64_t stride = align_up(align_up(2 * MiB + 1000, RAD_ALIGN_UNIT) + MiB + 24,
+                                    RAD_ALIGN_UNIT);
+    Config c = base_config();
+    c.placement = "expert_tiered";
+    c.deterministic = true;
+    c.vram_weights_mib = 32;
+    c.host_pool_mib = (RAD_PLACE_FILE_STAGE_SLOTS * stride +
+                       RAD_PLACE_FILE_WINDOWS * RAD_PLACE_FILE_WINDOW_BYTES) / MiB + 1;
+    c.weights_disk_tier = true;
+    PlannerInput in{&f.prog, &c, 0, 1, prof.data(), (int64_t)prof.size()};
+    Plan p;
+    REQUIRE_EQ(Planner(in).plan(&p), RAD_OK);
+    Mover m;
+    MoverConfig mc;
+    mc.container_path = path;
+    REQUIRE_EQ(m.init(f.prog, p, mc), RAD_OK);
+    RadStream s = nullptr;
+    REQUIRE_EQ(rad_stream_create(&s, 0), RAD_OK);
+    REQUIRE_EQ(m.bind_compute_stream(s), RAD_OK);
+    auto pub = [&](int l, int e) { return published(m, p, f.prog, unit_at(p, l, e), img, s); };
+
+    /* A source in the model's numbering: eight counts for a layer of four local experts. */
+    SharedCounts global(8);
+    FileStager fs;
+    REQUIRE_EQ(fs.init(f.prog, p, &m, &SharedCounts::get, &global), RAD_OK);
+    RadBatch b{};
+    b.n_tok = 1;
+    CHECK(fs.begin_pass(&b));
+    bool resync = false;
+    CHECK_OK(fs.before_op(0, s, &resync));
+    global.route({0, 0, 0, 0, 0, 1, 0, 1});            /* would skip both local file-tier experts */
+    CHECK_OK(fs.before_op(1, s, &resync));
+    CHECK(pub(0, 1) == Pub::Bytes && pub(0, 3) == Pub::Bytes);   /* read whole instead */
+    CHECK(fs.route_fallbacks() >= 1);
+    CHECK_OK(fs.end_pass(s));
+
+    /* Local counts: zero local routes skip both; then more routes than one row at top-2 can make
+     * fall back to a whole read. */
+    SharedCounts local(4);
+    FileStager ls;
+    REQUIRE_EQ(ls.init(f.prog, p, &m, &SharedCounts::get, &local), RAD_OK);
+    CHECK(ls.begin_pass(&b));
+    CHECK_OK(ls.before_op(0, s, &resync));
+    local.route({0, 0, 0, 0});
+    CHECK_OK(ls.before_op(1, s, &resync));
+    CHECK(pub(0, 1) == Pub::Zeros && pub(0, 3) == Pub::Zeros);
+    CHECK_EQ(ls.route_fallbacks(), (int64_t)0);
+    CHECK_OK(ls.before_op(2, s, &resync));
+    local.route({0, 2, 0, 1});                          /* 3 routes from 1 row at top-2 */
+    CHECK_OK(ls.before_op(3, s, &resync));
+    CHECK(pub(1, 1) == Pub::Bytes && pub(1, 3) == Pub::Bytes);
+    CHECK_EQ(ls.route_fallbacks(), (int64_t)1);
+    CHECK_OK(ls.end_pass(s));
+    rad_stream_sync(m.transfer_stream());
+    rad_stream_destroy(s);
+    std::remove(path.c_str());
+}
+
+/* The host admission (place/host_admit.h): admitted with exactly 24 GiB left, refused a byte
+ * past it, past the pin cap, with availability unreadable or past the commit room -- and, measured
+ * on this machine, refused when asked for more RAM than is available. Nothing is allocated. */
+TEST(the_host_admission_keeps_24_gib_free) {
+    const int64_t GiB = (int64_t)1 << 30;
+    HostAdmitIn in;
+    in.avail = 106 * GiB;
+    in.commit_avail = 200 * GiB;
+    in.pin_cap = 47 * GiB;
+    in.pinned_now = 1 * GiB;
+    in.pins = 40 * GiB;
+    in.ram_store = 24 * GiB;
+    in.relay_scratch = GiB / 2;
+    in.misc = kHostMiscAllowance;
+    HostAdmitOut o = host_admit(in);
+    CHECK(o.ok);
+    CHECK_EQ(o.peak, 40 * GiB + 24 * GiB + GiB / 2 + kHostMiscAllowance);
+    CHECK_EQ(o.left, in.avail - o.peak);
+
+    in.ram_store = in.avail - kHostRamFloor - (in.pins + in.relay_scratch + in.misc);
+    o = host_admit(in);
+    CHECK(o.ok);                                        /* exactly the floor left */
+    CHECK_EQ(o.left, kHostRamFloor);
+    in.ram_store += 1;
+    o = host_admit(in);
+    CHECK(!o.ok);                                       /* a byte under it */
+    CHECK(o.why.find("floor") != std::string::npos);
+    in.ram_store -= 1;
+
+    in.pins = in.pin_cap - in.pinned_now + 1;
+    o = host_admit(in);
+    CHECK(!o.ok);
+    CHECK(o.why.find("pin") != std::string::npos);
+    in.pins = 40 * GiB;
+
+    in.avail = -1;
+    CHECK(!host_admit(in).ok);
+    in.avail = 106 * GiB;
+    in.commit_avail = 10 * GiB;
+    CHECK(!host_admit(in).ok);
+    CHECK_EQ(kHostRamFloor, 24 * GiB);
+
+#if defined(_WIN32)
+    /* This machine, now: ask for all the memory available as RAM store. The guard refuses. */
+    const os::MemInfo mi = os::mem_info();
+    if (mi.avail > 0) {
+        HostAdmitIn live;
+        live.avail = mi.avail;
+        live.commit_avail = mi.commit_avail;
+        live.ram_store = mi.avail;
+        const HostAdmitOut lo = host_admit(live);
+        CHECK(!lo.ok);
+        CHECK(lo.left < kHostRamFloor);
+    }
+#endif
 }
 
 RAD_TEST_MAIN()

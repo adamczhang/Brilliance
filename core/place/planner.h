@@ -100,8 +100,16 @@ struct MoveUnit {
     int64_t slot_bytes = 0;
 
     /* Every weight lies in the container exactly as its kernel reads it (weight_file_direct), so
-     * the file tier can stage it with a read. A unit that is not never goes to the file tier. */
+     * the file tier can stage it with a read. A unit that is not never goes to the file tier.
+     * Brilliance: under --weights-file-relayout a routed expert whose weights a kernel relays from
+     * their planes counts too (`file_relaid`): the file tier reads its planes and relays them on
+     * the read (Mover::read_relaid). Such a unit is only ever read by the file stager. */
     bool    file_direct = true;
+    bool    file_relaid = false;
+    /* Brilliance: a file-tier unit --expert-ram-mib keeps in ordinary RAM, in its stored form, read
+     * and relaid once at load (Mover::build_ram_store). Still Tier::SSD: it has no device address
+     * of its own, and the file stager copies it from RAM where it would read the drive. */
+    bool    ram_held = false;
 
     /* The drafter's own weights (the "mtp." namespace). They run on every draft pass of every
      * decode step -- up to depth passes plus the verify pass, each re-staging them from the drive
@@ -254,6 +262,14 @@ public:
      * file tier. */
     int64_t file_layer_max = 0;
     int64_t file_stage_vram = 0;
+    /* Brilliance: the file tier's routed units, split by where a read finds them: `ram_*` the ones
+     * held in ordinary RAM (MoveUnit::ram_held), against `ram_budget`, this rank's share of
+     * --expert-ram-mib; `disk_*` the rest, read from the drive. `relaid_units` of all of them are
+     * relaid on the read (MoveUnit::file_relaid); `relay_input_max` is the largest plane span one
+     * such weight reads, which sizes each relayout thread's input buffer. */
+    int64_t ram_budget = 0, ram_bytes = 0, ram_units = 0;
+    int64_t disk_bytes = 0, disk_units = 0;
+    int64_t relaid_units = 0, relay_input_max = 0;
     /* Slab VRAM no weight occupies: shadow slots (the cost of dynamic placement) and the staging
      * ring (the cost of offload). Reported separately from the tier totals. */
     int64_t slab_overhead = 0;
@@ -274,6 +290,10 @@ public:
     /* The placement plan report (spec §16): tier and site per weight class (not per weight), the
      * pool totals, and what did not fit. */
     std::string report(const Program& p) const;
+    /* Brilliance: one line naming where this rank's routed experts are, by tier, with units and
+     * bytes: VRAM, the pinned pool, the RAM store, the drive; and the file tier's pinned windows
+     * and VRAM layer buffers. The startup log prints it for every rank. */
+    std::string tier_line() const;
 };
 
 /* ------------------------------------------------------------------ the planner */
@@ -329,6 +349,9 @@ private:
     int  pin_towers(const Config& cfg, Plan* p) const;
     int  pin_draft_experts(const Program& prog, const Config& cfg, Plan* p) const;
     void pin_hot(const Config& cfg, Plan* p) const;
+    /* Brilliance: marks file-tier routed units MoveUnit::ram_held in rank order, hottest first,
+     * while they fit Plan::ram_budget, and fills the Plan's ram_/disk_ split. */
+    void hold_in_ram(Plan* p) const;
     void build_classes(Plan* p);
     void rank_units(Plan* p, std::vector<int32_t>* order) const;
     int  assign(Plan* p);
@@ -432,7 +455,7 @@ int plan_check_weights_pool(const Plan& p, int64_t pool_bytes);
 
 /* The tables the placement flags move, identified by their readers rather than by name: a
  * model-level weight read by at least one op, and only by `embed_lookup`, is a token embedding;
- * only by `embed_lookup_q`, an n-gram table. A lookup reads M rows a step, so a tier below the
+ * only by `embed_lookup_q` or `embed_lookup_planes`, an n-gram table. A lookup reads M rows a step, so a tier below the
  * card is usable; a weight a GEMM also reads (an output head tied to the embedding) would stream
  * whole every step and is neither. Shared by the budget resolver and the planner. */
 bool read_only_by(const Program& prog, rad_weight w, const char* op);
@@ -440,7 +463,7 @@ inline bool is_embedding_table(const Program& prog, rad_weight w) {
     return read_only_by(prog, w, "embed_lookup");
 }
 inline bool is_ngram_table(const Program& prog, rad_weight w) {
-    return read_only_by(prog, w, "embed_lookup_q");
+    return read_only_by(prog, w, "embed_lookup_q") || read_only_by(prog, w, "embed_lookup_planes");
 }
 
 /* "blk.12.ffn_gate_exps.3.weight" -> "blk.*.ffn_gate_exps.*.weight": the report's per-class

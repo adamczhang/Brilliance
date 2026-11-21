@@ -19,11 +19,12 @@ Measured on the project's test machine: four Radeon AI PRO R9700 (gfx1201) at -2
 | Qwen3-ASR 1.7B bf16 (`Qwen/Qwen3-ASR-1.7B-hf` as it ships, 4.09 GB) | **Qualified**: `/v1/audio/transcriptions` (5 formats, 4 response forms, past 30 s cut at pauses) and `/v1/realtime`, 16 sequences | - | - |
 | Nemotron 3.5 Rerank 8B BF16 (`nvidia/Nemotron-3.5-Rerank-8B-BF16` @ f88f8d91 as it ships, 16.78 GB) | **Qualified**: `/rerank` and `/v1/rerank`, text and picture documents, 32,768 tokens a pair | - | - |
 | SDXL base 1.0 bf16 (`stabilityai/stable-diffusion-xl-base-1.0`, the single-file checkpoint converted with `rad-convert`, 6.39 GiB) | **Qualified**: `/v1/images/generations`; a seed repeats its picture byte for byte; `/v1/images/edits` answers 501 | - | - |
-| LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`) | **Runs, not yet qualified**: `/v1/videos`, text to video and image to video (`input_reference`), MP4 | - | - |
+| LTX-2.5 distilled IQ8R (`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`, `ltx-2.5-distilled-iq8r.rad`, 36.86 GiB; gated, LTX-2.x Community License) | **Runs, not yet qualified**: `/v1/videos`, text to video and image to video (`input_reference`), MP4. Its Gemma text encoder (14.00 GiB) and token embedding (1.88 GiB) are pinned in host memory: the DiT and the activation arena fill the card. A profile of your own may leave out `vision-tower-placement: ram`: the engine then moves the encoder to host memory itself and says so in the log. Profile: `ltx-2.5-1card` | - | - |
 | Gemma 4 31B a4 (`keptn/gemma4-31b-a4`, `gemma4-31b-a4.rad`, 19.95 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 2, bf16 KV, MTP; thinking off by the profile, as for the 12B (a request turns it on). Audio is refused with a 501. Speed not yet measured. Profile: `gemma4-31b-1card` | Not run | Not run |
 | Gemma 4 12B i8g (`keptn/gemma4-12b-i8g`, `gemma4-12b-i8g.rad`, 13.79 GiB) | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures, audio and video; 32K x 4, bf16 KV, MTP; thinking off by the profile, as the container's card sets it (a request turns it on). Speed not yet measured. Profile: `gemma4-12b-1card` | - | - |
 | Qwen-Image 2.1 IQ8R (`StillDeadcode/radiance-qwen-image-2.1-iq8r`, `qwen-image-2.1-iq8r.rad`, 16.13 GiB; Qwen's research licence, non-commercial) | **Qualified** for generation: `/v1/images/generations`, PNG, JPEG and WebP; a seed repeats its picture byte for byte; `n` gives seeds s, s + 1, ...; sizes from 512x512 to the default 2048x2048 on one card, a size off the model's grid rounded down; `response_format: url` is refused with a 400. Edits (`/v1/images/edits`) work for most seeds; see known issue 13. Profile: `qwen-image-1card` | Not run | - |
-| Qwen3.6-35B-A3B IQ8R (`StillDeadcode/qwen3.6-35b-a3b-iq8r`, `qwen3.6-35b-a3b-iq8r.rad`, 35.04 GiB) | - | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 4, int8 KV, MTP; the weights fit the two cards, so no expert is read from host memory. It thinks before answering by default: a client's token limit counts the reasoning too. Audio is refused with a 501. Speed not yet measured. Profile: `qwen36-35b-2card` | Not run |
+| Qwen3.6-35B-A3B IQ8R (`StillDeadcode/qwen3.6-35b-a3b-iq8r`, `qwen3.6-35b-a3b-iq8r.rad`, 35.04 GiB) | - | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 4, int8 KV, MTP; the weights fit the two cards, so no expert is read from host memory. It thinks before answering by default: a client's token limit counts the reasoning too. With `tool_choice: "required"` it can repeat its call; send `parallel_tool_calls: false` for exactly one. Audio is refused with a 501. Speed not yet measured. Profile: `qwen36-35b-2card` | Not run |
+| DeepSeek-V4.1-Flash-1017, bakon3's uncensored container (`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`, `deepseek-v4.1-flash-1017-uncensored.rad`, 251.13 GiB with a 103 GiB Engram table; IQ1_S and IQ2_XXS routed experts; MIT) | - | **Runs, not yet qualified** (preview): text; plain completions and chat with thinking on and off; 4K x 1, bf16 KV, no drafting, the exact wire. The routed experts do not fit two cards: each card holds what fits, then a 20 GiB pinned pool a card, and the rest (about 9 GiB a card) is read once from the file at load, repacked and kept in ordinary RAM, with the file as the fallback; nothing was read from the disk while it served. About 61 GiB less host memory is available while it serves; the start refuses, before it allocates, when its peak would leave less than 24 GiB available or pin more than the process may (`--plan-only` prints the plan and the check). Its greedy text can differ from four cards' (known issue 14). Profile: `deepseek41-2card` | **Runs, not yet qualified** (preview): text; plain completions and chat with thinking on and off; 4K x 1, bf16 KV, no drafting, the exact wire; every routed expert on the cards (about 29.7 GiB a card), the Engram table read from the file as each step needs it, about 21 GiB less host memory available while it serves. The checkpoint sets no sampling of its own: send `temperature` with each request. No soak, stop or concurrency checks yet; not run in the Sandbox. Rank 0 follows the runtime's device order. Profile: `deepseek41-4card` |
 | Other upstream models | Not qualified on Windows. The package carries many of upstream's architecture plugins, but no other model and modality has been run here ("Find your model file", below). Speech-only and music-only models cannot serve in this build (speech synthesis and music are refused, "Upstream features") | | |
 
 For Qwen3.8-Flash-Next IQR-V4 on two cards, **safe `flashnext-2card`** is the recommended
@@ -37,8 +38,23 @@ precision, and all 124 greedy test answers matched. With the exact wire, SDMA pr
 output in sequential drafter tests. Prefill was unchanged with SDMA, and its decode gain was
 inconclusive.
 
+**A faster prefill for long prompts, opt-in:** `.\serve.ps1 flashnext-2card -Bus 3,9 -Env
+BRILLIANCE_TP2_PIPELINE=1` (or `flashnext-2card-fast`). A long prompt prefilled alone in a step
+wider than one expert pass (the profiles' 6,144-token steps) sends each layer's two-card exchange in
+pieces on a second stream while the next piece is computed; the attention and recurrent layers
+still run the whole step at once. Other steps keep the usual schedule: several requests in one
+step, short steps, draft and verify passes, pictures and audio, active control vectors, a
+checkpoint inside the step, and `prefill-span-pass: step`. It is off by default in both profiles.
+On the exact wire it gives the same greedy tokens as without it, at the same batch shape and
+drafting settings, with the copy engines on or off. Its exchange has the same protection as the
+others (known issue 1): a lost write is re-sent, and one past the limit stops the server with
+status 70. This was checked on the exact wire and, for lost writes and a stuck block, with
+`flashnext-2card-fast`'s wht6.
+
 Containers of the 0.2.2 era (whole-model FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash
-MXFP4, DeepSeek-V4.1, Gemma 4 FP8) are not read by Radiance 2.2. Use the current containers above.
+MXFP4, Brilliance 0.2.2's DeepSeek-V4.1 containers, Gemma 4 FP8) are not read by Radiance 2.2.
+Use the current containers above; the DeepSeek-V4.1 container this build serves is the one in the
+table.
 
 ## Find your model file
 
@@ -55,7 +71,8 @@ precision (`model:` names the folder).
 | The repository's other sizes (`qwen3.8-27b-iq2r-v4.rad` and the rest) | `StillDeadcode/qwen3.8-27b-iqr-v4` | Not run | - |
 | `qwen3.8-next-flash-iqr-v4.rad` | `StillDeadcode/qwen3.8-next-flash-iqr-v4` | **Supported** on `flashnext-2card` (safe) and `flashnext-4card`. **Runs** on `flashnext-2card-fast` (fastest). 1 card: not run | Chat, streaming; upstream 2.2's drafting options and control vectors |
 | `minicpm5-2b-iq8r.rad` | `StillDeadcode/minicpm5-2b-iq8r` | 1 card and the CPU kernels: **Runs** (bring-up model). Profile `minicpm5-2b-1card` (on the CPU: `-Cpu`) | Chat, streaming |
-| `ltx-2.5-distilled-iq8r.rad` | `StillDeadcode/radiance-ltx-2.5-distilled-iq8r` | 1 card: **Runs, not yet qualified**. No profile | `/v1/videos` |
+| `ltx-2.5-distilled-iq8r.rad` | `StillDeadcode/radiance-ltx-2.5-distilled-iq8r` | 1 card: **Runs, not yet qualified**. Profile `ltx-2.5-1card` | `/v1/videos` |
+| `deepseek-v4.1-flash-1017-uncensored.rad` | `bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad` (reassembled from its six parts) | 2 and 4 cards: **Runs, not yet qualified**. Profiles `deepseek41-2card`, `deepseek41-4card` | `/completion`, Chat Completions, thinking on and off |
 | `gemma4-31b-a4.rad`, `gemma4-12b-i8g.rad`, `qwen3.6-35b-a3b-iq8r.rad`, `qwen-image-2.1-iq8r.rad` | the repositories in "Models and card counts" | See each model's row there | See each model's row there |
 | The folder `Qwen3-ASR-1.7B-hf` | `Qwen/Qwen3-ASR-1.7B-hf`, as it ships | 1 card: **Qualified** | `/v1/audio/transcriptions`, `/v1/realtime` |
 | The folder `Nemotron-3.5-Rerank-8B-BF16` | `nvidia/Nemotron-3.5-Rerank-8B-BF16` @ f88f8d91, as it ships | 1 card: **Qualified** | `/rerank`, `/v1/rerank` |
@@ -131,7 +148,7 @@ other settings gets a different cache: read the `kv:` line from its own start.
 | Upstream 2.2's launch-path speed-ups in the AQL backend: chained launches without the packet processor's acquire, the host data path flushed before each doorbell, the scalar cache emptied behind a chained wait, kept queues handed out oldest first, the expert prefetch stream's argument ring | No: Windows runs the native HIP backend, which has no AQL queues and does not chain launches. Upstream's two-card decode times for 2.2 (Flash-Next at tp 2: 11.2 ms a step at one stream, 12.4 in 2.1) come partly from these and from the peer-to-peer forms above, so they do not carry over to Windows as they are |
 | Runtime LoRA on a rotated int8 trunk (`plugin/lora_plain`, upstream 2.2) | No: upstream builds the library by hand, the Windows build does not make it, and its source loads `libr4d.so` by name |
 | `rad-convert`'s GPTQ step through OpenBLAS (upstream 2.2) | No: the Windows build has no OpenBLAS, so `libquant`'s GPTQ factorisations take upstream's single-threaded reference loops (upstream's own path without OpenBLAS; slower conversions, same method) |
-| Dashboard | Yes; per card it shows temperature, not load or power. Each model's page has a Monitoring tab (upstream's views) and a Brilliance **Sandbox** tab for a quick check: Start and Stop load and unload the model through `/admin/models/NAME/{load,unload}` (loopback callers only, as those routes are, unless the server has an API key), and a plain streamed chat over `/v1/chat/completions` kept in the page only. Checked against a stand-in server; not yet on a card |
+| Dashboard | Yes; per card it shows load (GFX activity), board power and junction temperature, read from the AMD driver's ADL (`atiadlxx.dll`, no admin needed). A card without ADL shows its temperature, and the page says load and power are not available on Windows. Each model's page has a Monitoring tab (upstream's views) and a Brilliance **Sandbox** tab for a quick check: Start and Stop load and unload the model through `/admin/models/NAME/{load,unload}` (loopback callers only, as those routes are, unless the server has an API key), and a plain streamed chat over `/v1/chat/completions` kept in the page only. Start loads with `?hold=1`, so until Stop a plain API request for another model that needs its cards is refused (503, naming the hold) instead of evicting it. From another machine without a key, the page lists the models from the public `/v1/models` and opens each one's pages and Sandbox; the fleet overview and Start and Stop stay with the server's own machine. Checked against a stand-in server and on one card; not qualified |
 | Terms of use (`GET /terms`) | Brilliance's own, not upstream's. The page the server shows the people it serves, linked from the dashboard and open without the API key: the shipped template `TERMS-OF-USE.md`, which carries the use restrictions some model licences (LTX-2.5's, SDXL's) require operators to pass on, or the operator's own file named by `terms-file:` under `server:`. Operators who serve other people must adopt it as their own terms (`PREVIEW.md`, "Serving on the network"). `/terms/licenses` shows each listed model's full licence text, from the files the package carries in `share/doc/radiance/model-licenses`, by the same rules: open without the key, no model woken |
 | Diagnose mode | Runs; the busy-host warning reads the CPUs' load over a quarter second |
 | `rad-convert` | CPU only, by decision; `--gpus` refused. A real model converted: SDXL, 9.6 s on the CPU |
@@ -164,6 +181,12 @@ other settings gets a different cache: read the `kv:` line from its own start.
      so a service's recovery should restart it (not yet run under the Service Control Manager:
      `SERVICE.md`). A hang that does not end in this stop is not restarted ("Hang detection",
      under "Upstream features"). `/stats` (`host_mailbox`) counts faults and resends per collective.
+     During a long prompt's prefill the fault is noticed at the step that hit it, not only at the
+     prompt's last step: the request fails with no token sent. A fault that only a cancelled
+     request could have seen stops the server before the next request runs.
+   - **The opt-in faster prefill** (`BRILLIANCE_TP2_PIPELINE=1`, "Models and card counts") sends
+     its exchange through the same checked host collectives: a lost write is re-sent and one past
+     the limit stops the server (status 70), on the exact wire and on wht6.
    - **The data slots use non-coherent memory** by default on two and four cards, for every
      model, which makes the fault rarer; the flags stay coherent. `BRILLIANCE_MAILBOX_MEM`
      overrides (`default` or `coherent` gives coherent slots).
@@ -235,7 +258,15 @@ other settings gets a different cache: read the `kv:` line from its own start.
    IQR 5-bit row-scaled layers (and short MoE gate/up batches) verify exactly as single-token
    decoding does. It costs about 36-41% of DFlash2 single-stream decode on Qwen3.8-27B IQ4R-L-V4
    and does not cover every layer, so it narrows such differences without removing them.
-6. **The dashboard** shows no card load or power on Windows.
+   On Qwen3.8-Flash-Next with two cards (`flashnext-2card`, 2026-11-21), the shipped MTP drafting
+   and decoding without drafts gave the same greedy text on 2 of 8 prompts. Every token was the
+   top choice of the pass that computed it, and where the texts parted, the two leading tokens
+   were within 0.02-0.13 nat of each other. Decoding without drafts changes as much when other
+   requests share its steps (0 of 8 the same as alone; known issue 8), so neither text is the
+   reference. With `BRILLIANCE_EXACT_VERIFY=1`, 6 of 8 were identical, logprobs included; the
+   prompts of about 28K and 57K tokens still parted.
+6. **The dashboard** reads card load and power only through the AMD driver's ADL. Windows' own GPU
+   counters do not see HIP's work, so a card without ADL shows "not available on Windows" for them.
 7. **Folder names outside the system code page.** `radiance.exe` and the package's scripts use
    UTF-8 throughout: the package was checked unpacked into, and serving from, a folder whose name
    has spaces and non-ASCII characters. Other tools (some archive and console tools) can still
@@ -288,6 +319,12 @@ other settings gets a different cache: read the `kv:` line from its own start.
     cached conditioning and attention were each checked and are not the cause; whether upstream on
     Linux gives the same picture is not yet known. If an edit comes out burnt, retry with another
     seed.
+14. **DeepSeek-V4.1 on two cards can give different greedy text from four cards.** `deepseek41-2card`
+    and `deepseek41-4card` serve the same file, but the two-card profile's next-token choices differ
+    from the four-card one's at some positions: in a check of 96 positions, the top token agreed at
+    86. Most differences are where the model is unsure between two tokens, but a few are where the
+    four-card profile is confident. The cause is not yet known. Take `deepseek41-4card` as the
+    reference, and expect `deepseek41-2card`'s answers to part from it now and then.
 
 ## From Brilliance 0.2.2
 

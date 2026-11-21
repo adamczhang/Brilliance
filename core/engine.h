@@ -466,6 +466,17 @@ private:
      * by fail_loop(); read by the server watcher to stop HTTP and by serve() to return it. */
     std::atomic<int>              loop_status_{RAD_OK};
     std::string                   fault_exit_;   /* fault_exit() */
+    /* Brilliance: the fault poll on steps with no sampled row (collect_step, FaultLook::kNoWait):
+     * how many, and their host time, logged when the engine is freed. Step loop only. */
+    int64_t                       nowait_polls_ = 0;
+    uint64_t                      nowait_poll_ns_ = 0, nowait_poll_max_ns_ = 0;
+    /* BRILLIANCE_TEST_COLL_FAULT=<step>[:late], the host backend's stand-in for a collective that
+     * records a fault in step <step>: latched when that step is issued, or with `late` once its
+     * collection has looked (a record that lands after the host's poll). Read by step_loop, on the
+     * host backend only; -1 off. */
+    int                           test_fault_step_ = -1;
+    bool                          test_fault_late_ = false;
+    bool                          test_fault_latched_ = false;
     server::Front*                front_ = nullptr;
     std::vector<std::string>      front_aliases_;
     std::atomic<bool>             stop_requested_{false};
@@ -573,6 +584,19 @@ private:
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
     int  collect_issue(StepOut& so, bool fence = false);
     int  collect_step(const RadBatch* b, StepOut& so);
+    /* Brilliance: where the step loop reads the collectives' fault records (coll_fault_check).
+     * kWaited: after a step's wait, so every collective its tokens depend on is on record.
+     * kNoWait: a step with no sampled row, which does not wait for the card; a record seen there
+     * is from this step, one the card ran before it, or the step issued ahead. kIdle: with no step
+     * to run, so a record of a step whose request was cancelled or ended is not left for the next
+     * request to find. */
+    enum class FaultLook { kWaited, kNoWait, kIdle };
+    /* RAD_E_DEVICE when a collective has a fault on record (naming it and the step's requests,
+     * and setting fault_exit_), RAD_OK when none has. Non-blocking: loads of pinned host memory. */
+    int  coll_fault_check(int step, const StepPlan* plan, FaultLook look);
+    /* The fault records' poll: the backend's, or the host backend's test stand-in
+     * (BRILLIANCE_TEST_COLL_FAULT). */
+    int  coll_fault_poll(std::string* why) const;
     /* `row`'s logprobs for `token`, filed at `at` (default `row`): a tree verify emits a token from
      * its parent node's row but files it as the entry's j-th emitted token. */
     int  row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at = -1);

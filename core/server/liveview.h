@@ -111,6 +111,9 @@ struct LinkStat {
     int64_t ar_calls = 0, ar_bytes = 0;
     int64_t h2d_bytes = 0, d2h_bytes = 0;
     int64_t ssd_reads = 0, ssd_bytes = 0;
+    /* Brilliance: the expert RAM tier's copies (weights copied from the RAM store into the read
+     * windows) and the drive reads relaid on the read, which ssd_reads already counts. */
+    int64_t ram_weights = 0, ram_bytes = 0, relaid_weights = 0;
     /* The SSD tier's staging leg: the file stager's copies of those same extents from its
      * pinned windows into the VRAM staging buffer. Moves out of h2d_bytes so Promotions shows
      * heat's churn, not the streaming it is spent on. */
