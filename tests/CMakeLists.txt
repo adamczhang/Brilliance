@@ -49,7 +49,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
 # relayout_iqr_test holds the IQR relayout to the stored form r4d_iqr.h describes, so it also
 # compiles r4d_iqr_layout.cpp.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test)
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test relayout_iqr_test
+    r4d_ar4_weights_test)
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
 # whether or not libr4d itself is.
 include(${CMAKE_SOURCE_DIR}/cmake/RadSimdLevels.cmake)
@@ -436,6 +437,10 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
                                   ${CMAKE_SOURCE_DIR}/libquant/lq_ggml_tables.cpp)
       target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/libquant)
       add_dependencies(${t} radiance libref deepseek41)
+      # Its libavx case runs the fixture on libavx alone (skipped where the build made none).
+      if(TARGET libavx)
+        add_dependencies(${t} libavx)
+      endif()
     elseif(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)
     elseif(t STREQUAL "clef_decision_test")

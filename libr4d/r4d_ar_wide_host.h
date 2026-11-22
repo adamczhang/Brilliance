@@ -106,3 +106,7 @@ void arw_rs_twoshot(int dtype, int nb, int nt, hipStream_t st, const int4* in4, 
 void arw_rs_coded(int nb, int nt, hipStream_t st, const int4* in4, int4* out4, int n16,
                   const ArwArgs& A);
 size_t arw_coded_region_bytes(long long SL);   // one coded region of a shard of SL chunks
+// ---- tp4-link-weight's (r4d_ar_wide_tw.hip): the coded two-shot over a weighted table (`off` its
+// WS + 1 shard offsets in 16-byte words, every shard whole waves of 32; `sh_max` the longest).
+void arw_rs_coded_w(int nb, int nt, hipStream_t st, const int4* in4, int4* out4, const int* off,
+                    int sh_max, const ArwArgs& A);

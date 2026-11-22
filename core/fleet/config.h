@@ -148,4 +148,22 @@ void print_reference(FILE* to);
 /* Durations: "250ms", "30s", "30m", "2h"; a bare number is seconds. False on anything else. */
 bool parse_duration_ms(const std::string& s, int64_t* out_ms);
 
+/* Brilliance (fast-loop): what a reload changed in one model's flag list (ModelEntry::args), split
+ * by whether a loaded engine can take it without reloading its weights (Engine::retune).
+ *
+ * `warm` are the keys of warm_key(): the drafting rule's host-side settings (--draft-depth and its
+ * -max/-min/-stop/-load* keys), --draft-suffix and its tuning, and --max-num-seqs. Each entry is
+ * "--flag old -> new" with "(unset)" for a side that does not name it. `cold` is every other
+ * changed flag, the same way: anything sized, declared or read at load (the program, the pools,
+ * the wire, the window), which a reload still serves by unloading and loading the model. A flag a
+ * side gives twice compares as its whole list of values. */
+struct ArgDiff {
+    std::vector<std::string> warm, cold;
+    bool empty() const { return warm.empty() && cold.empty(); }
+};
+ArgDiff diff_args(const std::vector<std::string>& before, const std::vector<std::string>& after);
+
+/* Whether a loaded engine may take a new value of `flag` ("--draft-depth-stop") in place. */
+bool warm_key(const std::string& flag);
+
 }  // namespace rad::fleet

@@ -149,6 +149,10 @@ set(R4D_UNITS
   # Brilliance: the two-shot with the resend (W4), plain and coded, a unit of its own for the same
   # reason; picked by r4d_ar_wide_host.hip's launchers.
   "r4d_ar_wide_ts|"
+  # Brilliance (tp4-link-weight): the coded two-shot over a link-weighted shard table, a unit of its
+  # own so that W4's even kernels above stay as they were; picked by r4d_ar_wide_host.hip's coded
+  # launcher only for a weighted instance (r4d_ar4_weights.h).
+  "r4d_ar_wide_tw|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"

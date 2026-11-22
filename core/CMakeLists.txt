@@ -69,6 +69,11 @@ set_property(TARGET rad_json PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(rad_json PRIVATE rad_vendor_yyjson rad_simd)
 target_link_libraries(rad_core PUBLIC rad_json)
 target_compile_definitions(rad_core PUBLIC RAD_VERSION="${PROJECT_VERSION}")
+# Brilliance: the rank stop gate (Engine::rank_loop), for engine_e2e_test's stop-after-release
+# cases. Host test builds only: packages come from the HIP build (win/package.ps1), which never has it.
+if(RAD_BUILD_TESTS AND NOT RAD_HIP_FOUND)
+  set_property(SOURCE engine.cpp APPEND PROPERTY COMPILE_DEFINITIONS RAD_ENABLE_RANK_STOP_TEST_HOOK)
+endif()
 if(RAD_ENABLE_KV_ROLLBACK_TEST_HOOK)
   # Scheduler is embedded in Engine and its test-only callback changes its class layout.
   # Propagate the definition to every consumer to keep all translation units ABI-consistent.

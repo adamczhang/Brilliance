@@ -3,8 +3,9 @@
 The conventional op vocabulary in hand-written x86 SIMD, dispatched at run time by CPU feature.
 
 libavx is a kernel plugin beside `libref` and `libr4d`. libref is the only other host
-implementation, and it is a slow reference. libavx implements all 161 of libref's ops with the
-same schemas and the same answers to a tolerance, the image generator's included (below).
+implementation, and it is a slow reference. libavx implements every one of libref's ops (260 rows
+in the source tree) with the same schemas and the same answers to a tolerance, the image
+generator's and DeepSeek-V4.1's included (below).
 
     cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix> && cmake --build build-avx -j4
     K=build-avx/radiance_home/kernels; R=<radiance prefix>/share/radiance/kernels
@@ -63,10 +64,21 @@ four levels and the engine never reaches it.
 ## Coverage
 
 Every op `libref` implements, `libavx` implements, so the selector resolves no op of a CPU-only
-deployment to libref: Flash-Next's QSA indexer, the DFlash2 drafters' convolution and the image
-and audio generators included. `rad-avx-check` fails on any missing op, and reports a row that returns
+deployment to libref: Flash-Next's QSA indexer, the DFlash2 drafters' convolution, the image
+and audio generators and DeepSeek-V4.1's text ops included. `rad-avx-check` fails on any missing op,
+with no exception list, and reports a row that returns
 `RAD_E_UNSUPPORTED` separately from one that is absent: a declining row is worse than none, because
 the selector resolves to it and the step fails at issue rather than at declare.
+
+DeepSeek-V4.1's eighteen ops (`avx_ds41.cpp`, `avx_glm.cpp`, `avx_ggml.cpp`) are libref's arithmetic
+with libref's refusals. The four over llama.cpp's native blocks (`gemm_nt_ggml`, `moe_gemm_ggml`,
+`logits_gemm_ggml`, `embed_lookup_ggml`) dequantise with libquant's own `dequantize_row`, compiled
+once at the baseline with the rows' layout hooks (`avx_ggml_hooks.cpp`, libref's hooks restated), so
+both libraries store and read the same blocks; like libref's, those four rows exist only where
+libquant's sources are beside the plugin's. The checker draws their weights in the float logical
+form; `tests/deepseek41_test.cpp` runs a small DeepSeek-shaped model on libavx alone over native
+blocks, against libref. `entry_store` checks every page before it writes, where libref writes the
+rows before a page past the cache; both then return `RAD_E_INVAL`.
 
 Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the same geometry:
 

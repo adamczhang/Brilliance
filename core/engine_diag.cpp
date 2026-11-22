@@ -173,8 +173,11 @@ void Engine::print_startup_report(int status) {
             RAD_ERR("startup report: INCOMPATIBLE: %s: %s. Fix: %s", x.id.c_str(), x.what.c_str(),
                     x.fix.c_str());
     }
-    /* Repeat the failure last, since the original error line is now above the report. */
-    if (status < 0)
+    /* Repeat the failure last, since the original error line is now above the report. An
+     * admitted --plan-only stop is no failure: it is said once, at info level. */
+    if (status < 0 && plan_admitted_)
+        RAD_INFO("startup stopped: --plan-only admitted the plan; nothing was loaded");
+    else if (status < 0)
         RAD_ERR("startup stopped: %s (the reason is said above the startup report)",
                 rad_strerror(status));
 }

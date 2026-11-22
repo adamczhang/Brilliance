@@ -1,0 +1,9 @@
+AMD Windows kernel-mode interface header attribution
+
+https://github.com/ROCm/rocm-systems/tree/7da43026e4f2ef7600433c38c820732f7a205d22/shared/amdgpu-windows-interop/wkmi/wkmi.h
+
+/*
+ * Copyright (c) Advanced Micro Devices, Inc., or its affiliates.
+ *
+ * SPDX-License-Identifier: MIT
+ */

@@ -7,9 +7,9 @@
 The Sandbox tab of the dashboard (docs/GUIDE.md section 6.1) picks a model from a list and loads it
 with POST /admin/models/NAME/load. The page is served by the running radiance process, so it cannot
 restart radiance on another profile; instead one process serves a fleet with one entry per shipped
-profile, named after it, with that profile's model keys, none loaded at start (scheduler.warm-up:
-false and no pin). Start on the page unloads whatever holds cards and loads the chosen entry; Stop
-unloads it. The single-model profiles stay as they are; this file is derived from them.
+profile, named after it, with that profile's model keys and startup warm-up off. A request or
+Sandbox Start can load an entry. Models can stay resident together when they fit. Start holds
+the selected model until Stop. This file is derived from the single-model profiles.
 
 Process-wide keys cannot differ per entry: memory.gpu-headroom-mib takes the smallest any profile
 sets, scheduler.load-timeout the longest. Reads and writes files only; standard library only.
@@ -28,9 +28,9 @@ HEADER = """\
 # other profiles in this folder; do not edit it by hand (`python -I win/tools/sandbox_profile.py write`).
 #
 # One radiance process serving every shipped profile as a model of its own, named after the profile,
-# none loaded at start. Open the dashboard (http://127.0.0.1:8000/), pick a model on any model's
-# Sandbox tab, and Start loads it (after unloading whatever else holds cards); Stop unloads it. For
-# quick checks only: to serve a model, start its own profile.
+# with startup warm-up off. A request or Sandbox Start can load an entry. Models can stay resident
+# together when they fit. Start holds the selected model until Stop. For quick fleet checks, open
+# the dashboard (http://127.0.0.1:8000/). To serve one model, start its own profile.
 #
 #   .\\serve.ps1 sandbox                    every discrete card, so every entry can load on four
 #   .\\serve.ps1 sandbox -Bus 3,9           two cards: the one- and two-card entries

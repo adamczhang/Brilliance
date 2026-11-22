@@ -37,9 +37,11 @@ Err compare(const float* got, const float* ref, int64_t n);
 /* One output buffer of `n` elements of `dt`, the library's against the oracle's. Token and row ids
  * (i32, u32, i64) must match exactly: widened to f32, two ids above 2^24 can compare equal and an
  * off-by-one under the relative tolerance passes. Everything else is held to `tol` in rel_l2 with
- * the finiteness pattern first. Returns false with the reason in `why`; `rel` gets the error. */
+ * the finiteness pattern first. Returns false with the reason in `why`; `rel` gets the error and
+ * `max_abs`, when given, the largest absolute difference over the finite elements (0 for ids that
+ * match). */
 bool same_values(uint32_t dt, const void* ref, const void* got, int64_t n, double tol,
-                 double* rel, std::string* why);
+                 double* rel, std::string* why, double* max_abs = nullptr);
 
 /* The serial run's outputs against a rerun with every parallel region forced to `threads` team
  * threads (avx_par_force). libavx partitions only outer loops and never reduces across threads

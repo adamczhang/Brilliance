@@ -1,6 +1,6 @@
 # Brilliance starter profile: MiniCPM5-2B IQ8R (8-bit weights and activations, its DSpark drafter
 # merged) on one Radeon AI PRO R9700. The small first run: a 3.04 GiB download instead of the
-# preview's 17.42 GiB. Text only; for tools, pictures and video use qwen27-preview.
+# preview's 17.42 GiB. Text and tool calls; for picture and video input use qwen27-preview.
 # Loads in about 4 s and holds 8.6 GiB of the card (2.55 GiB of weights, a 5.88 GiB KV cache for
 # every sequence at full length), plus the 510 MiB token embedding pinned in host memory.
 # 32K tokens of context, four requests at once, the default (bf16) KV cache. DSpark speculation at

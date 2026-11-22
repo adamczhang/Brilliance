@@ -62,6 +62,8 @@ set(AVX_KERNEL_SRC
   avx_vsa.cpp
   avx_audio.cpp
   avx_lili.cpp
+  avx_ds41.cpp
+  avx_ggml.cpp
 )
 
 # The flag sets, written out because each states which instructions the object may contain.
@@ -102,13 +104,26 @@ endforeach()
 # ============================ the plugin ============================
 # Baseline sources. avx_ngram.cpp is also here because it holds the embedding gather's row cache
 # and reader thread, which must exist once per process, not once per level.
-set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp)
+set(AVX_BASELINE_SRC avx_dispatch.cpp avx_registry.cpp avx_ngram.cpp avx_ggml_hooks.cpp)
+# The ggml rows read llama.cpp's blocks through libquant's one definition of them, compiled here
+# at the baseline as libref compiles it (avx_ggml.h). Out of tree, where libquant's sources are
+# not beside libavx's, the rows are absent, as libref's are.
+set(AVX_GGML_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../libquant)
+if(EXISTS ${AVX_GGML_DIR}/lq_ggml_planes.cpp)
+  list(APPEND AVX_BASELINE_SRC ${AVX_GGML_DIR}/lq_ggml_planes.cpp ${AVX_GGML_DIR}/lq_ggml_dequant.cpp
+                               ${AVX_GGML_DIR}/lq_ggml_tables.cpp)
+  set(AVX_HAVE_GGML ON)
+endif()
 
 rad_add_plugin(libavx kernels SOURCES ${AVX_BASELINE_SRC} INCLUDES ${CMAKE_CURRENT_SOURCE_DIR})
 
 foreach(lvl RANGE 0 3)
   target_link_libraries(libavx PRIVATE avx_lvl${lvl})
 endforeach()
+if(AVX_HAVE_GGML)
+  target_compile_definitions(libavx PRIVATE AVX_HAVE_GGML=1)
+  target_include_directories(libavx PRIVATE ${AVX_GGML_DIR})
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(libavx PRIVATE Threads::Threads)
 if(OpenMP_CXX_FOUND)

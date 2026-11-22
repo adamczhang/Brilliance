@@ -262,6 +262,15 @@ LoRA adapters are addressed `base:adapter`. `/v1/load_lora_adapter` takes `base`
   `cold`, `failed`), `kind`, `tp`, `cards`, and its adapters as `base:adapter` children.
   `/admin/fleet` adds `waiting` for a model that waits for room (§8.1).
 - `/health` is the process (200 once the front listens); `/health?model=NAME` is that model.
+  Brilliance: so is `/ping` naming no model (GET or POST) in a process of several models, where it
+  used to answer 400. With one model it is that model's own answer while the model is open, and the
+  process `/health` answer while it is cold or parked, so a model waiting for its first request is not
+  reported down and is not loaded by the probe. `/ping` naming a model
+  (query, form field or body) is `/health?model=` for it: the state the fleet is in, never a load
+  (upstream forwards it as a request, which wakes a cold model). Neither probe retries a failed load
+  or counts as a use of the model, so probing keeps no model from going idle. A failed model's reason
+  (`error`) answers the operator only (GUIDE §6.6), and with `server.api-key` a caller without the
+  key reads `{"status": ...}` alone.
 - `/metrics` carries a `model` label on every per-model series, plus fleet series: per-card
   committed fixed/flex bytes, parked bytes, loads, parks, evictions and their durations.
 - `/stats`, `/sessions` and the dashboard take `?model=`; the dashboard grows a fleet page.
@@ -766,6 +775,12 @@ anything. Then, per entry:
 
 - unchanged (same normalised key set): untouched;
 - changed only in request defaults and limits: applied in place to its `ModelFront`;
+- Brilliance: changed only in warm keys (`fleet::warm_key`: the `draft-depth` rule and its `-load`
+  keys, `draft-suffix` and its tuning, `max-num-seqs` at or below the loaded value) on a resident
+  model: retuned in place at the engine's next idle point, weights resident (`Engine::retune`). The log
+  says `retuned warm`. A value past what the load sized falls through to the next case.
+  `POST /admin/reload?warm=only` refuses (409, nothing changed) a file that would unload any model.
+  The answer's `models` says per model what was `retuned`, `reloaded`, `added` or `removed`;
 - changed otherwise: drained, unloaded, and re-registered as cold (loaded on the next request, or at
   once if pinned);
 - removed: drained and unloaded; its name answers 404;

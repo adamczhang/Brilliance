@@ -46,6 +46,12 @@ struct HttpRequest {
     std::string raw_peer;                                /* "addr:port" of the socket peer as the
                                                             kernel saw it; empty in-process. The
                                                             only address the guards read. */
+    /* Brilliance: true when the server requires an API key and this request does not carry a valid
+     * one. The key gate refuses such a request everywhere but the key-exempt routes (/health,
+     * /v1/health, /ping, the dashboard page, /terms), so only those ever see it set; they answer
+     * it the liveness alone, without the detail a key holder reads (docs/GUIDE.md §6.6). False on
+     * a keyless server and in-process. */
+    bool        missing_key = false;
     /* Steady-clock nanoseconds at which the whole body had arrived. The server's own time for
      * the request starts here, before parsing, so network time is excluded. -1 in-process. */
     int64_t     t_received_ns = -1;
@@ -94,6 +100,9 @@ bool ip_in_cidr(const std::string& addr, const std::string& cidr);
  * answers loopback callers keyless reads this, the fleet's front included. */
 bool local_operator(const HttpRequest& req, const std::string& bind_host,
                     const std::vector<std::string>& local_hosts);
+
+/* Report exposure after a successful bind. bound_addr is the socket's numeric address. */
+void warn_if_keyless_network_listener(const std::string& bound_addr, bool has_api_key);
 
 /* The caller a proxy chain vouches for. `raw_addr` is the socket peer (no port), `xff` the
  * request's X-Forwarded-For value ("" when there is none), `trusted` the vouched CIDRs.
@@ -240,7 +249,7 @@ bool terms_path(const std::string& path);
  * therefore connection counts, which Server::run derives from the admission ceiling, not the
  * core count. */
 struct TransportOptions {
-    std::string host = "0.0.0.0";
+    std::string host = "127.0.0.1";
     int         port = 8000;              /* 0 -> any free port; see HttpTransport::port */
     int         n_threads = 0;            /* kept alive while idle. 0 -> hardware_concurrency,
                                            * floor 4 */

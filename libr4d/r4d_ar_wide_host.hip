@@ -37,6 +37,7 @@
 #include <string>
 
 #include "r4d_ar_wide_host.h"
+#include "r4d_ar4_weights.h"   // tp4-link-weight: the weighted tables
 
 // ---------------------------------------------------------------- the one-shot all-reduce
 template <typename T, int LANES, bool INJ>
@@ -597,7 +598,7 @@ extern "C" void r4d_arw_twoshot(const long long* ps, const long long* pf, long l
                                 long long inp, long long out, long long n_elem, long long dtype,
                                 long long rank, long long stream, long long nblocks,
                                 long long nthreads, long long drain, long long acq, long long pub,
-                                long long stage, long long inj, long long rs) {
+                                long long stage, long long inj, long long rs, const int* weights) {
   const char* what = "ar_twoshot_4rank_exact (host)";
   const int esize = (dtype == 2) ? 4 : 2;
   const long long nbytes = n_elem * esize;
@@ -606,8 +607,10 @@ extern "C" void r4d_arw_twoshot(const long long* ps, const long long* pf, long l
     throw std::runtime_error(std::string(what) + ": exceeds the two-shot band");
   const long long n16 = nbytes / 16;
   if (n16 < ARW_WS) throw std::runtime_error(std::string(what) + ": shorter than a word a rank");
+  /* tp4-link-weight: `weights` (r4d_ar4_weights.h; null: even) are the instance's, passed only when
+   * the entry found the weighted table fits the slot. W1's and W4's kernels took a table already. */
   long long off[ARW_WS + 1];
-  const long long sh_max = r4d_ar_shard_table(n16, ARW_WS, nullptr, off);
+  const long long sh_max = r4d_ar_shard_table(n16, ARW_WS, weights, off);
   ArwShard sh{};
   for (int s = 0; s <= ARW_WS; ++s) sh.off[s] = (int)off[s];
   sh.sh_max = (int)sh_max;
@@ -646,11 +649,35 @@ extern "C" void r4d_arw_twoshot_coded(const long long* ps, const long long* pf, 
                                       long long inp, long long out, long long n_elem, long long rank,
                                       long long stream, long long nblocks, long long nthreads,
                                       long long drain, long long acq, long long pub, long long stage,
-                                      long long inj) {
+                                      long long inj, const int* weights) {
   const char* what = "ar_twoshot_4rank_exact (coded, host)";
   if (n_elem <= 0 || n_elem % (ARW_WS * 256) != 0)
     throw std::runtime_error(std::string(what) + ": the message is not whole 256-value waves a rank");
   const long long n16 = n_elem / 8, SL = n16 / ARW_WS;
+  if (weights) {
+    /* tp4-link-weight: the weighted table in whole waves (r4d_ar4_weights.h), r4d_ar_wide_tw.hip's
+     * kernel; the even table below keeps W4's kernel as it was. The entry passes `weights` only when
+     * the two coded regions of the longest shard fit the slot. */
+    R4DArwTab t;
+    r4d_arw_tab(n16, weights, 32, &t);
+    if (!r4d_arw_tab_fits(t, true, slot_stride16))
+      throw std::runtime_error(std::string(what) + ": a slot does not hold two coded regions of the weighted table's longest shard");
+    int nbw = (int)nblocks;
+    if (nbw < 1) nbw = 4;
+    if (nbw > R4D_AR_WIDE_MAX_BLOCKS) nbw = R4D_AR_WIDE_MAX_BLOCKS;
+    if (nbw > t.sh_max / 32) nbw = t.sh_max / 32;
+    int ntw = (int)nthreads;
+    if (ntw < 256) ntw = 256;
+    if (ntw > 1024) ntw = 1024;
+    ntw &= ~31;
+    ArwArgs Aw = arw_args(ps, pf, my_scratch, my_flags, seq_ctrs, slot_stride16, rank, drain, acq, pub,
+                          stage, what);
+    int w0 = 0, w1 = 0;
+    r4d_arw_span(t.sh_max, nbw, 0, 32, &w0, &w1);
+    Aw.iw = inj_pick(inj, R4D_AR_OP_W_CODED, (int)rank, nbw, w1 - w0, true);
+    arw_rs_coded_w(nbw, ntw, (hipStream_t)stream, (const int4*)inp, (int4*)out, t.off, t.sh_max, Aw);
+    return;
+  }
   if (2 * arw_coded_region_bytes(SL) > (size_t)slot_stride16 * 16)
     throw std::runtime_error(std::string(what) + ": a slot does not hold two coded regions");
   int nb = (int)nblocks;

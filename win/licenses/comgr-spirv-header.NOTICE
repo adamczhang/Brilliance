@@ -1,0 +1,11 @@
+SPIR-V Headers generated header attribution
+
+https://github.com/KhronosGroup/SPIRV-Headers/blob/575b6512579ebde466ed3dfc04e413439d14d95d/include/spirv/unified1/spirv.hpp
+
+// Copyright: 2014-2024 The Khronos Group Inc.
+// License: MIT
+//
+// MODIFICATIONS TO THIS FILE MAY MEAN IT NO LONGER ACCURATELY REFLECTS
+// KHRONOS STANDARDS. THE UNMODIFIED, NORMATIVE VERSIONS OF KHRONOS
+// SPECIFICATIONS AND HEADER INFORMATION ARE LOCATED AT
+// https://www.khronos.org/registry/

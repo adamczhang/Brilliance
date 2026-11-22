@@ -43,6 +43,20 @@ add_test(NAME serve_launcher_test
 set_tests_properties(serve_launcher_test PROPERTIES LABELS unit TIMEOUT 300
   ENVIRONMENT "BRILLIANCE_SERVE_TEST_DEVICES=0:33:1,1:6:0,2:3:0,3:9:0,4:32:0;HIP_VISIBLE_DEVICES=-1")
 
+# Replay recorded engine rank rows without running radiance or the HIP runtime.
+add_test(NAME rank_report_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/rank_report_test.ps1")
+set_tests_properties(rank_report_test PROPERTIES LABELS unit TIMEOUT 30)
+# The published DeepSeek TP2 dry-plan command should explain the YAML form.
+add_test(NAME plan_only_cli_test
+         COMMAND ${CMAKE_COMMAND}
+                 "-DEXE=$<TARGET_FILE:radiance>"
+                 "-DPROFILE=${CMAKE_SOURCE_DIR}/win/profiles/deepseek41-2card.yaml"
+                 -P "${CMAKE_CURRENT_SOURCE_DIR}/plan_only_cli_test.cmake")
+set_tests_properties(plan_only_cli_test PROPERTIES LABELS unit TIMEOUT 30
+  ENVIRONMENT "BRILLIANCE_DEVICE=host;HIP_VISIBLE_DEVICES=-1;RADIANCE_HOST_DEVICES=1")
+
 # serve.ps1 on a profile of several models (profiles\sandbox.yaml): the entries needing more cards
 # than radiance will see are dropped and named, and radiance reads a copy without them. The HIP
 # runtime is never asked; radiance runs as --check only.
@@ -63,6 +77,14 @@ add_test(NAME fetch_launch_test
                  -File "${CMAKE_CURRENT_SOURCE_DIR}/fetch_launch_test.ps1" -Exe "$<TARGET_FILE:radiance>")
 set_tests_properties(fetch_launch_test PROPERTIES LABELS unit TIMEOUT 300 SKIP_RETURN_CODE 77)
 
+# win\tools\build-identity.ps1 on fixture headers: the "build identity:" line win\build.ps1 prints
+# after a build, by which the release's G1.build gate binds a build log to its candidate. No build.
+add_test(NAME build_identity_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/build_identity_test.ps1")
+set_tests_properties(build_identity_test PROPERTIES LABELS unit TIMEOUT 60
+  ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
 # profiles\sandbox.yaml is generated from the other profiles (win\tools\sandbox_profile.py): it
 # fails while a profile changed and the sandbox was not regenerated.
 find_program(RAD_PYTHON3 NAMES python3)
@@ -70,6 +92,34 @@ if(RAD_PYTHON3)
   add_test(NAME sandbox_profile_test
            COMMAND ${RAD_PYTHON3} -I ${CMAKE_SOURCE_DIR}/win/tools/sandbox_profile.py check)
   set_tests_properties(sandbox_profile_test PROPERTIES LABELS unit TIMEOUT 60)
+  add_test(NAME docs_check_known_issues_test
+           COMMAND ${RAD_PYTHON3} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/docs_check_known_issues_test.py ${CMAKE_SOURCE_DIR})
+  set_tests_properties(docs_check_known_issues_test PROPERTIES LABELS unit TIMEOUT 60)
+  # REFERENCE.md lists every setting the code reads (win/tools/docs_check.py's settings rule): a
+  # fixture of a missing, a stale, a misplaced and a moved setting, then the repository itself.
+  add_test(NAME docs_check_reference_test
+           COMMAND ${RAD_PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/docs_check_reference_test.py ${CMAKE_SOURCE_DIR})
+  set_tests_properties(docs_check_reference_test PROPERTIES LABELS unit TIMEOUT 120)
+  # The stop journal's checker (win\tools\stop_log_check.py, core/util/stoplog.h) on synthetic
+  # journals: bounded, over a bound, a split rank exit, a stream not drained, cut off mid-teardown;
+  # and the retire (a timed-out drain) as expected, on saved journals in win/tools/fixtures/stoplog.
+  add_test(NAME stop_log_check_test
+           COMMAND ${RAD_PYTHON3} -I -B ${CMAKE_SOURCE_DIR}/win/tools/stop_log_check_test.py)
+  set_tests_properties(stop_log_check_test PROPERTIES LABELS unit TIMEOUT 60
+                       ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
+  # win\tools\gate_runner.py, the release gate runner, on fixture candidates (a small ZIP with a
+  # MANIFEST, logs, check plug-ins, criteria files): the pass, fail, skip and carryover verdicts, the
+  # record tied to the ZIP's SHA-256 and the snapshot commit, the build lease. No GPU, no server.
+  add_test(NAME gate_runner_test
+           COMMAND ${RAD_PYTHON3} -I ${CMAKE_SOURCE_DIR}/win/tests/gate_runner_test.py
+                   --tmp ${CMAKE_BINARY_DIR}/tmp)
+  set_tests_properties(gate_runner_test PROPERTIES LABELS unit TIMEOUT 120
+    ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+  add_test(NAME licence_checks_test
+           COMMAND ${RAD_PYTHON3} -I -B ${CMAKE_CURRENT_SOURCE_DIR}/licence_checks_test.py)
+  set_tests_properties(licence_checks_test PROPERTIES LABELS unit TIMEOUT 60
+    ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
 endif()
 
 # bin\rad-export.cmd in an unpacked package runs the rad-convert beside it with bin\ off PATH, and

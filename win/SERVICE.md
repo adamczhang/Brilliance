@@ -1,13 +1,28 @@
-# Brilliance as a Windows service
+# Brilliance as a Windows service (preview)
 
-radiance can run as a Windows service: started by the system at boot, stopped by the same graceful
-drain as Ctrl-C in a console. **This is not advertised until the qualification below has passed on
-the machine.** Everything that does not need the Service Control Manager is covered by the host tests
-`service_win_test` and `serve_service_test`. The steps here are the part that needs an elevated shell.
+The LocalSystem service is a **preview in Brilliance 0.3.0**. Host tests check the launcher's
+install and uninstall dry runs, including the planned YAML copy, environment, key handling and
+recovery settings. They also cover log rotation, simulated service controls and exit codes, and
+console runs of `radiance --service` with no model loaded. The console runs verify health, API-key
+handling and shutdown through the service stop path and Ctrl-Break.
 
-## What it does
+Elevated Service Control Manager (SCM) install, installed key file permissions (ACL), graceful
+stop and detachment under SCM, boot and preshutdown, reinstall, and one-restart recovery remain
+unverified. The no-GPU recovery drill is blocked before registration by the launcher's no-card
+guard when HIP enumeration succeeds. A GPU stall may be reported in the log and health status.
+The Windows process stays up on a stall, so SCM recovery does not start.
+[Windows known-issue table](SUPPORT.md#known-issues)
 
-The Service Control Manager (SCM) starts
+For a first trial, unpack the package into a folder only administrators can change, such as
+`C:\Program Files\Brilliance` and use full model paths. Review `-Install -WhatIf` without
+elevation. A real install requires an elevated PowerShell. Use `-Manual -NoRestart` if you want
+to control every start. Check the log, `/health` and an inference request before relying on the
+service, and verify the installed key ACL if you use a key. Use the console launcher for
+workloads that depend on the established console start and stop path.
+
+## Expected service behavior
+
+SCM starts
 
     radiance.exe --service NAME --config FILE [--log FILE] [--env-from-file VAR=FILE]...
                  [--stop-timeout SECONDS]
@@ -22,8 +37,9 @@ The service adds only what a service needs and a console already has:
 | **Working directory** | the config's folder. The SCM starts services in System32. |
 | **Status** | `START_PENDING`, then `RUNNING` just before the engine starts, so `RUNNING` does not mean a model is ready. The model then loads (seconds to minutes). With a one-model profile, wait until `/health` answers and a test request gets an answer. |
 
-**A stop is the drain.** `STOP` (`Stop-Service`, `sc.exe stop`), `PRESHUTDOWN` (Windows shutting
-down) and `SHUTDOWN` all reach the engine as SIGTERM, which is what Ctrl-Break does in a console.
+**A stop asks the engine to drain.** `STOP` (`Stop-Service`, `sc.exe stop`), `PRESHUTDOWN`
+(Windows shutting down) and `SHUTDOWN` all reach the engine as SIGTERM, which is what
+Ctrl-Break does in a console.
 The fleet stops admitting work, lets running requests finish for up to `scheduler.drain-timeout`
 (30 s by default) and then ends them, releases the cards, and exits 0. A stop that arrives while a
 model is loading waits for that load to finish first. A stop that arrives before the engine has
@@ -65,21 +81,23 @@ exit. The manager should then see the process end unexpectedly, which the recove
 as a failure. Unverified: no such fault has been run under the service, so the codes `sc.exe query`
 shows for it are not recorded.
 
-**Recovery** (`serve.ps1 -Install` sets it): the first failure restarts the service after 2
-minutes, and later failures do nothing until a full day (24 hours) has passed without a failure,
-when the count starts again. So a card in trouble gets one more load at most. `-NoRestart` sets no
-action at all. A non-zero exit nobody asked for counts as a failure, as does a crash. A stop that
-was asked for and completes is reported as a success. A hang is not a failure the Service Control
-Manager sees (above).
+**Recovery policy.** The installer configures SCM to restart the service 2 minutes after the first
+failure and take no further action until 24 hours have passed without a failure. `-NoRestart`
+configures no restart action. The policy is intended to apply to a crash or an unrequested
+nonzero exit. A completed stop reports success. A stall that leaves the process running never
+triggers recovery. The installed one-restart behavior remains unverified.
 
 **Run from a console**, the same command line runs there as the service would. It prints
 `not started by the Service Control Manager` and the log's path, writes its output to the log,
 and stops on Ctrl-C or Ctrl-Break (`tools\stop-server.ps1 -ProcessId N`). Setting the event
 `Local\brilliance-service-stop-<pid>` takes the service's own STOP path. In a console the status
-the SCM would have been told goes to the log as `(console) status ...` lines. This is how the host
-test runs it, and the first step below.
+the SCM would have been told goes to the log as `(console) status ...` lines. The host test
+exercises this console path.
 
 ## Installing: `serve.ps1 -Install`
+
+These are the intended settings and permissions. Review the dry run first and verify the
+settings and ACLs on any service you install.
 
     .\win\serve.ps1 <profile> [-Bus N | -Device N] [-Listen ADDR] [-Port N] [-ApiKey off|env:NAME]
                     -Install [-Name NAME] [-Manual] [-NoRestart] [-StopTimeoutS S] [-Log FILE] [-Exe PATH] [-WhatIf]
@@ -130,21 +148,18 @@ test runs it, and the first step below.
 
 ## Moving a service to a new release
 
-**Not yet run in an elevated shell.** A service runs the `radiance.exe` it was installed from, so it
-keeps running that release until it is installed again from the new one; `-Install` refuses a name
-that is already installed. From alpha.4 to alpha.5 nothing changes in how the service's YAML is
-written or read: record what the service has, remove it, and install it again from the new folder,
-as steps 0-8 of the next section describe, reading alpha.4 for alpha.3 and alpha.5 for alpha.4
-(the `server:` lines and `api-key:` notes of step 2 do not apply: alpha.4 already installed the
-profile as it is). One difference: a profile whose name has a dot (`ltx-2.5-1card`) now gives a
-service named after the whole name (`Brilliance-ltx-2.5-1card`); alpha.4 cut it at the dot
-(`Brilliance-ltx-2`), so pass `-Name` with the old name to `-Uninstall` such a service. From
-alpha.3, follow the next section, installing alpha.5 where it says alpha.4.
+**Reinstall remains unverified under SCM.** A service starts the `radiance.exe` it was installed
+from. To move it to a new release, record its settings, uninstall it and install it again from
+the new folder. `-Install` refuses a name already registered. Use the sequence in the next
+section with your source and target releases. For alpha.4 and later, read any listener overrides
+from the service's `Environment` and skip the alpha.3-specific `server:` edits in step 2. Use
+`-ApiKey env:NAME` for a key held in a file. Alpha.4 cut a profile name at its first dot, so use
+`-Name` with the old name when uninstalling one such as `Brilliance-ltx-2`. Alpha.5 and later
+use the full name, such as `Brilliance-ltx-2.5-1card`.
 
 ## Moving an alpha.3 service to alpha.4
 
-**Not yet run in an elevated shell.** These steps follow how `-Install` and `-Uninstall` work in
-`serve.ps1`; they have not been run end to end on an installed service.
+These steps follow the launcher logic. The migration remains unverified on an installed service.
 
 A service runs the `radiance.exe` it was installed from, so an alpha.3 service keeps running
 alpha.3 until it is installed again. There is no upgrade in place: `-Install` refuses a name that is
@@ -232,6 +247,9 @@ In an elevated PowerShell:
    (it holds the key).
 
 ## Qualification, in an elevated PowerShell
+
+This checklist records the expected results for future qualification. The elevated steps and
+the Windows restart were deferred for 0.3.0.
 
 The service in these steps is `Brilliance-qwen27-preview`, the preview profile on the card on
 PCI bus 3, loopback, no key. Adjust `-Bus`, `-Listen` and `-ApiKey` to the machine's policy; a
@@ -333,18 +351,11 @@ build (`build-win\hip\bin`) or a package. Note the GPU tuning in force when you 
    The previous log (`$svc.log.1`) should end with `service: PRESHUTDOWN: draining ...` and
    `service: stopped`: the drain ran at shutdown.
 
-8. **Recovery without a card (optional).** This installs a second service that cannot start, to see
-   the "restart once, then not again" policy. `-Device -1` hides every card, so no GPU is used.
-
-       $p = "$env:TEMP\failtest.yaml"
-       "server:`n  port: 18399`nmodels:`n  x:`n    model: C:/no/such/model.rad`n" | Set-Content -Encoding ascii $p
-       .\win\serve.ps1 $p -Name Brilliance-failtest -Device -1 -Manual -Install
-       Start-Service Brilliance-failtest; Start-Sleep 5
-       sc.exe query Brilliance-failtest     # STOPPED, WIN32_EXIT_CODE 1066, SERVICE_EXIT_CODE 1
-       Start-Sleep 150; Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 10 |
-         Where-Object Message -match 'failtest' | Format-List TimeCreated, Message
-       # one restart, about 120 s after the first failure, then no further one
-       .\win\serve.ps1 $p -Name Brilliance-failtest -Uninstall
+8. **Recovery without a card (blocked).** When HIP enumeration succeeds, `-Device -1` leaves
+   an empty device list. The launcher's no-card guard rejects the install before SCM registers
+   the service. A replacement drill needs a CPU-only profile that passes the installer's
+   preflight and then fails at service startup. One restart after about 2 minutes, followed by
+   no further restart on the next failure, is the policy to verify.
 
 9. **Uninstall, while it runs.**
 
@@ -353,8 +364,7 @@ build (`build-win\hip\bin`) or a package. Note the GPU tuning in force when you 
        Get-Service $svc -ErrorAction SilentlyContinue   # nothing
        Get-ChildItem $dir                          # the YAML and the logs are still there
 
-Record for each step what it showed (times, exit codes, the log's last lines). Whether the service
-is advertised is decided from that record.
+For each step you run, record the observed times, exit codes and last log lines.
 
 ## In the package
 

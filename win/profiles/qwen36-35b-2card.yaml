@@ -15,8 +15,8 @@
 # 3f3dffb91b4584227b958d244846b3f951df4e5b2ae80bc60a92494056cc112e. Point `model:` at where it is.
 # Apache 2.0, as Qwen's Qwen3.6-35B-A3B.
 #
-# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Rank 0 follows the
-# runtime's device order, not the order the cards are named in. Without -Bus the first two discrete
+# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Windows HIP
+# determines device order. The startup report lists the ranks. Without -Bus the first two discrete
 # cards HIP shows are used and the rest stay visible,
 # which lowers the pin limit (SUPPORT.md, known issue 3); name the two. Cards talk
 # through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is off with more
@@ -34,3 +34,5 @@ models:
     max-num-seqs: 4
     max-model-len: 32768
     kv-cache-dtype: i8
+    # weight-prefetch off: Windows TP2 A/B on flashnext-2card-fast (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical; same host-staged collective path.
+    weight-prefetch: off

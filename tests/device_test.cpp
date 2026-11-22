@@ -1511,7 +1511,7 @@ TEST(a_host_wait_on_a_gated_stream_is_refused_not_a_deadlock) {
 /* Behind a closed gate the queue only fills. Submissions up to the room succeed and the one after
  * is refused rather than waiting for room that cannot appear; opening the gate runs every accepted
  * submission in order. The ring holds 1024 tasks, the gate's own among them until the worker takes
- * it, so 1023 or 1024 fit. */
+ * it, so 1023 or 1024 fit, and the worker can take it after the refusal. */
 TEST(a_full_gated_queue_refuses_the_next_submission_instead_of_waiting) {
     if (!need_host_backend()) return;
     Stream st;
@@ -1532,6 +1532,62 @@ TEST(a_full_gated_queue_refuses_the_next_submission_instead_of_waiting) {
     }
     CHECK_EQ(refused, 1);
     CHECK(ok == 1023 || ok == 1024);
+    /* The refusal leaves no room, but the gate's own slot may still come free after it: the worker
+     * takes the gate off the ring whenever it is scheduled and then waits on it. So with 1023
+     * accepted the room reads 0 or 1; with 1024 the gate had already left and nothing can drain. */
+    const int64_t room = rad_gate_room(st.s);
+    CHECK(room == 0 || (ok == 1023 && room == 1));
+    CHECK_OK(rad_gate_open(gate));
+    CHECK_OK(rad_stream_sync(st.s));
+    CHECK_EQ((int)a[0], ok & 0xff);
+    CHECK_EQ((int)a[63], ok & 0xff);
+}
+
+/* Room until the stream reports `want` or two seconds pass. */
+static int64_t gate_room_reaches(RadStream s, int64_t want) {
+    const auto t0 = std::chrono::steady_clock::now();
+    int64_t room = rad_gate_room(s);
+    while (room != want && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
+        std::this_thread::yield();
+        room = rad_gate_room(s);
+    }
+    return room;
+}
+
+/* The case above with the race pinned down: an earlier gate holds the worker, so the gate under
+ * test is still on the ring when the queue fills and the refusal comes. Opening the earlier gate
+ * lets the worker take the later one off the ring and wait on it, which frees exactly one slot:
+ * the room says so, one more submission fits, and the next is refused again. */
+TEST(a_gate_the_worker_takes_off_a_full_ring_frees_one_slot) {
+    if (!need_host_backend()) return;
+    Stream st;
+    DevBuf<uint8_t> a(64, RAD_MEM_DEVICE);
+    REQUIRE(a);
+    void* hold = nullptr;
+    REQUIRE_EQ(rad_stream_gate(st.s, &hold), RAD_OK);
+    const int64_t held = gate_room_reaches(st.s, 1024);   /* the worker waits on `hold` */
+    CHECK_EQ(held, 1024ll);
+    void* gate = nullptr;
+    const int grc = held == 1024 ? rad_stream_gate(st.s, &gate) : RAD_E_STATE;
+    CHECK_EQ(grc, RAD_OK);
+    if (grc != RAD_OK) {   /* a stream must not be destroyed behind a closed gate */
+        CHECK_OK(rad_gate_open(hold));
+        return;
+    }
+    CHECK_EQ(rad_gate_room(st.s), 1023ll);
+    int ok = 0, refused = 0;
+    for (int i = 0; i < 2048 && !refused; ++i) {
+        const int rc = rad_memset_async(a, (ok + 1) & 0xff, 64, st.s);
+        if (rc == RAD_OK) ++ok; else { CHECK_EQ(rc, RAD_E_STATE); ++refused; }
+    }
+    CHECK_EQ(refused, 1);
+    CHECK_EQ(ok, 1023);
+    CHECK_EQ(rad_gate_room(st.s), 0ll);
+    CHECK_OK(rad_gate_open(hold));
+    CHECK_EQ(gate_room_reaches(st.s, 1), 1ll);
+    CHECK_OK(rad_memset_async(a, (ok + 1) & 0xff, 64, st.s));
+    ++ok;
+    CHECK_EQ(rad_memset_async(a, (ok + 1) & 0xff, 64, st.s), RAD_E_STATE);
     CHECK_EQ(rad_gate_room(st.s), 0ll);
     CHECK_OK(rad_gate_open(gate));
     CHECK_OK(rad_stream_sync(st.s));

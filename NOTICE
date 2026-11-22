@@ -300,3 +300,8 @@ f88f8d9104726747791283ab156d2fcdb29e90a7:
 https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16/tree/f88f8d9104726747791283ab156d2fcdb29e90a7
 It is covered by the same retained OpenMDW-1.1 license.
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+The Brilliance Windows package with HIP includes AMD ROCm Core SDK DLLs. The package's
+third_party/THIRD-PARTY.md records those DLLs and their applicable component notices. The
+MetroHash attributions, HSA loader and libelf notices, and AMD COMGR compiler notices are
+in third_party/ beside that index. In the source tree, these files are under win/licenses/.

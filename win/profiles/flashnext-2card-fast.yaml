@@ -48,3 +48,5 @@ models:
     max-num-batched-tokens: 6144
     prefill-span: 3
     ngram-warm: true
+    # weight-prefetch off: measured on this profile, Windows TP2 A/B (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical.
+    weight-prefetch: off

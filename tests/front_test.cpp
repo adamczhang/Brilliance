@@ -5,6 +5,10 @@
  *   Merged   several models' metrics are one exposition, each family declared once
  *   Reads    what the dashboard polls is told apart from requests for work
  *   Jobs     a finished job is answered by its id with no model, until it expires or is deleted
+ *   Probes   a bare /ping on several models is the process's liveness; a probe without the key
+ *            reads the status alone, and a failed load's reason is the operator's (Brilliance,
+ *            LAN F3 and F4); /ping naming a model reads its state and never loads it, with or
+ *            without the key (Brilliance, ping-state)
  *
  * Most cases dispatch in process; discovery activity also uses a loopback listener.
  */
@@ -235,6 +239,337 @@ TEST(model_discovery_does_not_restart_the_idle_clock) {
     CHECK_EQ(after_work.uses, before.uses + 1);
     CHECK(after_work.last_used_ns >= before.last_used_ns);
     CHECK_EQ(after_work.leases, 0);
+}
+
+/* A Front on a loopback listener, torn down before the models it serves. */
+namespace {
+struct LiveFront {
+    Front front;
+    std::thread thread;
+    explicit LiveFront(const TransportOptions& o) : front(o, 0) {}
+    ~LiveFront() { front.stop(); if (thread.joinable()) thread.join(); }
+    bool start() {
+        thread = std::thread([this] { front.run(); });
+        for (int i = 0; i < 200 && !front.port(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return front.port() > 0;
+    }
+};
+
+TransportOptions loopback(const char* key = "") {
+    TransportOptions o;
+    o.host = "127.0.0.1";
+    o.port = 0;
+    o.api_key = key;
+    return o;
+}
+
+json body_of(const httplib::Result& r) {
+    return r ? json::parse(r->body, nullptr, false) : json();
+}
+}  /* namespace */
+
+/* Brilliance (LAN F4): /ping is the load balancer's liveness probe. With one model it is that
+ * model's answer, as it always was; with several and none named it is the process's, as /health
+ * is -- never a 400 a probe reads as down. Naming a model still asks that model. */
+TEST(a_bare_ping_on_several_models_is_the_process_liveness) {
+    Fixture a, b;
+    LiveFront lf(loopback());
+    Front& front = lf.front;
+    front.add("a", {}, 100, false);
+    front.attach("a", {}, a.srv.get());
+    REQUIRE(lf.start());
+    httplib::Client c("127.0.0.1", front.port());
+    c.set_read_timeout(2, 0);
+    /* One model: forwarded to it. */
+    auto one = c.Get("/ping");
+    REQUIRE(one != nullptr);
+    CHECK_EQ(one->status, 200);
+    CHECK(body_of(one).contains("queue_cap"));
+    /* Several. */
+    front.add("b", {}, 100, false);
+    front.attach("b", {}, b.srv.get());
+    for (int post = 0; post < 2; ++post) {
+        auto r = post ? c.Post("/ping", "", "application/json") : c.Get("/ping");
+        REQUIRE(r != nullptr);
+        CHECK_EQ(r->status, 200);
+        const json j = body_of(r);
+        CHECK_EQ(j.value("status", ""), std::string("ok"));
+        CHECK(j.contains("models") && j["models"].contains("a") && j["models"].contains("b"));
+    }
+    /* Named, by query or body: that model's own answer. */
+    auto named = c.Get("/ping?model=b");
+    REQUIRE(named != nullptr);
+    CHECK_EQ(named->status, 200);
+    CHECK(body_of(named).contains("queue_cap"));
+    auto by_body = c.Post("/ping", R"({"model":"a"})", "application/json");
+    REQUIRE(by_body != nullptr);
+    CHECK_EQ(by_body->status, 200);
+    CHECK(body_of(by_body).contains("queue_cap"));
+    auto unknown = c.Get("/ping?model=nope");
+    REQUIRE(unknown != nullptr);
+    CHECK_EQ(unknown->status, 404);
+    /* A model that must be loaded and is not: the bare probe says so, as /health does. */
+    front.add("c", {}, 100, true);
+    auto waiting = c.Get("/ping");
+    REQUIRE(waiting != nullptr);
+    CHECK_EQ(waiting->status, 503);
+    CHECK_EQ(body_of(waiting).value("status", ""), std::string("loading"));
+}
+
+/* Brilliance (LAN F3): on a keyed server the probes answer a caller without the key the status
+ * alone -- no model names, states, load, or a failed load's reason -- with the code the key holder
+ * gets, so a load balancer reads the same verdict. The key holder reads everything. */
+TEST(a_probe_without_the_key_reads_no_models_or_reasons) {
+    Fixture a;
+    LiveFront lf(loopback("k"));
+    Front& front = lf.front;
+    const std::string why = "startup failed: D:/models/secret/b.rad not found";
+    front.add("a", {}, 100, false);
+    front.attach("a", {}, a.srv.get());
+    front.add("b", {}, 100, false);
+    front.fail("b", why, 3600 * 1000);
+    front.set_describe([&](const std::string& n) {
+        return n == "b" ? json{{"error", why}}.dump() : std::string("{}");
+    });
+    REQUIRE(lf.start());
+    httplib::Client c("127.0.0.1", front.port());
+    c.set_read_timeout(2, 0);
+    const httplib::Headers none, wrong = {{"Authorization", "Bearer nope"}},
+                                 key = {{"Authorization", "Bearer k"}};
+    for (const httplib::Headers* h : { &none, &wrong }) {
+        for (const char* p : { "/health", "/v1/health", "/ping" }) {
+            auto r = c.Get(p, *h);
+            REQUIRE(r != nullptr);
+            CHECK_EQ(r->status, 200);
+            CHECK_EQ(r->body, std::string(R"({"status":"ok"})"));
+        }
+        auto post = c.Post("/ping", *h, "", "application/json");
+        REQUIRE(post != nullptr);
+        CHECK_EQ(post->body, std::string(R"({"status":"ok"})"));
+        auto open = c.Get("/health?model=a", *h);
+        REQUIRE(open != nullptr);
+        CHECK_EQ(open->status, 200);
+        CHECK_EQ(open->body, std::string(R"({"status":"ok"})"));
+        auto failed = c.Get("/health?model=b", *h);
+        REQUIRE(failed != nullptr);
+        CHECK_EQ(failed->status, 503);
+        CHECK_EQ(failed->body, std::string(R"({"status":"failed"})"));
+        auto ping_failed = c.Get("/ping?model=b", *h);
+        REQUIRE(ping_failed != nullptr);
+        CHECK_EQ(ping_failed->status, 503);
+        CHECK(!has(ping_failed->body, "secret"));
+        auto models = c.Get("/v1/models", *h);
+        REQUIRE(models != nullptr);
+        CHECK_EQ(models->status, 401);
+    }
+    auto whole = c.Get("/health", key);
+    REQUIRE(whole != nullptr);
+    CHECK_EQ(whole->status, 200);
+    const json w = body_of(whole);
+    CHECK(w.contains("models") && w["models"].value("b", "") == "failed");
+    auto failed = c.Get("/health?model=b", key);
+    REQUIRE(failed != nullptr);
+    CHECK_EQ(failed->status, 503);
+    CHECK_EQ(body_of(failed).value("error", ""), why);
+    CHECK_EQ(body_of(failed).value("model", ""), std::string("b"));
+    auto ping_failed = c.Get("/ping?model=b", key);
+    REQUIRE(ping_failed != nullptr);
+    CHECK(has(ping_failed->body, "secret"));
+    auto open = c.Get("/health?model=a", key);
+    REQUIRE(open != nullptr);
+    CHECK(body_of(open).contains("queue_cap"));
+    auto models = c.Get("/v1/models", key);
+    REQUIRE(models != nullptr);
+    CHECK(has(models->body, "secret"));
+}
+
+/* Brilliance (LAN F3): a keyless server's states are public, as its /v1/models is, but a failed
+ * load's reason is the operator's: the three-leg rule decides, as lease() already did for the
+ * request a failed model refuses. */
+TEST(a_stranger_reads_no_failure_reason_on_a_keyless_server) {
+    LiveFront lf(loopback());
+    Front& front = lf.front;
+    const std::string why = "startup failed: D:/models/secret/b.rad not found";
+    front.add("b", {}, 100, false);
+    front.fail("b", why, 3600 * 1000);
+    front.set_describe([&](const std::string&) { return json{{"error", why}}.dump(); });
+    front.set_operator_rule([](const HttpRequest& q) { return local_operator(q, "0.0.0.0", {}); });
+    REQUIRE(lf.start());
+    httplib::Client c("127.0.0.1", front.port());
+    c.set_read_timeout(2, 0);
+    const std::string port = std::to_string(front.port());
+    const httplib::Headers lan = {{"Host", "192.168.1.50:" + port}},
+                           box = {{"Host", "127.0.0.1:" + port}};
+    auto h = c.Get("/health?model=b", lan);
+    REQUIRE(h != nullptr);
+    CHECK_EQ(h->status, 503);
+    CHECK_EQ(body_of(h).value("status", ""), std::string("failed"));
+    CHECK_EQ(body_of(h).value("model", ""), std::string("b"));
+    CHECK(!has(h->body, "secret"));
+    auto m = c.Get("/v1/models", lan);
+    REQUIRE(m != nullptr);
+    CHECK_EQ(m->status, 200);
+    CHECK(has(m->body, "\"failed\""));
+    CHECK(!has(m->body, "secret"));
+    auto all = c.Get("/health", lan);
+    REQUIRE(all != nullptr);
+    CHECK(body_of(all).contains("models"));
+    auto ho = c.Get("/health?model=b", box);
+    REQUIRE(ho != nullptr);
+    CHECK_EQ(body_of(ho).value("error", ""), why);
+    auto mo = c.Get("/v1/models", box);
+    REQUIRE(mo != nullptr);
+    CHECK(has(mo->body, "secret"));
+}
+
+/* Brilliance (ping-state): /ping naming a model is /health?model= for it -- the state the fleet is
+ * in, never a load. A cold, parked or failed model (its retry time past) stays as it is: the
+ * fleet's demand hook, which is how it loads, is never called, and the probe is not counted as a
+ * use. A keyed server's stranger reads the status alone, the key holder the model and the reason.
+ * A request for work still asks for the load, so the counter is live. */
+TEST(a_ping_naming_a_model_reads_its_state_and_never_loads_it) {
+    for (int keyed = 0; keyed < 2; ++keyed) {
+        Fixture a;
+        LiveFront lf(loopback(keyed ? "k" : ""));
+        Front& front = lf.front;
+        const std::string why = "startup failed: D:/models/secret/f.rad not found";
+        std::atomic<int> demands{ 0 };
+        front.set_demand([&](const std::string&) { ++demands; });
+        front.add("a", {}, 100, false);
+        front.attach("a", {}, a.srv.get());
+        front.add("cold", {}, 100, false);
+        front.add("park", {}, 100, false);
+        front.set_parked("park", true);
+        front.add("f", {}, 100, false);
+        front.fail("f", why, 0);   /* its retry time is now: a request for work would reload it */
+        REQUIRE(lf.start());
+        httplib::Client c("127.0.0.1", front.port());
+        c.set_read_timeout(2, 0);
+        const httplib::Headers none, wrong = {{"Authorization", "Bearer nope"}},
+                                     key = {{"Authorization", "Bearer k"}};
+        std::vector<const httplib::Headers*> callers = { &none };
+        if (keyed) callers = { &none, &wrong, &key };
+        const auto before = front.activity("a");
+        for (const httplib::Headers* h : callers) {
+            const bool stranger = keyed && h != &key;
+            struct Want { const char* name; const char* state; };
+            for (const Want w : { Want{ "cold", "cold" }, Want{ "park", "parked" }, Want{ "f", "failed" } }) {
+                const std::string q = std::string("/ping?model=") + w.name;
+                const std::string body = std::string(R"({"model":")") + w.name + "\"}";
+                const httplib::Result rs[] = {
+                    c.Get(q, *h), c.Post(q, *h, "", "application/json"),
+                    c.Post("/ping", *h, body, "application/json"),
+                };
+                for (const httplib::Result& r : rs) {
+                    REQUIRE(r != nullptr);
+                    CHECK_EQ(r->status, 503);
+                    const json j = body_of(r);
+                    CHECK_EQ(j.value("status", ""), std::string(w.state));
+                    if (stranger) {
+                        CHECK_EQ(r->body, std::string(R"({"status":")") + w.state + "\"}");
+                    } else {
+                        CHECK_EQ(j.value("model", ""), std::string(w.name));
+                    }
+                    /* The reason is the operator's: the key holder (keyed) or the box (the
+                     * front's own tests wire no operator rule, so a keyless caller is one). */
+                    CHECK_EQ(has(r->body, "secret"), !stranger && std::string(w.name) == "f");
+                }
+                /* The same answer /health?model= gives. */
+                auto h2 = c.Get(std::string("/health?model=") + w.name, *h);
+                REQUIRE(h2 != nullptr);
+                CHECK_EQ(h2->status, 503);
+                CHECK_EQ(body_of(h2).value("status", ""), std::string(w.state));
+            }
+            CHECK_EQ(demands.load(), 0);
+            CHECK(front.activity("cold").state == Front::State::Cold);
+            CHECK(front.activity("park").state == Front::State::Parked);
+            CHECK(front.activity("f").state == Front::State::Failed);
+            /* An open model: its own answer, and no use counted. */
+            auto open = c.Get("/ping?model=a", *h);
+            REQUIRE(open != nullptr);
+            CHECK_EQ(open->status, 200);
+            if (stranger) CHECK_EQ(open->body, std::string(R"({"status":"ok"})"));
+            else CHECK(body_of(open).contains("queue_cap"));
+            auto unknown = c.Get("/ping?model=nope", *h);
+            REQUIRE(unknown != nullptr);
+            CHECK_EQ(unknown->status, 404);
+            CHECK(!has(unknown->body, "cold"));   /* no list of what is served */
+        }
+        const auto after = front.activity("a");
+        CHECK_EQ(after.uses, before.uses);
+        CHECK_EQ(after.last_used_ns, before.last_used_ns);
+        CHECK_EQ(after.leases, 0);
+        CHECK_EQ(demands.load(), 0);
+        /* A request for work does ask for the load (and times out here: nothing loads it). */
+        const httplib::Headers& worker = keyed ? key : none;
+        auto work = c.Post("/v1/completions", worker,
+                           R"({"model":"cold","prompt":"hi","max_tokens":1})", "application/json");
+        REQUIRE(work != nullptr);
+        CHECK_EQ(work->status, 503);
+        CHECK(demands.load() > 0);
+    }
+}
+
+/* Brilliance (ping-state): a bare /ping on a one-model fleet asks of the process. While the model
+ * is open it is the model's own answer, as before; while it is cold or parked it is the process
+ * /health answer -- 200 when nothing must be loaded, 503 "loading" when the model must (pinned or
+ * preloaded) -- and the model is never loaded, with or without the key. A model that sits cold
+ * until a request brings it back is not a process a load balancer should take out of rotation. */
+TEST(a_bare_ping_on_one_model_reads_the_process_and_never_loads_it) {
+    for (int keyed = 0; keyed < 2; ++keyed) {
+        for (int required = 0; required < 2; ++required) {
+            Fixture solo;
+            LiveFront lf(loopback(keyed ? "k" : ""));
+            Front& front = lf.front;
+            std::atomic<int> demands{ 0 };
+            front.set_demand([&](const std::string&) { ++demands; });
+            front.add("solo", {}, 100, required != 0);
+            REQUIRE(lf.start());
+            httplib::Client c("127.0.0.1", front.port());
+            c.set_read_timeout(2, 0);
+            const httplib::Headers none, key = {{"Authorization", "Bearer k"}};
+            std::vector<const httplib::Headers*> callers = { &none };
+            if (keyed) callers = { &none, &key };
+            for (int parked = 0; parked < 2; ++parked) {
+                front.set_parked("solo", parked != 0);
+                for (const httplib::Headers* h : callers) {
+                    const bool stranger = keyed && h == &none;
+                    for (int post = 0; post < 2; ++post) {
+                        auto r = post ? c.Post("/ping", *h, "", "application/json") : c.Get("/ping", *h);
+                        REQUIRE(r != nullptr);
+                        const std::string status = required ? "loading" : "ok";
+                        CHECK_EQ(r->status, required ? 503 : 200);
+                        if (stranger) {
+                            CHECK_EQ(r->body, std::string(R"({"status":")") + status + "\"}");
+                        } else {
+                            const json j = body_of(r);
+                            CHECK_EQ(j.value("status", ""), status);
+                            CHECK(j.contains("models") && j["models"].contains("solo"));
+                        }
+                    }
+                }
+                CHECK_EQ(demands.load(), 0);
+                CHECK(front.activity("solo").state == (parked ? Front::State::Parked : Front::State::Cold));
+            }
+            /* Open: the model's own answer, and the probe is not a use of it. */
+            front.set_parked("solo", false);
+            front.attach("solo", {}, solo.srv.get());
+            const auto before = front.activity("solo");
+            for (const httplib::Headers* h : callers) {
+                auto r = c.Get("/ping", *h);
+                REQUIRE(r != nullptr);
+                CHECK_EQ(r->status, 200);
+                if (keyed && h == &none) CHECK_EQ(r->body, std::string(R"({"status":"ok"})"));
+                else CHECK(body_of(r).contains("queue_cap"));
+            }
+            const auto after = front.activity("solo");
+            CHECK_EQ(after.uses, before.uses);
+            CHECK_EQ(after.last_used_ns, before.last_used_ns);
+            CHECK_EQ(after.leases, 0);
+            CHECK_EQ(demands.load(), 0);
+        }
+    }
 }
 
 RAD_TEST_MAIN()

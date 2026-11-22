@@ -51,6 +51,9 @@ if ($Target) { $b += @('--target') + $Target }
 if ($KeepGoing) { $b += @('--', '-k', '0') }
 & cmake @b
 if ($LASTEXITCODE -ne 0) { Write-Host 'build failed' -ForegroundColor Red; exit 2 }
+# The commit the binaries carry, as one line, so the build log names what it built (the release's
+# G1.build gate binds the log to the candidate by it). A build with no identity header says so.
+& (Join-Path $PSScriptRoot 'tools\build-identity.ps1') -BuildDir $build
 
 if ($Test) {
   # A few tests are POSIX shell scripts (`sh` in their add_test). Git for Windows' sh and the tools

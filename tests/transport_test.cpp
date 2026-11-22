@@ -113,6 +113,96 @@ struct LiveServer {
     }
 };
 
+TEST(the_server_and_transport_default_to_loopback) {
+    CHECK_EQ(ServerOptions{}.host, "127.0.0.1");
+    CHECK_EQ(TransportOptions{}.host, "127.0.0.1");
+}
+
+TEST(only_a_keyless_network_listener_warns_about_its_exposure) {
+    const Log saved = log_level();
+    log_set_level(Log::Error);
+    for (const char* addr : {"0.0.0.0", "::", "203.0.113.50", "2001:db8::1", ""}) {
+        const std::string warning = stderr_of([&] { warn_if_keyless_network_listener(addr, false); });
+        CHECK(has(warning, "W server: listening beyond loopback with no API key"));
+        CHECK(has(warning, "run inference, trigger model loads, read operational telemetry and use the dashboard"));
+        CHECK(stderr_of([&] { warn_if_keyless_network_listener(addr, true); }).empty());
+    }
+    for (const char* addr : {"127.0.0.1", "127.2.3.4", "::1", "::ffff:127.0.0.1"})
+        CHECK(stderr_of([&] { warn_if_keyless_network_listener(addr, false); }).empty());
+    log_set_level(saved);
+}
+
+TEST(a_keyless_loopback_socket_starts_without_the_exposure_warning) {
+    const Log saved = log_level();
+    log_set_level(Log::Info);
+    const std::string log = stderr_of([] {
+        LiveServer s(/*n_threads=*/4, /*max_seqs=*/1);
+        CHECK(s.srv->port() > 0);
+    });
+    log_set_level(saved);
+    CHECK(has(log, "server: listening on http://127.0.0.1:"));
+    CHECK(!has(log, "listening beyond loopback with no API key"));
+}
+
+/* Reads `fd` until the peer closes it (true) or the read times out (false). */
+static bool drain_until_closed(int fd) {
+    char buf[512];
+    for (;;) {
+        const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+        if (n == 0) return true;
+        if (n < 0) return false;
+    }
+}
+
+/* Brilliance: a listener owns its port. On Windows, httplib's default SO_REUSEADDR let a second
+ * server bind a host:port another was listening on, with no error, while requests still went to
+ * the first. Now the second start is refused at once and the log names the address. And a restart
+ * on the same port still binds at once after the last listener closed a connection itself (its
+ * side of that connection sits in TIME_WAIT). Off Windows, httplib's default option is kept, so
+ * only the restart is checked there. */
+TEST(a_taken_port_is_refused_and_a_restart_on_it_binds_at_once) {
+    const Log saved = log_level();
+    log_set_level(Log::Error);
+    int port = 0;
+    {
+        LiveServer first(/*n_threads=*/2, /*max_seqs=*/1);
+        port = first.srv->port();
+        REQUIRE(port > 0);
+#if defined(_WIN32)
+        {
+            FakeScheduler sched;
+            FakeTokenizer tok;
+            Deps d;
+            d.sched = &sched;
+            d.tok = &tok;
+            ServerOptions o;
+            o.host = "127.0.0.1";
+            o.port = port;
+            o.n_threads = 2;
+            o.max_seqs = 1;
+            Server second(d, o);
+            int rc = RAD_OK;
+            const std::string log = stderr_of([&] { rc = second.run(); });
+            CHECK(rc < 0);
+            CHECK_EQ(second.port(), 0);
+            CHECK(has(log, "server: cannot bind 127.0.0.1:" + std::to_string(port) +
+                               ": the port is already in use"));
+        }
+#endif
+        /* The first still answers on its port, and closes the connection itself. */
+        const int fd = first.open("GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+        REQUIRE(fd >= 0);
+        CHECK(has(status_line(fd), " 200 "));
+        CHECK(drain_until_closed(fd));
+    }
+    LiveServer again(/*n_threads=*/2, /*max_seqs=*/1, [port](ServerOptions& o) { o.port = port; });
+    CHECK_EQ(again.srv->port(), port);
+    const int fd = again.open("GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    REQUIRE(fd >= 0);
+    CHECK(has(status_line(fd), " 200 "));
+    log_set_level(saved);
+}
+
 /* The pool outgrows the admission ceiling. A generation holds its connection's worker while it
  * runs, so a pool no larger than the ceiling fills before admission refuses anyone: the 429 never
  * comes, and a probe queues behind generations. Here the ceiling is 8 and the resident pool 4.
@@ -338,6 +428,42 @@ TEST(the_api_key_gate_holds_every_route_but_the_probes) {
      * path does. */
     CHECK_EQ(ask("POST /ping HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n").status, 200);
     CHECK_EQ(ask("HEAD / HTTP/1.1\r\nHost: t\r\n\r\n", /*head_only=*/true).status, 200);
+}
+
+/* Brilliance (LAN F3): the probes stay exempt from the key, but a caller without it reads the
+ * liveness alone -- the status and its code, all a load balancer reads. The model, its load and
+ * the queue ceiling are the key holder's, as /load and /metrics are. A wrong key is no key. */
+TEST(a_probe_without_the_key_reads_the_liveness_alone) {
+    LiveServer s(4, 1, [](ServerOptions& o) { o.api_key = "k"; });
+    REQUIRE(s.srv->port() > 0);
+    for (const char* p : { "/health", "/v1/health", "/ping" })
+        for (const char* h : { "", "Authorization: Bearer wrong\r\n", "X-Api-Key: wrong\r\n" }) {
+            const Reply r = ask(s, get(p, h));
+            CHECK_EQ(r.status, 200);
+            const json j = json::parse(r.body, nullptr, false);
+            CHECK(j.is_object());
+            if (!j.is_object()) continue;
+            CHECK_EQ(j.value("status", ""), std::string("ok"));
+            CHECK_EQ(j.size(), (size_t)1);
+            CHECK(!has(r.body, "\"model\""));
+        }
+    const Reply pinged = ask(s, "POST /ping HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n");
+    CHECK_EQ(pinged.status, 200);
+    CHECK_EQ(pinged.body, std::string(R"({"status":"ok"})"));
+    for (const char* h : { "Authorization: Bearer k\r\n", "X-Api-Key: k\r\n" }) {
+        const Reply r = ask(s, get("/health", h));
+        CHECK_EQ(r.status, 200);
+        CHECK(has(r.body, "\"model\":\""));
+        CHECK(has(r.body, "\"queue_cap\""));
+        CHECK(has(r.body, "\"in_flight\""));
+    }
+    /* A keyless server has no key to hold back for: the whole answer, as before. */
+    LiveServer open(4, 1);
+    REQUIRE(open.srv->port() > 0);
+    const Reply whole = ask(open, get("/health"));
+    CHECK_EQ(whole.status, 200);
+    CHECK(has(whole.body, "\"model\":\""));
+    CHECK(has(whole.body, "\"queue_cap\""));
 }
 
 /* Brilliance: the terms of use (GET /terms, core/server/terms.cpp) bind the people a server

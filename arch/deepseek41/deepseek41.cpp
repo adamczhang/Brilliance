@@ -1469,6 +1469,45 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 }
 
 /* ------------------------------------------------------------------ step */
+/* RADIANCE_DEBUG_DS41_DUMP=DIR: a per-layer trace of every multi-row (prefill) step, for comparing
+ * two layouts (TP2 against TP4) or a layout against a reference tensor by tensor. Each site is
+ * written as `<DIR>/s<step>.t<rows>.l<layer>.<site>.r<rank>.<dtype>`, the step's rows of the
+ * buffer as the device holds them right after the op that writes it:
+ *   in      the four mHC streams entering the layer          [T, 4 * n_embd] bf16
+ *   attnp   this rank's attention partial, before the reduce [T, n_embd]     bf16
+ *   attn    the reduced attention output                     [T, n_embd]     bf16
+ *   xf      the MoE input (the normed ffn row, the router's) [T, n_embd]     bf16
+ *   logits  the router scores, every expert                  [T, n_expert]   f32
+ *   ids     the selected experts                             [T, top_k]      i32
+ *   ew      their weights                                    [T, top_k]      f32
+ *   moe     the MoE output after its reduce                  [T, n_embd]     bf16
+ * and, layer -1, `final` (the final norm's rows) and `head` (this rank's vocabulary slice of the
+ * output rows' logits). Off unless set. It synchronises the stream at every site, so it is a
+ * diagnostic only. A recorded pass replays without calling step, so a dump needs a step the
+ * engine runs eagerly: a prefill length seen for the first time (or any op oracle armed, which
+ * turns recording off). Decode steps (one row) are never written. */
+static const char* ds_dump_dir() {
+    static const char* d = std::getenv("RADIANCE_DEBUG_DS41_DUMP");
+    return d && *d ? d : nullptr;
+}
+static void ds_dump(RadCtx* x, const RadBatch* batch, int layer, const char* site, rad_buf b,
+                    int64_t bytes, const char* dt) {
+    const char* dir = ds_dump_dir();
+    if (!dir || !b || bytes <= 0 || batch->n_tok < 2) return;
+    void* p = rad_buf_ptr(x, b);
+    if (!p) return;
+    std::vector<uint8_t> h((size_t)bytes);
+    if (rad_memcpy_async(h.data(), p, bytes, rad_stream(x)) < 0) return;
+    rad_stream_sync(rad_stream(x));
+    char path[512];
+    std::snprintf(path, sizeof path, "%s/s%d.t%lld.l%d.%s.r%d.%s", dir, batch->step,
+                  (long long)batch->n_tok, layer, site, rad_rank(x), dt);
+    if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(h.data(), 1, h.size(), f);
+        std::fclose(f);
+    }
+}
+
 struct MixBeside {
     const Layer* L;
     const Model* m;
@@ -1548,9 +1587,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
                         RAD_NONE);
     }
 
+    const bool dumping = ds_dump_dir() && T > 1;
     for (auto& L : m.layers) {
         const int l = L.l;
         const int64_t r = L.r;
+        if (dumping) ds_dump(x, batch, l, "in", m.h0, T * c.hc * D * 2, "bf16");
         if (L.e_ids) {
             const int64_t H = c.ple_heads;
             /* T rows of operands; the gather's band is T * H, one table row per head per token,
@@ -1810,7 +1851,9 @@ static void step(RadCtx* x, const RadBatch* batch) {
             if (late) mix_a();
             lin_issue(x, m, L.o_b, T, brows(m.oa, T), L.wo_b, brows(m.attn_out, T));
         }
+        if (dumping) ds_dump(x, batch, l, "attnp", m.attn_out, T * D * 2, "bf16");
         if (L.ar_attn) RAD_ISSUE_N(x, L.ar_attn, T * D, brows(m.attn_out, T), RAD_NONE);
+        if (dumping) ds_dump(x, batch, l, "attn", m.attn_out, T * D * 2, "bf16");
         if (L.pcn_f)   /* post_a, col_f and norm_f in one */
             RAD_ISSUE_N(x, L.pcn_f, T, brows(m.attn_out, T), brows(m.h0, T), brows(m.post, T),
                         brows(m.comb, T), brows(m.h1, T), brows(m.pre_a, T), brows(m.xcol, T),
@@ -1834,11 +1877,18 @@ static void step(RadCtx* x, const RadBatch* batch) {
             }
         };
         col_f();
+        if (dumping) ds_dump(x, batch, l, "xf", m.act.x, T * D * 2, "bf16");
         MixBeside mb{ &L, &m, T };
         MoeFP8::Beside bs;
         bs.fn = mix_f_beside;
         bs.arg = &mb;
         L.moe.step(x, batch, bs);
+        if (dumping) {
+            ds_dump(x, batch, l, "logits", m.mw.logits, T * c.n_expert * 4, "f32");
+            ds_dump(x, batch, l, "ids", m.mw.ids, T * c.top_k * 4, "i32");
+            ds_dump(x, batch, l, "ew", m.mw.ew, T * c.top_k * 4, "f32");
+            ds_dump(x, batch, l, "moe", m.act.x, T * D * 2, "bf16");
+        }
         /* post_f, or post_f with the next collapse + norm (the next layer's pcn_a, or pcn_fin). */
         const Layer* nx = L.l + 1 < c.n_layer ? &m.layers[(size_t)L.l + 1] : nullptr;
         if (nx && nx->pcn_a)
@@ -1866,6 +1916,11 @@ static void step(RadCtx* x, const RadBatch* batch) {
                     praw(batch->out_ids, RAD_I32, batch->n_out), brows(m.logit_input, batch->n_out));
         RAD_ISSUE_N(x, m.head_op, batch->n_out, brows(m.logit_input, batch->n_out), RAD_W(m.head),
                     brows(m.logits, batch->n_out));
+    }
+    if (dumping) {
+        ds_dump(x, batch, -1, "final", m.final_hidden, T * D * 2, "bf16");
+        if (batch->n_out > 0)
+            ds_dump(x, batch, -1, "head", m.logits, batch->n_out * g.n_vocab * 4, "f32");
     }
 }
 

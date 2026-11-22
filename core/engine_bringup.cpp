@@ -2558,13 +2558,8 @@ int Engine::plan() {
         if (r->index == 0) {
             decide("--placement", strategy_name(r->plan.strategy),
                    r->plan.strategy_why.empty() ? std::string("as asked") : r->plan.strategy_why);
-            const int64_t host = r->plan.totals.bytes[(int)Tier::HostPinned] +
-                                 r->plan.totals.bytes[(int)Tier::HostPageable];
-            decide("weights by tier",
-                   fmt("VRAM %s, host pool %s, container on disk %s, mapped %s (rank 0)",
-                       humanb(r->plan.totals.bytes[(int)Tier::VRAM]).c_str(), humanb(host).c_str(),
-                       humanb(r->plan.totals.bytes[(int)Tier::SSD]).c_str(),
-                       humanb(r->plan.totals.bytes[(int)Tier::Mapped]).c_str()),
+            /* Brilliance (rc-fixes): the RAM store apart from the disk (Plan::weights_by_tier). */
+            decide("weights by tier", r->plan.weights_by_tier() + " (rank 0)",
                    r->plan.forced_host_used > 0
                        ? fmt("the host pool holds the %s the placement flags put there (the token "
                              "embedding, the encoder towers, the drafter's experts) beside the "
@@ -2590,7 +2585,12 @@ int Engine::plan() {
         const int rc = expert_tier_admission(cfg_, pins, ram,
                                              expert_tiers ? relay_scratch_bound(cfg_.tp) : 0,
                                              "from the plans");
-        RAD_INFO("--plan-only: stopped before loading (%s)", rc < 0 ? "refused" : "admitted");
+        /* Brilliance (rc-fixes): an admitted plan is the mode's success, so its verdict is an I
+         * line and the fleet exits 0 (plan_only_admitted); a refused one is an E line, said beside
+         * the admission's reason above, and the start fails as before. */
+        plan_admitted_ = rc >= 0;
+        if (plan_admitted_) RAD_INFO("--plan-only: stopped before loading (admitted)");
+        else                RAD_ERR("--plan-only: stopped before loading (refused)");
         return RAD_E_CANCELLED;
     }
 #if defined(_WIN32)

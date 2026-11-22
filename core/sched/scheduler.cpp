@@ -318,6 +318,7 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     running_.reserve((size_t)cfg.max_seqs);
     waiting_.reserve((size_t)cfg.max_seqs * 4 + 64);
     free_slots_.reserve((size_t)cfg.max_seqs);
+    init_max_seqs_ = cfg.max_seqs;   /* the slots sized here: retune() caps admission below */
     free_cards_.resize((size_t)cfg.max_seqs);
     for (int64_t c = 0; c < cfg.max_seqs; ++c)
         free_cards_[(size_t)c] = (int32_t)(cfg.max_seqs - 1 - c);   /* 0 is taken first */
@@ -987,6 +988,19 @@ int Scheduler::reap(uint64_t id) {
     }
     release_locked(s);
     return RAD_OK;
+}
+
+bool Scheduler::retune(int64_t max_seqs, bool suffix, int suffix_min_match, int suffix_max,
+                       float suffix_min_score) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!running_.empty() || !waiting_.empty()) return false;
+    if (max_seqs < 1 || max_seqs > init_max_seqs_) return false;
+    cfg_.max_seqs = max_seqs;
+    cfg_.draft_suffix = suffix;
+    cfg_.draft_suffix_min_match = suffix_min_match;
+    cfg_.draft_suffix_max = suffix_max;
+    cfg_.draft_suffix_min_score = suffix_min_score;
+    return true;
 }
 
 int Scheduler::queue_snapshot(uint64_t* out, int max) const {

@@ -150,7 +150,8 @@ static const Flag g_flags[] = {
     "                                    copies them through the pinned read windows, and the rest\n"
     "                                    stay on the drive. Refused unless 24 GiB of RAM stays free" },
     { "--plan-only",          nullptr,  "plan placement and check host memory and pins, print both,\n"
-    "                                    and stop before allocating any pool or reading a weight" },
+    "                                    and stop before allocating any pool or reading a weight;\n"
+    "                                    the start exits 0 when admitted, 1 when refused" },
     { "--prefix-cache-mib",   "N",      "copy finished conversations' KV to host memory, up to N MiB,\n"
     "                                    so their VRAM can go to experts and a return restores\n"
     "                                    instead of re-prefilling. A full tier drops its least\n"
@@ -323,7 +324,7 @@ static const Flag g_flags[] = {
     { "--host",               "ADDR",   "listen address" },
     { "--port",               "N",      "listen port" },
     { "--api-key",            "KEY",    "require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but /health,\n"
-    "                                    /v1/health, /ping, the dashboard page and /terms" },
+    "                                    /v1/health, /ping (the status alone), the dashboard page and /terms" },
     { "--api-key-env",        "NAME",   "read the API key from the named environment variable; keeps it off the\n"
     "                                    command line, where every process on the machine can read it" },
     { "--allow-host",         "NAME",   "a Host name the keyless loopback-only routes (/diagnostics,\n"

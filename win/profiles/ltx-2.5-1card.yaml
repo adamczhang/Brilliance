@@ -1,8 +1,12 @@
 # Brilliance profile: LTX-2.5 distilled IQ8R (video with sound) on one Radeon AI PRO R9700.
 # Runs, not yet qualified. OpenAI's video jobs only: POST /v1/videos queues one (text to video, or
-# image to video with `input_reference` as the first frame), GET /v1/videos/ID polls it and
-# GET /v1/videos/ID/content returns the MP4 (H.264 and AAC, marked AI-generated in its metadata).
+# image to video with `input_reference` as the first frame). Poll GET /v1/videos/ID for
+# `status: completed` before downloading the MP4 from GET /v1/videos/ID/content (H.264 and AAC,
+# marked AI-generated in its metadata). DELETE /v1/videos/ID removes the job and cancels it if
+# it is still running.
 # Chat and embeddings answer 501. LTX-2.5 runs on one card only; tp above 1 is refused.
+# If a one-card Sandbox fleet refuses to load LTX after other models have unloaded, stop the
+# fleet and start this standalone profile.
 #
 #   .\serve.ps1 ltx-2.5-1card -Bus 6
 #   bin\radiance.exe --config profiles\ltx-2.5-1card.yaml

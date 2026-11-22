@@ -38,8 +38,8 @@
 # repository's six parts. Point `model:` at where it is. The separate Q8_0 DSpark sidecar beside it
 # is not used.
 #
-# The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out. Rank 0
-# follows the runtime's device order, not the order the cards are named in.
+# The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out.
+# Windows HIP determines device order. The engine's startup report lists the rank assignments.
 #
 # Loopback only and no key. To serve the local network: .\serve.ps1 deepseek41-4card -Listen 0.0.0.0
 # -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
@@ -64,3 +64,5 @@ models:
     num-speculative-tokens: 0
     ngram-placement: disk
     deterministic: true
+    # weight-prefetch off: not measured at TP4; same host-staged collective path as TP2, where an A/B (prefetch-ab, 2026-11-22) measured update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical. The G6 gate measures it.
+    weight-prefetch: off

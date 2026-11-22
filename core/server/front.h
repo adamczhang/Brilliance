@@ -184,8 +184,11 @@ public:
      * for those callers; unset, they wake as any request does (no fleet, no guards to precede). */
     void set_operator_rule(std::function<bool(const HttpRequest&)> f) { operator_rule_ = std::move(f); }
     /* The caller-side view of the rule: a wired rule decides; no rule at all (the front used
-     * without fleet wiring, as in its own tests) trusts the caller. */
-    bool caller_is_operator(const HttpRequest& q) const { return !operator_rule_ || operator_rule_(q); }
+     * without fleet wiring, as in its own tests) trusts the caller. Brilliance: never a caller
+     * the key gate let through without the key (HttpRequest::missing_key), whatever the rule. */
+    bool caller_is_operator(const HttpRequest& q) const {
+        return !q.missing_key && (!operator_rule_ || operator_rule_(q));
+    }
 
 private:
     struct Entry {
@@ -235,6 +238,8 @@ private:
     void         forward_socket(const HttpRequest& q, WsConn& c);
     HttpResponse models(const HttpRequest& q);
     HttpResponse health(const HttpRequest& q);
+    /* /health?model= and /ping naming a model: the model's state, never a load (front.cpp). */
+    HttpResponse model_health(const HttpRequest& q, const std::string& name);
     HttpResponse metrics(const HttpRequest& q);
     void         install_routes(const Router& model_router);
     /* Leases on every Open entry, for the fleet-wide routes. */

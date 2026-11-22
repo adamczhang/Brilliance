@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -120,100 +121,126 @@ int Engine::step_state_init() {
     }
 
     /* --draft-depth adaptive: the rule, the per-round readback of the chain's states and one host
-     * event a round. Refused wherever the chain it stops does not exist, rather than served fixed. */
+     * event a round (depth_rule_setup, which a warm retune runs again). */
+    depth_slots_ = n_slot;
+    RAD_TRY(depth_rule_setup(cfg_, n_slot, /*alloc=*/true));
+
+    RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    return RAD_OK;
+}
+
+/* --draft-depth adaptive: the rule, the per-round readback of the chain's states and one host event
+ * a round. Refused wherever the chain it stops does not exist, rather than served fixed. At load
+ * (`alloc`) the readback and events are made; a warm retune (retune_service) finds them made, or
+ * retune_check has refused it. Either way the rule's host state starts as a load starts it. */
+int Engine::depth_rule_setup(const Config& c, int64_t n_slot, bool alloc) {
     depth_cfg_ = DraftDepthCfg{};
-    if (cfg_.draft_depth_adaptive) {
-        if (!mtp_couple_ || drafter_.kind != RAD_DRAFT_SERIAL) {
-            RAD_ERR("--draft-depth adaptive needs a coupled serial draft chain (--draft-coupling on, a "
-                    "serial head); this deployment's drafter is '%s'",
-                    drafter_.name ? drafter_.name : "(none)");
-            return RAD_E_INVAL;
+    depth_load_on_ = false;
+    depth_online_on_ = false;
+    depth_pend_.clear();
+    depth_note_t_ = {};
+    depth_note_step_ = -2;
+    depth_note_rows_ = 0;
+    depth_note_n_ = 0;
+    depth_stats_ = DepthStats{};
+    depth_logged_ = 0;
+    depth_last_ = 0;
+    if (!c.draft_depth_adaptive) return RAD_OK;
+    if (!mtp_couple_ || drafter_.kind != RAD_DRAFT_SERIAL) {
+        RAD_ERR("--draft-depth adaptive needs a coupled serial draft chain (--draft-coupling on, a "
+                "serial head); this deployment's drafter is '%s'",
+                drafter_.name ? drafter_.name : "(none)");
+        return RAD_E_INVAL;
+    }
+    /* --draft-window adaptive picks a window from the acceptance and the cost of the steps
+     * before (sched/draft.h); this rule picks the depth inside the step from the head's laws.
+     * Two controllers on one chain would fight over it. */
+    if (c.draft_window == DraftWindow::Adaptive) {
+        RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
+                "depth; serve one of them");
+        return RAD_E_INVAL;
+    }
+    if (!alloc && !depth_rb_) {
+        RAD_ERR("--draft-depth adaptive: this engine was loaded without the rule's readback");
+        return RAD_E_STATE;
+    }
+    depth_cfg_.on   = true;
+    depth_cfg_.max  = (int)std::min<int64_t>(drafter_.depth, couple_planes_);
+    /* --draft-suffix widens the verify window (and the depth the plugin declares) past the head's
+     * own rounds: the chain never goes deeper than the head's num-speculative-tokens. */
+    if (cfg_.n_spec_head > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.n_spec_head);
+    if (c.draft_depth_max > 0) depth_cfg_.max = std::min(depth_cfg_.max, c.draft_depth_max);
+    depth_cfg_.max  = std::min(depth_cfg_.max, (int)RAD_MTP_COUPLE_MAX_ROUNDS);
+    depth_cfg_.min  = std::min(std::max(c.draft_depth_min, 1), depth_cfg_.max);
+    depth_cfg_.lag  = c.draft_depth_lag;
+    depth_cfg_.stat = c.draft_depth_stat;
+    depth_cfg_.stop = c.draft_depth_stop;
+    depth_cfg_.lawless = std::min(3, depth_cfg_.max);
+    /* --draft-depth-load: the rule's tables (built in, or the configured lists) and the online
+     * calibration that keeps them. */
+    if (c.draft_depth_load) {
+        draft_depth_load_defaults(&depth_cfg_);
+        depth_cfg_.load      = true;
+        depth_load_on_       = true;
+        depth_cfg_.load_from = std::max(2, c.draft_depth_load_from);
+        depth_cfg_.load_min  = std::min(std::max(c.draft_depth_load_min, 1), depth_cfg_.max);
+        depth_cfg_.late      = c.draft_depth_load_late;
+        depth_cfg_.late_lag  = 1;
+        const int kN = DraftDepthCfg::kLoadSeqs, kJ = DraftDepthCfg::kJumps;
+        /* a list by drafting rows 1 .. 8; a short one repeats its last number */
+        auto by_rows = [&](const std::string& l, double* dst) {
+            double v[DraftDepthCfg::kLoadSeqs];
+            const int k = l.empty() ? 0 : draft_depth_parse_list(l.c_str(), v, kN, 0.0, 1000.0);
+            for (int i = 0; i < kN && k > 0; ++i) dst[1 + i] = v[std::min(i, k - 1)];
+            dst[0] = dst[1];
+        };
+        by_rows(c.draft_depth_load_tok_ms, depth_cfg_.load_lam);
+        by_rows(c.draft_depth_load_row_ms, depth_cfg_.load_row_ms);
+        by_rows(c.draft_depth_load_round_ms, depth_cfg_.load_round_ms);
+        if (!c.draft_depth_load_jump_ms.empty()) {
+            double v[DraftDepthCfg::kJumps] = {};
+            const int k = draft_depth_parse_list(c.draft_depth_load_jump_ms.c_str(), v, kJ, 0.0, 1000.0);
+            for (int nn = 0; nn <= kN && k > 0; ++nn)
+                for (int j = 0; j < kJ; ++j) depth_cfg_.load_jump_ms[nn][j] = j < k ? v[j] : 0.0;
         }
-        /* --draft-window adaptive picks a window from the acceptance and the cost of the steps
-         * before (sched/draft.h); this rule picks the depth inside the step from the head's laws.
-         * Two controllers on one chain would fight over it. */
-        if (cfg_.draft_window == DraftWindow::Adaptive) {
-            RAD_ERR("--draft-depth adaptive and --draft-window adaptive both choose the chain's "
-                    "depth; serve one of them");
-            return RAD_E_INVAL;
+        depth_online_on_ = c.draft_depth_load_online;
+        depth_online_ = DraftDepthOnline{};
+        draft_depth_online_begin(depth_cfg_, &depth_online_);
+        depth_pend_.assign((size_t)n_slot, DepthPend{});
+        if (const char* e = std::getenv("RADIANCE_DEBUG_CONC_LOG"); e && *e && !depth_log_) {
+            depth_log_ = std::fopen(e, "w");
+            if (depth_log_) std::setvbuf(depth_log_, nullptr, _IOFBF, 1 << 20);
         }
-        depth_cfg_.on   = true;
-        depth_cfg_.max  = (int)std::min<int64_t>(drafter_.depth, couple_planes_);
-        /* --draft-suffix widens the verify window (and the depth the plugin declares) past the head's
-         * own rounds: the chain never goes deeper than the head's num-speculative-tokens. */
-        if (cfg_.n_spec_head > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.n_spec_head);
-        if (cfg_.draft_depth_max > 0) depth_cfg_.max = std::min(depth_cfg_.max, cfg_.draft_depth_max);
-        depth_cfg_.max  = std::min(depth_cfg_.max, (int)RAD_MTP_COUPLE_MAX_ROUNDS);
-        depth_cfg_.min  = std::min(std::max(cfg_.draft_depth_min, 1), depth_cfg_.max);
-        depth_cfg_.lag  = cfg_.draft_depth_lag;
-        depth_cfg_.stat = cfg_.draft_depth_stat;
-        depth_cfg_.stop = cfg_.draft_depth_stop;
-        depth_cfg_.lawless = std::min(3, depth_cfg_.max);
-        /* --draft-depth-load: the rule's tables (built in, or the configured lists) and the online
-         * calibration that keeps them. */
-        if (cfg_.draft_depth_load) {
-            draft_depth_load_defaults(&depth_cfg_);
-            depth_cfg_.load      = true;
-            depth_load_on_       = true;
-            depth_cfg_.load_from = std::max(2, cfg_.draft_depth_load_from);
-            depth_cfg_.load_min  = std::min(std::max(cfg_.draft_depth_load_min, 1), depth_cfg_.max);
-            depth_cfg_.late      = cfg_.draft_depth_load_late;
-            depth_cfg_.late_lag  = 1;
-            const int kN = DraftDepthCfg::kLoadSeqs, kJ = DraftDepthCfg::kJumps;
-            /* a list by drafting rows 1 .. 8; a short one repeats its last number */
-            auto by_rows = [&](const std::string& l, double* dst) {
-                double v[DraftDepthCfg::kLoadSeqs];
-                const int k = l.empty() ? 0 : draft_depth_parse_list(l.c_str(), v, kN, 0.0, 1000.0);
-                for (int i = 0; i < kN && k > 0; ++i) dst[1 + i] = v[std::min(i, k - 1)];
-                dst[0] = dst[1];
-            };
-            by_rows(cfg_.draft_depth_load_tok_ms, depth_cfg_.load_lam);
-            by_rows(cfg_.draft_depth_load_row_ms, depth_cfg_.load_row_ms);
-            by_rows(cfg_.draft_depth_load_round_ms, depth_cfg_.load_round_ms);
-            if (!cfg_.draft_depth_load_jump_ms.empty()) {
-                double v[DraftDepthCfg::kJumps] = {};
-                const int k = draft_depth_parse_list(cfg_.draft_depth_load_jump_ms.c_str(), v, kJ, 0.0, 1000.0);
-                for (int nn = 0; nn <= kN && k > 0; ++nn)
-                    for (int j = 0; j < kJ; ++j) depth_cfg_.load_jump_ms[nn][j] = j < k ? v[j] : 0.0;
-            }
-            depth_online_on_ = cfg_.draft_depth_load_online;
-            draft_depth_online_begin(depth_cfg_, &depth_online_);
-            depth_pend_.assign((size_t)n_slot, DepthPend{});
-            if (const char* e = std::getenv("RADIANCE_DEBUG_CONC_LOG"); e && *e) {
-                depth_log_ = std::fopen(e, "w");
-                if (depth_log_) std::setvbuf(depth_log_, nullptr, _IOFBF, 1 << 20);
-            }
-        }
+    }
+    if (alloc) {
         depth_rb_ = static_cast<RadMtpCoupleState*>(rad_dev_alloc(
             (int64_t)RAD_MTP_COUPLE_MAX_ROUNDS * couple_rows_ * (int64_t)sizeof(RadMtpCoupleState),
             RAD_MEM_HOST_PINNED));
         if (!depth_rb_) return RAD_E_NOMEM;
         for (RadEvent& e : depth_ev_)
             RAD_TRY(rad_event_create_as(&e, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
-        depth_row_.assign((size_t)n_slot, DraftDepthRow{});
-        depth_of_.assign((size_t)n_slot, 0);
-        RAD_INFO("draft depth adaptive: 1..%d draft(s) a step, the chain goes on while the product of "
-                 "the head's %s probabilities is >= %.3f (decided %d round(s) behind, %d round(s) "
-                 "always run); a row with no law drafts %d",
-                 depth_cfg_.max, depth_cfg_.stat == DRAFT_DEPTH_PATH ? "drawn-token" : "top",
-                 depth_cfg_.stop, depth_cfg_.lag, depth_cfg_.min, depth_cfg_.lawless);
-        if (depth_cfg_.load)
-            RAD_INFO("draft depth load-aware: a step drafting for %d sequence(s) or more runs a round "
-                     "for the rows whose expected accepted drafts pay their verify rows, the tile "
-                     "they open and the round (%d round(s) always run; late choice of the verify's "
-                     "rows %s); tables %s (at 8 sequences: %.3f tok/ms, a row %.3f ms, a round "
-                     "%.3f ms, past %d/%d/%d/%d rows +%.2f/%.2f/%.2f/%.2f ms)",
-                     depth_cfg_.load_from, depth_cfg_.load_min, depth_cfg_.late ? "on" : "off",
-                     depth_online_on_ ? "calibrated online from these" : "static",
-                     depth_cfg_.load_lam[8], depth_cfg_.load_row_ms[8], depth_cfg_.load_round_ms[8],
-                     depth_cfg_.load_jump_at[0], depth_cfg_.load_jump_at[1], depth_cfg_.load_jump_at[2],
-                     depth_cfg_.load_jump_at[3], depth_cfg_.load_jump_ms[8][0],
-                     depth_cfg_.load_jump_ms[8][1], depth_cfg_.load_jump_ms[8][2],
-                     depth_cfg_.load_jump_ms[8][3]);
     }
-
-    RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
-    RAD_TRY(rad_event_create_as(&tok_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    depth_row_.assign((size_t)n_slot, DraftDepthRow{});
+    depth_of_.assign((size_t)n_slot, 0);
+    RAD_INFO("draft depth adaptive: 1..%d draft(s) a step, the chain goes on while the product of "
+             "the head's %s probabilities is >= %.3f (decided %d round(s) behind, %d round(s) "
+             "always run); a row with no law drafts %d",
+             depth_cfg_.max, depth_cfg_.stat == DRAFT_DEPTH_PATH ? "drawn-token" : "top",
+             depth_cfg_.stop, depth_cfg_.lag, depth_cfg_.min, depth_cfg_.lawless);
+    if (depth_cfg_.load)
+        RAD_INFO("draft depth load-aware: a step drafting for %d sequence(s) or more runs a round "
+                 "for the rows whose expected accepted drafts pay their verify rows, the tile "
+                 "they open and the round (%d round(s) always run; late choice of the verify's "
+                 "rows %s); tables %s (at 8 sequences: %.3f tok/ms, a row %.3f ms, a round "
+                 "%.3f ms, past %d/%d/%d/%d rows +%.2f/%.2f/%.2f/%.2f ms)",
+                 depth_cfg_.load_from, depth_cfg_.load_min, depth_cfg_.late ? "on" : "off",
+                 depth_online_on_ ? "calibrated online from these" : "static",
+                 depth_cfg_.load_lam[8], depth_cfg_.load_row_ms[8], depth_cfg_.load_round_ms[8],
+                 depth_cfg_.load_jump_at[0], depth_cfg_.load_jump_at[1], depth_cfg_.load_jump_at[2],
+                 depth_cfg_.load_jump_at[3], depth_cfg_.load_jump_ms[8][0],
+                 depth_cfg_.load_jump_ms[8][1], depth_cfg_.load_jump_ms[8][2],
+                 depth_cfg_.load_jump_ms[8][3]);
     return RAD_OK;
 }
 
@@ -455,7 +482,7 @@ int Engine::depth_observe_upto(int round, int n, const StepOut& so) {
 
 /* The adaptive chain's tuning line: the shares of each depth and what the host waits cost, then
  * by the drafts a step made, the card's cycle and the drafts its verify accepted. Logged every
- * 4096 drafting rows and at shutdown. */
+ * 4096 drafting rows at debug level, and at shutdown. */
 void Engine::depth_log_stats(const char* when) {
     const DepthStats& ds = depth_stats_;
     if (!depth_cfg_.on || ds.rows == 0 || (depth_logged_ == ds.rows && !std::strcmp(when, "final"))) return;
@@ -510,7 +537,10 @@ void Engine::depth_step_note(const RadBatch* b, const StepOut& so) {
     if (depth_log_) depth_log_step(b, so);
     if (depth_online_on_ && (++depth_note_n_ & 63u) == 0) {
         draft_depth_online_refresh(&depth_cfg_, &depth_online_);
-        if ((depth_note_n_ & 32767u) == 0) depth_load_log("running");
+        /* the running tables only at debug level; shutdown logs the final ones at info (the owner,
+         * 2026-11-22: "make it print less. I don't want random noisy output") */
+        if ((depth_note_n_ & 32767u) == 0 && (int)::rad::Log::Debug <= (int)::rad::log_level())
+            depth_load_log("running");
         if (depth_log_) {
             /* K: the tables after a refresh, at the step's drafting rows */
             const int nn = draft_depth_seqs(std::max(n, 1));
@@ -755,7 +785,8 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
         }
         depth_last_ = 0;
         for (int i = 0; i < n; ++i) depth_last_ = std::max(depth_last_, (int)depth_of_[(size_t)i]);
-        if (ds.rows >= depth_logged_ + 4096) depth_log_stats("running");
+        if (ds.rows >= depth_logged_ + 4096 && (int)::rad::Log::Debug <= (int)::rad::log_level())
+            depth_log_stats("running"); /* debug level only; "final" at shutdown stays info */
     } else {
         depth_last_ = 0;
     }
@@ -1152,6 +1183,155 @@ int Engine::finish_block_drafter(const StepOut& so) {
             RAD_TRY(bind_couple(seq, i, steps, rc == RAD_OK, block_row_[(size_t)i].card));
     }
     return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ warm retune (fast-loop) */
+
+std::string Engine::retune_check(const Config& next) const {
+    if (gen_ || embedding_ || cfg_.kld() || cfg_.calib() || cfg_.diagnose_mode())
+        return "this engine is not a text server's step loop";
+    /* What the change may not move with it: the program's drafting half and the verify. */
+    if (next.draft_coupling != cfg_.draft_coupling)
+        return "--draft-coupling would change (the head's coupled planes are declared at load)";
+    if (next.draft_verify_block != cfg_.draft_verify_block ||
+        next.draft_verify_traversal != cfg_.draft_verify_traversal)
+        return "--draft-verify would change (the sampler's verify is declared at load)";
+    if (next.draft_window != cfg_.draft_window)
+        return "--draft-window would change";
+    /* --max-num-seqs: an admission cap within the slots, pools and buffers the load sized. */
+    if (next.max_seqs < 1 || next.max_seqs > cfg_.max_seqs)
+        return "--max-num-seqs " + std::to_string(next.max_seqs) + " is above the " +
+               std::to_string(cfg_.max_seqs) + " sequence slots this load sized (lower is warm; "
+               "higher needs a reload)";
+    /* --draft-depth adaptive: the rule's readback and events exist only if the load served it. */
+    if (next.draft_depth_adaptive) {
+        if (!mtp_couple_ || drafter_.kind != RAD_DRAFT_SERIAL)
+            return "--draft-depth adaptive needs a coupled serial draft chain";
+        if (!depth_rb_)
+            return "--draft-depth adaptive: this load served the fixed chain, so the rule's readback "
+                   "was never allocated (load with adaptive, then switch warm between its settings "
+                   "or to fixed)";
+    }
+    /* --draft-suffix: its window is the verify window, which the load sized. */
+    if (next.draft_suffix) {
+        if (cfg_.n_spec_head <= 0)
+            return "--draft-suffix on: this load served it off, so the verify window is the head's "
+                   "own (load with it on, then switch warm)";
+        if (next.draft_suffix_max > cfg_.n_spec)
+            return "--draft-suffix-max " + std::to_string(next.draft_suffix_max) + " is past the " +
+                   std::to_string(cfg_.n_spec) + "-row verify window this load sized";
+    }
+    return "";
+}
+
+std::string Engine::retune(const Config& next, std::string* what, int64_t wait_ms) {
+    if (const std::string why = retune_check(next); !why.empty()) return why;
+    auto job = std::make_shared<RetuneJob>();
+    job->next = next;
+    {
+        std::lock_guard<std::mutex> lk(retune_mu_);
+        if (retune_job_) return "another warm reload is still waiting";
+        retune_job_ = job;
+        retune_posted_.store(true, std::memory_order_release);
+    }
+    sched_.wake();
+    std::unique_lock<std::mutex> lk(retune_mu_);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<int64_t>(wait_ms, 0));
+    while (job->state != 2) {
+        if (job->state == 0 && std::chrono::steady_clock::now() >= until) {
+            /* Not taken in time: withdrawn, so it cannot land later. */
+            retune_job_.reset();
+            retune_posted_.store(false, std::memory_order_release);
+            return "the engine was not idle (requests were queued or running) within " +
+                   std::to_string(wait_ms / 1000) + " s";
+        }
+        /* Taken (state 1): the step loop finishes it or puts it back, and says so either way. */
+        if (job->state == 0) retune_cv_.wait_until(lk, until);
+        else                 retune_cv_.wait(lk);
+    }
+    if (what) *what = job->what;
+    return job->err;
+}
+
+/* The step loop, idle: nothing issued, the scheduler found no work. Applies a posted retune once
+ * the scheduler confirms, under its lock, that no request waits or runs; otherwise it stays posted
+ * for the next idle point. */
+void Engine::retune_service() {
+    if (!retune_posted_.load(std::memory_order_acquire)) return;
+    std::shared_ptr<RetuneJob> job;
+    {
+        std::lock_guard<std::mutex> lk(retune_mu_);
+        job = retune_job_;
+        if (!job || job->state != 0) return;
+        /* Taken before the scheduler's check, so retune() cannot withdraw it half applied. */
+        job->state = 1;
+    }
+    const Config& n = job->next;
+    if (!sched_.retune(n.max_seqs, n.draft_suffix, n.draft_suffix_min_match, n.draft_suffix_max,
+                       n.draft_suffix_min_score)) {
+        /* A request arrived: back to posted, for the next idle point (or retune()'s timeout). */
+        std::lock_guard<std::mutex> lk(retune_mu_);
+        job->state = 0;
+        retune_cv_.notify_all();
+        return;
+    }
+    std::string what;
+    auto note = [&](const char* k, const std::string& a, const std::string& b) {
+        if (a != b) what += std::string(what.empty() ? "" : ", ") + k + " " + a + " -> " + b;
+    };
+    auto on = [](bool b) { return std::string(b ? "on" : "off"); };
+    auto num = [](double v) { char s[32]; std::snprintf(s, sizeof s, "%g", v); return std::string(s); };
+    note("max-num-seqs (admission)", std::to_string(admit_seqs_ > 0 ? admit_seqs_ : cfg_.max_seqs),
+         std::to_string(n.max_seqs));
+    note("draft-depth", cfg_.draft_depth_adaptive ? "adaptive" : "fixed",
+         n.draft_depth_adaptive ? "adaptive" : "fixed");
+    note("draft-depth-stop", num(cfg_.draft_depth_stop), num(n.draft_depth_stop));
+    note("draft-depth-max", std::to_string(cfg_.draft_depth_max), std::to_string(n.draft_depth_max));
+    note("draft-depth-min", std::to_string(cfg_.draft_depth_min), std::to_string(n.draft_depth_min));
+    note("draft-depth-load", on(cfg_.draft_depth_load), on(n.draft_depth_load));
+    note("draft-suffix", on(cfg_.draft_suffix), on(n.draft_suffix));
+    note("draft-suffix-max", std::to_string(cfg_.draft_suffix_max), std::to_string(n.draft_suffix_max));
+    /* The drafting rule's keys move into cfg_ (no sizing reads them after load); the slots stay
+     * what the load sized, so cfg_.max_seqs does not move and the cap is kept apart. */
+    const Config keep = cfg_;
+    cfg_.draft_depth_adaptive      = n.draft_depth_adaptive;
+    cfg_.draft_depth_max           = n.draft_depth_max;
+    cfg_.draft_depth_min           = n.draft_depth_min;
+    cfg_.draft_depth_stop          = n.draft_depth_stop;
+    cfg_.draft_depth_load          = n.draft_depth_load;
+    cfg_.draft_depth_load_from     = n.draft_depth_load_from;
+    cfg_.draft_depth_load_min      = n.draft_depth_load_min;
+    cfg_.draft_depth_load_late     = n.draft_depth_load_late;
+    cfg_.draft_depth_load_online   = n.draft_depth_load_online;
+    cfg_.draft_depth_load_tok_ms   = n.draft_depth_load_tok_ms;
+    cfg_.draft_depth_load_row_ms   = n.draft_depth_load_row_ms;
+    cfg_.draft_depth_load_round_ms = n.draft_depth_load_round_ms;
+    cfg_.draft_depth_load_jump_ms  = n.draft_depth_load_jump_ms;
+    cfg_.draft_suffix              = n.draft_suffix;
+    cfg_.draft_suffix_min_match    = n.draft_suffix_min_match;
+    cfg_.draft_suffix_max          = n.draft_suffix_max;
+    cfg_.draft_suffix_min_score    = n.draft_suffix_min_score;
+    std::string err;
+    if (depth_rule_setup(cfg_, depth_slots_, /*alloc=*/false) != RAD_OK) {
+        /* retune_check refuses every case depth_rule_setup does; this is the belt to its braces. */
+        cfg_ = keep;
+        (void)depth_rule_setup(cfg_, depth_slots_, false);
+        (void)sched_.retune(admit_seqs_ > 0 ? admit_seqs_ : cfg_.max_seqs, cfg_.draft_suffix,
+                            cfg_.draft_suffix_min_match, cfg_.draft_suffix_max,
+                            cfg_.draft_suffix_min_score);
+        err = "the drafting rule refused the new settings (see the log); nothing changed";
+    } else {
+        admit_seqs_ = n.max_seqs;
+        RAD_INFO("retune: %s; the weights, pools and program stay as loaded",
+                 what.empty() ? "no engine setting changed" : what.c_str());
+    }
+    std::lock_guard<std::mutex> lk(retune_mu_);
+    job->what = what;
+    job->err = err;
+    job->state = 2;
+    retune_job_.reset();
+    retune_posted_.store(false, std::memory_order_release);
+    retune_cv_.notify_all();
 }
 
 }  /* namespace rad */

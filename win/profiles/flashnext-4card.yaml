@@ -1,8 +1,10 @@
 # Brilliance profile: Qwen3.8-Flash-Next IQR-V4 on four Radeon AI PRO R9700s, tensor parallel (TP4),
 # every expert on the cards (placement: all_vram, about 17 GiB of weights a card).
-# 256K tokens of context (262,144), eight requests at once, a bf16 KV cache, MTP speculation 3 deep,
-# prefill steps of up to 6,144 tokens. With no expert read from host memory, the two-card lost write
-# (SUPPORT.md, known issue 1) has not been seen. Supported: soaked at 32K on its earlier settings
+# 256K tokens of context (262,144), eight requests at once, a bf16 KV cache, MTP speculation with an
+# adaptive depth up to 5, and prefill steps of up to 6,144 tokens. When the cards' PCIe links differ,
+# the large exchanges give their reduce work to the fastest links (BRILLIANCE_AR4_SHARD_WEIGHTS,
+# auto by default; REFERENCE.md), with the same output bits as an even split. With no expert read
+# from host memory, the two-card lost write (SUPPORT.md, known issue 1) has not been seen. Supported: soaked at 32K on its earlier settings
 # (2,048-token steps and an int8 KV cache), before the four-card re-send and stop (SUPPORT.md,
 # known issue 1). With them, these tuned settings pass the injection, stop and serving checks; a
 # soak on them has not run yet.
@@ -46,7 +48,7 @@
 #
 # The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out; with
 # exactly four, that is all of them. Name the four with -Bus (PCI buses) or -Device (HIP indices) on a
-# machine with more. Rank 0 follows the runtime's device order, not the order the cards are named in.
+# machine with more. Windows HIP determines device order. The startup report lists the ranks.
 # Cards talk through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is
 # off with more than one card visible, so the KV cache is sized whole at load.
 #
@@ -69,7 +71,19 @@ models:
     kv-cache-dtype: bf16
     checkpoint-slots: 8
     vision-tower-placement: ram
-    num-speculative-tokens: 3
+    # The drafting stack, as on two cards: up to 5 MTP drafts, coupled drafting, traversal verify,
+    # an adaptive depth that stops at 0.85 and backs off under load. On four R9700s it measured about
+    # 13% faster single-stream decode, with prefill unchanged. Its greedy text is that of a fixed
+    # depth of 3; against decoding without drafts it can differ where two tokens are almost tied,
+    # as it can when other requests share a step (SUPPORT.md, known issues 5 and 8).
+    num-speculative-tokens: 5
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+    draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
     ngram-warm: true
+    # weight-prefetch off: not measured at TP4; same host-staged collective path as TP2, where an A/B (prefetch-ab, 2026-11-22) measured update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical. The G6 gate measures it.
+    weight-prefetch: off

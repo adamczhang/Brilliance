@@ -4,13 +4,14 @@ Brilliance is a fork of Radiance (https://codeberg.org/StillDeadcode/radiance), 
 Apache License 2.0 (LICENSE; NOTICE credits Radiance's authors). This tree is upstream's
 commit b6b8751cccb0e834a13ae9e5afca824ee9a487aa plus the Windows port.
 As section 4(b) of the licence asks, this file states which of upstream's files Brilliance
-has changed: the 376 listed under "Modified" carry changes made for Brilliance. Files under
+has changed: the 391 listed under "Modified" carry changes made for Brilliance. Files under
 "Added" are Brilliance's own. Every other file is upstream's, unchanged.
 
-Modified (376)
+Modified (391)
 
   .gitignore
   CMakeLists.txt
+  NOTICE
   README.md
   abi/rad_abi.h
   abi/rad_builder.h
@@ -47,9 +48,11 @@ Modified (376)
   core/engine_bringup.cpp
   core/engine_diag.cpp
   core/engine_diagnose.cpp
+  core/engine_draft.cpp
   core/engine_hostmem.cpp
   core/engine_hostmem.h
   core/fleet/config.cpp
+  core/fleet/config.h
   core/fleet/fleet.cpp
   core/format/radfile.cpp
   core/format/table_copy.cpp
@@ -80,6 +83,8 @@ Modified (376)
   core/runtime/ctx.cpp
   core/runtime/ctx.h
   core/runtime/issue.cpp
+  core/runtime/rank_barrier.cpp
+  core/runtime/rank_barrier.h
   core/runtime/wtab.hip
   core/runtime/xprefetch.hip
   core/sched/advance.hip
@@ -92,6 +97,7 @@ Modified (376)
   core/server/dashboard.cpp
   core/server/dashboard_page.h
   core/server/front.cpp
+  core/server/front.h
   core/server/http.cpp
   core/server/http.h
   core/server/liveview.h
@@ -111,12 +117,20 @@ Modified (376)
   dashboard/src/pages/overview.tsx
   data/kernels_moe.rkb
   docs/GUIDE.md
+  docs/MULTIMODEL.md
+  libavx/CMakeLists.txt
+  libavx/README.md
   libavx/avx_bench.cpp
+  libavx/avx_cases.cpp
   libavx/avx_check.cpp
+  libavx/avx_check.h
   libavx/avx_check_rows.cpp
   libavx/avx_common.h
   libavx/avx_dispatch.cpp
+  libavx/avx_glm.cpp
+  libavx/avx_isa.h
   libavx/avx_ngram.cpp
+  libavx/avx_registry.cpp
   libhalo/halo.h
   libhalo/halo_ar_entry.hip
   libhalo/halo_ar_gather_2rank.hip
@@ -337,6 +351,7 @@ Modified (376)
   tests/engine_e2e_test.cpp
   tests/fleet_config_test.cpp
   tests/format_test.cpp
+  tests/front_test.cpp
   tests/halo_emu/cfg_host.cpp
   tests/harness_test.cpp
   tests/hf_model_test.cpp
@@ -386,10 +401,11 @@ Modified (376)
   vendor/llama/common/json-partial.cpp
   vendor/llama/src/unicode.cpp
 
-Added (236)
+Added (289)
 
   .gitattributes
   RADIANCE-README.md
+  REFERENCE.md
   abi/rad_kv_fp8.h
   arch/common/rad_expert_split.h
   arch/common/rad_ggml.h
@@ -400,17 +416,26 @@ Added (236)
   core/format/table_warm.h
   core/place/host_admit.h
   core/server/terms.cpp
+  core/util/stoplog.cpp
+  core/util/stoplog.h
   dashboard/src/components/chat.tsx
   dashboard/src/pages/sandbox.tsx
   docs/img/banner.png
+  libavx/avx_ds41.cpp
+  libavx/avx_ggml.cpp
+  libavx/avx_ggml.h
+  libavx/avx_ggml_hooks.cpp
   libquant/lq_ggml_dequant.cpp
   libquant/lq_ggml_dequant.h
   libquant/lq_ggml_planes.cpp
   libquant/lq_ggml_planes.h
+  libr4d/r4d_ar4_weights.h
+  libr4d/r4d_ar_wide_coded.h
   libr4d/r4d_ar_wide_host.h
   libr4d/r4d_ar_wide_host.hip
   libr4d/r4d_ar_wide_rs.hip
   libr4d/r4d_ar_wide_ts.hip
+  libr4d/r4d_ar_wide_tw.hip
   libr4d/r4d_ar_wide_x.h
   libr4d/r4d_ds41_elem.h
   libr4d/r4d_ds41_elem.hip
@@ -434,6 +459,8 @@ Added (236)
   tests/loader_transfer_test.cpp
   tests/ngram_warm_test.cpp
   tests/paging_fence_test.cpp
+  tests/r4d_ar4_weights_test.cpp
+  tests/stoplog_test.cpp
   tests/terms_test.cpp
   tools/rad_warm_bench.cpp
   vendor/patches/0023-unicode-a-16-bit-wchar_t-keeps-one-unit-per-codepoint.patch
@@ -515,25 +542,42 @@ Added (236)
   win/libexec/rad-export.cmd
   win/licenses/THIRD-PARTY.md
   win/licenses/adl-sdk.LICENSE
+  win/licenses/amd-hsa-loader.NOTICE
   win/licenses/amdgpu-windows-interop.EULA
   win/licenses/amf.LICENSE
+  win/licenses/comgr-blake3.LICENSE
+  win/licenses/comgr-clang.LICENSE
+  win/licenses/comgr-device-libs.LICENSE
+  win/licenses/comgr-lld.LICENSE
+  win/licenses/comgr-llvm-support.NOTICE
+  win/licenses/comgr-llvm.LICENSE
+  win/licenses/comgr-spirv-header.NOTICE
+  win/licenses/comgr-spirv-headers.LICENSE
+  win/licenses/comgr-spirv-translator.LICENSE
   win/licenses/dav1d.LICENSE
   win/licenses/dav1d.PATENTS
   win/licenses/elfio.NOTICE
   win/licenses/ffmpeg.SOURCE
   win/licenses/hip-clr.LICENSE
   win/licenses/hip.LICENSE
+  win/licenses/interop-libelf.NOTICE
   win/licenses/libwebp.LICENSE
   win/licenses/libwebp.PATENTS
   win/licenses/llvm-openmp.LICENSE
   win/licenses/metrohash.LICENSE
+  win/licenses/metrohash.NOTICE
   win/licenses/msgpack-cxx.LICENSE
   win/licenses/msvc-runtime.NOTICE
+  win/licenses/pal-rdf.NOTICE
+  win/licenses/pal-zstd.LICENSE
   win/licenses/pal.LICENSE
   win/licenses/rocclr.LICENSE
   win/licenses/rocm-kpack.LICENSE
   win/licenses/rocr-hsa-runtime.LICENSE
   win/licenses/rocr-runtime.LICENSE
+  win/licenses/roct-thunk.LICENSE
+  win/licenses/simde.LICENSE
+  win/licenses/wkmi-header.NOTICE
   win/licenses/zlib.LICENSE
   win/licenses/zstd.LICENSE
   win/model-licenses/apache-2.0.txt
@@ -572,11 +616,18 @@ Added (236)
   win/serve.ps1
   win/setup.ps1
   win/tests/CMakeLists.txt
+  win/tests/build_identity_test.ps1
+  win/tests/docs_check_known_issues_test.py
+  win/tests/docs_check_reference_test.py
   win/tests/fetch_launch_test.ps1
   win/tests/gate_lib_test.ps1
+  win/tests/gate_runner_test.py
   win/tests/hub_stub.py
+  win/tests/licence_checks_test.py
   win/tests/pin_limit_test.cpp
+  win/tests/plan_only_cli_test.cmake
   win/tests/rad_export_cmd_test.ps1
+  win/tests/rank_report_test.ps1
   win/tests/selftest_ref_path_test.cpp
   win/tests/serve_launcher_test.ps1
   win/tests/serve_sandbox_test.ps1
@@ -585,16 +636,28 @@ Added (236)
   win/tests/stall_watch_card_test.cpp
   win/tests/stall_watch_test.cpp
   win/tests/terms_check.ps1
+  win/tools/GATE-RUNNER.md
   win/tools/api_check.py
   win/tools/bench_selftest.py
+  win/tools/build-identity.ps1
   win/tools/build-log.ps1
   win/tools/capture_proxy.py
   win/tools/check-yaml.ps1
   win/tools/clean-rebuild.ps1
   win/tools/docs_check.py
   win/tools/fixtures/opencode-disk-after-tool.json
+  win/tools/fixtures/stoplog/tp2-retire-bounded.log
+  win/tools/fixtures/stoplog/tp2-retire-split-truncated.log
+  win/tools/fixtures/stoplog/tp4-retire-bounded.log
   win/tools/fleet_check.py
   win/tools/gate-lib.ps1
+  win/tools/gate-runner.ps1
+  win/tools/gate_check_lib.py
+  win/tools/gate_checks/_example.py
+  win/tools/gate_checks/profile_scope.py
+  win/tools/gate_checks/runtime_licences.py
+  win/tools/gate_runner.py
+  win/tools/lan-matrix.ps1
   win/tools/llp64_sweep.py
   win/tools/logprob_batched.py
   win/tools/logprob_repeat.py
@@ -603,9 +666,12 @@ Added (236)
   win/tools/openwebui_check.py
   win/tools/package-check.ps1
   win/tools/package_audit.py
+  win/tools/perf-criteria.json
   win/tools/prefill-bench.md
   win/tools/prefill_bench.py
+  win/tools/profile-scope.json
   win/tools/qualify_api.py
+  win/tools/rank-report.ps1
   win/tools/reload-server.ps1
   win/tools/replay_chat.py
   win/tools/sampler_fidelity.py
@@ -618,6 +684,8 @@ Added (236)
   win/tools/stacks/brl-stacks.cpp
   win/tools/stacks/resolve-stacks.py
   win/tools/stop-server.ps1
+  win/tools/stop_log_check.py
+  win/tools/stop_log_check_test.py
   win/tools/template_check.py
   win/tools/template_hf_compare.py
   win/tools/test-each.ps1

@@ -294,6 +294,12 @@ public:
      * bytes: VRAM, the pinned pool, the RAM store, the drive; and the file tier's pinned windows
      * and VRAM layer buffers. The startup log prints it for every rank. */
     std::string tier_line() const;
+    /* Brilliance (rc-fixes): the startup report's "weights by tier" value, every weight by where a
+     * step reads it: VRAM, the host pool (pinned and pageable), the RAM store (the file tier's units
+     * held in ordinary RAM, said when --expert-ram-mib gives a budget or the store holds any), the
+     * container on disk (the rest of the file tier), and the mapping. The SSD tier's total is
+     * split, as tier_line splits it, so the RAM store is never called the disk. */
+    std::string weights_by_tier() const;
 };
 
 /* ------------------------------------------------------------------ the planner */

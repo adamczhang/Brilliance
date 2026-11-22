@@ -137,7 +137,7 @@ struct ServerOptions {
     /* What --model named, reported as the model entry's `root` as vLLM reports its loaded path
      * (the served name says nothing about the file behind it). Empty omits the field. */
     std::string model_path;
-    std::string host = "0.0.0.0";
+    std::string host = "127.0.0.1";
     int         port = 8000;
     int         n_threads = 0;
 

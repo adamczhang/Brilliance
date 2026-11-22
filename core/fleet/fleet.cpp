@@ -10,6 +10,7 @@
 #include "server/history.h"
 #include "server/server.h"
 #include "util/stallwatch.h"
+#include "util/stoplog.h"
 
 #include "rad_device.h"
 #include "device/device.h"
@@ -55,7 +56,17 @@ constexpr int64_t kMiB = (int64_t)1 << 20;
  * or SIGTERM gets the default disposition, so the operator can still force an immediate kill. */
 std::atomic<bool> g_stop{false};
 std::atomic<bool> g_hup{false};
-void on_stop(int) { g_stop.store(true, std::memory_order_relaxed); }
+void on_stop(int sig) {
+    g_stop.store(true, std::memory_order_relaxed);
+#if defined(_WIN32)
+    /* Brilliance: the stop journal's first record, from the console's own thread (no signal
+     * handler on Windows, so it may write). Elsewhere the fleet's loop records it. */
+    rad::stoplog::begin(sig == SIGINT ? "Ctrl-C at the console (SIGINT)"
+                                      : "Ctrl-Break or the console closing (SIGTERM)");
+#else
+    (void)sig;
+#endif
+}
 void on_hup(int) { g_hup.store(true, std::memory_order_relaxed); }
 
 /* The listener's settings. Every model carries the same server keys (the loader writes them into
@@ -372,6 +383,8 @@ private:
         /* Its grant found the room held by loads still waiting for the bring-up lock it held:
          * the start ends, and the load is asked for again once they are in. */
         std::atomic<bool>                  room_retry{ false };
+        /* Brilliance (rc-fixes): its last load was a --plan-only stop with the plan admitted. */
+        std::atomic<bool>                  planned{ false };
         int                                room_retries = 0;
         std::thread                        worker;
         uint64_t                           seq = 0;
@@ -500,7 +513,8 @@ private:
     int    close_idle_queues(const Model& m, const std::map<int, int64_t>& need);
     void   reopen_queues(const std::vector<int>& cards);
 
-    void   fail(Model& m, const std::string& why);
+    /* `planned`: a --plan-only stop whose plan was admitted, said at info level (no E line). */
+    void   fail(Model& m, const std::string& why, bool planned = false);
     bool   choose_cards(Model& m, const Config& cfg, std::vector<int>* out, std::string* why);
     /* The cards `m` may be placed on: its own list (models.NAME.cards), else the fleet's. */
     const std::vector<int>& cards_of(const Model& m) const {
@@ -518,7 +532,10 @@ private:
     std::vector<Resident> residents(const Model* except);
     void   reap();
     void   ttl_tick();
-    std::string reload();
+    /* Brilliance (fast-loop): `warm_only` refuses, before anything changes, a file whose changes
+     * would unload a model (a cold key, a model added or removed, a warm key on a model not
+     * resident); `report`, when given, says per model what was retuned and what reloaded. */
+    std::string reload(bool warm_only = false, json* report = nullptr);
     void   stop_all();
     void   add_routes();
     /* Whether `q`'s caller may reach the fleet's admin routes: everyone who pays the api key, or
@@ -1737,8 +1754,9 @@ int Fleet::grant(Model& m, const VramAsk& ask, int64_t* grant, std::string* why)
     return RAD_OK;
 }
 
-void Fleet::fail(Model& m, const std::string& why) {
+void Fleet::fail(Model& m, const std::string& why, bool planned) {
     m.held.store(false);   /* Brilliance: a load that failed holds nothing */
+    m.planned.store(planned);
     /* A warm load that finds no room is not a failure: nobody asked for the model yet. */
     if (m.warm.exchange(false)) {
         {
@@ -1753,11 +1771,12 @@ void Fleet::fail(Model& m, const std::string& why) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         m.error = why;
-        ++m.failures;
+        if (!planned) ++m.failures;
         m.resident = false;
         m.cards.clear();
     }
-    RAD_ERR("model %s: not loaded: %s", m.entry.name.c_str(), why.c_str());
+    if (planned) RAD_INFO("model %s: not loaded: %s", m.entry.name.c_str(), why.c_str());
+    else         RAD_ERR("model %s: not loaded: %s", m.entry.name.c_str(), why.c_str());
     front_.fail(m.entry.name, why, 15000);
 }
 
@@ -2093,10 +2112,13 @@ void Fleet::load_op(Model& m) {
     const int s = e->start();
     if (s < 0) {
         watch.reset();
+        /* Brilliance (rc-fixes): --plan-only stopped it on purpose with its plan admitted. */
+        const bool planned = e->plan_only_admitted();
         /* Out of memory while other loads were starting beside it: the room it was granted was
          * someone's in flight, so it starts again rather than fail what is queued for it. */
         const bool beside = s == RAD_E_NOMEM && loads_in_flight_.load() > 1;
-        const bool retry = (m.room_retry.exchange(false) || beside) && m.room_retries < 20 && !m.warm.load();
+        const bool retry = !planned && (m.room_retry.exchange(false) || beside) &&
+                           m.room_retries < 20 && !m.warm.load();
         if (!retry && !m.warm.load()) e->print_startup_report(s);
         drop_reservation();
         std::map<int, int64_t> held;
@@ -2122,7 +2144,8 @@ void Fleet::load_op(Model& m) {
             std::lock_guard<std::mutex> lk(mu_);
             room = m.room_why;
         }
-        if (s == RAD_E_NOMEM && !room.empty()) fail(m, "the fleet has no room for it: " + room);
+        if (planned) fail(m, "--plan-only: the plan was admitted and nothing was loaded", true);
+        else if (s == RAD_E_NOMEM && !room.empty()) fail(m, "the fleet has no room for it: " + room);
         else fail(m, std::string("startup failed with ") + rad_strerror(s) + " (see the log)");
         return;
     }
@@ -2427,7 +2450,7 @@ void Fleet::ttl_tick() {
     }
 }
 
-std::string Fleet::reload() {
+std::string Fleet::reload(bool warm_only, json* report) {
     FleetConfig nf;
     if (fleet::load(fc_.path, &nf) != RAD_OK) return "the file does not load (see the log)";
     if (const std::string u = unsupported(nf); !u.empty())
@@ -2446,12 +2469,47 @@ std::string Fleet::reload() {
         if (std::find(cards_.begin(), cards_.end(), c) == cards_.end())
             return "memory.card-headroom-mib names card " + std::to_string(c) +
                    ", which is not a card this fleet uses";
-    if (nf.log_set) log_set_level(nf.log);
     /* Work in flight finishes first. */
     for (auto& m : models_) {
         while (m->op.load() != kIdle) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if (m->worker.joinable()) m->worker.join();
     }
+    /* Brilliance (fast-loop): what changed in each model kept, and whether a loaded engine can take
+     * it in place (fleet::diff_args, Engine::retune). Decided for every model before anything
+     * changes, so a warm-only reload that cannot be is refused whole. */
+    std::map<std::string, ArgDiff> diffs;
+    for (const ModelEntry& e : nf.models) {
+        Model* m = find(e.name);
+        if (!m) {
+            if (warm_only) return "warm only: models." + e.name + " would be added";
+            continue;
+        }
+        if (m->entry.cards != e.cards) {
+            if (warm_only) return "warm only: models." + e.name + ": its cards would change";
+            continue;
+        }
+        ArgDiff d = diff_args(m->entry.args, e.args);
+        if (d.empty()) continue;
+        if (warm_only) {
+            if (!d.cold.empty())
+                return "warm only: models." + e.name + ": " + d.cold.front() +
+                       " needs a reload (only the drafting rule, --draft-suffix and --max-num-seqs "
+                       "change warm)";
+            if (!m->engine || !m->resident || m->parked)
+                return "warm only: models." + e.name + " is not resident, so there is no engine to retune";
+            if (const std::string why = m->engine->retune_check(e.cfg); !why.empty())
+                return "warm only: models." + e.name + ": " + why;
+        }
+        diffs[e.name] = std::move(d);
+    }
+    if (warm_only)
+        for (auto& m : models_) {
+            bool kept = false;
+            for (const ModelEntry& e : nf.models) kept |= e.name == m->entry.name;
+            if (!kept) return "warm only: models." + m->entry.name + " would be removed";
+        }
+    if (nf.log_set) log_set_level(nf.log);
+    json rep = json::object();
     std::vector<std::string> keep;
     for (const ModelEntry& e : nf.models) keep.push_back(e.name);
     for (size_t i = 0; i < models_.size();) {
@@ -2461,6 +2519,7 @@ std::string Fleet::reload() {
         front_.remove(m.entry.name);
         history_.forget(m.entry.name);
         RAD_INFO("model %s: removed", m.entry.name.c_str());
+        rep[m.entry.name] = json({ { "action", "removed" } });
         std::lock_guard<std::mutex> lk(mu_);
         models_.erase(models_.begin() + (long)i);
     }
@@ -2476,11 +2535,41 @@ std::string Fleet::reload() {
             }
             front_.add(e.name, e.aliases, nf.load_timeout_ms, required);
             RAD_INFO("model %s: added", e.name.c_str());
+            rep[e.name] = json({ { "action", "added" } });
             continue;
         }
-        if (m->entry.args != e.args || m->entry.cards != e.cards) {
+        bool warmed = false;
+        if (auto it = diffs.find(e.name); it != diffs.end() && it->second.cold.empty() &&
+            m->entry.cards == e.cards && m->engine && m->resident && !m->parked) {
+            /* Brilliance (fast-loop): only warm keys changed: the loaded engine takes them at its
+             * next idle point, its weights resident. A refusal (a value past what the load sized,
+             * or no idle point within a minute) falls back to the reload below, unless warm only. */
+            std::string what;
+            const std::string why = m->engine->retune(e.cfg, &what, 60000);
+            std::string keys;
+            for (const std::string& k : it->second.warm) keys += (keys.empty() ? "" : "; ") + k;
+            if (why.empty()) {
+                warmed = true;
+                RAD_INFO("model %s: retuned warm (%s); weights stay resident", e.name.c_str(), keys.c_str());
+                rep[e.name] = json({ { "action", "retuned" }, { "changed", it->second.warm },
+                                     { "engine", what } });
+            } else if (warm_only) {
+                if (report) *report = rep;
+                return "warm only: models." + e.name + ": " + why;
+            } else {
+                RAD_INFO("model %s: not retuned warm (%s): %s", e.name.c_str(), keys.c_str(), why.c_str());
+            }
+        }
+        if (!warmed && (m->entry.args != e.args || m->entry.cards != e.cards)) {
             unload(*m, fc_.drain_timeout_ms, "its configuration changed");
             RAD_INFO("model %s: reconfigured", e.name.c_str());
+            if (auto it = diffs.find(e.name); it != diffs.end()) {
+                std::vector<std::string> all = it->second.cold;
+                all.insert(all.end(), it->second.warm.begin(), it->second.warm.end());
+                rep[e.name] = json({ { "action", "reloaded" }, { "changed", all } });
+            } else {
+                rep[e.name] = json({ { "action", "reloaded" } });
+            }
             std::lock_guard<std::mutex> lk(mu_);
             m->claim = 0;
         }
@@ -2495,6 +2584,7 @@ std::string Fleet::reload() {
     for (const ModelEntry& e : fc_.models)
         if (e.pin) demand(e.name);
     RAD_INFO("reload: %s applied, %zu model(s)", fc_.path.c_str(), fc_.models.size());
+    if (report) *report = rep;
     return "";
 }
 
@@ -2795,6 +2885,9 @@ json Fleet::status() {
 
 bool Fleet::operator_ok(const server::HttpRequest& q) const {
     const Config& c = fc_.models.front().cfg;
+    /* Brilliance: a key-exempt route (/health, /ping) reached without the key is no operator's,
+     * though the server has a key (HttpRequest::missing_key). */
+    if (q.missing_key) return false;
     return !c.api_key.empty() || server::local_operator(q, c.host, c.allow_hosts);
 }
 
@@ -2913,11 +3006,18 @@ void Fleet::add_routes() {
         }
         return bad(q, 404, "no admin action '" + action + "'; load, park, unload, pin or unpin");
     });
+    /* Brilliance (fast-loop): ?warm=only refuses (409, nothing changed) a file whose changes would
+     * unload a model; the answer's `models` says per model what was retuned in place and what
+     * reloaded (win/tools/AB-BENCH.md). */
     front_.route("POST", "/admin/reload", [this, guard, ok, bad, run_cmd](const server::HttpRequest& q) {
         if (auto g = guard(q)) return *g;
-        const auto r = run_cmd([this] { return reload(); }, 3600000);
-        if (!r.second.empty()) return bad(q, 400, "reload refused: " + r.second);
-        return ok({ { "reloaded", fc_.path } });
+        const bool warm_only = q.query.count("warm") && q.query.at("warm") == "only";
+        auto rep = std::make_shared<json>(json::object());
+        const auto r = run_cmd([this, warm_only, rep] { return reload(warm_only, rep.get()); }, 3600000);
+        if (!r.first) return bad(q, 503, "reload still running after an hour (see the log)");
+        if (!r.second.empty())
+            return bad(q, r.second.rfind("warm only:", 0) == 0 ? 409 : 400, "reload refused: " + r.second);
+        return ok({ { "reloaded", fc_.path }, { "models", *rep } });
     });
 }
 
@@ -2968,16 +3068,37 @@ void Fleet::loop() {
 }
 
 void Fleet::stop_all() {
+    /* Brilliance: the stop journal names each step of the bounded stop (util/stoplog.h, and
+     * win/SUPPORT.md "Stopping a multi-card server"). */
+    namespace sl = rad::stoplog;
     for (auto& m : models_) {
-        while (m->op.load() != kIdle) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        {
+            sl::Step st("model." + m->entry.name + ".op_idle",
+                        sl::bound::kOpIdle);
+            while (m->op.load() != kIdle) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        sl::Step st("model." + m->entry.name + ".worker_join", sl::bound::kOpIdle);
         if (m->worker.joinable()) m->worker.join();
         join_spill(*m);
     }
     for (auto& m : models_)
-        if (m->engine) m->engine->request_stop(fc_.drain_timeout_ms);
+        if (m->engine) {
+            sl::note("fleet.request_stop", "model %s, drain %lld ms", m->entry.name.c_str(),
+                     (long long)fc_.drain_timeout_ms);
+            m->engine->request_stop(fc_.drain_timeout_ms);
+        }
     for (auto& m : models_)
-        if (m->serve.joinable()) m->serve.join();
-    front_.stop();
+        if (m->serve.joinable()) {
+            /* The engine's own steps inside (drain, step loop, rank threads) have their own
+             * records; this one bounds the whole: the drain, then one step and the joins. */
+            sl::Step st("model." + m->entry.name + ".serve_join",
+                        fc_.drain_timeout_ms + sl::bound::kStepLoopStop + sl::bound::kRankJoin);
+            m->serve.join();
+        }
+    {
+        sl::Step st("fleet.front_stop", sl::bound::kFrontStop);
+        front_.stop();
+    }
     /* Reverse load order: a later engine may share the plugin set an earlier one loaded. */
     std::vector<Model*> order;
     for (auto& m : models_)
@@ -2985,8 +3106,10 @@ void Fleet::stop_all() {
     std::sort(order.begin(), order.end(), [](Model* a, Model* b) { return a->seq > b->seq; });
     for (Model* m : order) {
         std::lock_guard<std::mutex> lk(mu_);
+        sl::Step st("model." + m->entry.name + ".teardown", sl::bound::kTeardown);
         m->engine.reset();
     }
+    sl::Step st("fleet.sweep_buffers", sl::bound::kRelease);
     sweep_buffers_keep(false);
 }
 
@@ -3056,9 +3179,11 @@ int Fleet::run() {
     /* Brilliance: Ctrl-C, Ctrl-Break and the console closing drain like SIGINT and SIGTERM, and a
      * second one ends the process (os::on_terminate). Windows has no SIGHUP: a named event takes its
      * place (os::on_reload; win\tools\reload-server.ps1 sets it), beside POST /admin/reload. */
+    rad::stoplog::arm_from_env();   /* before the handler: a stop records from its first moment */
     rad::os::on_terminate(on_stop);
     rad::os::on_reload(on_hup);
 #else
+    rad::stoplog::arm_from_env();
     struct sigaction sa {};
     sa.sa_handler = on_stop;
     sigemptyset(&sa.sa_mask);
@@ -3099,7 +3224,7 @@ int Fleet::run() {
     }
     sweep_buffers_keep(fc_.models.size() > 1);
 
-    size_t up = 0;
+    size_t up = 0, planned = 0;
     for (const std::string& n : preload) {
         if (g_stop.load()) break;
         Model* m = find(n);
@@ -3108,11 +3233,17 @@ int Fleet::run() {
         load_op(*m);
         m->op.store(kIdle);
         if (m->engine) ++up;
+        else if (m->planned.load()) ++planned;
     }
     if (g_stop.load() || (!preload.empty() && up == 0)) {
-        if (!g_stop.load()) RAD_ERR("no model started");
+        /* Brilliance (rc-fixes): every model the start needed stopped at --plan-only with its
+         * plan admitted: the mode did what it was asked, so the process exits 0. A refused plan,
+         * or any model that failed beside it, still ends with the E line and 1. */
+        const bool all_planned = !g_stop.load() && planned == preload.size();
+        if (all_planned) RAD_INFO("--plan-only: every model's plan was admitted; nothing was loaded");
+        else if (!g_stop.load()) RAD_ERR("no model started");
         stop_all();
-        return g_stop.load() ? 0 : 1;
+        return g_stop.load() || all_planned ? 0 : 1;
     }
 
     /* §8.6: the rest load in the background, lowest priority first (later in the file first among
@@ -3136,11 +3267,24 @@ int Fleet::run() {
     });
     std::thread history([this] { history_loop(); });
     loop();
+    namespace sl = rad::stoplog;
+    if (!sl::begun())
+        sl::begin(g_stop.load() ? "a stop signal, seen by the fleet's loop"
+                                : "the listener stopped (front stopping or a listen error)");
+    sl::note("fleet.loop_exit", "the fleet's loop has ended");
     RAD_INFO("stopping: draining in-flight requests");
-    if (history.joinable()) history.join();
+    {
+        sl::Step st("fleet.history_join", sl::bound::kHistoryJoin);
+        if (history.joinable()) history.join();
+    }
     stop_all();
-    if (listener.joinable()) listener.join();
-    return listen_rc.load() < 0 ? 1 : 0;
+    {
+        sl::Step st("fleet.listener_join", sl::bound::kFrontStop);
+        if (listener.joinable()) listener.join();
+    }
+    const int rc = listen_rc.load() < 0 ? 1 : 0;
+    sl::note("fleet.run_return", "status %d", rc);
+    return rc;
 }
 
 }  // namespace

@@ -48,6 +48,15 @@ std::string HttpRequest::param(const std::string& k, const std::string& def) con
     return q == query.end() ? def : q->second;
 }
 
+static bool is_loopback_ip(const std::string& addr) {
+    in_addr v4{};
+    if (inet_pton(AF_INET, addr.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, addr.c_str(), &v6) != 1) return false;
+    if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
+    return IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127;
+}
+
 bool HttpRequest::peer_is_loopback() const {
     /* The socket, never the attributed peer: `peer` is whatever a vouched proxy said, and a
      * guard that read it would let a proxy hand out loopback to the world. */
@@ -57,12 +66,15 @@ bool HttpRequest::peer_is_loopback() const {
     std::string addr = colon == std::string::npos ? raw_peer : raw_peer.substr(0, colon);
     if (addr.size() >= 2 && addr.front() == '[' && addr.back() == ']')
         addr = addr.substr(1, addr.size() - 2);
-    in_addr v4{};
-    if (inet_pton(AF_INET, addr.c_str(), &v4) == 1) return (ntohl(v4.s_addr) >> 24) == 127;
-    in6_addr v6{};
-    if (inet_pton(AF_INET6, addr.c_str(), &v6) != 1) return false;
-    if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
-    return IN6_IS_ADDR_V4MAPPED(&v6) && v6.s6_addr[12] == 127;
+    return is_loopback_ip(addr);
+}
+
+void warn_if_keyless_network_listener(const std::string& bound_addr, bool has_api_key) {
+    if (has_api_key || is_loopback_ip(bound_addr)) return;
+    /* Brilliance: keep the exposure warning visible even with an error-only log. */
+    log_emit(Log::Warn, __FILE__, __LINE__,
+             "server: listening beyond loopback with no API key. Anyone who can reach this port "
+             "can run inference, trigger model loads, read operational telemetry and use the dashboard.");
 }
 
 /* The parsed form of one "--trusted-proxy CIDR": network, prefix length, family. */
@@ -501,8 +513,23 @@ private:
 
 /* ------------------------------------------------------------------ the httplib binding */
 
+class BoundServer : public httplib::Server {
+public:
+    std::string bound_address() const {
+        /* Classify the socket itself, including when the configured host is a name. */
+        sockaddr_storage addr{};
+        socklen_t len = sizeof addr;
+        const auto* sa = reinterpret_cast<const sockaddr*>(&addr);
+        char host[NI_MAXHOST];
+        if (::getsockname(svr_sock_.load(), reinterpret_cast<sockaddr*>(&addr), &len) != 0 ||
+            ::getnameinfo(sa, len, host, sizeof host, nullptr, 0, NI_NUMERICHOST) != 0)
+            return {};
+        return host;
+    }
+};
+
 struct HttpTransport::Impl {
-    httplib::Server  svr;
+    BoundServer      svr;
     std::atomic<int> port{0};
 };
 
@@ -660,6 +687,78 @@ static bool is_socket_upgrade(const httplib::Request& q) {
     return q.get_header_value("Sec-WebSocket-Version") == "13";
 }
 
+/* The calling thread's last socket error. */
+static int last_socket_error() {
+#if defined(_WIN32)
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+/* The error binding host:port gives, for the log when the listener's own bind failed: httplib
+ * closes the socket a failed bind leaves, which can clear the error, so the bind is tried once
+ * more here on a socket of our own with the listener's options. 0 if it binds now; -1 if the
+ * address does not resolve. */
+static int bind_error(std::string host, int port) {
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+        host = host.substr(1, host.size() - 2);
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    addrinfo* res = nullptr;
+    const std::string service = std::to_string(port);
+    if (::getaddrinfo(host.empty() ? nullptr : host.c_str(), service.c_str(), &hints, &res) != 0 ||
+        !res)
+        return -1;
+    int err = 0;
+    const socket_t s = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) {
+        err = last_socket_error();
+    } else {
+        if (res->ai_family == AF_INET6)   /* as httplib sets it on the listener */
+            httplib::set_socket_opt(s, IPPROTO_IPV6, IPV6_V6ONLY, CPPHTTPLIB_IPV6_V6ONLY ? 1 : 0);
+#if defined(_WIN32)
+        httplib::set_socket_opt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
+        httplib::default_socket_options(s);
+#endif
+        if (::bind(s, res->ai_addr, (socklen_t)res->ai_addrlen) != 0) err = last_socket_error();
+#if defined(_WIN32)
+        ::closesocket(s);
+#else
+        ::close(s);
+#endif
+    }
+    ::freeaddrinfo(res);
+    return err;
+}
+
+/* Why a listener could not bind, in words: a taken port says so, anything else is the system's
+ * own message. */
+static std::string bind_failure(int err) {
+#if defined(_WIN32)
+    const bool in_use = err == WSAEADDRINUSE;
+    /* WSAEACCES: a socket holds the port exclusively, or the port sits in a range the system
+     * reserves (`netsh int ipv4 show excludedportrange protocol=tcp`). */
+    const bool denied = err == WSAEACCES;
+#else
+    const bool in_use = err == EADDRINUSE;
+    const bool denied = false;
+#endif
+    if (in_use)
+        return "the port is already in use; another server (or another program) is listening "
+               "there. Stop it, or start this one on another port";
+    if (denied)
+        return "access to the port was denied; another program holds it exclusively, or Windows "
+               "reserves it (netsh int ipv4 show excludedportrange protocol=tcp). Choose another "
+               "port";
+    if (err < 0) return "the address does not resolve to one this machine can listen on";
+    if (err == 0) return "the bind failed, but a second try succeeded (the port was freed meanwhile?)";
+    return std::system_category().message(err) + " (error " + std::to_string(err) + ")";
+}
+
 int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     auto& svr = impl_->svr;
 
@@ -674,6 +773,17 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * included) for a delayed ACK, which is latency on every token for no throughput gain at
      * these write sizes. */
     svr.set_tcp_nodelay(true);
+#if defined(_WIN32)
+    /* Brilliance: the listener owns its port. httplib's default socket option is SO_REUSEADDR
+     * here, which on Windows lets a second socket bind a port another one is listening on: a
+     * second server started on a taken port came up with no error while every request still went
+     * to the first. SO_EXCLUSIVEADDRUSE refuses that bind (and any other process's), so the start
+     * fails at once. A restart on the same port still binds: TIME_WAIT connections left by the
+     * last listener do not hold it. Elsewhere httplib's default stays. */
+    svr.set_socket_options([](socket_t sock) {
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+    });
+#endif
 
     const int nt = idle_workers(o.n_threads);
     const size_t most = (size_t)std::max<int64_t>(o.max_threads, nt);
@@ -786,7 +896,7 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         return true;
     };
 
-    auto bridge = [&router, fill_peers](const httplib::Request& hreq, std::string body,
+    auto bridge = [&router, fill_peers, api_key, key_ok](const httplib::Request& hreq, std::string body,
                             httplib::Response& hres, std::vector<FormPart> form = {}) {
         HttpRequest req;
         /* HEAD is GET without the body, which httplib leaves off the wire. */
@@ -795,6 +905,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
         req.body = std::move(body);
         req.form = std::move(form);
         fill_peers(req, hreq);
+        /* Brilliance: the gate let a keyless request through only on a key-exempt route; mark it
+         * so that route answers the liveness alone (HttpRequest::missing_key). */
+        req.missing_key = !api_key.empty() && !key_ok(hreq);
         req.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         for (auto& h : hreq.headers) req.headers[h.first] = h.second;
@@ -1057,9 +1170,11 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     const int port = o.port == 0 ? svr.bind_to_any_port(o.host.c_str())
                      : svr.bind_to_port(o.host.c_str(), o.port) ? o.port : -1;
     if (port <= 0) {
-        RAD_ERR("server: cannot bind %s:%d", o.host.c_str(), o.port);
+        const int err = bind_error(o.host, o.port);
+        RAD_ERR("server: cannot bind %s:%d: %s", o.host.c_str(), o.port, bind_failure(err).c_str());
         return RAD_E_IO;
     }
+    warn_if_keyless_network_listener(svr.bound_address(), !api_key.empty());
     impl_->port.store(port);
     RAD_INFO("server: listening on http://%s:%d (%d threads, up to %zu)", o.host.c_str(), port,
              nt, most);

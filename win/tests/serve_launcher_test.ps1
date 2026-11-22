@@ -14,7 +14,8 @@
     the listener   -Listen, -Port and -ApiKey as radiance's own reader applies them, whatever the
                    profile's layout (flow mapping, comments, anchors, a server block at the end)
     the cards      -Bus (decimal, 0x, PCI address), -Device, the caller's mask, and the default that
-                   hides an integrated GPU; what radiance will see, by PCI bus
+                   hides an integrated GPU; selection by PCI bus; rank lines from radiance
+                   literal comma lists at a 5.1 prompt, directly and through powershell.exe -File
     the log        -Background -Log with a bare file name
     the CPU        -Cpu: no card asked or shown, the host backend, the CPU kernels and no drafting
                    over any profile, in radiance's own reading; no CPU start without it
@@ -38,7 +39,9 @@ $red = '0:33:1,1:6:0,2:3:0,3:9:0,4:32:0'
 # redirect in the same session as the script, where a native command's stderr lines become
 # ErrorRecords. (A separate powershell.exe -File never shows that: there the redirect is the
 # process's.) Each ErrorRecord that reaches the caller is marked 'ERRORRECORD '.
-function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '', [switch]$InSession) {
+# -PromptTail appends literal PowerShell syntax from the test case, so the prompt parser sees the
+# commas and quotes. Without -InSession, that prompt calls powershell.exe -File instead.
+function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '', [switch]$InSession, [string]$PromptTail = '') {
   $all = @{ BRILLIANCE_SERVE_TEST_DEVICES = $red; HIP_VISIBLE_DEVICES = $null
             BRILLIANCE_SERVER_HOST = $null; BRILLIANCE_SERVER_PORT = $null; BRILLIANCE_SERVER_API_KEY = $null
             BRILLIANCE_DEVICE = $null; BRILLIANCE_SERVER_KERNELS = $null; BRILLIANCE_MODEL_SPECULATION = $null
@@ -50,10 +53,12 @@ function Serve([string[]]$a, [hashtable]$envSet = @{}, [string]$cwd = '', [switc
   try {
     if ($cwd) { Set-Location -LiteralPath $cwd }
     $ErrorActionPreference = 'Continue'
-    if ($InSession) {
+    if ($InSession -or $PromptTail) {
       # An option name stays bare, so it binds as the parameter; every value is quoted.
       $q = @($a | ForEach-Object { if ($_ -match '^-[A-Za-z]+$') { $_ } else { "'" + ($_ -replace "'", "''") + "'" } }) -join ' '
-      $cmd = "& '$($serve -replace "'", "''")' $q 2>&1 | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { 'ERRORRECORD ' + `$_ } else { `"`$_`" } }; exit `$LASTEXITCODE"
+      $scriptPath = "'$($serve -replace "'", "''")'"
+      $launch = if ($InSession) { "& $scriptPath" } else { "& powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $scriptPath" }
+      $cmd = "$launch $q $PromptTail 2>&1 | ForEach-Object { if (`$_ -is [System.Management.Automation.ErrorRecord]) { 'ERRORRECORD ' + `$_ } else { `"`$_`" } }; exit `$LASTEXITCODE"
       $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cmd))
       $o = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $enc 2>&1 | ForEach-Object { "$_" }
     } else {
@@ -99,6 +104,15 @@ try {
     $r = Serve @($p, '-Check', '-Exe', $Exe, '-Port', '18373', '-ApiKey', 'off')
     Check ($r.Rc -eq 0 -and (Has $r.Out 'server host 127.0.0.1 (server.host), port 18373 (environment (BRILLIANCE_SERVER_PORT)), api key none')) "${name}: -Check with -Port:`n$($r.Out)"
   }
+  # Even with an error-only log, -Check reports the listener and its source without binding.
+  $noHost = Join-Path $tmp 'no host.yaml'
+  [IO.File]::WriteAllText($noHost, "models:`n  a:`n    model: $model`n")
+  $r = Serve @($noHost, '-Cpu', '-Check', '-Exe', $Exe) @{ RADIANCE_LOG = 'error' }
+  Check ($r.Rc -eq 0 -and (Has $r.Out 'server host 127.0.0.1 (default), port 8000 (default), api key none')) "omitted host uses loopback and names the default:`n$($r.Out)"
+  $r = Serve @((Join-Path $tmp 'layout 1.yaml'), '-Cpu', '-Check', '-Exe', $Exe, '-Listen', '0.0.0.0')
+  Check ($r.Rc -eq 0 -and (Has $r.Out 'server host 0.0.0.0 (environment (BRILLIANCE_SERVER_HOST)), port 18371 (server.port), api key none') -and (Has $r.Out '(from -Listen; over the profile)')) "-Listen overrides the file and names its source:`n$($r.Out)"
+  Check (-not (Has $r.Out 'listening beyond loopback with no API key')) '-Check does not print the startup warning'
+
   # a key in the file, turned off; the file's other keys stay
   $withKey = Join-Path $tmp 'with key.yaml'
   [IO.File]::WriteAllText($withKey, "server: {port: 18374, api-key: sk-in-the-file}`nmodels:`n  a:`n    model: $model`n")
@@ -148,9 +162,11 @@ try {
   # A start under the same redirect: a server's stderr line no longer ends the launcher while the
   # server runs on; its later lines and its exit code come through.
   $stub2 = Join-Path $stubDir 'radiance-stderr.cmd'
-  [IO.File]::WriteAllText($stub2, "@echo first line, on stderr 1>&2`r`n@echo second line, on stdout`r`n@echo third line, on stderr 1>&2`r`n@exit /b 7`r`n")
+  $rankLine = 'I   card 0000:03:00.0  rank 0 (device 0)  0x1002:0x7551 "AMD Radeon AI PRO R9700"  31.86 GiB VRAM  NUMA -1  driver amduw23g-205499-ac7b5433'
+  [IO.File]::WriteAllText($stub2, "@echo first line, on stderr 1>&2`r`n@echo second line, on stdout`r`n@echo $rankLine 1>&2`r`n@echo third line, on stderr 1>&2`r`n@exit /b 7`r`n")
   $r = Serve @($p1, '-Exe', $stub2, '-Bus', '3') -InSession
   Check ($r.Rc -eq 7 -and (Has $r.Out 'second line, on stdout') -and (Has $r.Out 'third line, on stderr') -and -not (Has $r.Out 'NativeCommandError')) "a start under 2>&1 runs radiance to its end and returns its status:`n$($r.Out)"
+  Check ((Has $r.Out $rankLine) -and (Has $r.Out 'HIP ordinal 2 before masking')) "the foreground shows radiance's rank row and identifies the preflight ordinal:`n$($r.Out)"
   # -Install: the service runs a copy of the profile as it is, overrides in its environment
   $r = Serve @($p1, '-Install', '-WhatIf', '-Exe', $Exe, '-Name', 'Brl-LaunchTest', '-Bus', '9', '-Listen', '0.0.0.0', '-ApiKey', 'off') @{ BRILLIANCE_HF_CACHE = $null }
   $o = $r.Out
@@ -168,14 +184,34 @@ try {
   Check ($r.Rc -ne 0 -and (Has $r.Out 'holds an API key itself')) "a profile with a key is refused for a service even with -ApiKey off (the copy would hold it):`n$($r.Out)"
 
   # ======================================================================= the cards
+  # A PowerShell prompt passes unquoted comma lists to a script as arrays, but joins them into
+  # one comma string for powershell.exe -File. The profile path contains a space in either form.
+  foreach ($inSession in $true, $false) {
+    $entry = if ($inSession) { 'direct prompt' } else { 'powershell.exe -File from a prompt' }
+    foreach ($pick in "-Bus 3,9", "-Bus '3,9'", "-Device 2,3", "-Device '2,3'") {
+      $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) -InSession:$inSession -PromptTail $pick
+      $cards = [regex]::Matches($r.Out, '(?m)^serve: +selected PCI bus (\d+) \(')
+      $buses = @($cards | ForEach-Object { $_.Groups[1].Value } | Sort-Object) -join ','
+      Check ($r.Rc -eq 0 -and $buses -eq '3,9' -and $r.Out -match '(?m)^ +HIP_VISIBLE_DEVICES=2,3$' -and
+             (Has $r.Out 'nothing was started') -and (Has $r.Out "--config `"$p1`"")) "$entry ${pick}:`n$($r.Out)"
+    }
+    foreach ($case in @(@('-Bus 3,5', 'no HIP device on PCI bus 5'),
+                        @('-Cpu -Bus 3,9', '-Cpu uses no GPU: it takes neither -Bus nor -Device'),
+                        @('-Cpu -Device 2,3', '-Cpu uses no GPU: it takes neither -Bus nor -Device'))) {
+      $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) -InSession:$inSession -PromptTail $case[0]
+      Check ($r.Rc -ne 0 -and (Has $r.Out $case[1])) "$entry $($case[0]) is refused:`n$($r.Out)"
+    }
+  }
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe)
   $o = $r.Out
   Check (Has $o 'HIP_VISIBLE_DEVICES=1,2,3,4') "no -Bus: the discrete cards, the iGPU hidden:`n$o"
-  Check ((Has $o 'card 0 = PCI bus 6 (0x06), HIP device 1') -and (Has $o 'card 3 = PCI bus 32 (0x20), HIP device 4')) "the cards radiance will see, by bus:`n$o"
+  Check ((Has $o 'selected PCI bus 6 (0x06), HIP ordinal 1 before masking') -and
+         (Has $o 'selected PCI bus 32 (0x20), HIP ordinal 4 before masking')) "the selected devices, by bus:`n$o"
+  Check ($o -notmatch '(?m)^serve:\s+card \d+ =|\brank \d+') "-WhatIf does not predict device or rank positions:`n$o"
   Check (Has $o 'hidden from HIP: PCI bus 33 (0x21), integrated') "the hidden iGPU is named:`n$o"
   Check (Has $o '4 visible cards: elastic memory (VMM) is off by default') "the visible-device effect:`n$o"
-  foreach ($c in @(@('3', '2', 'card 0 = PCI bus 3 (0x03), HIP device 2'), @('0x20', '4', 'card 0 = PCI bus 32 (0x20)'),
-                   @('0000:09:00.0', '3', 'card 0 = PCI bus 9 (0x09)'), @('9,3', '3,2', 'card 1 = PCI bus 3 (0x03), HIP device 2'))) {
+  foreach ($c in @(@('3', '2', 'selected PCI bus 3 (0x03), HIP ordinal 2'), @('0x20', '4', 'selected PCI bus 32 (0x20)'),
+                   @('0000:09:00.0', '3', 'selected PCI bus 9 (0x09)'), @('9,3', '3,2', 'selected PCI bus 3 (0x03), HIP ordinal 2'))) {
     $r = Serve @($p1, '-WhatIf', '-Exe', $Exe, '-Bus', $c[0])
     Check ($r.Rc -eq 0 -and (Has $r.Out "HIP_VISIBLE_DEVICES=$($c[1])") -and (Has $r.Out $c[2])) "-Bus $($c[0]):`n$($r.Out)"
   }
@@ -183,15 +219,15 @@ try {
   Check ((Has $r.Out 'one visible card: elastic memory (VMM) can be on') -and (Has $r.Out 'hidden from HIP: PCI bus 33 (0x21), integrated; PCI bus 6')) "one card by bus:`n$($r.Out)"
   # the common one-card machine: an iGPU and one card, no -Bus needed
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) @{ BRILLIANCE_SERVE_TEST_DEVICES = '0:33:1,1:3:0' }
-  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES=1') -and (Has $r.Out 'card 0 = PCI bus 3 (0x03), HIP device 1') -and (Has $r.Out 'one visible card')) "an iGPU and one card:`n$($r.Out)"
+  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES=1') -and (Has $r.Out 'selected PCI bus 3 (0x03), HIP ordinal 1') -and (Has $r.Out 'one visible card')) "an iGPU and one card:`n$($r.Out)"
   # no iGPU: nothing to hide, no mask
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) @{ BRILLIANCE_SERVE_TEST_DEVICES = '0:3:0' }
-  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES not set') -and (Has $r.Out 'card 0 = PCI bus 3 (0x03), HIP device 0')) "one card, no iGPU:`n$($r.Out)"
+  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES not set') -and (Has $r.Out 'selected PCI bus 3 (0x03), HIP ordinal 0')) "one card, no iGPU:`n$($r.Out)"
   # the caller's mask stands (HIP is asked through it, so a card it hides is not asked about), and its
   # effect is shown
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) @{ HIP_VISIBLE_DEVICES = '0,2' }
-  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES as this shell set it') -and (Has $r.Out 'card 0 = PCI bus 33 (0x21), integrated') -and
-         (Has $r.Out 'card 1 = PCI bus 3 (0x03)') -and -not (Has $r.Out 'hidden from HIP') -and
+  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES as this shell set it') -and (Has $r.Out "selected PCI bus 33 (0x21), integrated, HIP ordinal 0 with the caller's mask") -and
+         (Has $r.Out "selected PCI bus 3 (0x03), HIP ordinal 1 with the caller's mask") -and -not (Has $r.Out 'hidden from HIP') -and
          (Has $r.Out 'the integrated GPU is visible')) "the caller's mask, iGPU visible:`n$($r.Out)"
   # every card hidden: shown, and refused -- a CPU start is never made unasked
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe) @{ HIP_VISIBLE_DEVICES = '-1' }
@@ -200,7 +236,7 @@ try {
   $r = Serve @($p1, '-Exe', $stub, '-Device', '-1')
   Check ($r.Rc -ne 0 -and -not (Has $r.Out 'args=') -and (Has $r.Out 'add -Cpu')) "-Device -1 does not start radiance on the CPU:`n$($r.Out)"
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe, '-Device', '3')
-  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES=3') -and (Has $r.Out 'card 0 = PCI bus 9 (0x09), HIP device 3')) "-Device by HIP index:`n$($r.Out)"
+  Check ((Has $r.Out 'HIP_VISIBLE_DEVICES=3') -and (Has $r.Out 'selected PCI bus 9 (0x09), HIP ordinal 3 before masking')) "-Device by HIP index:`n$($r.Out)"
   # refusals, and no HIP at all
   $r = Serve @($p1, '-WhatIf', '-Exe', $Exe, '-Bus', '5')
   Check ($r.Rc -ne 0 -and (Has $r.Out 'no HIP device on PCI bus 5') -and (Has $r.Out 'PCI bus 33 (0x21), integrated')) "a bus with no card:`n$($r.Out)"
@@ -281,6 +317,7 @@ try {
     Start-Sleep -Milliseconds 500
   }
   Check (Test-Path -LiteralPath $log) "the log is in the caller's folder ($log):`n$($r.Out)"
+  Check (Has $r.Out "radiance startup report will be in $log") "-Background names the startup report's log:`n$($r.Out)"
   Check ((Has $text "--config $bgProfile") -and (Has $text 'serve: cards (-Cpu): HIP_VISIBLE_DEVICES=-1') -and
          (Has $text 'serve: environment BRILLIANCE_DEVICE=host (from -Cpu)')) "the log starts with the launcher's lines:`n$text"
   # A HIP build says it was told to use no GPU (core/device/dispatch.cpp); a host build has no HIP to

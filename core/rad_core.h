@@ -1260,7 +1260,8 @@ struct Config {
      * container carries an audio encoder; --mm-max-patches 0 (text only) turns it off too. */
     int64_t mm_audio_frames = -1;
 
-    std::string host = "0.0.0.0";
+    /* Brilliance: serving beyond loopback requires an explicit address. */
+    std::string host = "127.0.0.1";
     /* The chat endpoint's default `reasoning_effort`, empty for the template's own default.
      * Passed through verbatim: the legal set belongs to the template. */
     std::string reasoning_effort;

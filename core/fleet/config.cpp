@@ -1182,4 +1182,59 @@ std::string yaml_from_args(int argc, char** argv) {
     return y;
 }
 
+/* ------------------------------------------------------------------ warm reload (fast-loop) */
+
+bool warm_key(const std::string& flag) {
+    /* Each is read per step by the scheduler or by the drafting rule on the host, and sizes nothing:
+     * Engine::retune checks a new value against what the load sized (the sequence slots, the
+     * verify window, the adaptive rule's readback) and refuses one past it. */
+    static const char* const kWarm[] = {
+        "--max-num-seqs",
+        "--draft-depth", "--draft-depth-max", "--draft-depth-min", "--draft-depth-stop",
+        "--draft-depth-load", "--draft-depth-load-from", "--draft-depth-load-min",
+        "--draft-depth-load-late", "--draft-depth-load-calib", "--draft-depth-load-tok-ms",
+        "--draft-depth-load-row-ms", "--draft-depth-load-round-ms", "--draft-depth-load-jump-ms",
+        "--draft-suffix", "--draft-suffix-min-match", "--draft-suffix-max", "--draft-suffix-min-score",
+    };
+    for (const char* k : kWarm)
+        if (flag == k) return true;
+    return false;
+}
+
+ArgDiff diff_args(const std::vector<std::string>& before, const std::vector<std::string>& after) {
+    /* A flag list is "--flag [value]" pairs; a word after a flag that is not itself a flag is its
+     * value. A flag given twice keeps every value, in order. */
+    auto split = [](const std::vector<std::string>& args) {
+        std::map<std::string, std::string> m;
+        for (size_t i = 0; i < args.size(); ++i) {
+            if (args[i].rfind("--", 0) != 0) continue;
+            const std::string& flag = args[i];
+            std::string v;
+            if (i + 1 < args.size() && args[i + 1].rfind("--", 0) != 0) v = args[++i];
+            auto [it, fresh] = m.emplace(flag, v);
+            if (!fresh) it->second += "\x1f" + v;
+        }
+        return m;
+    };
+    const std::map<std::string, std::string> a = split(before), b = split(after);
+    std::set<std::string> keys;
+    for (const auto& [k, v] : a) keys.insert(k);
+    for (const auto& [k, v] : b) keys.insert(k);
+    ArgDiff d;
+    for (const std::string& k : keys) {
+        const auto ia = a.find(k), ib = b.find(k);
+        const bool ha = ia != a.end(), hb = ib != b.end();
+        if (ha && hb && ia->second == ib->second) continue;
+        auto shown = [](bool has, const std::string& v) {
+            if (!has) return std::string("(unset)");
+            std::string s = v.empty() ? std::string("(set)") : v;
+            for (char& c : s) if (c == '\x1f') c = ',';
+            return s;
+        };
+        (warm_key(k) ? d.warm : d.cold).push_back(k + " " + shown(ha, ha ? ia->second : "") + " -> " +
+                                                  shown(hb, hb ? ib->second : ""));
+    }
+    return d;
+}
+
 }  // namespace rad::fleet

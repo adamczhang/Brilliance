@@ -38,6 +38,7 @@
 #include "r4d_args.h"
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
+#include "r4d_ar4_weights.h"   /* tp4-link-weight: the four-rank weights setting */
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
@@ -31517,7 +31518,16 @@ static bool ar_w_setup(int r, const std::string& op, ArWSetup& S) {
         const bool bf = coded || big;
         const int64_t N = big ? 5242880 : coded ? 1048576 : 262144;
         const size_t es = bf ? 2 : 4;
-        ps = { PI("world_size", W), PI("numel", N), PS("dtype", bf ? "bf16" : "fp32"), PI("exact", 1) };
+        /* tp4-link-weight: under weighted shards (BRILLIANCE_AR4_SHARD_WEIGHTS set, not off/even) the
+         * coded geometry's instance is sized for three messages, as the engine's 6,144-row instance
+         * carries 2,048-row pieces: a slot of one message holds no weighted coded table, which would
+         * run even (r4d_ar_entry.hip, ar4_weights_for) and leave the weighted kernel unexercised.
+         * Unset (the selftest's default, off), nothing changes. */
+        const char* wenv = std::getenv("BRILLIANCE_AR4_SHARD_WEIGHTS");
+        const int wkind = r4d_ar4_spec_parse(wenv).kind;
+        const bool wtd = wenv && wkind != R4D_AR4_SPEC_EVEN && wkind != R4D_AR4_SPEC_BAD;
+        ps = { PI("world_size", W), PI("numel", coded && wtd ? 3 * N : N), PS("dtype", bf ? "bf16" : "fp32"),
+               PI("exact", 1) };
         if (coded) ps.push_back(PI("overlap", 1));
         void* di = dmem((size_t)N * es);
         void* dout = ip ? di : dmem((size_t)N * es);
@@ -32002,6 +32012,29 @@ static void ar_wresend_case(const Plugin& pl, const std::vector<int>& devs, cons
     const int writer = r3 ? 3 : 1, peer = r3 ? 0 : 2;
     int writer2 = (writer + 1) % 4;
     if (writer2 == peer) writer2 = (writer2 + 1) % 4;
+    /* tp4-link-weight: under BRILLIANCE_AR4_SHARD_WEIGHTS given by rank, a two-shot push to or from a
+     * rank weighted 0 can carry no words (hop 1 from a to b carries b's shard, hop 2 a's), and an
+     * injection there has nothing to damage, so the tables' E = I cannot hold. Such a case is skipped
+     * by name; every other case must pass as tabled, the zero-share rank's hop-1 push (its whole
+     * contribution) included. */
+    if (idx >= 4) {
+        const R4DAr4Spec ws = r4d_ar4_spec_parse(std::getenv("BRILLIANCE_AR4_SHARD_WEIGHTS"));
+        if (ws.kind == R4D_AR4_SPEC_RANKS && !r4d_ar4_weights_equal(ws.w)) {
+            auto words = [&](int a, int b) { return hop1 ? ws.w[b] : ws.w[a]; };
+            const int pidx = peer < writer ? peer : peer - 1, p2i = (pidx + 1) % 3;
+            const int peer2 = p2i < writer ? p2i : p2i + 1;
+            const bool data = md == "lose" || md == "dup" || md == "pair" || md == "late" || stuck ||
+                              md == "multi" || cross;
+            bool empty = data && words(writer, peer) == 0;
+            if (md == "multi") empty = empty || words(writer, peer2) == 0;
+            if (cross) empty = empty || words(writer2, peer) == 0;
+            if (md == "ctl-rq") empty = (hop1 ? ws.w[writer] : ws.w[peer]) == 0;
+            if (empty) {
+                skip(name, "BRILLIANCE_AR4_SHARD_WEIGHTS gives the damaged push no words (a rank weighted 0)");
+                return;
+            }
+        }
+    }
     rpin(1);
     if (none) {
         pin("off");
@@ -37931,6 +37964,12 @@ static void usage(void) {
 int main(int argc, char** argv) {
     /* Before the runtime starts: eight ranks on one card need a hardware queue each. */
     if (st_one_card() && !std::getenv("GPU_MAX_HW_QUEUES")) setenv("GPU_MAX_HW_QUEUES", "16", 0);
+    /* tp4-link-weight: the engine's four-rank two-shot weights its shards from a start-time link
+     * probe unless told otherwise (BRILLIANCE_AR4_SHARD_WEIGHTS, r4d_ar4_weights.h). The selftest's
+     * rows, their injection targets and their expected counts were written for even shards, so it
+     * keeps them even unless the variable is set; a weighted run sets it ("1,1,1,0", "3:1,9:1,6:1,32:0",
+     * "auto"), and every row must then give the same bits. */
+    if (!std::getenv("BRILLIANCE_AR4_SHARD_WEIGHTS")) setenv("BRILLIANCE_AR4_SHARD_WEIGHTS", "off", 0);
     const char* path = nullptr;
     long long perf_n = 0, perf_k = 0, perf_m = 0;
     int perf_it = 50, perf_w2 = 0, perf_w4 = 0, perf_bf = 0, perf_w8 = 0, perf_f32 = 0,

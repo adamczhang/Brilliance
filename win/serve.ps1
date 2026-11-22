@@ -10,7 +10,7 @@
     .\serve.ps1 qwen27-preview -Bus 3                   the card on PCI bus 3 (decimal, or 0x03)
     .\serve.ps1 qwen27-preview -Listen 0.0.0.0 -ApiKey off     the local network, no key
     .\serve.ps1 qwen27-preview -ApiKey env:RADIANCE_API_KEY    a key read from that variable
-    .\serve.ps1 qwen27-preview -Check                   validate the YAML and exit
+    .\serve.ps1 qwen27-preview -Check                   validate the YAML and show the resolved listener
     .\serve.ps1 qwen27-preview -Env GPU_X=1,HIP_Y=2     also set these for the server (ENVIRONMENT below)
     .\serve.ps1 qwen27-preview -WhatIf                  print what a start would set and run; start nothing
     .\serve.ps1 qwen27-preview -Background -Log srv.log start it in a console of its own (Ctrl-Break
@@ -27,8 +27,8 @@
   edit. -Listen, -Port and -ApiKey reach radiance as BRILLIANCE_SERVER_HOST, BRILLIANCE_SERVER_PORT
   and BRILLIANCE_SERVER_API_KEY, which radiance's own YAML reader applies over the profile's server:
   block, at the start and at every reload; its startup report names them as the source. Everything
-  else is the profile's. Nothing here is a second configuration language. -WhatIf shows the host,
-  port and key radiance reads with them (radiance --check).
+  else is the profile's. Nothing here is a second configuration language. -Check and -WhatIf show
+  the host, port and key policy radiance reads with their sources (radiance --check).
 
   CARDS BY PCI BUS: HIP numbers devices in its own order (on the test machine: the iGPU, then buses
   6, 3, 9, 32), so -Bus is translated to HIP indices by asking the HIP runtime beside radiance for
@@ -38,9 +38,10 @@
   (0000:20:00.0). Neither given: HIP_VISIBLE_DEVICES as the caller set it, else every discrete card
   HIP shows with the integrated GPU hidden from HIP (visible, it divides the pinned-memory limit and
   turns elastic memory off, though the engine never runs on it). A one-card machine needs no -Bus.
-  Every start and -WhatIf prints the cards radiance will see, as its card 0, 1, ... (what the YAML's
-  cards: and memory.card-headroom-mib count), each with its PCI bus, and what is hidden; -Background
-  writes the same lines at the head of its log.
+  Every start and -WhatIf prints the visibility selection and the PCI buses it hides. Windows HIP
+  determines the visible device order. The engine's startup report prints the actual rank, the
+  HIP ordinal inside the server process, the PCI address and the device name for each serving
+  card. With -Background, these lines are in -Log, after the launcher's selection.
 
   Runs in this console by default, so Ctrl-C stops it the way the engine expects: it drains and
   exits. Nothing here kills a server.
@@ -598,8 +599,8 @@ if ($Cpu) {
 } else {
   $how = "no -Bus: every card HIP shows"
 }
-# What radiance will see: its cards 0, 1, ... in this order (the YAML's cards: and
-# memory.card-headroom-mib count these).
+# Use the selected devices for preflight membership and card counts. HIP assigns the server's
+# device ordinals when it applies the mask, and the engine reports the ranks it opened.
 $seen = $null
 if ($null -ne $devs) {
   if (-not $whole) {
@@ -624,8 +625,9 @@ if ($Cpu) {
 } elseif (-not $seen.Count) {
   $cardLines.Add("  radiance sees no card")
 } else {
-  for ($c = 0; $c -lt $seen.Count; $c++) {
-    $cardLines.Add("  card $c = $(Format-Bus $seen[$c])$(if ($whole) { ", HIP device $($seen[$c].Index)" })")
+  $ordinalScope = if ($whole) { 'before masking' } else { "with the caller's mask" }
+  foreach ($d in $seen) {
+    $cardLines.Add("  selected $(Format-Bus $d), HIP ordinal $($d.Index) $ordinalScope")
   }
   $hidden = @(if ($whole) { $devs | Where-Object { $seen -notcontains $_ } })
   if ($hidden.Count) { $cardLines.Add("  hidden from HIP: $(($hidden | ForEach-Object { Format-Bus $_ }) -join '; ')") }
@@ -1021,8 +1023,8 @@ if ($WhatIf) {
 }
 Write-Host "serve: $reloadHint"
 if ($Background) {
-  # The launcher's own lines head the log, so it says which cards and which overrides the server
-  # started with; the helper appends radiance's output.
+  # The helper appends radiance's output, including the actual rank lines, to the launch preamble.
+  Write-Host "serve: radiance startup report will be in $Log"
   $head = New-Object System.Collections.Generic.List[string]
   $head.Add("serve: $(Get-Date -Format 'yyyy-MM-dd h:mm:ss tt') $exe --config $yaml")
   foreach ($l in $cardLines) { $head.Add("serve: $l") }

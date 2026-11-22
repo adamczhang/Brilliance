@@ -16,9 +16,10 @@
     3. bin\radiance.exe --help from a minimal environment (SystemRoot, a PATH of System32 only,
        TEMP): every DLL comes from the package or Windows
     4. --check on a CPU profile written into the folder
-    5. serve.ps1 <profile> -Cpu -Listen 0.0.0.0 -Port <Port> -ApiKey off -Background: no GPU
+    5. serve.ps1 <profile> -Cpu -Listen 127.0.0.1 -Port <Port> -ApiKey off -Background: no GPU
        (-Cpu: the host backend, HIP not asked, the CPU kernels, no drafting): /health, a chat
-       request and the dashboard page over loopback AND over this machine's LAN address
+       request and the dashboard page over loopback. An explicit -Listen on loopback: listening on
+       a LAN address would make Windows Firewall ask about every new package folder
     6. stopped with tools\stop-server.ps1 (Ctrl-Break), exit status 0 in the log
 
   The GPU package serves on the CPU only without its gfx1201 kernel libraries. Step 5's -Cpu sets
@@ -170,12 +171,12 @@ if ($NoServe) {
 $log = Join-Path $dir 'serve ü.log'
 $serve = Join-Path $root 'serve.ps1'
 $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$r = Invoke-Minimal $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $serve, $yaml, '-Cpu', '-Listen', '0.0.0.0',
+$r = Invoke-Minimal $ps @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $serve, $yaml, '-Cpu', '-Listen', '127.0.0.1',
                           '-Port', "$Port", '-ApiKey', 'off', '-Background', '-Log', $log) @{ HIP_VISIBLE_DEVICES = '-1' }
 $serverPid = 0
 $pidLine = ($r.out -split "`r?`n" | Where-Object { $_ -match '^\s*\d+\s*$' } | Select-Object -Last 1)
 if ($pidLine) { $serverPid = [int]$pidLine.Trim() }
-Result ($serverPid -gt 0) "serve.ps1 -Cpu -Listen 0.0.0.0 -Port $Port -ApiKey off -Background (pid $serverPid)"
+Result ($serverPid -gt 0) "serve.ps1 -Cpu -Listen 127.0.0.1 -Port $Port -ApiKey off -Background (pid $serverPid)"
 if (-not $serverPid) { Write-Host $r.out }
 $deadline = (Get-Date).AddSeconds(180)
 $up = $false
@@ -185,12 +186,11 @@ while ((Get-Date) -lt $deadline) {
   Start-Sleep -Milliseconds 500
 }
 Result $up "the server is listening (log '$log')"
-$lan = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress
 $bound = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-Result ($bound -and $bound.LocalAddress -eq '0.0.0.0') "listening on $($bound.LocalAddress):$Port"
+Result ($bound -and $bound.LocalAddress -eq '127.0.0.1') "listening on $($bound.LocalAddress):$Port"
 # A reasoning model spends its first tokens thinking (reasoning_content); either text is an answer.
 $body = '{"model":"minicpm5-2b","messages":[{"role":"user","content":"Name a primary colour. One word."}],"max_tokens":256,"temperature":0}'
-foreach ($h in @('127.0.0.1', $lan)) {
+foreach ($h in @('127.0.0.1')) {
   if (-not $h) { continue }
   try {
     $hr = Invoke-WebRequest -UseBasicParsing -Uri "http://${h}:$Port/health" -TimeoutSec 10

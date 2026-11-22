@@ -1281,6 +1281,99 @@ std::vector<Case> build_cases() {
                 }
     }
 
+    /* ================================================================== DeepSeek-V4.1's text ops
+     *
+     * arch/deepseek41's ops at small geometries that keep its constraints (a rotary over the last
+     * part of each head, block sizes that divide the row, an entry's bytes a multiple of the page)
+     * and both sides of every option: the three router scores, both rotary modes and the inverse,
+     * the four quantise formats, the attention with and without its compressed source and with an
+     * E4M3 one, the indexer split by row_part and over E4M3 keys, the top-k with and without the
+     * candidate mask. The ggml rows run on the logical float weight here; the engine test
+     * (tests/deepseek41_test.cpp) runs them over native blocks. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("mhc_mix", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
+                         HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("mhc_collapse", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("mhc_collapse", { HI("M", 5), HI("n", 645), HI("hc", 2), HS("dtype", dt) });
+        for (const char* score : { "sigmoid", "sqrtsoftplus", "softmax" })
+            for (int norm : { 0, 1 })
+                add("router_scored_topk",
+                    { HI("M", 5), HI("n_expert", 288), HI("top_k", 8), HI("norm", norm),
+                      HF("route_scale", 2.5), HS("score", score), HS("dtype", dt) });
+        for (const char* mode : { "neox", "gptj" })
+            for (int inv : { 0, 1 }) {
+                add("ds41_rope_rows", { HI("M", 12), HI("n_head", 4), HI("head_dim", 128),
+                                        HI("rot", 64), HI("off", 64), HS("mode", mode),
+                                        HI("inverse", inv), HS("dtype", dt) });
+                add("ds41_rope_rows", { HI("M", 7), HI("n_head", 3), HI("head_dim", 50),
+                                        HI("rot", 30), HI("off", 7), HS("mode", mode),
+                                        HI("inverse", inv), HS("dtype", dt) });
+            }
+        add("quant_roundtrip", { HI("M", 5), HI("n", 640), HI("block", 128),
+                                 HS("format", "fp8_e4m3"), HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 640), HI("block", 64),
+                                 HS("format", "fp8_e4m3"), HS("scale", "f32"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 640), HI("block", 32),
+                                 HS("format", "fp4_e2m1"), HS("scale", "ue8m0"), HS("dtype", dt) });
+        add("quant_roundtrip", { HI("M", 5), HI("n", 640), HI("block", 16),
+                                 HS("format", "fp4_e2m1"), HS("scale", "e4m3"), HS("dtype", dt) });
+        add("softmax_pool", { HI("M", 7), HI("n", 645), HI("ratio", 4), HS("dtype", dt) });
+        add("softmax_pool", { HI("M", 5), HI("n", 129), HI("ratio", 1), HS("dtype", dt) });
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 3), HI("dim", 72), HI("window", 5),
+                                  HI("ratio", 2), HI("topk", 4), HF("scale", 0.117851130),
+                                  HS("dtype", dt) });
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 2), HI("dim", 37), HI("window", 4),
+                                  HI("ratio", 0), HI("topk", 0), HF("scale", 0.164398987),
+                                  HS("dtype", dt) });
+        add("index_score", { HI("M", 7), HI("heads", 4), HI("dim", 64), HI("ratio", 2),
+                             HI("width", 9), HF("wscale", 0.5), HS("dtype", dt) });
+        add("index_score", { HI("M", 4), HI("heads", 3), HI("dim", 36), HI("ratio", 4),
+                             HI("width", 5), HF("wscale", 0.25), HI("row_part", 1),
+                             HS("dtype", dt) });
+        for (const char* fmt : { "bf16", "e4m3_e4m3_16", "e4m3_ue8m0_32" })
+            add("entry_store", { HI("M", 5), HI("n", 64), HI("block_size", 4), HS("dtype", dt),
+                                 HS("format", fmt) });
+        add("stream_gate_add", { HI("M", 5), HI("n", 129), HI("hc", 4), HF("eps", 1e-6),
+                                 HF("gate_eps", 1e-6), HS("dtype", dt) });
+        add("stream_gate_add", { HI("M", 3), HI("n", 645), HI("hc", 1), HF("eps", 1e-6),
+                                 HF("gate_eps", 1e-6), HS("dtype", dt) });
+        for (double mult : { 1.0, 0.5 })
+            add("embed_lookup_planes", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
+                                         HI("group", 32), HS("dtype", dt), HI("vocab_offset", 0),
+                                         HF("mult", mult) });
+        for (int M : { 1, 7 })
+            for (const char* type : { "q6_K", "iq4_nl", "q8_0" })
+                add("gemm_nt_ggml", { HI("M", M), HI("N", 37), HI("K", 512), HS("type", type),
+                                      HS("dtype", dt) });
+        for (const char* order : { "token", "sorted" })
+            add("moe_gemm_ggml", { HI("M", 5), HI("N", 37), HI("K", 256), HI("n_expert", 4),
+                                   HI("top_k", 2), HS("a_order", order), HS("type", "iq1_s"),
+                                   HS("dtype", dt) });
+        add("logits_gemm_ggml", { HI("M", 3), HI("n_vocab", 67), HI("n_embd", 256),
+                                  HS("type", "q6_K"), HS("dtype", dt) });
+        add("embed_lookup_ggml", { HI("M", 9), HI("n_embd", 256), HI("n_vocab", 64),
+                                   HS("type", "q6_K"), HS("dtype", dt), HI("vocab_offset", 0),
+                                   HF("mult", 1.5) });
+    }
+    /* Ids only: one geometry each. */
+    add("index_candidates", { HI("M", 7), HI("width", 645), HI("block", 8), HI("topk_blocks", 3),
+                              HI("ratio", 2) });
+    add("index_candidates", { HI("M", 5), HI("width", 33), HI("block", 1), HI("topk_blocks", 40),
+                              HI("ratio", 1) });
+    add("index_topk", { HI("M", 7), HI("width", 645), HI("topk", 8), HI("ratio", 1),
+                        HI("block", 8) });
+    add("index_topk", { HI("M", 7), HI("width", 645), HI("topk", 8), HI("ratio", 1) });
+    add("token_map", { HI("M", 9), HI("n_vocab", 64) });
+    /* The compressed source as block-scaled E4M3 entries, and E4M3 index keys. */
+    for (const char* lf : { "e4m3_e4m3_16", "e4m3_ue8m0_32" }) {
+        add("attn_sparse_sink", { HI("M", 9), HI("heads", 2), HI("dim", 64), HI("window", 5),
+                                  HI("ratio", 2), HI("topk", 4), HF("scale", 0.125),
+                                  HS("dtype", "bf16"), HS("latent_format", lf) });
+        add("index_score", { HI("M", 7), HI("heads", 4), HI("dim", 64), HI("ratio", 2),
+                             HI("width", 9), HF("wscale", 0.5), HS("dtype", "bf16"),
+                             HS("key_format", lf) });
+    }
+
     /* ================================================================== speed-only, at model size
      *
      * Timed by rad-avx-bench, skipped by rad-avx-check. The cases above are sized to break kernels;

@@ -15,6 +15,7 @@
  * No tunables. The vector width is fixed by the ISA level, and the GEMM's M block is derived from K
  * against a fixed L2 byte target (avx_gemm.cpp), with no occupancy interaction to search over.
  */
+#include "avx_ggml.h"
 #include "avx_isa.h"
 #include "avx_planes.h"
 #include "avx_rows.h"
@@ -983,6 +984,64 @@ static const RadOperandSpec oDflashConv[] = { OPD("x"), OPD("delta"), WGT("base"
  * Doc strings are libavx's own (schema_same does not compare them); which plugin's string a reader
  * sees depends on which fixed the schema first. libref's are the definition.
  */
+/* ---- DeepSeek-V4.1's text ops (libref/ref_registry.cpp, the same specs) ------------------ */
+static const RadOperandSpec oMhcMix[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("pre"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcCollapse[] = { OPD("h"), OPD("pre"), OUT("x") };
+static const RadParamSpec pRouterScored[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("score"), P_STR("dtype") };
+static const RadParamSpec pRopeRows[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+    P_INT("rot"), P_INT("off"), P_STR("mode"), P_INT("inverse"), P_STR("dtype") };
+static const RadOperandSpec oRopeRows[] = { INOUT("x"), OPD("cos_sin"), OPD("positions") };
+static const RadParamSpec pQuantRoundtrip[] = { P_INT("M"), P_INT("n"), P_INT("block"),
+    P_STR("format"), P_STR("scale"), P_STR("dtype") };
+static const RadOperandSpec oQuantRoundtrip[] = { INOUT("x") };
+static const RadParamSpec pSoftmaxPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype") };
+static const RadOperandSpec oSoftmaxPool[] = { OPD("stage"), OUT("out"), OPD_O("page") };
+static const RadParamSpec pAttnSparseSink[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("window"), P_INT("ratio"), P_INT("topk"), P_F64("scale"), P_STR("dtype"),
+    P_STRO("latent_format") };
+static const RadOperandSpec oAttnSparseSink[] = { OPD("q"), OPD("window_cache"), OPD("window_bt"),
+    OPD("window_used"), OPD_O("comp_cache"), OPD_O("comp_bt"), OPD_O("sel"), OPD("positions"), OPD("cu_seqlens"),
+    WGT("sinks"), OUT("out") };
+static const RadParamSpec pIndexScore[] = { P_INT("M"), P_INT("heads"), P_INT("dim"),
+    P_INT("ratio"), P_INT("width"), P_F64("wscale"), P_STR("dtype"), P_INTO("row_part"),
+    P_STRO("key_format") };
+static const RadOperandSpec oIndexScore[] = { OPD("q"), OPD("w"), OPD("index_cache"), OPD("bt"),
+    OPD("positions"), OPD("cu_seqlens"), OUT("score") };
+static const RadParamSpec pIndexCand[] = { P_INT("M"), P_INT("width"), P_INT("block"),
+    P_INT("topk_blocks"), P_INT("ratio") };
+static const RadOperandSpec oIndexCand[] = { OPD("score"), OPD("positions"), OUT("keep") };
+static const RadParamSpec pTokenMap[] = { P_INT("M"), P_INT("n_vocab") };
+static const RadOperandSpec oTokenMap[] = { OPD("ids"), WGT("table"), OUT("mapped") };
+static const RadParamSpec pStreamGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_F64("gate_eps"), P_STR("dtype") };
+static const RadOperandSpec oStreamGate[] = { OPD("h"), OPD("k"), OPD("v"), WGT("w"), OUT("out") };
+static const RadParamSpec pGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oGemmGgml[] = { OPD("a"), WGT("w"), OUT("y") };
+static const RadParamSpec pMoeGemmGgml[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
+    P_INT("top_k"), P_STR("a_order"), P_STR("type"), P_STR("dtype") };
+static const RadOperandSpec oMoeGemmGgml[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
+                                               OPD("expert_offset"), OUT("y") };
+static const RadParamSpec pLogitsGgml[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"), P_STR("type"),
+    P_STR("dtype") };
+static const RadOperandSpec oLogitsGgml[] = { OPD("x"), WGT("lm_head"), OUT("logits") };
+static const RadParamSpec pEmbedGgml[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"), P_STR("type"),
+    P_STR("dtype"), P_INTO("vocab_offset"), P_F64O("mult") };
+static const RadOperandSpec oEmbedGgml[] = { OPD("tokens"), WGT("wte"), OUT("x") };
+static const RadParamSpec pEntryStore[] = { P_INT("M"), P_INT("n"), P_INT("block_size"), P_STR("dtype"),
+    P_STRO("format") };
+static const RadOperandSpec oEntryStore[] = { OPD("x"), OPD("page"), INOUT("cache") };
+static const RadParamSpec pIndexTopk[] = { P_INT("M"), P_INT("width"), P_INT("topk"), P_INT("ratio"),
+    P_INTO("block") };
+static const RadOperandSpec oIndexTopk[] = { OPD("score"), OPD_O("keep"), OPD("positions"), OUT("sel") };
+static const RadParamSpec pEmbedPlanes[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
+                                             P_INT("group"), P_STR("dtype"), P_INTO("vocab_offset"),
+                                             P_F64O("mult") };
+static const RadOperandSpec oEmbedPlanes[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                               WGT_O("table"), OUT("x") };
+
 static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd); the sum of squares is a four-accumulator vector "
@@ -1548,6 +1607,91 @@ static const RadOpSchema kSchemas[] = {
   "children are the valid candidates at the next position with log probability parent + "
   "log_softmax(score / temp); each round takes the largest untaken child, ties to the first "
   "pushed. tokens and parents list the taken nodes in order, a parent as its node index." },
+/* DeepSeek-V4.1's text ops: libref's schemas and descriptions. */
+{ "mhc_mix", ARR(pMhcPre), ARR(oMhcMix),
+  "mhc_pre without the collapse: the same RMS-scaled projection, gates and Sinkhorn mixing, with "
+  "the pre gates written to `pre` (f32 [M, hc]) instead of collapsing h. For models that collapse "
+  "a sublayer's input with gates an earlier sublayer computed (DeepSeek-V4.1); mhc_collapse "
+  "applies them." },
+{ "mhc_collapse", ARR(pHcWrite), ARR(oMhcCollapse),
+  "x[i] = sum over hc streams of pre[stream] * h[stream, i], accumulated in f32 and rounded once "
+  "to dtype. pre is f32 [M, hc]; with every pre 1/hc it is mhc_contract." },
+{ "router_scored_topk", ARR(pRouterScored), ARR(oRouterSigmoid),
+  "router_sigmoid_topk with the score function a required name: sigmoid, sqrtsoftplus "
+  "(sqrt(softplus(logit)), softplus linear above 20) or softmax over all n_expert logits." },
+{ "ds41_rope_rows", ARR(pRopeRows), ARR(oRopeRows),
+  "rope from a rope_table plane over columns [off, off+rot) of each head_dim-wide head of x, in "
+  "place: gptj pairs adjacent columns, neox i with i+rot/2; (a,b)(c+is) in f32, rounded once; "
+  "inverse 1 conjugates the rotation. A negative or out-of-table position leaves its row." },
+{ "quant_roundtrip", ARR(pQuantRoundtrip), ARR(oQuantRoundtrip),
+  "Block-scaled quantise then dequantise in place: per `block` values of a row, amax, a scale "
+  "(fp8_e4m3: amax floored at 1e-4, ue8m0 = power of two at or above amax*f32(1/448), f32 = "
+  "amax*f32(1/448); fp4_e2m1: ue8m0 from amax floored at 6*2^-126 times f32(1/6), e4m3 = "
+  "fp8(max(amax, 6*2^-9)/6)), codes of clamp(x/scale) (fp8 RNE saturating, e2m1 ties to the "
+  "even code), times scale in f32, rounded once to dtype." },
+{ "softmax_pool", ARR(pSoftmaxPool), ARR(oSoftmaxPool),
+  "Channel-wise softmax pooling of `ratio` rows: stage [M*ratio, 2n] f32 holds each entry's "
+  "values then scores; out[w,c] = sum_i softmax_i(score[i,c]) value[i,c] in f32, rounded once. "
+  "An entry whose optional page is negative is not written." },
+{ "attn_sparse_sink", ARR(pAttnSparseSink), ARR(oAttnSparseSink),
+  "Latent attention (key = value, dim wide) with a per-head sink over the window cache's keys "
+  "at [pos-window+1, pos] (the window table rebased at first = pos(last row of s) + 1 - "
+  "window_used[s]: block wbt[s][(j-first)/bs], cache [blocks,1,bs,dim]) and, with ratio > 0, "
+  "the selected compressed entries c (tokens [c ratio, (c+1) ratio), block cbt[s][c ratio/cbs], "
+  "cache [blocks,1,cbs,dim/ratio]). f32 scores q.k*scale, max floored at -1e30, "
+  "out = sum p k / (sum p + exp(sink - max)), rounded once; a row with no key is zero. "
+  "latent_format e4m3_e4m3_16 / e4m3_ue8m0_32: the compressed cache holds block-scaled E4M3 "
+  "entries (rad_kv_fp8.h; E4M3 [blocks,1,cbs,bytes/ratio]), a value code x scale in f32." },
+{ "index_score", ARR(pIndexScore), ARR(oIndexScore),
+  "Per row and compressed position j: sum_h relu(q_h . k_j) w_h with k_j entry j of the paged "
+  "index cache and w_h = round(w * wscale); the dot, relu(dot) w_h and the f32 head sum each "
+  "rounded once to dtype. "
+  "j >= (pos+1)/ratio or an unmapped block scores -inf. score is f32 [M, width]. With row_part "
+  "p, score row i is step row p M + i (q, w, positions the step's; past the step -inf). "
+  "key_format e4m3_e4m3_16 / e4m3_ue8m0_32: the index cache holds block-scaled E4M3 entries "
+  "(rad_kv_fp8.h), a value code x scale in f32." },
+{ "index_candidates", ARR(pIndexCand), ARR(oIndexCand),
+  "Blocks of `block` positions scored by their maximum, the newest reachable block pinned to "
+  "+inf, the topk_blocks highest (ties to the lower block) kept unless -inf; keep is a bit a "
+  "block, i32 [M, ceil(ceil(width/block)/32)], bit b%32 of word b/32 set when block b is kept." },
+{ "index_topk", ARR(pIndexTopk), ARR(oIndexTopk),
+  "The topk highest-scoring passed positions (j < (pos+1)/ratio), inside keep when given "
+  "(index_candidates' bits over blocks of `block`), never -inf, ties to the lower position, in "
+  "ascending order, then -1." },
+{ "entry_store", ARR(pEntryStore), ARR(oEntryStore),
+  "x[w] (n values) into the whole of block page[w] of a paged cache [blocks, heads, block_size, "
+  "slot], heads*block_size*slot == n, rounded once to the cache dtype; a negative page writes "
+  "nothing. Declared right after its group, its block_size sets the group's. format "
+  "e4m3_e4m3_16 / e4m3_ue8m0_32: each entry packed as block-scaled E4M3 (rad_kv_fp8.h) into an "
+  "E4M3 cache, heads*block_size*slot its bytes; exact for quant_roundtrip's output." },
+{ "token_map", ARR(pTokenMap), ARR(oTokenMap),
+  "mapped[m] = table[ids[m]], -1 for an id outside [0, n_vocab): ids through an id table." },
+{ "stream_gate_add", ARR(pStreamGate), ARR(oStreamGate),
+  "Per row and stream s: dot = sum h w k * rsqrt(mean h^2 + eps) rsqrt(mean k^2 + eps) / sqrt(n), "
+  "gate = sigmoid(copysign(sqrt(max(|dot|, gate_eps)), dot)), out = h + gate v; f32, rounded "
+  "once. v is one [n] row a token shared by the hc streams; w is f32 [hc*n]." },
+{ "embed_lookup_planes", ARR(pEmbedPlanes), ARR(oEmbedPlanes),
+  "A gather from a table stored as single-level affine planes, read in place: x[m, i] = v * "
+  "scale[id, i / group] * mult, v = table[code] when a table is given, else the code. Codes are i8, "
+  "u8, or 4-bit elements of a bit stream along the row, lowest bits first; a table is indexed by an "
+  "unsigned code and holds every value. Padding, bounds and vocab_offset as embed_lookup." },
+{ "gemm_nt_ggml", ARR(pGemmGgml), ARR(oGemmGgml),
+  "y = a . w^T with w llama.cpp's own blocks of GGUF type `type` (\"iq1_s\", \"q6_K\", ...), "
+  "relayouted from the type's planes at load: each row dequantised as llama.cpp does, f32 dot in "
+  "index order, rounded once to dtype. A float [N, K] w is the logical form." },
+{ "moe_gemm_ggml", ARR(pMoeGemmGgml), ARR(oMoeGemmGgml),
+  "moe_gemm with each expert's weight in llama.cpp's blocks of GGUF type `type`: y[i] = a[row(i)] . "
+  "w[e]^T in sorted order, row(i) per `a_order` as moe_gemm, a dropped slot a row of zeros. `w` is a "
+  "WEIGHT TABLE of n_expert entries, each read as gemm_nt_ggml reads its weight (native blocks, or "
+  "the float [N, K] logical form), so each output row equals gemm_nt_ggml's for its row and "
+  "expert." },
+{ "logits_gemm_ggml", ARR(pLogitsGgml), ARR(oLogitsGgml),
+  "logits_gemm with lm_head in llama.cpp's blocks of GGUF type `type`, read as gemm_nt_ggml reads its "
+  "weight: logits[M, n_vocab] (f32) = x[M, n_embd] . lm_head^T." },
+{ "embed_lookup_ggml", ARR(pEmbedGgml), ARR(oEmbedGgml),
+  "embed_lookup from a table in llama.cpp's blocks of GGUF type `type`: the id's row dequantised as "
+  "llama.cpp does, times `mult` when given, rounded once. Padding, bounds and vocab_offset behave as "
+  "embed_lookup's. A float [n_vocab, n_embd] wte is the logical form." },
 /* Row forms libr4d declares under names of their own, so a model can ask for the form: the same op, the same
  * arithmetic and the same schema as the op named in each string. */
 { "rmsnorm_rows", ARR(pRmsnorm), ARR(oRmsnorm),
@@ -1652,6 +1796,13 @@ static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const 
       nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avxp::lay,                  \
       avxp::avx_relayout_planes<avxp::lay>, nullptr, avxp::avx_unrelayout_planes<avxp::lay>,     \
       nullptr }
+
+/* A row over llama.cpp's native blocks: the layout hooks store the type's planes as its blocks,
+ * the bytes libref's hooks store (avx_ggml.h). */
+#define ROW_GGML(nm, opname, fam, what, dts, fn)                                                  \
+    { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
+      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_ggml_layout,            \
+      avx_ggml_relayout, nullptr, avx_ggml_unrelayout, nullptr }
 
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
@@ -2191,6 +2342,45 @@ SIMPLE("avx_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
 SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),
+/* DeepSeek-V4.1's text ops (avx_ds41.cpp, avx_glm.cpp, avx_ggml.cpp). */
+SIMPLE("avx_mhc_mix", "mhc_mix", "norm", "manifold residual gates and Sinkhorn mixing, pre gates out",
+       DT_FLOAT, L(mhc_mix)),
+SIMPLE("avx_mhc_collapse", "mhc_collapse", "norm", "manifold residual streams collapsed by given gates",
+       DT_FLOAT, L(mhc_collapse)),
+SIMPLE("avx_router_scored_topk", "router_scored_topk", "moe",
+       "correction-bias routing over named scores", DT_FLOAT, L(router_scored_topk)),
+SIMPLE("avx_ds41_rope_rows", "ds41_rope_rows", "attn",
+       "rope from a cos/sin plane over a window of each head", DT_FLOAT, L(ds41_rope_rows)),
+SIMPLE("avx_quant_roundtrip", "quant_roundtrip", "quant",
+       "block-scaled fp8/fp4 quantise-dequantise in place", DT_FLOAT, L(quant_roundtrip)),
+SIMPLE("avx_softmax_pool", "softmax_pool", "attn", "channel-wise softmax pooling of ratio rows",
+       DT_FLOAT, L(softmax_pool)),
+SIMPLE("avx_attn_sparse_sink", "attn_sparse_sink", "attn",
+       "window plus selected compressed latent attention with sinks", DT_FLOAT, L(attn_sparse_sink)),
+SIMPLE("avx_index_score", "index_score", "attn",
+       "indexer relu-gated head scores over a paged index cache", DT_FLOAT, L(index_score)),
+SIMPLE("avx_index_candidates", "index_candidates", "attn", "two-level top-k: kept candidate blocks",
+       DT_ANY, L(index_candidates)),
+SIMPLE("avx_index_topk", "index_topk", "attn", "top-k passed positions in position order", DT_ANY,
+       L(index_topk)),
+SIMPLE("avx_entry_store", "entry_store", "attn", "one entry a block into a paged cache", DT_FLOAT,
+       L(entry_store)),
+SIMPLE("avx_token_map", "token_map", "embed", "ids through an id table", DT_ANY, L(token_map)),
+SIMPLE("avx_stream_gate_add", "stream_gate_add", "norm",
+       "normalized-dot gated write into hc streams", DT_FLOAT, L(stream_gate_add)),
+SIMPLE("avx_embed_lookup_planes", "embed_lookup_planes", "vocab",
+       "embedding gather from a table's affine planes in place",
+       "i8 u8 i4 u4 codes, any float scale and table, per operand", L(embed_lookup_planes)),
+#ifdef AVX_HAVE_GGML
+ROW_GGML("avx_gemm_nt_ggml", "gemm_nt_ggml", "gemm", "llama.cpp native-block linear", DT_FLOAT,
+         L(gemm_nt_ggml)),
+ROW_GGML("avx_moe_gemm_ggml", "moe_gemm_ggml", "moe",
+         "grouped GEMM over llama.cpp native-block experts", DT_FLOAT, L(moe_gemm_ggml)),
+ROW_GGML("avx_logits_gemm_ggml", "logits_gemm_ggml", "vocab", "lm_head over llama.cpp native blocks",
+         DT_FLOAT, L(logits_gemm_ggml)),
+ROW_GGML("avx_embed_lookup_ggml", "embed_lookup_ggml", "vocab",
+         "embedding gather from llama.cpp native blocks", DT_FLOAT, L(embed_lookup_ggml)),
+#endif
 /* The row-form names (see the schema table): each the base op's row. */
 SIMPLE("avx_rmsnorm_rows", "rmsnorm_rows", "norm", "rmsnorm under its row-form name", DT_FLOAT,
        L(rmsnorm)),

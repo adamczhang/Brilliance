@@ -47,6 +47,11 @@ MODELS = "share/doc/radiance/model-licenses"
 MODELS_SRC = "win/model-licenses"
 LICENCE_LINK_RE = re.compile(r"/terms/licenses/([A-Za-z0-9_.-]+)")
 RENAME_RE = re.compile(r"third_party\s+RENAME\s+([A-Za-z0-9_.+-]+)\)?")
+HIP_DLLS = {"amdhip64_7.dll", "amd_comgr.dll", "rocm_kpack.dll"}
+HIP_KERNELS = {"share/radiance/kernels/" + name + ".dll" for name in ("libr3d", "libr4d", "libhalo")}
+COMGR_LICENCE = "amd_comgr.LICENSE.txt"
+FFMPEG_LICENCE = "ffmpeg.LICENSE.txt"
+BUILD_LICENCES = {COMGR_LICENCE, FFMPEG_LICENCE}
 # OpenH264's and x264's code, by strings only their code carries (lower case; each module is
 # lowered before matching): OpenH264's encoder and decoder classes and version line, FFmpeg's
 # wrappers' long names, x264's SEI banner, and FFmpeg's configure line enabling either. Plain
@@ -123,25 +128,52 @@ def dll_table(index_text):
     return pats
 
 
+def check_runtime_index(index_text, dlls, available, rep, *, hip):
+    """Match the licence index to a staged package or ZIP."""
+    pats = dll_table(index_text)
+    if not pats:
+        rep.err("licences", "THIRD-PARTY.md has no DLL rows")
+    for d in dlls:
+        if not any(fnmatch.fnmatch(d.lower(), p.lower()) for p in pats):
+            rep.err("licences", "bin/%s has no row in THIRD-PARTY.md's DLL table" % d)
+    for p in pats:
+        if not hip and p.lower() in HIP_DLLS:
+            continue
+        if not any(fnmatch.fnmatch(d.lower(), p.lower()) for d in dlls):
+            rep.warn("licences", "THIRD-PARTY.md lists %s, which bin/ does not carry" % p)
+    named = set(TEXT_RE.findall(index_text))
+    required = named.copy()
+    if hip:
+        required.add(COMGR_LICENCE)
+    else:
+        # CPU installs still carry the source-tree notices. Only this SDK-supplied
+        # text and the HIP DLLs themselves are absent from their install.
+        required.discard(COMGR_LICENCE)
+    if any(d.lower().startswith("avcodec-") for d in dlls):
+        required.add(FFMPEG_LICENCE)
+    for n in sorted(required - available):
+        rep.err("licences", "%s is required and missing or empty in %s" % (n, THIRD))
+    rep.ok("licences", "%d DLLs in bin/ against %d index rows; %d required texts"
+           % (len(dlls), len(pats), len(required)))
+    return named
+
+
 def check_licences(pkg, root, rep):
     index_path = os.path.join(pkg, INDEX)
     if not os.path.isfile(index_path):
         rep.err("licences", "%s is missing" % INDEX)
         return
-    index_text = open(index_path, encoding="utf-8").read()
-    pats = dll_table(index_text)
+    with open(index_path, encoding="utf-8") as f:
+        index_text = f.read()
     bin_dir = os.path.join(pkg, "bin")
-    dlls = sorted(f for f in os.listdir(bin_dir) if f.lower().endswith(".dll")) if os.path.isdir(bin_dir) else []
-    for d in dlls:
-        if not any(fnmatch.fnmatch(d.lower(), p.lower()) for p in pats):
-            rep.err("licences", "bin/%s has no row in THIRD-PARTY.md's DLL table" % d)
-    for p in pats:
-        if not any(fnmatch.fnmatch(d.lower(), p.lower()) for d in dlls):
-            rep.warn("licences", "THIRD-PARTY.md lists %s, which bin/ does not carry" % p)
+    dlls = sorted(f for f in os.listdir(bin_dir) if f.lower().endswith(".dll")
+                  and os.path.isfile(os.path.join(bin_dir, f))) if os.path.isdir(bin_dir) else []
     have = set(os.listdir(os.path.join(pkg, THIRD)))
-    named = set(TEXT_RE.findall(index_text))
-    for n in sorted(named - have):
-        rep.err("licences", "THIRD-PARTY.md names %s, which is not in %s" % (n, THIRD))
+    available = {name for name in have if os.path.isfile(os.path.join(pkg, THIRD, name))
+                 and os.path.getsize(os.path.join(pkg, THIRD, name))}
+    hip = bool(HIP_DLLS.intersection(d.lower() for d in dlls)
+               or any(os.path.isfile(os.path.join(pkg, path)) for path in HIP_KERNELS))
+    named = check_runtime_index(index_text, dlls, available, rep, hip=hip)
     upstream = set()
     for rel in ("CMakeLists.txt", "win/cmake/RadWindows.cmake"):
         with open(os.path.join(root, rel), encoding="utf-8") as f:
@@ -150,16 +182,12 @@ def check_licences(pkg, root, rep):
         rep.err("licences", "%s/%s is named by no index and installed by no rule" % (THIRD, n))
     for n in sorted(have & FORBIDDEN_TEXTS):
         rep.err("licences", "%s ships; the package carries no GPL-3.0 or OpenH264 code" % n)
-    ff = os.path.join(pkg, THIRD, "ffmpeg.LICENSE.txt")
-    if any(d.lower().startswith("avcodec-") for d in dlls):
-        if not os.path.isfile(ff):
-            rep.err("licences", "FFmpeg DLLs ship without ffmpeg.LICENSE.txt")
-        else:
-            t = open(ff, encoding="utf-8", errors="replace").read()
-            if "GNU LESSER GENERAL PUBLIC LICENSE" not in t or "Version 2.1" not in t:
-                rep.err("licences", "ffmpeg.LICENSE.txt is not the LGPL-2.1 text")
-    rep.ok("licences", "%d DLLs in bin/ against %d index rows; %d texts in third_party"
-           % (len(dlls), len(pats), len(have)))
+    ff = os.path.join(pkg, THIRD, FFMPEG_LICENCE)
+    if FFMPEG_LICENCE in available and any(d.lower().startswith("avcodec-") for d in dlls):
+        with open(ff, encoding="utf-8", errors="replace") as f:
+            t = f.read()
+        if "GNU LESSER GENERAL PUBLIC LICENSE" not in t or "Version 2.1" not in t:
+            rep.err("licences", "ffmpeg.LICENSE.txt is not the LGPL-2.1 text")
 
 
 def check_model_licences(pkg, root, rep):

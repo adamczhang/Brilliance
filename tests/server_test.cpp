@@ -3233,6 +3233,54 @@ TEST(server_info_drops_an_engine_blob_that_is_not_an_object) {
     CHECK(has(r2.body, "\"arch\":\"testarch\""));
 }
 
+/* Brilliance: keyless, /server_info's engine blob keeps this machine's paths from strangers --
+ * the container down to its file name, expert_stats.file dropped -- and gives them whole to the
+ * local operator and, with a key, to whoever holds it (the lan-matrix finding, 2026-11-22). */
+TEST(server_info_keeps_engine_paths_from_strangers) {
+    FakeScheduler sched;
+    FakeTokenizer tok;
+    Deps d;
+    d.sched = &sched;
+    d.tok = &tok;
+    ServerOptions o;
+    o.model_id = "test-model";
+    o.host = "127.0.0.1";
+    o.engine_info = R"({"arch":"testarch","container":"D:/models/hf/x/y/model-q8.rad",)"
+                    R"("expert_stats":{"file":"D:/logs/xstats.jsonl","interval_s":30}})";
+    auto ask = [](Server& s, const char* host) {
+        HttpRequest q;
+        q.path = "/server_info";
+        q.peer = "127.0.0.1:50000";
+        q.raw_peer = "127.0.0.1:50000";
+        q.headers["Host"] = host;
+        return s.router().dispatch(q);
+    };
+    Server srv(d, o);
+    /* A LAN client's request, or a remote one behind a localhost proxy: a foreign Host. */
+    HttpResponse lan = ask(srv, "192.168.1.50:8000");
+    CHECK_EQ(lan.status, 200);
+    CHECK(has(lan.body, "\"container\":\"model-q8.rad\""));
+    CHECK(!has(lan.body, "D:/models"));
+    CHECK(!has(lan.body, "xstats.jsonl"));
+    CHECK(has(lan.body, "\"interval_s\":30"));
+    /* The operator on the box sees both paths. */
+    HttpResponse local = ask(srv, "127.0.0.1:8000");
+    CHECK(has(local.body, "\"container\":\"D:/models/hf/x/y/model-q8.rad\""));
+    CHECK(has(local.body, "xstats.jsonl"));
+    /* With a key, the transport has admitted the caller: whole, from any Host. */
+    ServerOptions k = o;
+    k.api_key = "secret";
+    Server keyed(d, k);
+    HttpResponse held = ask(keyed, "192.168.1.50:8000");
+    CHECK(has(held.body, "\"container\":\"D:/models/hf/x/y/model-q8.rad\""));
+    /* A Windows path's backslashes cut the same way. */
+    ServerOptions w = o;
+    w.engine_info = R"({"container":"C:\\models\\m.rad"})";
+    Server win(d, w);
+    CHECK(has(ask(win, "192.168.1.50:8000").body, "\"container\":\"m.rad\""));
+    sched.join_all();
+}
+
 /* /diagnostics describes the host, so without a key it answers this machine only — and the Host
  * must name it, since a rebinding victim's browser or a localhost proxy's every remote client
  * arrives with a loopback socket. With a key the transport's gate has already checked the

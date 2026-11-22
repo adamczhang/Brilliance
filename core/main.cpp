@@ -7,6 +7,7 @@
 #include "hf_model.h"
 #include "server/server.h"
 #include "util/stallwatch.h"
+#include "util/stoplog.h"
 
 #include <cstring>
 #include <string>
@@ -40,18 +41,27 @@ int main(int argc, char** argv) {
 #endif
     std::string path;
     bool check = false;
+    bool plan_only_flag = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) {
             rad::fleet::print_reference(stdout);
             return 0;
         }
         if (!std::strcmp(argv[i], "--check")) { check = true; continue; }
+        if (!std::strcmp(argv[i], "--plan-only")) { plan_only_flag = true; continue; }
         if (!std::strcmp(argv[i], "--config") && i + 1 < argc && path.empty()) { path = argv[++i]; continue; }
         return refuse_flags(argc, argv);
     }
     if (path.empty()) {
         if (argc > 1) return refuse_flags(argc, argv);
         rad::fleet::print_reference(stderr);
+        return 2;
+    }
+    if (plan_only_flag) {
+        RAD_ERR("--plan-only is a YAML setting. Copy the configuration with only the model you "
+                "want to plan, and add 'plan-only: true' to that model's entry. Run "
+                "radiance --config FILE with the copy and expose only the intended cards "
+                "to the GPU runtime.");
         return 2;
     }
 
@@ -89,7 +99,8 @@ int main(int argc, char** argv) {
                      m.cfg.tp);
         /* Brilliance: the listener and key as this parser read them -- the file's, or the
          * launcher's BRILLIANCE_SERVER_* over it (fleet/config.cpp) -- each with its source, so
-         * win\serve.ps1 shows what a start would apply. A key itself is never printed. */
+         * win\serve.ps1 shows what a start would apply, even at a quieter log level.
+         * A key itself is never printed. */
         const rad::Config& c = fleet.models.front().cfg;
         auto src = [&c](const char* flag) {
             const auto g = c.given.find(flag);
@@ -98,8 +109,9 @@ int main(int argc, char** argv) {
         const std::string key = c.api_key.empty()       ? std::string("none")
                               : !c.api_key_env.empty()  ? "env " + c.api_key_env + " (" + src("--api-key-env") + ")"
                                                         : "in the file (" + src("--api-key") + ")";
-        RAD_INFO("%s: server host %s (%s), port %d (%s), api key %s", path.c_str(), c.host.c_str(),
-                 src("--host").c_str(), c.port, src("--port").c_str(), key.c_str());
+        rad::log_emit(rad::Log::Info, __FILE__, __LINE__,
+                      "%s: server host %s (%s), port %d (%s), api key %s", path.c_str(), c.host.c_str(),
+                      src("--host").c_str(), c.port, src("--port").c_str(), key.c_str());
         /* Brilliance: what serve.ps1 -Cpu and -Model apply over the file (BRILLIANCE_SERVER_KERNELS,
          * BRILLIANCE_MODEL_SPECULATION, BRILLIANCE_MODEL_PATH), with the source of each. */
         std::string kernels;
@@ -128,7 +140,13 @@ int main(int argc, char** argv) {
     bool offline = false;
     for (const rad::fleet::ModelEntry& m : fleet.models)
         offline |= m.cfg.kld() || m.cfg.calib() || m.cfg.diagnose_mode() || m.cfg.debug_graph;
-    if (!offline) return rad::fleet::run(fleet);
+    if (!offline) {
+        const int rc = rad::fleet::run(fleet);
+        /* Brilliance: the stop journal's last record from the server's own code (util/stoplog.h);
+         * its CLOSE at exit follows, then the runtime libraries unload. */
+        rad::stoplog::note("process.main_return", "status %d", rc);
+        return rc;
+    }
     if (fleet.models.size() != 1) {
         RAD_ERR("%s: an offline mode or the graph dump runs one model; the file names %zu",
                 path.c_str(), fleet.models.size());

@@ -227,6 +227,33 @@ void Front::install_routes(const Router& model_router) {
                                          path == "/terms/licenses" || path == "/terms/licenses/:id");
         for (const auto& [p, fn] : own) fleet |= method == "GET" && path == p;
         if (fleet) continue;
+        if (path == "/ping") {
+            /* Brilliance: /ping is the load balancer's liveness probe (docs/GUIDE.md §6.6), and a
+             * probe never loads or evicts anything: it reads the state the fleet is in. Naming a
+             * model (query, form or body), it is /health?model= for that model. Naming none, it
+             * asks of the process: the one model's own answer while that model is open, as a
+             * one-model server's /ping is, and otherwise (several models, or the one not open)
+             * the process /health answer -- never a 400 a probe reads as down, and never a 503
+             * for a model that sits cold or parked until a request brings it back. Upstream
+             * forwards /ping like a request for work, which wakes a cold model; on a keyed
+             * server that let a caller without the key load models (ping-state). */
+            router_.add(method, path, [this](const HttpRequest& q) {
+                std::string name = requested_model(q);
+                if (name.empty()) {
+                    {
+                        /* Read under the lock, answer outside it: health() and model_health()
+                         * take mu_ themselves. A model that closes in between is reported as
+                         * model_health() finds it. */
+                        std::lock_guard<std::mutex> lk(mu_);
+                        Entry* only = resolve("");
+                        if (only && only->state == State::Open) name = only->name;
+                    }
+                    if (name.empty()) return health(q);
+                }
+                return model_health(q, name);
+            }, model_router.guarded(method, path));
+            continue;
+        }
         /* Copy the guarded mark with the route: the front's wake-guard then reads the same fact
          * the engine's registration set, through the same matcher. */
         router_.add(method, path, [this](const HttpRequest& q) { return forward(q); },
@@ -832,6 +859,7 @@ HttpResponse Front::models(const HttpRequest& q) {
             rows.push_back(std::move(r));
         }
     }
+    const bool operator_seen = caller_is_operator(q);
     json data = json::array();
     for (Row& row : rows) {
         json extra = json::object();
@@ -839,6 +867,9 @@ HttpResponse Front::models(const HttpRequest& q) {
             const json j = json::parse(describe_(row.name), nullptr, false);
             if (j.is_object()) extra = j;
         }
+        /* Brilliance: a failed load's reason is the operator's (lease() withholds it the same
+         * way); a stranger's card says `failed` without the story. */
+        if (!operator_seen) extra.erase("error");
         std::vector<json> cards;
         if (row.hold) {
             HttpRequest one = q;
@@ -879,24 +910,33 @@ HttpResponse Front::models(const HttpRequest& q) {
     return HttpResponse::json_body(200, out.dump());
 }
 
-HttpResponse Front::health(const HttpRequest& q) {
-    /* One model: its own answer when loaded, its state when not; asking does not load it. */
-    if (auto it = q.query.find("model"); it != q.query.end()) {
-        Entry* e = nullptr;
-        std::shared_ptr<void> l;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            e = resolve(it->second);
-            if (!e) return refuse(q.path, 404, "not_found_error", "no model '" + it->second + "' is served here");
-            if (e->state != State::Open) {
-                json j = {{"status", state_name(e->state)}, {"model", e->name}};
-                if (e->state == State::Failed) j["error"] = e->why;
-                return HttpResponse::json_body(503, j.dump());
-            }
-            l = lease_entry(e);
+/* One model: its own answer when loaded, its state when not. Asking neither loads it, nor retries
+ * a failed load, nor counts as a use of it: the hold is quiet, so a probe every second does not
+ * keep a model from going idle or change which model an eviction picks. */
+HttpResponse Front::model_health(const HttpRequest& q, const std::string& name) {
+    Entry* e = nullptr;
+    std::shared_ptr<void> l;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        e = resolve(name);
+        if (!e) return refuse(q.path, 404, "not_found_error", "no model '" + name + "' is served here");
+        if (e->state != State::Open) {
+            /* Brilliance: a caller without the key reads the state alone; the failure prose
+             * (paths, fetch errors, other models' names) is the operator's, as in lease(). */
+            json j = {{"status", state_name(e->state)}};
+            if (!q.missing_key) j["model"] = e->name;
+            if (e->state == State::Failed && caller_is_operator(q)) j["error"] = e->why;
+            return HttpResponse::json_body(503, j.dump());
         }
-        return e->server->router().dispatch(q);
+        l = lease_quiet(e);
     }
+    HttpResponse r = e->server->router().dispatch(q);
+    hold_until_close(r, l);
+    return r;
+}
+
+HttpResponse Front::health(const HttpRequest& q) {
+    if (auto it = q.query.find("model"); it != q.query.end()) return model_health(q, it->second);
     /* The process: healthy once every model that must be loaded (pinned or preloaded) is, and
      * each of those says so. */
     std::vector<std::pair<Entry*, std::shared_ptr<void>>> held;
@@ -912,15 +952,18 @@ HttpResponse Front::health(const HttpRequest& q) {
             else missing += (missing.empty() ? "" : ", ") + p->name;
         }
     }
+    /* Brilliance: a keyed server answers a caller without the key the liveness alone; which
+     * models it serves and their states are the key holder's, as /v1/models is. */
     if (!missing.empty()) {
-        json j = {{"status", "loading"}, {"waiting_for", missing}, {"models", states}};
+        json j = q.missing_key ? json{{"status", "loading"}}
+                               : json{{"status", "loading"}, {"waiting_for", missing}, {"models", states}};
         return HttpResponse::json_body(503, j.dump());
     }
     for (auto& [e, hold] : held) {
         HttpResponse r = e->server->router().dispatch(q);
         if (r.status != 200) return r;
     }
-    json j = {{"status", "ok"}, {"models", states}};
+    json j = q.missing_key ? json{{"status", "ok"}} : json{{"status", "ok"}, {"models", states}};
     return HttpResponse::json_body(200, j.dump());
 }
 

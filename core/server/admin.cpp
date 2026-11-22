@@ -526,13 +526,22 @@ HttpResponse Server::handle_server_info(const HttpRequest& req) {
         if (e.is_discarded() || !e.is_object())
             RAD_WARN("server: engine_info is not a JSON object; /server_info omits it");
         else {
-            /* One member names a file on this machine -- expert_stats.file, the xstats output,
-             * the same path the model card strips for strangers (server.cpp). /server_info
-             * answers keyless by the dashboard-data posture, but a filesystem path is not
-             * dashboard data: a stranger gets the interval, never the path. */
-            if (opt_.api_key.empty() && !local_operator(req) && e.contains("expert_stats") &&
-                e["expert_stats"].is_object())
-                e["expert_stats"].erase("file");
+            /* Two members name files on this machine -- `container`, the model's own path (the
+             * one the model card's `root` and /props' model_path keep from strangers), and
+             * expert_stats.file, the xstats output. /server_info answers keyless by the
+             * dashboard-data posture, but a filesystem path is not dashboard data: a stranger
+             * gets the container's file name, which the dashboard's remote view shows, and the
+             * interval, never a path. Brilliance: `container` was handed out whole before
+             * 0.3.0 (the lan-matrix run, 2026-11-22). */
+            if (opt_.api_key.empty() && !local_operator(req)) {
+                if (e.contains("container") && e["container"].is_string()) {
+                    const std::string c = e["container"].get<std::string>();
+                    const size_t cut = c.find_last_of("/\\");
+                    e["container"] = cut == std::string::npos ? c : c.substr(cut + 1);
+                }
+                if (e.contains("expert_stats") && e["expert_stats"].is_object())
+                    e["expert_stats"].erase("file");
+            }
             o["engine"] = std::move(e);
         }
     }
@@ -603,7 +612,7 @@ HttpResponse Server::handle_health(const HttpRequest& req) { return handle_ping(
  * a minute of nothing advancing anywhere is a hang a restart clears. */
 constexpr int64_t kStuckMs = 60000;
 
-HttpResponse Server::handle_ping(const HttpRequest&) {
+HttpResponse Server::handle_ping(const HttpRequest& req) {
     const bool stopping = stopping_.load();
     const int64_t stuck = deps_.stuck_ms ? deps_.stuck_ms() : 0;
     const bool wedged = stuck >= kStuckMs;
@@ -614,10 +623,16 @@ HttpResponse Server::handle_ping(const HttpRequest&) {
                 "packet it is stuck on); /health answers 503 until it does, so a supervisor can "
                 "restart the server", (long long)(stuck / 1000));
     }
-    json o = health_body(opt_.model_id, stopping ? "stopping" : wedged ? "stuck" : "ok",
-                         in_flight_.load(std::memory_order_relaxed), queue_depth_);
+    const char* status = stopping ? "stopping" : wedged ? "stuck" : "ok";
+    const int code = stopping || wedged ? 503 : 200;
+    /* Brilliance: a keyed server answers a caller without the key the liveness alone -- the
+     * status and its code, which is all a load balancer reads. The model, the load and the stall
+     * time are the key holder's, as /load and /metrics are (docs/GUIDE.md §6.6). */
+    if (req.missing_key) return HttpResponse::json_body(code, json_dump(json{{"status", status}}));
+    json o = health_body(opt_.model_id, status, in_flight_.load(std::memory_order_relaxed),
+                         queue_depth_);
     if (wedged) o["stuck_s"] = stuck / 1000;
-    return HttpResponse::json_body(stopping || wedged ? 503 : 200, json_dump(o));
+    return HttpResponse::json_body(code, json_dump(o));
 }
 
 }  /* namespace server */

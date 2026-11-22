@@ -1,0 +1,73 @@
+2026-11-22 07:41:55.871 t=0.2 tid=21456 ARM journal pid=8832 written through to the disk record by record
+2026-11-22 07:42:20.246 t=24375.3 tid=18800 STOP begin Ctrl-Break or the console closing (SIGTERM)
+2026-11-22 07:42:20.317 t=24446.2 tid=21456 NOTE fleet.loop_exit the fleet's loop has ended
+2026-11-22 07:42:20.318 t=24447.2 tid=21456 BEGIN fleet.history_join bound 2000 ms
+2026-11-22 07:42:20.319 t=24448.1 tid=21456 END fleet.history_join ok 0.9 ms bound 2000 ms done
+2026-11-22 07:42:20.320 t=24448.8 tid=21456 BEGIN model.qwen3.8-next-flash.op_idle bound 60000 ms
+2026-11-22 07:42:20.320 t=24449.3 tid=21456 END model.qwen3.8-next-flash.op_idle ok 0.5 ms bound 60000 ms done
+2026-11-22 07:42:20.321 t=24449.8 tid=21456 BEGIN model.qwen3.8-next-flash.worker_join bound 60000 ms
+2026-11-22 07:42:20.321 t=24450.2 tid=21456 END model.qwen3.8-next-flash.worker_join ok 0.4 ms bound 60000 ms done
+2026-11-22 07:42:20.322 t=24450.5 tid=21456 NOTE fleet.request_stop model qwen3.8-next-flash, drain 30000 ms
+2026-11-22 07:42:20.322 t=24450.8 tid=21456 BEGIN model.qwen3.8-next-flash.serve_join bound 50000 ms
+2026-11-22 07:42:20.410 t=24539.0 tid=24636 NOTE engine.at_stop model qwen3.8-next-flash tp 4: mid-prefill; running 1, queued 0; prefill 1, decode 0, waiting 0; step 2
+2026-11-22 07:42:20.411 t=24539.5 tid=24636 NOTE engine.request model qwen3.8-next-flash id 1: prefill, prompt 250035, in the cache 8192, output 0, age 1.1 s
+2026-11-22 07:42:20.411 t=24540.0 tid=24636 BEGIN model.qwen3.8-next-flash.drain bound 30000 ms
+2026-11-22 07:42:50.412 t=54540.5 tid=24636 END model.qwen3.8-next-flash.drain over 30000.5 ms bound 30000 ms the drain timed out; the open responses are ended (retire)
+2026-11-22 07:42:50.429 t=54558.0 tid=24636 NOTE engine.retired model qwen3.8-next-flash: responses ended, server retired
+2026-11-22 07:42:50.430 t=54558.6 tid=24636 NOTE engine.stopping model qwen3.8-next-flash: stopping the step loop (stopping_ set, barrier closed); serve returned 0
+2026-11-22 07:42:50.430 t=54559.2 tid=24636 BEGIN model.qwen3.8-next-flash.step_loop_stop bound 10000 ms
+2026-11-22 07:42:50.884 t=55012.8 tid=4608 NOTE rank.exit model qwen3.8-next-flash rank 3 device 3: left on the barrier's abort; last issued step 31
+2026-11-22 07:42:50.884 t=55013.3 tid=23876 NOTE rank.exit model qwen3.8-next-flash rank 2 device 2: left on the barrier's abort; last issued step 31
+2026-11-22 07:42:50.885 t=55013.7 tid=13396 NOTE rank.exit model qwen3.8-next-flash rank 1 device 1: left on the barrier's abort; last issued step 31
+2026-11-22 07:42:50.885 t=55014.1 tid=25628 NOTE rank.exit model qwen3.8-next-flash rank 0 device 0: left on the barrier's abort; last issued step 31
+2026-11-22 07:42:50.894 t=55023.4 tid=24636 END model.qwen3.8-next-flash.step_loop_stop ok 464.2 ms bound 10000 ms done
+2026-11-22 07:42:50.895 t=55023.8 tid=24636 BEGIN model.qwen3.8-next-flash.rank_join bound 10000 ms
+2026-11-22 07:42:50.895 t=55024.0 tid=24636 END model.qwen3.8-next-flash.rank_join ok 0.2 ms bound 10000 ms done
+2026-11-22 07:42:50.896 t=55024.5 tid=21456 END model.qwen3.8-next-flash.serve_join ok 30573.7 ms bound 50000 ms done
+2026-11-22 07:42:50.896 t=55024.8 tid=21456 BEGIN fleet.front_stop bound 5000 ms
+2026-11-22 07:42:50.896 t=55025.1 tid=21456 END fleet.front_stop ok 0.3 ms bound 5000 ms done
+2026-11-22 07:42:50.897 t=55025.5 tid=21456 BEGIN model.qwen3.8-next-flash.teardown bound 60000 ms
+2026-11-22 07:42:51.911 t=56039.4 tid=21456 BEGIN model.qwen3.8-next-flash.stream_probe bound 8000 ms
+2026-11-22 07:42:51.913 t=56041.8 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 0 device 0 compute: drained after 2.0 ms
+2026-11-22 07:42:51.915 t=56043.9 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 0 device 0 lane1: drained after 1.8 ms
+2026-11-22 07:42:51.917 t=56046.2 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 0 device 0 transfer: drained after 2.1 ms
+2026-11-22 07:42:51.921 t=56049.7 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 1 device 1 compute: drained after 3.2 ms
+2026-11-22 07:42:51.923 t=56051.7 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 1 device 1 lane1: drained after 1.7 ms
+2026-11-22 07:42:51.925 t=56053.7 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 1 device 1 transfer: drained after 1.6 ms
+2026-11-22 07:42:51.929 t=56057.7 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 2 device 2 compute: drained after 3.7 ms
+2026-11-22 07:42:51.931 t=56060.0 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 2 device 2 lane1: drained after 2.0 ms
+2026-11-22 07:42:51.933 t=56062.0 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 2 device 2 transfer: drained after 1.7 ms
+2026-11-22 07:42:51.937 t=56066.0 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 3 device 3 compute: drained after 3.7 ms
+2026-11-22 07:42:51.939 t=56068.0 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 3 device 3 lane1: drained after 1.7 ms
+2026-11-22 07:42:51.941 t=56070.0 tid=21456 NOTE stream.probe model.qwen3.8-next-flash rank 3 device 3 transfer: drained after 1.7 ms
+2026-11-22 07:42:51.941 t=56070.2 tid=21456 END model.qwen3.8-next-flash.stream_probe ok 30.8 ms bound 8000 ms every stream drained
+2026-11-22 07:42:51.942 t=56070.5 tid=21456 BEGIN model.qwen3.8-next-flash.transfer_sync bound 10000 ms
+2026-11-22 07:42:51.942 t=56070.7 tid=21456 END model.qwen3.8-next-flash.transfer_sync ok 0.3 ms bound 10000 ms done
+2026-11-22 07:42:51.942 t=56071.0 tid=21456 BEGIN model.qwen3.8-next-flash.rank0.ctx_shutdown bound 10000 ms
+2026-11-22 07:42:51.951 t=56080.0 tid=21456 END model.qwen3.8-next-flash.rank0.ctx_shutdown ok 8.9 ms bound 10000 ms done
+2026-11-22 07:42:51.951 t=56080.3 tid=21456 BEGIN model.qwen3.8-next-flash.rank1.ctx_shutdown bound 10000 ms
+2026-11-22 07:42:51.960 t=56088.6 tid=21456 END model.qwen3.8-next-flash.rank1.ctx_shutdown ok 8.3 ms bound 10000 ms done
+2026-11-22 07:42:51.960 t=56088.9 tid=21456 BEGIN model.qwen3.8-next-flash.rank2.ctx_shutdown bound 10000 ms
+2026-11-22 07:42:51.968 t=56097.2 tid=21456 END model.qwen3.8-next-flash.rank2.ctx_shutdown ok 8.3 ms bound 10000 ms done
+2026-11-22 07:42:51.969 t=56097.6 tid=21456 BEGIN model.qwen3.8-next-flash.rank3.ctx_shutdown bound 10000 ms
+2026-11-22 07:42:51.977 t=56105.9 tid=21456 END model.qwen3.8-next-flash.rank3.ctx_shutdown ok 8.3 ms bound 10000 ms done
+2026-11-22 07:42:51.977 t=56106.3 tid=21456 BEGIN model.qwen3.8-next-flash.cards_unclaim bound 10000 ms
+2026-11-22 07:42:51.978 t=56106.6 tid=21456 END model.qwen3.8-next-flash.cards_unclaim ok 0.3 ms bound 10000 ms done
+2026-11-22 07:42:51.978 t=56106.8 tid=21456 BEGIN model.qwen3.8-next-flash.kv_stream_free bound 10000 ms
+2026-11-22 07:42:51.978 t=56107.1 tid=21456 END model.qwen3.8-next-flash.kv_stream_free ok 0.3 ms bound 10000 ms done
+2026-11-22 07:42:51.978 t=56107.4 tid=21456 BEGIN model.qwen3.8-next-flash.sched_fini bound 10000 ms
+2026-11-22 07:42:52.009 t=56138.2 tid=21456 END model.qwen3.8-next-flash.sched_fini ok 30.9 ms bound 10000 ms done
+2026-11-22 07:42:52.010 t=56138.6 tid=21456 BEGIN model.qwen3.8-next-flash.ranks_free bound 10000 ms
+2026-11-22 07:42:53.695 t=57823.8 tid=21456 END model.qwen3.8-next-flash.ranks_free ok 1685.2 ms bound 10000 ms done
+2026-11-22 07:42:53.695 t=57824.3 tid=21456 BEGIN model.qwen3.8-next-flash.host_tables_free bound 10000 ms
+2026-11-22 07:42:53.696 t=57824.6 tid=21456 END model.qwen3.8-next-flash.host_tables_free ok 0.3 ms bound 10000 ms done
+2026-11-22 07:42:53.696 t=57824.8 tid=21456 BEGIN model.qwen3.8-next-flash.plugins_release bound 10000 ms
+2026-11-22 07:42:53.804 t=57933.3 tid=21456 END model.qwen3.8-next-flash.plugins_release ok 108.4 ms bound 10000 ms done
+2026-11-22 07:42:54.736 t=58864.5 tid=21456 END model.qwen3.8-next-flash.teardown ok 3839.0 ms bound 60000 ms done
+2026-11-22 07:42:54.736 t=58865.0 tid=21456 BEGIN fleet.sweep_buffers bound 10000 ms
+2026-11-22 07:42:54.736 t=58865.2 tid=21456 END fleet.sweep_buffers ok 0.3 ms bound 10000 ms done
+2026-11-22 07:42:54.737 t=58865.5 tid=21456 BEGIN fleet.listener_join bound 5000 ms
+2026-11-22 07:42:54.737 t=58865.7 tid=21456 END fleet.listener_join ok 0.2 ms bound 5000 ms done
+2026-11-22 07:42:54.737 t=58866.0 tid=21456 NOTE fleet.run_return status 0
+2026-11-22 07:42:54.738 t=58866.6 tid=21456 NOTE process.main_return status 0
+2026-11-22 07:42:54.744 t=58872.6 tid=21456 CLOSE journal process exit (atexit); the runtime libraries unload after this

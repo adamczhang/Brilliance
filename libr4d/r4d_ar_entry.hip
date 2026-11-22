@@ -23,6 +23,7 @@
 #include "r4d_log.h"       /* Brilliance: W lines through the host's logger */
 #include "r4d_ar_shards.h"
 #include "r4d_ar_links.h"
+#include "r4d_ar4_weights.h"  /* tp4-link-weight: the four-rank two-shot's shard weights */
 #include "r4d_ar_seq.h"     /* the two-rank flags layout (R4D_AR2_*) and the fault record */
 #include "r4d_ar_wide_x.h"  /* the wide host flags layout (R4D_ARW_*), W1 */
 
@@ -116,13 +117,16 @@ extern "C" void r4d_arw_twoshot(const long long* ps, const long long* pf, long l
                                 long long inp, long long out, long long n_elem, long long dtype,
                                 long long rank, long long stream, long long nblocks,
                                 long long nthreads, long long drain, long long acq, long long pub,
-                                long long stage, long long inj, long long rs);
+                                long long stage, long long inj, long long rs, const int* weights);
 extern "C" void r4d_arw_twoshot_coded(const long long* ps, const long long* pf, long long my_scratch,
                                       long long my_flags, long long seq_ctrs, long long slot_stride16,
                                       long long inp, long long out, long long n_elem, long long rank,
                                       long long stream, long long nblocks, long long nthreads,
                                       long long drain, long long acq, long long pub, long long stage,
-                                      long long inj);
+                                      long long inj, const int* weights);
+/* tp4-link-weight: `weights` (both two-shots) is the instance's table (r4d_ar4_weights.h) or null for
+ * even shards, which keeps the launches as they were; ar4_weights_for below passes it only when the
+ * weighted table fits the slot. */
 extern "C" void r4d_arw_hc_write(const long long* ps, const long long* pf, long long my_scratch,
                                  long long my_flags, long long seq_ctrs, long long slot_stride16,
                                  long long y, long long inj, long long h, long long M, long long n,
@@ -161,6 +165,10 @@ struct Rendezvous {
     int  dev    [R4D_MAX_RANKS] = { 0 };
     /* Each rank's card's link, which the eight-rank two-shot's weights are derived from. */
     R4DArLink ar8_link[R4D_MAX_RANKS];
+    /* tp4-link-weight: each four-rank host rank's link rate (GB/s, the start-time probe; 0 unknown)
+     * and its card's PCI bus (-1 unknown), which the shard weights are derived from (ar4_settle). */
+    double ar4_gbs[R4D_MAX_RANKS] = { 0 };
+    int  ar4_bus[R4D_MAX_RANKS] = { 0 };
     int  failed = 0;
 };
 
@@ -520,6 +528,228 @@ static long long mailbox2_alloc(long long size, const char* what, bool slots, lo
     return (long long)p;
 }
 
+/* ---- tp4-link-weight: the four-rank two-shot's shard weights (r4d_ar4_weights.h) ----------------
+ *
+ * On Windows every four-rank collective crosses host memory, each card over its own link, and the
+ * two-shot puts (1 + 2 x) N on a link each way for a rank reducing a share x of a message of N
+ * bytes. With unequal links (the test machine: Gen5 x8, x8, Gen5 x4 and a Gen4 x4 riser) even shards make every
+ * large reduction wait on the slowest. BRILLIANCE_AR4_SHARD_WEIGHTS (r4d_ar4_weights.h) sets the
+ * table; unset or "auto", each rank times a copy over its own link at its first instance and the
+ * table comes from the four rates (r4d_ar4_weights_from_rates); "off" or "even" keeps the even
+ * split, the kernels and launches of the build before this setting. Messages under
+ * BRILLIANCE_AR4_MIN_ELEMS elements (default R4D_AR8_MIN_ELEMS_DEFAULT: every decode and verify
+ * message) stay even. The weights reach the wide host kernels only (wide_x: Windows), both
+ * two-shot forms: W1's and W4's plain kernels, which took a table already, and the coded form
+ * through r4d_ar_wide_tw.hip's kernel. The coded form's default kernel (BRILLIANCE_AR_RESEND=0) and
+ * the one-shot row's two-shot band stay even. A table never grows a slot: one that does not fit runs
+ * even (ar4_weights_for). The fold is the same under every table, so the output bits are too. */
+
+/* This rank's card's PCI bus number, -1 when the runtime does not say. */
+int ar4_own_bus() {
+    int dev = 0;
+    char bus[64] = { 0 };
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetPCIBusId(bus, (int)sizeof bus, dev) != hipSuccess) {
+        (void)hipGetLastError();
+        return -1;
+    }
+    unsigned dom = 0, b = 0, d = 0, f = 0;
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) return -1;
+    return (int)b;
+}
+
+/* The current card's link as it carries data (GB/s, the slower direction), 0 when it cannot be
+ * measured: a 32 MiB copy each way between pinned host memory and VRAM, one warm-up and three timed,
+ * the fastest of each kept. Once a process per card, one card at a time (the copies of four cards at
+ * once would share the host's memory and understate the fast links); about 20 ms a card on Gen5 x8,
+ * 40 on Gen4 x4. The buffers are freed before it returns. 0.2.x's start probe timed a 128 MiB copy
+ * each way per card the same way: a lane width says what a link was trained to, not what it carries
+ * (a riser falls back a generation under load and still reports its width). */
+double ar4_probe_gbs() {
+    static std::mutex mu;
+    static std::map<int, double> cache;
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess) { (void)hipGetLastError(); return 0.0; }
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = cache.find(dev);
+    if (it != cache.end()) return it->second;
+    const size_t bytes = (size_t)32 << 20;
+    void* h = nullptr;
+    void* d = nullptr;
+    double rate = 0.0;
+    if (hipHostMalloc(&h, bytes, hipHostMallocDefault) == hipSuccess && h &&
+        hipMalloc(&d, bytes) == hipSuccess && d) {
+        std::memset(h, 0, bytes);
+        double best_up = 0.0, best_down = 0.0;   /* seconds, the fastest timed copy */
+        bool ok = hipDeviceSynchronize() == hipSuccess;
+        for (int i = 0; ok && i < 4; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            ok = hipMemcpy(d, h, bytes, hipMemcpyHostToDevice) == hipSuccess;
+            const auto t1 = std::chrono::steady_clock::now();
+            ok = ok && hipMemcpy(h, d, bytes, hipMemcpyDeviceToHost) == hipSuccess;
+            const auto t2 = std::chrono::steady_clock::now();
+            if (!ok || i == 0) continue;
+            const double up = std::chrono::duration<double>(t1 - t0).count();
+            const double down = std::chrono::duration<double>(t2 - t1).count();
+            if (best_up <= 0.0 || up < best_up) best_up = up;
+            if (best_down <= 0.0 || down < best_down) best_down = down;
+        }
+        if (ok && best_up > 0.0 && best_down > 0.0) {
+            const double slow = best_up > best_down ? best_up : best_down;
+            rate = (double)bytes / slow / 1e9;
+        }
+    }
+    (void)hipGetLastError();
+    if (d) (void)hipFree(d);
+    if (h) (void)hipHostFree(h);
+    (void)hipGetLastError();
+    cache[dev] = rate;
+    return rate;
+}
+
+/* The startup line, printed when it differs from the last one (a process builds several instances,
+ * r4d_selftest changes the setting between its cases). */
+void ar4_say(const std::string& line) {
+    static std::mutex mu;
+    static std::string last;
+    std::lock_guard<std::mutex> lk(mu);
+    if (line == last) return;
+    last = line;
+    std::fprintf(stderr, "I r4d: %s\n", line.c_str());
+    std::fflush(stderr);
+}
+
+/* Every rank of a four-rank host instance, before anything is sized: each publishes its card's bus
+ * and (for "auto") its link rate, and after one barrier every rank derives the same table from the
+ * same four entries. A setting that does not parse, or a by-bus table that misses a rank, stops the
+ * build by name. */
+int ar4_settle(ArInst* in, int rank, int world) {
+#if !defined(_WIN32)
+    (void)in; (void)rank; (void)world;
+    return RAD_OK;   /* the weights reach the wide host kernels only, which are Windows' */
+#else
+    const char* env = std::getenv("BRILLIANCE_AR4_SHARD_WEIGHTS");
+    const R4DAr4Spec spec = r4d_ar4_spec_parse(env);
+    long long min_elems = R4D_AR8_MIN_ELEMS_DEFAULT;
+    bool min_bad = false;
+    const char* menv = std::getenv("BRILLIANCE_AR4_MIN_ELEMS");
+    if (menv && *menv) {
+        char* end = nullptr;
+        const long long v = std::strtoll(menv, &end, 10);
+        if (end == menv || *end || v < 0) min_bad = true;
+        else min_elems = v;
+    }
+    Rendezvous& rv = rv_for(in->group);
+    const int bus = ar4_own_bus();
+    const double gbs = spec.kind == R4D_AR4_SPEC_AUTO ? ar4_probe_gbs() : 0.0;
+    {
+        std::lock_guard<std::mutex> lk(rv.m);
+        rv.ar4_gbs[rank] = gbs;
+        rv.ar4_bus[rank] = bus;
+    }
+    const int rc = rv_barrier(rv, world);
+    if (rc != RAD_OK) return rc;
+    double all_gbs[R4D_AR4_WS];
+    int all_bus[R4D_AR4_WS];
+    {
+        std::lock_guard<std::mutex> lk(rv.m);
+        for (int r = 0; r < R4D_AR4_WS; ++r) { all_gbs[r] = rv.ar4_gbs[r]; all_bus[r] = rv.ar4_bus[r]; }
+    }
+    if (spec.kind == R4D_AR4_SPEC_BAD) {
+        std::fprintf(stderr, "E r4d: BRILLIANCE_AR4_SHARD_WEIGHTS=%s is not auto, off, even, four weights "
+                     "of 0 to %d in rank order (\"1,1,1,0\") or bus:weight pairs (\"3:1,9:1,6:1,32:0\"), "
+                     "with a sum above zero\n", env, (int)R4D_AR4_WEIGHT_MAX);
+        return RAD_E_INVAL;
+    }
+    if (min_bad) {
+        std::fprintf(stderr, "E r4d: BRILLIANCE_AR4_MIN_ELEMS=%s is not a count of elements\n", menv);
+        return RAD_E_INVAL;
+    }
+    std::string links;
+    for (int r = 0; r < R4D_AR4_WS; ++r) {
+        char one[96];
+        if (spec.kind == R4D_AR4_SPEC_AUTO)
+            std::snprintf(one, sizeof one, "%srank %d bus %d %.1f GB/s", r ? ", " : "", r, all_bus[r], all_gbs[r]);
+        else
+            std::snprintf(one, sizeof one, "%srank %d bus %d", r ? ", " : "", r, all_bus[r]);
+        links += one;
+    }
+    if (spec.kind == R4D_AR4_SPEC_EVEN) {
+        ar4_say("four-rank two-shot: even shards (BRILLIANCE_AR4_SHARD_WEIGHTS=" + std::string(env) +
+                "; " + links + ")");
+        return RAD_OK;
+    }
+    int w[R4D_AR4_WS] = { 0, 0, 0, 0 };
+    std::string from;
+    if (spec.kind == R4D_AR4_SPEC_RANKS) {
+        std::memcpy(w, spec.w, sizeof w);
+        from = "BRILLIANCE_AR4_SHARD_WEIGHTS=" + std::string(env) + ", by rank";
+    } else if (spec.kind == R4D_AR4_SPEC_BUSES) {
+        if (!r4d_ar4_spec_by_bus(spec, all_bus, w)) {
+            std::fprintf(stderr, "E r4d: BRILLIANCE_AR4_SHARD_WEIGHTS=%s does not name every rank's bus with "
+                         "weights summing above zero (%s)\n", env, links.c_str());
+            return RAD_E_INVAL;
+        }
+        from = "BRILLIANCE_AR4_SHARD_WEIGHTS=" + std::string(env) + ", by bus";
+    } else {
+        if (!r4d_ar4_weights_from_rates(all_gbs, w)) {
+            bool known = true;
+            for (int r = 0; r < R4D_AR4_WS; ++r) known = known && all_gbs[r] > 0.0;
+            ar4_say(std::string("four-rank two-shot: even shards, ") +
+                    (known ? "the links are close enough to equal" : "a link's rate is unknown") +
+                    " (the link probe: " + links + "; BRILLIANCE_AR4_SHARD_WEIGHTS=off keeps them even)");
+            return RAD_OK;
+        }
+        from = "the link probe";
+    }
+    if (r4d_ar4_weights_equal(w)) {
+        ar4_say("four-rank two-shot: even shards (" + from + ": equal weights; " + links + ")");
+        return RAD_OK;
+    }
+    in->shard_weighted = 1;
+    std::memset(in->shard_w, 0, sizeof(in->shard_w));
+    std::memcpy(in->shard_w, w, sizeof w);
+    in->weights_min = min_elems;
+    char head[320];
+    std::snprintf(head, sizeof head, "four-rank two-shot shards weighted %d,%d,%d,%d by rank (%s) from "
+                  "%lld elements up; ", w[0], w[1], w[2], w[3], from.c_str(), min_elems);
+    std::string line = head + links;
+    if (spec.kind == R4D_AR4_SPEC_AUTO) {
+        int slow = 0;
+        for (int r = 1; r < R4D_AR4_WS; ++r)
+            if (all_gbs[r] < all_gbs[slow]) slow = r;
+        char t[224];
+        std::snprintf(t, sizeof t, "; the slowest link (rank %d) carries %.2f of a message each way a "
+                      "reduction, %.2f even (BRILLIANCE_AR4_SHARD_WEIGHTS=off keeps them even)",
+                      slow, r4d_ar4_link_load(w, slow), r4d_ar4_link_load(nullptr, slow));
+        line += t;
+    }
+    ar4_say(line);
+    return RAD_OK;
+#endif
+}
+
+/* The weights for one four-rank two-shot launch, or null for even: a weighted instance, a message of
+ * at least weights_min elements, and a table that fits the slot (`coded`: two coded regions of the
+ * longest shard, in whole waves; else two plain shards). One that does not fit runs even, said once. */
+const int* ar4_weights_for(const ArInst* in, long long numel, bool coded) {
+    const int* w = ar8_weights_for(in, numel);
+    if (!w || in->world != 4 || !in->wide_x) return nullptr;
+    const long long n16 = numel * in->esize / 16;
+    if (coded && n16 % (32 * R4D_AR4_WS)) return nullptr;
+    R4DArwTab t;
+    r4d_arw_tab(n16, w, coded ? 32 : 1, &t);
+    if (r4d_arw_tab_fits(t, coded, in->slot16)) return w;
+    static std::once_flag said;
+    std::call_once(said, [&] {
+        std::fprintf(stderr, "I r4d: four-rank two-shot: a %s message of %lld elements does not fit its slot "
+                     "under the weighted table (longest shard %d words, slot %lld), so it runs even; the "
+                     "bits are the same\n", coded ? "coded" : "plain", numel, t.sh_max, in->slot16);
+        std::fflush(stderr);
+    });
+    return nullptr;
+}
+
 /* Sequence counter allocation in words: 2 * nbw (r4d_ar_seq.h), then r4d_ar_link_landed's block
  * counter, padded to a cache line. */
 long long kSeqWords(long long nbw) { return 2LL * nbw + 32; }
@@ -566,7 +796,13 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
         const int rc8 = ar8_settle(in, rank, world);
         if (rc8 != RAD_OK) return rc8;
     }
-    if (in->shard_weighted) {
+    /* tp4-link-weight: the four-rank weights (ar4_settle) never grow the slot: a weighted table
+     * that does not fit runs even (ar4_weights_for), so their memory is the even build's. */
+    if (world == 4 && host) {
+        const int rc4 = ar4_settle(in, rank, world);
+        if (rc4 != RAD_OK) return rc4;
+    }
+    if (in->shard_weighted && world == 8) {
         const long long need16 =
             2 * r4d_ar_shard_max_bound((long long)max_numel * in->esize / 16, 8, in->shard_w);
         /* Sized only if some message this instance carries is weighted. */
@@ -3580,7 +3816,8 @@ extern "C" int r4d_rad_ar_oneshot_4rank_exact(const RadArgs* a, RadStream s) {
                                 in->rank, (long long)(uintptr_t)s, nb, c.nthreads, c.drain,
                                 c.acq, c.pub, in->my_stage,
                                 ar_inj_take_w(in, R4D_AR_OP_W_TWOSHOT, 1),
-                                ar_resend_on() ? 1LL : 0LL));
+                                ar_resend_on() ? 1LL : 0LL,
+                                nullptr /* the band's decode-sized messages stay even (tp4-link-weight) */));
             return RAD_OK;
         }
         const long long gate = link_gate(a), early = in->host ? 0LL : gate;
@@ -3694,7 +3931,8 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                 r4d_arw_twoshot_coded(in->peer_scratch, in->peer_flags, in->my_scratch, in->my_flags,
                                       in->my_seq, in->slot16, c.inp, c.out, c.numel, in->rank,
                                       (long long)(uintptr_t)s, 4, 1024, c.drain, c.acq, c.pub,
-                                      in->my_stage, ar_inj_take_w(in, R4D_AR_OP_W_CODED, 1)));
+                                      in->my_stage, ar_inj_take_w(in, R4D_AR_OP_W_CODED, 1),
+                                      ar4_weights_for(in, c.numel, true)));
             return RAD_OK;
         }
         const long long gate = link_gate(a), early = in->host ? 0LL : gate;
@@ -3716,7 +3954,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_exact(const RadArgs* a, RadStream s) {
                             in->my_seq, in->slot16, c.inp, c.out, c.numel, in->dtype, in->rank,
                             (long long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq, c.pub,
                             in->my_stage, ar_inj_take_w(in, R4D_AR_OP_W_TWOSHOT, 1),
-                            ar_resend_on() ? 1LL : 0LL));
+                            ar_resend_on() ? 1LL : 0LL, ar4_weights_for(in, c.numel, false)));
         return RAD_OK;
     }
     /* The kernel ends the hold after its second handshake (its reduce is fused with the phase-2

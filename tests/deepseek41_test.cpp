@@ -15,7 +15,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <map>
+#include <set>
 #include <tuple>
 
 namespace {
@@ -25,6 +30,9 @@ using namespace lq::ggml;
 constexpr int kWidth = 256, kFfn = 1024, kExperts = 8, kLayers = 5, kVocab = 32;
 constexpr int kEngramRows = 128, kEngramWidth = 64;
 constexpr int kBatch = 16, kContext = 192;
+/* The trace test's bound on the TP2-against-TP4 relative difference of any layer's MoE input: the
+ * fixture measured 0.0162 at its worst layer (2026-11-22), about a third of this. */
+constexpr double kTraceXfBound = 0.05;
 
 const std::pair<const char*, const char*> kMeta[] = {
     { "qk_rope_head_dim", "64" }, { "q_lora_rank", "256" }, { "o_groups", "4" },
@@ -272,21 +280,27 @@ void write_fixture(const std::string& path) {
     REQUIRE_EQ(writer.finish(), RAD_OK);
 }
 
+/* The engine on the host backend over `kernels`: libref (the reference, which needs the debug
+ * leave) or libavx alone, as a CPU-only deployment selects. */
 void run_engine(const std::string& path, int world, int batch,
-                const std::vector<std::string>& args, const std::string& log_path) {
+                const std::vector<std::string>& args, const std::string& log_path,
+                const std::string& kernels = "libref",
+                const std::vector<std::string>& extra_env = {}) {
     std::vector<std::string> command = {
-        RAD_E2E_SERVER, "--model", path, "--kernels", "libref", "--debug-accept-reference-kernels",
+        RAD_E2E_SERVER, "--model", path, "--kernels", kernels,
         "--tp", std::to_string(world), "--tp-wire", "exact", "--num-speculative-tokens", "0",
         "--kv-cache-dtype", "bf16", "--max-model-len", std::to_string(kContext),
         "--max-num-seqs", "1", "--max-num-batched-tokens", std::to_string(batch),
     };
+    if (kernels == "libref") command.push_back("--debug-accept-reference-kernels");
     command.insert(command.end(), args.begin(), args.end());
-    const std::vector<std::string> env = {
+    std::vector<std::string> env = {
         std::string("RADIANCE_HOME=") + RAD_E2E_HOME, "HIP_VISIBLE_DEVICES=-1",
         "ROCR_VISIBLE_DEVICES=-1", "CUDA_VISIBLE_DEVICES=-1",
         "RADIANCE_HOST_DEVICES=" + std::to_string(world), "RADIANCE_HOST_VRAM_MIB=512",
         "OMP_NUM_THREADS=2", "OMP_WAIT_POLICY=passive",
     };
+    env.insert(env.end(), extra_env.begin(), extra_env.end());
     std::string log;
     const int rc = tiny::run(radtest::config_argv(command), env, &log, 80);
     CHECK(tiny::write_text(log_path, log));
@@ -398,6 +412,228 @@ TEST(deepseek41_rad2_binds_and_steps_on_mocked_tp1_tp2_tp4) {
     const auto wide = dir / "tp1-wide";
     run_engine(model, 1, 32, { "--kld-record", wide, "--kld-corpus", corpus }, wide + ".log");
     CHECK(reference == tiny::read_text(wide + "/logp.f16"));
+}
+
+/* The same fixture on libavx alone, with no libref loaded and no leave to run reference kernels:
+ * every op of the graph resolves to a CPU row (the DeepSeek-V4.1 ops of avx_ds41.cpp, avx_glm.cpp
+ * and avx_ggml.cpp among them, the ggml rows over the weights' native blocks), or the server does
+ * not start. Its log-probabilities are held to libref's within rounding: libavx differs only in
+ * summation order, and the bf16 rounding of five layers turns that into a small difference. */
+TEST(deepseek41_rad2_runs_on_libavx_alone_within_rounding_of_libref) {
+#if defined(__x86_64__) || defined(_M_X64)
+    NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
+#else
+    SKIP("libavx is x86-64 only");
+#endif
+    tiny::TempDir dir("deepseek41-avx", std::getenv("BRILLIANCE_KEEP_DS41_FIXTURE") != nullptr);
+    REQUIRE(dir.ok());
+    const auto model = dir / "deepseek41.rad";
+    write_fixture(model);
+    const auto corpus = dir / "corpus.jsonl";
+    std::string prompt;
+    for (int i = 0; i < 5; ++i) prompt += "abcd efghi jklmn opqr stuvwxyz!";
+    REQUIRE(tiny::write_text(corpus, "{\"prompt\":\"" + prompt + "\"}\n"));
+    const auto ref = dir / "libref", avx = dir / "libavx";
+    run_engine(model, 1, kBatch, { "--kld-record", ref, "--kld-corpus", corpus }, ref + ".log");
+    run_engine(model, 1, kBatch, { "--kld-record", avx, "--kld-corpus", corpus }, avx + ".log",
+               "libavx");
+    const std::string avx_log = tiny::read_text(avx + ".log");
+    /* libavx alone: the config echo names each loaded library at its version, and every op band
+     * resolves to it. */
+    CHECK(avx_log.find("libavx@") != std::string::npos);
+    CHECK(avx_log.find("libref@") == std::string::npos);
+    CHECK(avx_log.find("kernel selection                   libavx (host)") != std::string::npos);
+    const std::string tokens = tiny::read_text(ref + "/tokens.i32");
+    REQUIRE(tokens.size() / sizeof(int32_t) > 128);
+    CHECK(tokens == tiny::read_text(avx + "/tokens.i32"));
+    const float error = logp_distance(tiny::read_text(ref + "/logp.f16"),
+                                      tiny::read_text(avx + "/logp.f16"));
+    std::fprintf(stderr, "libavx against libref: maximum log-probability error %.6f\n", error);
+    CHECK(error <= 0.125f);
+}
+
+/* ---- RADIANCE_DEBUG_DS41_DUMP's per-layer trace at TP2 and TP4 (ds41-tp2-trace, 2026-11-22).
+ *
+ * The real file's TP2 and TP4 disagreed on 10 of 96 teacher-forced top-1 tokens, two of them where
+ * TP4 was confident. The trace located where the layouts part: each layer's streams, attention
+ * partials and reduce, MoE input, routing and MoE output. This holds the trace and the invariants
+ * the investigation relied on, on the fixture at TP2 and TP4:
+ *  - every site of every layer, rank and prefill step is written, at its size;
+ *  - the collectives: every rank holds the same reduced attention output, MoE input and MoE output,
+ *    and the reduced attention output is the exact sum of the ranks' partials rounded once to bf16
+ *    (within one bf16 ulp);
+ *  - routing: each layout's experts are the top-k of sqrt(softplus(score)) + correction from the
+ *    scores it computed, and the weights those scores' normalised values x 1.5;
+ *  - layer 0's input is bit-identical on both layouts, and the MoE input of every layer stays
+ *    within the bound below of the other layout's.
+ * The fixture's corrections pin each layer's two experts, so it cannot reproduce a near-tie swap;
+ * the real model's swaps are judged from a trace of the real file (the stage report). */
+namespace {
+struct Trace {
+    /* (step, rows, layer, site, rank) -> path */
+    std::map<std::tuple<int, int, int, std::string, int>, std::string> files;
+    int ranks = 0;
+};
+
+Trace read_trace(const std::string& dir) {
+    Trace t;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string n = e.path().filename().string();
+        int step = 0, rank = 0, layer = 0;
+        long long rows = 0;
+        char site[32] = {}, dt[8] = {};
+        if (std::sscanf(n.c_str(), "s%d.t%lld.l%d.%31[a-z].r%d.%7s", &step, &rows, &layer, site,
+                        &rank, dt) == 6) {
+            t.files[{ step, (int)rows, layer, site, rank }] = e.path().string();
+            t.ranks = std::max(t.ranks, rank + 1);
+        }
+    }
+    return t;
+}
+
+std::vector<float> trace_f32(const Trace& t, int step, int rows, int layer, const char* site,
+                             int rank, bool bf16) {
+    const auto it = t.files.find({ step, rows, layer, site, rank });
+    if (it == t.files.end()) return {};
+    const std::string raw = tiny::read_text(it->second);
+    std::vector<float> v;
+    if (bf16) {
+        v.resize(raw.size() / 2);
+        for (size_t i = 0; i < v.size(); ++i) {
+            uint16_t h;
+            std::memcpy(&h, raw.data() + 2 * i, 2);
+            const uint32_t u = (uint32_t)h << 16;
+            std::memcpy(&v[i], &u, 4);
+        }
+    } else {
+        v.resize(raw.size() / 4);
+        std::memcpy(v.data(), raw.data(), v.size() * 4);
+    }
+    return v;
+}
+
+std::vector<int32_t> trace_i32(const Trace& t, int step, int rows, int layer, int rank) {
+    const auto it = t.files.find({ step, rows, layer, "ids", rank });
+    if (it == t.files.end()) return {};
+    const std::string raw = tiny::read_text(it->second);
+    std::vector<int32_t> v(raw.size() / 4);
+    std::memcpy(v.data(), raw.data(), v.size() * 4);
+    return v;
+}
+
+double bf16_ulp(double x) {
+    x = std::fabs(x);
+    return x < 0x1p-126 ? 0x1p-133 : std::ldexp(1.0, (int)std::floor(std::log2(x)) - 7);
+}
+
+double rel_l2(const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0, den = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+        num += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+        den += (double)b[i] * b[i];
+    }
+    return den > 0 ? std::sqrt(num / den) : 0;
+}
+}  // namespace
+
+TEST(deepseek41_layer_trace_holds_tp2_tp4_collectives_and_routing) {
+    tiny::TempDir dir("deepseek41-trace", std::getenv("BRILLIANCE_KEEP_DS41_FIXTURE") != nullptr);
+    REQUIRE(dir.ok());
+    const auto model = dir / "deepseek41.rad";
+    write_fixture(model);
+    const auto corpus = dir / "corpus.jsonl";
+    std::string prompt;
+    for (int i = 0; i < 5; ++i) prompt += "abcd efghi jklmn opqr stuvwxyz!";
+    REQUIRE(tiny::write_text(corpus, "{\"prompt\":\"" + prompt + "\"}\n"));
+    const char* const sites[] = { "in", "attnp", "attn", "xf", "logits", "ids", "ew", "moe" };
+    const int cols[] = { 4 * kWidth, kWidth, kWidth, kWidth, kExperts, 2, 2, kWidth };
+    Trace tr[2];
+    for (int w = 0; w < 2; ++w) {
+        const int world = w ? 4 : 2;
+        const auto out = dir / ("trace-tp" + std::to_string(world));
+        const auto dump = out + "-dump";
+        REQUIRE(std::filesystem::create_directories(dump));
+        run_engine(model, world, kBatch, { "--kld-record", out, "--kld-corpus", corpus },
+                   out + ".log", "libref", { "RADIANCE_DEBUG_DS41_DUMP=" + dump });
+        tr[w] = read_trace(dump);
+        CHECK_EQ(tr[w].ranks, world);
+    }
+    /* The prefill steps both layouts traced, by (step, rows). */
+    std::set<std::pair<int, int>> steps[2];
+    for (int w = 0; w < 2; ++w)
+        for (const auto& [k, p] : tr[w].files) steps[w].insert({ std::get<0>(k), std::get<1>(k) });
+    REQUIRE(!steps[0].empty());
+    CHECK(steps[0] == steps[1]);
+    double worst_xf = 0, worst_ar_ulp = 0;
+    for (const auto& [step, T] : steps[0]) {
+        for (int w = 0; w < 2; ++w) {
+            const Trace& t = tr[w];
+            for (int l = 0; l < kLayers; ++l) {
+                /* Every site, every rank, at its size. */
+                for (int s = 0; s < 8; ++s)
+                    for (int r = 0; r < t.ranks; ++r) {
+                        const auto it = t.files.find({ step, T, l, sites[s], r });
+                        REQUIRE(it != t.files.end());
+                        const int bytes = s >= 4 && s <= 6 ? 4 : 2;
+                        CHECK_EQ((long long)std::filesystem::file_size(it->second),
+                                 (long long)T * cols[s] * bytes);
+                    }
+                /* Every rank holds the same reduced rows. */
+                for (const char* s : { "attn", "xf", "moe" }) {
+                    const auto r0 = trace_f32(t, step, T, l, s, 0, true);
+                    for (int r = 1; r < t.ranks; ++r) CHECK(trace_f32(t, step, T, l, s, r, true) == r0);
+                }
+                /* The reduce is the exact sum of the partials, rounded once. */
+                std::vector<std::vector<float>> parts;
+                for (int r = 0; r < t.ranks; ++r) parts.push_back(trace_f32(t, step, T, l, "attnp", r, true));
+                const auto red = trace_f32(t, step, T, l, "attn", 0, true);
+                REQUIRE_EQ(red.size(), (size_t)T * kWidth);
+                for (size_t i = 0; i < red.size(); ++i) {
+                    double sum = 0;   /* bf16 partials: the double sum is exact */
+                    for (const auto& p : parts) sum += p[i];
+                    worst_ar_ulp = std::max(worst_ar_ulp, std::fabs(red[i] - sum) / bf16_ulp(sum));
+                }
+                /* Routing from the layout's own scores: the fixture's correction (+4 on expert l,
+                 * +3 on expert (l + 3) % 8) selects, the unbiased scores weigh. */
+                const auto lg = trace_f32(t, step, T, l, "logits", 0, false);
+                const auto ew = trace_f32(t, step, T, l, "ew", 0, false);
+                const auto ids = trace_i32(t, step, T, l, 0);
+                for (int row = 0; row < T; ++row) {
+                    double sel[kExperts], sc[kExperts];
+                    for (int e = 0; e < kExperts; ++e) {
+                        const double x = lg[(size_t)row * kExperts + e];
+                        sc[e] = std::sqrt(x > 20 ? x : std::log1p(std::exp(x)));
+                        sel[e] = sc[e] + (e == l ? 4.0 : e == (l + 3) % kExperts ? 3.0 : 0.0);
+                    }
+                    int a = 0;
+                    for (int e = 1; e < kExperts; ++e) if (sel[e] > sel[a]) a = e;
+                    int b = a == 0 ? 1 : 0;
+                    for (int e = 0; e < kExperts; ++e) if (e != a && sel[e] > sel[b]) b = e;
+                    const int32_t i0 = ids[(size_t)row * 2], i1 = ids[(size_t)row * 2 + 1];
+                    CHECK((i0 == a && i1 == b) || (i0 == b && i1 == a));
+                    const double tot = sc[a] + sc[b];
+                    const double wa = sc[a] / tot * 1.5, wb = sc[b] / tot * 1.5;
+                    const double w0 = i0 == a ? wa : wb, w1 = i0 == a ? wb : wa;
+                    CHECK(std::fabs(ew[(size_t)row * 2] - w0) <= 1e-5 * 1.5);
+                    CHECK(std::fabs(ew[(size_t)row * 2 + 1] - w1) <= 1e-5 * 1.5);
+                }
+            }
+        }
+        /* The layouts against each other: layer 0's input exactly, then each MoE input and the
+         * routing. */
+        CHECK(trace_f32(tr[0], step, T, 0, "in", 0, true) == trace_f32(tr[1], step, T, 0, "in", 0, true));
+        for (int l = 0; l < kLayers; ++l) {
+            worst_xf = std::max(worst_xf, rel_l2(trace_f32(tr[0], step, T, l, "xf", 0, true),
+                                                 trace_f32(tr[1], step, T, l, "xf", 0, true)));
+            CHECK(trace_i32(tr[0], step, T, l, 0) == trace_i32(tr[1], step, T, l, 0));
+        }
+    }
+    std::fprintf(stderr, "trace: %zu prefill steps; reduce within %.3f bf16 ulp of the exact sum; "
+                         "worst TP2-TP4 MoE-input relative difference %.3g\n",
+                 steps[0].size(), worst_ar_ulp, worst_xf);
+    CHECK(worst_ar_ulp <= 1.0);
+    CHECK(worst_xf <= kTraceXfBound);
 }
 
 /* Opt-in dry placement of the installed file. The weight blob is never read or

@@ -18,6 +18,10 @@
  *     requests go to llama-server's native /completion with token-id prompts and return_tokens.
  *
  * Every child gets ROCR_VISIBLE_DEVICES=99, so a machine with a card still runs the host backend.
+ * Brilliance: on Windows that variable is not the HIP runtime's, so a HIP build's children found
+ * the cards (2026-11-22). Every child there also gets BRILLIANCE_DEVICE=host (core/main.cpp: the
+ * host backend is chosen without asking HIP for a device) and HIP_VISIBLE_DEVICES=-1, as the other
+ * host tests run radiance; the_children_never_ask_hip_for_a_card holds the log to it.
  */
 #include "rad_test.h"
 #include "e2e_config.h"
@@ -44,6 +48,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 
 #if defined(_WIN32) && !defined(MSG_NOSIGNAL)
@@ -58,10 +63,15 @@ namespace {
 /* ------------------------------------------------------------------ the children */
 
 /* The host backend with a fixed device size, and OpenMP that sleeps between parallel regions, so
- * concurrent test binaries do not starve each other. */
+ * concurrent test binaries do not starve each other. Brilliance: on Windows, BRILLIANCE_DEVICE=host
+ * and HIP_VISIBLE_DEVICES=-1 keep a HIP build's child off every card; only the opt-in device run
+ * (RAD_NEMOTRON_DEVICE, nemotron_device_env) overrides them, by name, in `more`. */
 std::vector<std::string> engine_env(const std::vector<std::string>& more = {}) {
     std::vector<std::string> e = { "ROCR_VISIBLE_DEVICES=99", "RADIANCE_HOST_VRAM_MIB=512",
                                    "OMP_WAIT_POLICY=passive", "OMP_NUM_THREADS=2",
+#if defined(_WIN32)
+                                   "BRILLIANCE_DEVICE=host", "HIP_VISIBLE_DEVICES=-1",
+#endif
                                    std::string("RADIANCE_HOME=") + RAD_E2E_HOME };
     e.insert(e.end(), more.begin(), more.end());
     return e;
@@ -484,6 +494,7 @@ struct Server {
     int port = 0;
     bool quiet = false;   /* a start that fails is expected: print nothing */
     bool serving = false; /* serving_argv: no reference library unless the arguments name one */
+    std::string yaml_path; /* start_yaml's file, which a reload rereads */
 
     bool start(const std::string& model, const std::vector<std::string>& args,
                const std::vector<std::string>& env = {}) {
@@ -500,6 +511,7 @@ struct Server {
         static int seq = 0;
         const std::string path = radtest::tmp_path("fleet." + std::to_string(seq++) + ".yaml");
         std::ofstream(path) << yaml;
+        yaml_path = path;
         if (!child.start({ RAD_E2E_SERVER, "--config", path }, engine_env(env))) return false;
         return listening();
     }
@@ -533,28 +545,35 @@ struct Server {
         return port > 0;
     }
 
+    bool interrupt() {
+#if defined(_WIN32)
+        /* Brilliance: SIGTERM is Ctrl-Break to the server's own process group
+         * (rad::os::Captured::interrupt), which the engine's on_terminate handler takes as
+         * SIGTERM: it drains and exits with its own status, as on Linux. */
+        std::string why;
+        if (child.c.interrupt(&why)) return true;
+        ::radtest::fail(__FILE__, __LINE__, "no graceful stop for the server: " + why);
+        return false;
+#else
+        return kill(child.pid, SIGTERM) == 0;
+#endif
+    }
+
     /* SIGTERM drains and exits 0. The exit status; a second call returns it again. Afterwards
      * output() holds everything the server wrote. */
     int exit_status = -1;
     int stop() {
 #if defined(_WIN32)
-        /* Brilliance: SIGTERM is Ctrl-Break to the server's own process group
-         * (rad::os::Captured::interrupt), which the engine's on_terminate handler takes as
-         * SIGTERM: it drains and exits with its own status, as on Linux. A test process with no
-         * console to share with the server cannot send it. That fails the case, naming why, and
-         * the server is ended hard -- never a kill passed off as the drain. */
+        /* A test process with no console to share with the server cannot send Ctrl-Break.
+         * interrupt() fails the case, naming why, and the server is ended hard -- never a kill
+         * passed off as the drain. */
         if (child.c.pid() <= 0) return exit_status;
-        std::string why;
-        if (!child.c.interrupt(&why)) {
-            ::radtest::fail(__FILE__, __LINE__, "no graceful stop for the server: " + why +
-                                                "; it is killed instead");
-            child.c.kill();
-        }
+        if (!interrupt()) child.c.kill();
         if (drain.joinable()) drain.join();
         child.c.close_read();
 #else
         if (child.pid <= 0) return exit_status;
-        kill(child.pid, SIGTERM);
+        interrupt();
         if (drain.joinable()) drain.join();
         close(child.fd);
         child.fd = -1;
@@ -1066,6 +1085,109 @@ TEST(a_checkpoint_store_the_host_cannot_hold_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* Brilliance (port-exclusive): a second radiance on a port another is listening on stops before
+ * serving, naming the address, and exits 1. Before, Windows let it bind beside the first with no
+ * error, and every request still went to the first. The first keeps serving and stops cleanly. Off
+ * Windows httplib's own socket option is kept, so the case runs on Windows only. Bounded by a
+ * timeout: a second server that came up would listen until it. */
+TEST(a_second_server_on_a_taken_port_exits_1_naming_the_address) {
+#if defined(_WIN32)
+    World& w = world();
+    REQUIRE(w.ok);
+    Server first;
+    REQUIRE(first.start(w.qwen35, {}));
+    const std::string port = std::to_string(first.port);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", port }, {}, 120);
+    const bool named = has(r.log, "E server: cannot bind 127.0.0.1:" + port +
+                                      ": the port is already in use");
+    if (r.status != 1 || !named)
+        fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 20).c_str());
+    CHECK_EQ(r.status, 1);
+    CHECK(named);
+    CHECK(!has(r.log, "listening on http://"));
+    CHECK_EQ(tokens_of(post(first.port, "/completion", completion(prompt_ids(33, 20), 4))).size(),
+             (size_t)4);
+    CHECK_EQ(first.stop(), 0);
+#endif
+}
+
+/* Brilliance (rc-fixes): the E lines of a child's log, one per line, for the plan-only cases. */
+std::vector<std::string> error_lines(const std::string& log) {
+    std::vector<std::string> out;
+    size_t at = 0;
+    while (at < log.size()) {
+        size_t nl = log.find('\n', at);
+        if (nl == std::string::npos) nl = log.size();
+        const std::string line = log.substr(at, nl - at);
+        if (line.size() > 1 && line[0] == 'E' && (line[1] == ' ' || line[1] == '[')) out.push_back(line);
+        at = nl + 1;
+    }
+    return out;
+}
+
+/* Brilliance (rc-fixes): plan-only (the YAML key) on the host backend. An admitted plan is the
+ * mode's success: the verdict and the stop are I lines, no E line is logged, and the process exits
+ * 0, at TP1 and at TP2 (two host devices, as DeepSeek's TP2 preflight runs on two cards). Until
+ * 2026-11-22 it exited 1 after three E lines (`startup stopped: cancelled`, `not loaded`, `no
+ * model started`). A refused plan still fails: its reason and the startup stop are E lines and the
+ * exit is non-zero. The refusal asks the admission for more host pool than any host has, which it
+ * refuses from the budgets before anything is allocated (plan-only allocates no pool). */
+TEST(an_admitted_plan_only_start_exits_0_and_a_refused_one_fails) {
+    World& w = world();
+    REQUIRE(w.ok);
+    for (int tp : { 1, 2 }) {
+        const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0", "--tp",
+                                           std::to_string(tp), "--plan-only" },
+                               { "RADIANCE_HOST_DEVICES=" + std::to_string(tp) }, 120);
+        const std::vector<std::string> errors = error_lines(r.log);
+        if (r.status != 0 || !errors.empty())
+            fprintf(stderr, "    tp %d exited %d:\n%s\n", tp, r.status, tail(r.log, 30).c_str());
+        CHECK_EQ(r.status, 0);
+        CHECK(has(r.log, "I --plan-only: stopped before loading (admitted)"));
+        CHECK(has(r.log, "startup stopped: --plan-only admitted the plan; nothing was loaded"));
+        CHECK(has(r.log, "--plan-only: every model's plan was admitted; nothing was loaded"));
+        CHECK(!has(r.log, "startup stopped: cancelled"));
+        CHECK(!has(r.log, "no model started"));
+        CHECK(errors.empty());
+    }
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0", "--plan-only",
+                                       "--host-pool-mib", "1073741824" }, {}, 120);
+    const bool named = has(r.log, "--plan-only: stopped before loading: the host admission refused");
+    if (r.status == 0 || r.status == 124 || !named)
+        fprintf(stderr, "    refused plan exited %d:\n%s\n", r.status, tail(r.log, 30).c_str());
+    CHECK(r.status != 0);
+    CHECK(r.status != 124);
+    CHECK(named);
+    CHECK(has(r.log, "E startup stopped: "));
+    CHECK(has(r.log, "E no model started"));
+    CHECK(!has(r.log, "(admitted)"));
+}
+
+/* Brilliance (test-hygiene): no child of this test asks the HIP runtime for a card. On Windows
+ * ROCR_VISIBLE_DEVICES does not hide the cards, so a HIP build's children found them (2026-11-22,
+ * refused before allocating). engine_env now passes BRILLIANCE_DEVICE=host, which selects the host
+ * backend before any HIP call (core/device/dispatch.cpp, select_backend): the backend line says so,
+ * and neither HIP outcome (a native HIP backend, or HIP asked and no card visible) appears. A
+ * plan-only start selects the backend and loads nothing. */
+TEST(the_children_never_ask_hip_for_a_card) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const Ran r = radiance(w.qwen35, { "--host", "127.0.0.1", "--port", "0", "--plan-only" }, {}, 120);
+    if (r.status != 0) fprintf(stderr, "    exited %d:\n%s\n", r.status, tail(r.log, 30).c_str());
+    CHECK_EQ(r.status, 0);
+    CHECK(!has(r.log, "device: native HIP backend"));
+    CHECK(!has(r.log, "built with HIP but no device is visible"));
+    CHECK(has(r.log, "device: host backend, "));
+#if defined(_WIN32) && defined(RAD_HAVE_HIP)
+    CHECK(has(r.log, "device: this process uses no GPU (dev_host_only) -- the host backend, HIP not asked"));
+#endif
+    for (const char* line : { "device: this process uses no GPU", "device: host backend, " }) {
+        const size_t at = r.log.find(line);
+        if (at != std::string::npos)
+            fprintf(stderr, "    %s\n", r.log.substr(at, r.log.find('\n', at) - at).c_str());
+    }
+}
+
 /* The row split of a prefill's attention is a graph only a plugin that declares it can build, so
  * a plugin that does not (qwen35 here) is refused by the flag's name instead of serving the head
  * split under it. */
@@ -1154,6 +1276,243 @@ TEST(qwen35_two_ranks_agree_with_one_within_rounding) {
         { "--tp", "2", "--max-num-batched-tokens", "512", "--max-num-seqs", "1" },
         { "RADIANCE_HOST_DEVICES=2" }));
 }
+
+/* ================================================================== the stop journal */
+
+namespace {
+
+/* One record of the stop journal (core/util/stoplog.h): its KIND, name and detail. */
+struct StopRec {
+    std::string kind, name, detail;
+};
+std::vector<StopRec> stop_records(const std::string& path) {
+    std::vector<StopRec> v;
+    std::istringstream in(tiny::read_text(path));
+    for (std::string l; std::getline(in, l);) {
+        std::istringstream w(l);
+        std::string date, time, t, tid;
+        StopRec r;
+        w >> date >> time >> t >> tid >> r.kind >> r.name;
+        std::getline(w, r.detail);
+        v.push_back(r);
+    }
+    return v;
+}
+bool ends_with(const std::string& s, const std::string& tail) {
+    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+}
+/* The first record at or after `from` of `kind` whose name ends with `tail`; -1 if none. */
+int stop_find(const std::vector<StopRec>& v, const std::string& kind, const std::string& tail,
+              int from = 0) {
+    for (int i = std::max(from, 0); i < (int)v.size(); ++i)
+        if (v[(size_t)i].kind == kind && ends_with(v[(size_t)i].name, tail)) return i;
+    return -1;
+}
+
+/* The bounded stop contract's order (win/SUPPORT.md, "Stopping a multi-card server") on one
+ * journal of a one-model server at `tp` ranks, and every step within its bound. `phase` is what
+ * the journal must say the model was doing at the stop, or empty for any. */
+void check_stop_journal(const std::string& path, int tp, const std::string& phase) {
+    const std::vector<StopRec> v = stop_records(path);
+    std::string all;
+    for (const StopRec& r : v) all += "      " + r.kind + " " + r.name + r.detail + "\n";
+    const int failures_before = ::radtest::failures().load();
+    REQUIRE(!v.empty());
+    CHECK_EQ(v.front().kind, std::string("ARM"));
+    /* The steps in the contract's order, each after the one before. */
+    const std::pair<const char*, const char*> order[] = {
+        { "STOP", "begin" },
+        { "NOTE", "fleet.loop_exit" },
+        { "END", "fleet.history_join" },
+        { "NOTE", "fleet.request_stop" },
+        { "NOTE", "engine.at_stop" },
+        { "END", ".drain" },
+        { "NOTE", "engine.retired" },
+        { "NOTE", "engine.stopping" },
+        { "END", ".step_loop_stop" },
+        { "END", ".rank_join" },
+        { "END", ".serve_join" },
+        { "END", "fleet.front_stop" },
+        { "BEGIN", ".teardown" },
+        { "END", ".stream_probe" },
+        { "END", ".transfer_sync" },
+        { "END", ".rank0.ctx_shutdown" },
+        { "END", ".ranks_free" },
+        { "END", ".plugins_release" },
+        { "END", ".teardown" },
+        { "END", "fleet.sweep_buffers" },
+        { "END", "fleet.listener_join" },
+        { "NOTE", "fleet.run_return" },
+        { "NOTE", "process.main_return" },
+        { "CLOSE", "journal" },
+    };
+    int at = 0;
+    for (const auto& [kind, name] : order) {
+        const int i = stop_find(v, kind, name, at);
+        if (i < 0) ::radtest::fail(__FILE__, __LINE__, std::string("no ") + kind + " " + name +
+                                                         " after record " + std::to_string(at));
+        else at = i;
+    }
+    /* Each rank left its loop, before the joins ended, and none skipped a step its peers were
+     * released into. */
+    const int join = stop_find(v, "END", ".rank_join");
+    int exits = 0;
+    for (int i = 0; i < (int)v.size(); ++i) {
+        if (v[(size_t)i].kind != "NOTE" || v[(size_t)i].name != "rank.exit") continue;
+        ++exits;
+        CHECK(i < join);
+        CHECK(v[(size_t)i].detail.find("SPLIT") == std::string::npos);
+    }
+    CHECK_EQ(exits, tp);
+    /* Every rank's last ctx_shutdown, and every stream drained before the teardown waited. */
+    CHECK(stop_find(v, "END", ".rank" + std::to_string(tp - 1) + ".ctx_shutdown") > 0);
+    int probes = 0;
+    for (const StopRec& r : v)
+        if (r.kind == "NOTE" && r.name == "stream.probe") {
+            ++probes;
+            CHECK(r.detail.find(": drained after") != std::string::npos);
+        }
+    CHECK(probes >= tp);   /* each rank's compute stream at least */
+    /* Every step ended within its bound, and nothing waited past one. */
+    for (const StopRec& r : v) {
+        if (r.kind == "END") CHECK(r.detail.rfind(" ok ", 0) == 0);
+        CHECK(r.kind != "WAIT");
+    }
+    if (!phase.empty()) {
+        const int s = stop_find(v, "NOTE", "engine.at_stop");
+        CHECK(s >= 0 && v[(size_t)s].detail.find(": " + phase + ";") != std::string::npos);
+    }
+    /* RAD_E2E_SHOW_STOPLOG=1 prints it when the case passes too. */
+    if (::radtest::failures().load() != failures_before || ::radtest::env_flag("RAD_E2E_SHOW_STOPLOG"))
+        fprintf(stderr, "    the journal (%s):\n%s", path.c_str(), all.c_str());
+}
+
+}  /* namespace */
+
+/* Brilliance: Ctrl-Break to a two-rank server, idle and with a request decoding, writes the whole
+ * bounded stop to the journal BRILLIANCE_STOP_LOG names, in the contract's order: the drain, the
+ * step loop and the rank threads, every stream found drained, each rank's teardown, the releases,
+ * the process's return. The machine-level evidence for a four-card stop comes from the same
+ * journal (artifacts/pm/r030/tp4-stop-matrix-plan.md). */
+TEST(qwen35_two_ranks_stop_writes_the_bounded_stop_to_the_journal) {
+    REQUIRE(world().ok);
+    tiny::TempDir d("e2e_stoplog");
+    const std::vector<std::string> args = { "--tp", "2", "--max-num-seqs", "2",
+                                            "--num-speculative-tokens", "0" };
+    {
+        const std::string log = d / "idle.log";
+        Server s;
+        REQUIRE(s.start(world().qwen35, args,
+                        { "RADIANCE_HOST_DEVICES=2", "BRILLIANCE_STOP_LOG=" + log }));
+        CHECK_EQ(tokens_of(post(s.port, "/completion", completion(prompt_ids(31, 40), 8))).size(),
+                 (size_t)8);
+        CHECK_EQ(s.stop(), 0);
+        check_stop_journal(log, 2, "idle");
+    }
+    {
+        /* A request still decoding when the stop comes: the drain lets it finish. */
+        const std::string log = d / "decode.log";
+        Server s;
+        REQUIRE(s.start(world().qwen35, args,
+                        { "RADIANCE_HOST_DEVICES=2", "BRILLIANCE_STOP_LOG=" + log }));
+        json reply;
+        int status = 0;
+        std::thread client([&] {
+            reply = post(s.port, "/completion", completion(prompt_ids(32, 60), 800), &status);
+        });
+        /* Started: the scheduler runs it. Polled every 2 ms; the stop follows at once. */
+        for (int i = 0; i < 2500 && metric(s.port, "vllm:num_requests_running") < 1; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        CHECK_EQ(s.stop(), 0);
+        client.join();
+        CHECK_EQ(status, 200);
+        CHECK_EQ(tokens_of(reply).size(), (size_t)800);
+        check_stop_journal(log, 2, "");
+        const std::vector<StopRec> v = stop_records(log);
+        const int at = stop_find(v, "NOTE", "engine.at_stop");
+        REQUIRE(at >= 0);
+        /* Caught mid-decode, or (on a fast machine) after the reply was already whole. */
+        if (v[(size_t)at].detail.find("mid-decode") == std::string::npos)
+            fprintf(stderr, "    the stop came after the request ended:%s\n",
+                    v[(size_t)at].detail.c_str());
+    }
+}
+
+#ifndef RAD_HAVE_HIP  /* The rank gate is compiled into host test builds only (core/CMakeLists.txt). */
+namespace {
+
+/* A stop that lands between a step's release and one rank's wake-up (2026-11-22). The last rank
+ * is held by the test hook in Engine::rank_loop after its first release, until rank 0 is issuing
+ * step 0 and Engine::serve has begun stopping the step loop. Every rank must then issue step 0 and
+ * reach the join, the stop must exit 0, and the journal must show no SPLIT. */
+void check_stop_after_release(int tp) {
+    tiny::TempDir d("e2e_stop_release");
+    REQUIRE(d.ok());
+    tiny::Qwen35 shape;
+    shape.lin_k_heads = 4;  /* divide the gated delta net heads at TP2 and TP4 */
+    REQUIRE(tiny::write_qwen35(d.path, shape));
+    const std::string ranks = std::to_string(tp);
+    const std::string journal = d / "stop.log";
+    const std::string gate = d / "resume";
+    const std::string yaml =
+        "server: {host: 127.0.0.1, port: 0, http-threads: 4, kernels: libref,\n"
+        "         debug-accept-reference-kernels: true}\n"
+        "scheduler: {drain-timeout: 250ms}\n"
+        "models:\n"
+        "  q: {model: " + json(d.path).dump() + ", tp: " + ranks +
+        ", max-num-seqs: 1, num-speculative-tokens: 0}\n";
+    Server s;
+    REQUIRE(s.start_yaml(yaml, { "RADIANCE_HOST_DEVICES=" + ranks, "BRILLIANCE_STOP_LOG=" + journal,
+                                 "RAD_E2E_STOP_RANK_GATE=" + gate }));
+    const auto wait_for = [&](const std::string& note) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        do {
+            if (tiny::read_text(journal).find(note) != std::string::npos) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while (std::chrono::steady_clock::now() < deadline);
+        fprintf(stderr, "    waiting for %s:\n%s\n%s\n", note.c_str(),
+                tail(s.output()).c_str(), tiny::read_text(journal).c_str());
+        return false;
+    };
+    Call client;
+    REQUIRE(client.send(s.port, "POST", "/completion", completion(prompt_ids(33, 40), 1).dump()));
+    REQUIRE(wait_for("NOTE test.rank_parked"));
+    REQUIRE(wait_for("NOTE test.rank_issuing rank 0 step 0"));
+    REQUIRE(s.interrupt());
+    /* Engine::serve begins this step after it has set the stop: the parked rank now wakes into a
+     * stop, after its peers issued the step. */
+    REQUIRE(wait_for(".step_loop_stop bound"));
+    REQUIRE(tiny::write_text(gate, "resume\n"));
+    /* Bounded: a split leaves a host collective waiting for a peer that never comes, and the
+     * server is then ended after 8 s, which fails the case rather than hanging it. */
+    const int exit = s.wait_exit(8);
+    const std::string log = tiny::read_text(journal);
+    if (exit != 0 || log.find("SPLIT") != std::string::npos ||
+        ::radtest::env_flag("RAD_E2E_SHOW_STOPLOG"))
+        fprintf(stderr, "    TP%d exit %d, journal (%s):\n%s\n", tp, exit, journal.c_str(), log.c_str());
+    CHECK_EQ(exit, 0);
+    CHECK(log.find("SPLIT") == std::string::npos);
+    CHECK(log.find("the drain timed out") != std::string::npos);
+
+    const auto records = stop_records(journal);
+    const int resumed = stop_find(records, "NOTE", "test.rank_resumed");
+    CHECK(resumed >= 0 && stop_find(records, "END", ".step_loop_stop") > resumed);
+    const int joined = stop_find(records, "END", ".rank_join");
+    int exits = 0;
+    for (const StopRec& r : records) {
+        if (r.kind != "NOTE" || r.name != "rank.exit") continue;
+        ++exits;
+        CHECK(ends_with(r.detail, "last issued step 0"));
+    }
+    CHECK_EQ(exits, tp);
+    CHECK(joined >= 0 && stop_find(records, "CLOSE", "journal", joined) > joined);
+}
+
+}  /* namespace */
+
+TEST(qwen35_two_ranks_finish_a_step_released_before_stop) { check_stop_after_release(2); }
+TEST(qwen35_four_ranks_finish_a_step_released_before_stop) { check_stop_after_release(4); }
+#endif
 
 /* ================================================================== runtime LoRA */
 
@@ -2501,6 +2860,104 @@ TEST(a_held_model_stays_until_its_unload) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* Brilliance (fast-loop): a reload that changes only warm keys (fleet::warm_key) retunes the loaded
+ * engine in place -- no second load, the same greedy tokens as before and as a cold start with the
+ * new settings -- and ?warm=only refuses, changing nothing, what would unload the model: a value
+ * past what the load sized, or a cold key. A plain reload of a cold key still reloads it. */
+TEST(a_warm_reload_retunes_the_loaded_engine_and_keeps_its_weights) {
+    REQUIRE(world().ok);
+    const json req = completion({ 1, 2, 3, 4, 5 }, 8);
+    auto yaml = [](int seqs, const std::string& extra) {
+        return "server: {host: 127.0.0.1, port: 0, http-threads: 4, kernels: libref,\n"
+               "         debug-accept-reference-kernels: true}\n"
+               "scheduler: {warm-up: false}\n"
+               "defaults: {gpu-memory-mib: 200}\n"
+               "models:\n  q:\n    model: " + world().qwen35 + "\n    max-num-seqs: " +
+               std::to_string(seqs) + "\n" + extra;
+    };
+    auto fleet_model = [](int port) -> json {
+        Call c;
+        std::string out;
+        if (!c.send(port, "GET", "/admin/fleet", "") || c.read(&out) != 200) return json();
+        const json f = json::parse(out, nullptr, false);
+        if (f.is_object() && f.contains("models"))
+            for (const json& m : f["models"])
+                if (m.value("id", "") == "q") return m;
+        return json();
+    };
+    auto rewrite = [](const std::string& path, const std::string& text) { std::ofstream(path) << text; };
+    auto message = [](const json& r) {
+        return r.is_object() && r.contains("error") ? r["error"].value("message", "") : std::string();
+    };
+
+    /* The cold reference: a server started with two sequences. */
+    json cold2;
+    {
+        Server s;
+        REQUIRE(s.start_yaml(yaml(2, "")));
+        int st = 0;
+        cold2 = post(s.port, "/completion", req, &st).value("tokens", json::array());
+        CHECK_EQ(st, 200);
+        CHECK_EQ(s.stop(), 0);
+    }
+    CHECK(!cold2.empty());
+
+    Server s;
+    REQUIRE(s.start_yaml(yaml(4, "")));
+    int st = 0;
+    const json before = post(s.port, "/completion", req, &st).value("tokens", json::array());
+    CHECK_EQ(st, 200);
+    CHECK(before == cold2);
+    CHECK_EQ(fleet_model(s.port).value("loads", -1), 1);
+
+    /* Warm: four slots, admission capped at two. */
+    rewrite(s.yaml_path, yaml(2, ""));
+    json r = post(s.port, "/admin/reload?warm=only", json::object(), &st);
+    CHECK_EQ(st, 200);
+    if (st != 200) fprintf(stderr, "    warm reload: %s\n", r.dump().c_str());
+    CHECK_EQ(r["models"]["q"].value("action", ""), std::string("retuned"));
+    CHECK(s.output().find("retune: max-num-seqs (admission) 4 -> 2") != std::string::npos);
+    CHECK(s.output().find("model q: retuned warm (--max-num-seqs 4 -> 2)") != std::string::npos);
+    CHECK(post(s.port, "/completion", req, &st).value("tokens", json::array()) == cold2);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(fleet_model(s.port).value("loads", -1), 1);
+
+    /* Back up to four, within the slots: warm again. */
+    rewrite(s.yaml_path, yaml(4, ""));
+    post(s.port, "/admin/reload?warm=only", json::object(), &st);
+    CHECK_EQ(st, 200);
+
+    /* Past the slots the load sized: refused, nothing changed. */
+    rewrite(s.yaml_path, yaml(8, ""));
+    r = post(s.port, "/admin/reload?warm=only", json::object(), &st);
+    CHECK_EQ(st, 409);
+    CHECK(message(r).find("above the 4 sequence slots") != std::string::npos);
+    if (message(r).find("above the 4 sequence slots") == std::string::npos)
+        fprintf(stderr, "    the refusal: %s\n", r.dump().c_str());
+
+    /* A cold key: refused under warm=only, naming it; a plain reload reloads the model. */
+    rewrite(s.yaml_path, yaml(4, "    max-model-len: 2048\n"));
+    r = post(s.port, "/admin/reload?warm=only", json::object(), &st);
+    CHECK_EQ(st, 409);
+    CHECK(message(r).find("--max-model-len") != std::string::npos);
+    CHECK_EQ(fleet_model(s.port).value("loads", -1), 1);
+    r = post(s.port, "/admin/reload", json::object(), &st);
+    CHECK_EQ(st, 200);
+    CHECK_EQ(r["models"]["q"].value("action", ""), std::string("reloaded"));
+    CHECK(post(s.port, "/completion", req, &st).value("tokens", json::array()) == cold2);
+    CHECK_EQ(st, 200);
+    /* The load's bookkeeping lands just after its front opens to the request: read it settled. */
+    json fm = fleet_model(s.port);
+    for (int i = 0; i < 100 && fm.value("loads", -1) != 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        fm = fleet_model(s.port);
+    }
+    CHECK_EQ(fm.value("loads", -1), 2);
+    if (fm.value("loads", -1) != 2)
+        fprintf(stderr, "    /admin/fleet q: %s\n    server log:\n%s\n", fm.dump().c_str(), s.output().c_str());
+    CHECK_EQ(s.stop(), 0);
+}
+
 /* --checkpoint-slots auto, the default, sizes the snapshot store from --max-num-seqs and what the
  * retention policy keeps for a --max-model-len session (the tiny hybrid's 4096 tokens are two
  * 2048-token intervals: 2 snapshots, 3 a sequence), says so on its startup line and reports the
@@ -3126,13 +3583,19 @@ std::vector<const char*> nemotron_kernels() {
     return nemotron_device() ? std::vector<const char*>{"libr4d,libavx"}
                              : std::vector<const char*>{"libref", "libavx"};
 }
-std::string nemotron_device_env() {
+/* Brilliance: on Windows the card is HIP_VISIBLE_DEVICES's, and the default host guard
+ * (engine_env's BRILLIANCE_DEVICE=host) is lifted for this opt-in run only. */
+std::vector<std::string> nemotron_device_env() {
     const char* index = std::getenv("RAD_NEMOTRON_DEVICE_INDEX");
-    return std::string("ROCR_VISIBLE_DEVICES=") + (index && *index ? index : "0");
+    const std::string i = index && *index ? index : "0";
+#if defined(_WIN32)
+    return { "ROCR_VISIBLE_DEVICES=" + i, "BRILLIANCE_DEVICE", "HIP_VISIBLE_DEVICES=" + i };
+#else
+    return { "ROCR_VISIBLE_DEVICES=" + i };
+#endif
 }
 std::vector<std::string> nemotron_env() {
-    return nemotron_device() ? std::vector<std::string>{nemotron_device_env()}
-                             : std::vector<std::string>{};
+    return nemotron_device() ? nemotron_device_env() : std::vector<std::string>{};
 }
 
 const std::vector<std::string> nemotron_args = {
@@ -3400,14 +3863,19 @@ TEST(nemotron35_real_weights_match_the_offline_transformers_reference) {
     const auto validation = reference.value("validation", json::object());
     REQUIRE(rad::mm::decoder_available());
     Server s;
+    std::vector<std::string> env = {"RADIANCE_HOST_VRAM_MIB=24576", "OMP_NUM_THREADS=8"};
+    if (nemotron_device()) {
+        for (const std::string& e : nemotron_device_env()) env.push_back(e);
+    } else {
+        env.push_back("ROCR_VISIBLE_DEVICES=99");
+    }
     REQUIRE(
         s.start(reference["checkpoint"],
                 {"--kernels", nemotron_device() ? "libr4d,libavx" : "libavx", "--max-num-seqs", "4",
                  "--max-model-len", std::to_string(validation.value("context", 128)),
                  "--max-num-batched-tokens", std::to_string(validation.value("batch_tokens", 256)),
                  "--mm-max-patches", std::to_string(validation.value("patches", 64))},
-                {"RADIANCE_HOST_VRAM_MIB=24576", "OMP_NUM_THREADS=8",
-                 nemotron_device() ? nemotron_device_env() : "ROCR_VISIBLE_DEVICES=99"}));
+                env));
     json actual = json::array();
     for (const auto& c : reference["cases"]) {
         int status = 0;

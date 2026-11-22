@@ -285,6 +285,9 @@ public:
     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
      * the constraints on a second lane. */
     RadStream       cur_stream() const { return lane_ ? lane1_ : stream_; }
+    /* Brilliance: the second lane's stream, null until a lane is asked for (the stop journal's
+     * stream probe, Engine::~Engine). */
+    RadStream       lane1_stream() const { return lane1_; }
     int             lane()       const { return lane_; }
     int             set_lane(int lane);
     /* Builds the second stream and its events on first use; free when no lane is asked for. */

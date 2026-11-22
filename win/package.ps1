@@ -25,6 +25,8 @@
                       stop it with Ctrl-Break, never a kill; STACKS.md: reading a hung server
     serve.ps1         start a profile, choosing cards by PCI bus (win\serve.ps1)
     PREVIEW.md        quick start and known limits (win\PREVIEW.md)
+    REFERENCE.md      every setting: profile keys, the scripts' parameters, the tools' flags and the
+                      environment variables, with defaults (REFERENCE.md at the repository root)
     SERVICE.md        running radiance as a Windows service (win\SERVICE.md; serve.ps1 -Install)
     SUPPORT.md        models and card counts, upstream features on Windows, known issues, and what
                       changes from Brilliance 0.2.2 (win\SUPPORT.md)
@@ -192,6 +194,7 @@ foreach ($need in 'bin\brl-stacks.exe', 'libexec\brilliance\resolve-stacks.py', 
   if (-not (Test-Path (Join-Path $stage $need))) { throw "the install did not produce $need" }
 }
 Copy-Item (Join-Path $PSScriptRoot 'PREVIEW.md') $stage
+Copy-Item (Join-Path $PSScriptRoot '..\REFERENCE.md') $stage
 Copy-Item (Join-Path $PSScriptRoot 'SERVICE.md') $stage
 Copy-Item (Join-Path $PSScriptRoot 'SUPPORT.md') $stage
 Copy-Item (Join-Path $PSScriptRoot 'TERMS-OF-USE.md') $stage

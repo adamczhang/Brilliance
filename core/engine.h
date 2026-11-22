@@ -198,6 +198,10 @@ public:
      * serving cards' power-management files (hardware_facts). */
     std::string diagnostics_json() const;
     bool startup_report_printed() const { return report_printed_; }
+    /* Brilliance: --plan-only stopped start() after an admitted plan (RAD_E_CANCELLED by design,
+     * not a failure): the report says so at info level and the fleet exits 0. A refused plan, or
+     * any other stop, leaves it false. */
+    bool plan_only_admitted() const { return plan_admitted_; }
     /* Brilliance (stage 9; widened 11-19): set when the step loop stopped on a device error, which
      * the process does not survive: a collective's fault record (coll_fault_check), as logged, or
      * any other RAD_E_DEVICE that reached fail_loop, with the device layer's last error on that
@@ -207,6 +211,21 @@ public:
     /* The cards an engine may run on, as start() filters them (one architecture, discrete before
      * integrated); the fleet places models on them. */
     static int usable_cards(std::vector<int>* out);
+
+    /* Brilliance (fast-loop): a warm reload. The keys fleet::warm_key names -- the drafting rule's
+     * host settings, --draft-suffix and its tuning, --max-num-seqs as an admission cap -- take
+     * `next`'s values on this loaded engine, its weights, pools and program untouched.
+     *
+     * retune_check says, without changing anything, why `next` cannot be taken warm ("" when it
+     * can): a value past what the load sized (more sequences than its slots, a suffix window wider
+     * than its verify window, an adaptive depth whose readback was never allocated), or a setting
+     * the change would move with it that is fixed at load (coupling, the verify mode). retune runs
+     * that check, then has the step loop apply the change at an idle point -- no request queued or
+     * running, so no sequence sees two rules -- and waits up to `wait_ms` for it. "" when applied,
+     * with what changed in `*what`; otherwise why not, and nothing changed. A cold start with
+     * `next` serves the same rule: the drafting rule's online calibration starts over, as at load. */
+    std::string retune_check(const Config& next) const;
+    std::string retune(const Config& next, std::string* what, int64_t wait_ms);
 
     /* --proceed-with-incompatible-configuration's banner (diag::unsupported_banner) on W lines;
      * main prints it before anything else, so it heads the log. */
@@ -579,6 +598,10 @@ private:
     RadBuildCtx build_ctx(int rank, int64_t max_tok) const;
     void probe_arena_levels();
     int  step_loop();
+    /* Brilliance: the stop journal's records (util/stoplog.h): the model at the stop, and each
+     * rank's streams before the teardown waits on them. */
+    void stop_snapshot() const;
+    void stream_probe(const std::string& sl_name);
     /* Issue the copy of the step's sampled ids to the host, then wait for and interpret them.
      * Split so the copy is issued before draft passes overwrite the ids. With `fence` the copy
      * records tok_end_, so the wait for the ids skips the passes (StepOut::early). */
@@ -772,6 +795,24 @@ private:
      * the tables. */
     std::FILE*    depth_log_ = nullptr;
     void          depth_log_step(const RadBatch* b, const StepOut& so);
+    /* Brilliance (fast-loop): depth_cfg_ and the rule's host state from `c`'s --draft-depth keys,
+     * at load (step_state_init, `alloc`: the readback and its events too) and in a warm retune
+     * (the readback must exist already). `n_slot` is the card slots the per-row state covers. */
+    int           depth_rule_setup(const Config& c, int64_t n_slot, bool alloc);
+    int64_t       depth_slots_ = 0;                      /* step_state_init's n_slot */
+    int64_t       admit_seqs_ = 0;                       /* a retune's admission cap; 0 = cfg_.max_seqs */
+    /* A warm retune (retune()) waiting for the step loop's next idle point, where retune_service
+     * applies it. Guarded by retune_mu_; `state` 0 posted, 1 taken by the step loop, 2 done. */
+    struct RetuneJob {
+        Config      next;
+        int         state = 0;
+        std::string what, err;
+    };
+    std::mutex                 retune_mu_;
+    std::condition_variable    retune_cv_;
+    std::shared_ptr<RetuneJob> retune_job_;
+    std::atomic<bool>          retune_posted_{false};
+    void          retune_service();
     /* Drafting row i's depth after issue_serial_drafter: its own under the adaptive rule, else the
      * rounds every row ran. */
     int  depth_row_nodes(int i) const;
@@ -966,6 +1007,7 @@ private:
     std::atomic<bool>              cvec_default_{false};
     std::vector<std::string> env_set_;   /* the RADIANCE_* names set when the engine was made */
     bool        report_printed_ = false;
+    bool        plan_admitted_ = false;   /* plan_only_admitted() */
     /* Runtime device identity (PCI address, name, integrated flag, runtime version), read once in
      * start() beside usable_devices. Later reports make no runtime call: after a failed start
      * there may have been a device fault, and on an HTTP thread (/diagnostics) a runtime call can

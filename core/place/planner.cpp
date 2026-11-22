@@ -1358,6 +1358,23 @@ std::string Plan::tier_line() const {
                humanb(file_stage_vram).c_str());
 }
 
+std::string Plan::weights_by_tier() const {
+    int64_t ram = 0;
+    for (const MoveUnit& mu : units) {
+        if (mu.tier != Tier::SSD || !mu.ram_held) continue;
+        for (rad_weight w : mu.weights)
+            if ((size_t)w < weight.size()) ram += weight[w].bytes;
+    }
+    const int64_t ssd = totals.bytes[(int)Tier::SSD];
+    const int64_t host = totals.bytes[(int)Tier::HostPinned] + totals.bytes[(int)Tier::HostPageable];
+    const std::string store = ram_budget > 0 || ram > 0
+                                  ? fmt("RAM store %s, ", humanb(ram).c_str()) : std::string();
+    return fmt("VRAM %s, host pool %s, %scontainer on disk %s, mapped %s",
+               humanb(totals.bytes[(int)Tier::VRAM]).c_str(), humanb(host).c_str(), store.c_str(),
+               humanb(std::max<int64_t>(ssd - ram, 0)).c_str(),
+               humanb(totals.bytes[(int)Tier::Mapped]).c_str());
+}
+
 /* ------------------------------------------------------------------ the report (spec §16) */
 std::string Plan::report(const Program& prog) const {
     /* One line per weight class (weight_class_key), not per weight. */

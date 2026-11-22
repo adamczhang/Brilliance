@@ -1,0 +1,796 @@
+{
+  "schema": "brilliance-perf-criteria/1",
+  "previous_release": {
+    "tag": "v0.3.0-alpha.5",
+    "public_commit": "88bd8fc01021b7d2949101301fc69f3c65fa9d92",
+    "zip_sha256": "aaa641e51781d032d071e4a73a92daa3e05eb412e0cfc47d39278c26d1d0d0fe"
+  },
+  "run_conditions": {
+    "run_class": "M",
+    "solo": true,
+    "os": "Windows 11",
+    "gpu": "AMD Radeon AI PRO R9700",
+    "tuning": {
+      "board_power_offset_pct": -20,
+      "board_power_limit_w": 240,
+      "voltage_offset_mv": -50,
+      "vram_mhz": 2518
+    },
+    "reboot_after_tuning_write_before_prefill_tokens_at_least": 32768,
+    "min_available_host_ram_gib": 24,
+    "host": "127.0.0.1",
+    "port": 8020,
+    "card_sets": {
+      "tp2": [
+        3,
+        9
+      ],
+      "tp4": [
+        3,
+        6,
+        9,
+        32
+      ]
+    }
+  },
+  "models": {
+    "flash_next": {
+      "repository": "StillDeadcode/qwen3.8-next-flash-iqr-v4",
+      "revision": "679c9432",
+      "file": "qwen3.8-next-flash-iqr-v4.rad",
+      "sha256": "25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0"
+    },
+    "deepseek_v41": {
+      "repository": "bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad",
+      "file": "deepseek-v4.1-flash-1017-uncensored.rad",
+      "size_bytes": 269650269832
+    }
+  },
+  "profiles": {
+    "flashnext-2card": {
+      "config": "profiles/flashnext-2card.yaml",
+      "model": "flash_next",
+      "card_set": "tp2",
+      "wire": "exact",
+      "sdma": false
+    },
+    "flashnext-2card-fast": {
+      "config": "profiles/flashnext-2card-fast.yaml",
+      "model": "flash_next",
+      "card_set": "tp2",
+      "wire": "wht6",
+      "sdma": true
+    },
+    "flashnext-4card": {
+      "config": "profiles/flashnext-4card.yaml",
+      "model": "flash_next",
+      "card_set": "tp4",
+      "wire": "exact",
+      "sdma": false
+    },
+    "deepseek41-4card": {
+      "config": "profiles/deepseek41-4card.yaml",
+      "model": "deepseek_v41",
+      "card_set": "tp4",
+      "wire": "exact",
+      "sdma": false
+    },
+    "deepseek41-2card": {
+      "config": "profiles/deepseek41-2card.yaml",
+      "model": "deepseek_v41",
+      "card_set": "tp2",
+      "wire": "exact",
+      "sdma": false
+    }
+  },
+  "protocols": {
+    "fixed_text": {
+      "tool": "win/tools/prefill_bench.py",
+      "prompt_tokens": [
+        32768,
+        65536,
+        131072
+      ],
+      "seed": 20261120,
+      "warmup_passes": 1,
+      "repeats_per_size": 5,
+      "concurrency": 1,
+      "max_output_tokens": 1,
+      "stats": true,
+      "off_on_off_order": [
+        "A1",
+        "B",
+        "A2"
+      ]
+    },
+    "ttft_c8": {
+      "tool": "win/tools/ttft_probe.py",
+      "concurrency": 8,
+      "seconds": 300,
+      "warmup_seconds": 15,
+      "max_output_tokens": 96,
+      "prompt_set": "built-in short chat corpus",
+      "repeats_per_mode": 1
+    },
+    "betterbench_standard": {
+      "tool": "BetterBench",
+      "version": "0.6.1",
+      "corpus_version": "1.0",
+      "config": {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 20,
+        "seed": null,
+        "greedy": false,
+        "warmup": 3,
+        "runs_per_category": 20,
+        "unique_nonce": true,
+        "run_single_stream": true,
+        "concurrency_levels": [
+          1,
+          8
+        ],
+        "concurrency_requests": 48,
+        "run_concurrency": true,
+        "run_prefill": true,
+        "prefill_depths": [
+          2000,
+          8000,
+          16000,
+          32000,
+          64000,
+          128000
+        ],
+        "prefill_runs": 5,
+        "prefill_warmup": 1,
+        "prefill_max_tokens": 16,
+        "prefill_ctx_margin": 256,
+        "max_model_len": null,
+        "weights": {
+          "code": 0.3,
+          "reasoning": 0.2,
+          "prose": 0.15,
+          "json": 0.15,
+          "file_edit": 0.1,
+          "summarization": 0.1
+        },
+        "conf": 0.95,
+        "target_mde_pct": 1,
+        "ab_max_pairs": 200,
+        "ab_min_pairs": 12,
+        "timeout_s": 1800
+      },
+      "greedy_probe_prompts": 8,
+      "greedy_probe_order": [
+        "discarded_warmup",
+        "pre",
+        "post"
+      ],
+      "separate_prefill_warmup_passes": 0,
+      "repeats_per_mode": 1,
+      "confirmation_starts_per_mode": 2,
+      "matched_starts_per_version": 2
+    },
+    "deepseek_probe": {
+      "tool": "ds_probe.py",
+      "concurrency": 1,
+      "discarded_warmup_requests": 0,
+      "repeats_per_mode": 1,
+      "decode_prompt_tokens": [
+        22,
+        26,
+        21,
+        23
+      ],
+      "decode_repeats": 4,
+      "decode_output_tokens": 400,
+      "prefill_target_tokens": 3500,
+      "prefill_recorded_prompt_tokens": [
+        3519,
+        3506
+      ],
+      "prefill_repeats": 2,
+      "prefill_filler_seeds": [
+        7,
+        11
+      ],
+      "prefill_max_output_tokens": 8,
+      "temperature": 0,
+      "top_p": 1,
+      "thinking": false,
+      "ram_sample_seconds": 1,
+      "ram_early_stop_below_gib": 26,
+      "confirmation_starts_per_mode": 2
+    },
+    "protection_cost": {
+      "tool": "BetterBench",
+      "version": "0.6.1",
+      "corpus_version": "1.0",
+      "greedy": true,
+      "seed": 1234,
+      "unique_nonce": true,
+      "separate_start_warmup_requests": 0,
+      "prefill_warmup_per_size": 2,
+      "prefill_repeats_per_size": [
+        8,
+        6
+      ],
+      "tp2_concurrency_requests": {
+        "1": 20,
+        "4": 32
+      },
+      "tp4_concurrency_requests": {
+        "1": 24,
+        "4": 32,
+        "8": 48
+      },
+      "tp2_starts_per_arm": [
+        2,
+        2
+      ],
+      "tp4_starts_per_arm": [
+        4,
+        2,
+        2
+      ],
+      "tp2_config": "fn-tp2-upstream.yaml",
+      "tp4_config": "fn-tp4-nospec.yaml",
+      "tp2_prefill_target_depths": [
+        519
+      ],
+      "tp4_prefill_target_depths": [
+        519,
+        2048
+      ]
+    },
+    "wire_study": {
+      "tool": "win/tools/prefill_bench.py",
+      "prompt_tokens": [
+        8192,
+        32768,
+        65536,
+        131072
+      ],
+      "seed": 20261120,
+      "warmup_passes": 1,
+      "repeats_per_size": 4,
+      "concurrency": 1,
+      "max_output_tokens": 1,
+      "stats": true
+    },
+    "sdma_study": {
+      "tool": "BetterBench",
+      "version": "0.6.1",
+      "corpus_version": "1.0",
+      "config_variant": "prefill_and_concurrency_screen",
+      "starts_per_mode": 2,
+      "prefill_depths": [8000, 32000, 64000, 128000],
+      "prefill_warmup": 1,
+      "prefill_runs": 3,
+      "concurrency_levels": [1, 8],
+      "concurrency_requests": 48,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20,
+      "unique_nonce": true
+    },
+    "drafting_study": {
+      "tool": "BetterBench",
+      "version": "0.6.1",
+      "corpus_version": "1.0",
+      "config_variant": "prefill_and_concurrency_screen",
+      "concurrency_levels": [1, 8],
+      "concurrency_requests": 48,
+      "prefill_depths": [8000, 32000, 64000, 128000],
+      "prefill_warmup": 1,
+      "prefill_runs": 3,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20,
+      "unique_nonce": true,
+      "discarded_warmup_prefills_per_depth": 2,
+      "greedy_probe_prompts": 8,
+      "control_starts": 2,
+      "changed_starts": 1
+    },
+    "ngram_warm_study": {
+      "tool": "fresh.py",
+      "config_variant": "cold_cache_ngram_warm_on_off",
+      "discarded_warmup_requests": 0,
+      "starts_per_setting": 1,
+      "prompt_tokens": [22751, 6004, 21830, 45283],
+      "prefill_repeats": 1,
+      "decode_concurrency_levels": [1, 8],
+      "decode_requests": [16, 48],
+      "decode_max_tokens": 384,
+      "temperature": 0.7,
+      "top_p": 0.95,
+      "top_k": 20
+    },
+    "ngram_warm_startup": {
+      "tool": "engine startup log",
+      "config_variant": "ngram_warm_startup_smoke",
+      "prompt_tokens": [],
+      "discarded_warmup_requests": 0,
+      "starts_per_setting": 1
+    }
+  },
+  "cases": [
+    {
+      "id": "flashnext_tp2_default_prefill",
+      "profile": "flashnext-2card",
+      "protocol": "fixed_text",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "off",
+      "evidence": "rc4_exact",
+      "metrics": [
+        { "id": "prefill_32768", "unit": "tok/s", "direction": "higher", "target": 5944.33, "noise_floor_pct": 3.58 },
+        { "id": "prefill_65536", "unit": "tok/s", "direction": "higher", "target": 5878.23, "noise_floor_pct": 3 },
+        { "id": "prefill_131072", "unit": "tok/s", "direction": "higher", "target": 5857.42, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_default_decode",
+      "profile": "flashnext-2card",
+      "protocol": "ttft_c8",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "off",
+      "evidence": "rc4_c8",
+      "metrics": [
+        { "id": "output_c8", "unit": "tok/s", "direction": "higher", "target": 559.36, "noise_floor_pct": 3 },
+        { "id": "client_ttft_p50_c8", "unit": "ms", "direction": "lower", "target": 97.18, "noise_floor_pct": 4.97 },
+        { "id": "client_ttft_p99_c8", "unit": "ms", "direction": "lower", "target": 135.29, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_prefill",
+      "profile": "flashnext-2card-fast",
+      "protocol": "fixed_text",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "off",
+      "evidence": "rc4_fast",
+      "metrics": [
+        { "id": "prefill_32768", "unit": "tok/s", "direction": "higher", "target": 6758.13, "noise_floor_pct": 5.37 },
+        { "id": "prefill_65536", "unit": "tok/s", "direction": "higher", "target": 6677.71, "noise_floor_pct": 6.32 },
+        { "id": "prefill_131072", "unit": "tok/s", "direction": "higher", "target": 6632.15, "noise_floor_pct": 3.51 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_standard",
+      "profile": "flashnext-2card-fast",
+      "protocol": "betterbench_standard",
+      "comparison": "previous_release",
+      "mode": "screen",
+      "pipeline": "off",
+      "evidence": "rc4_bb_off",
+      "metrics": [
+        { "id": "weighted_decode", "unit": "tok/s", "direction": "higher", "target": 170.7, "noise_floor_pct": 3.7 },
+        { "id": "aggregate_c8", "unit": "tok/s", "direction": "higher", "target": 518.4, "noise_floor_pct": 5.32 },
+        { "id": "weighted_ttft_p50", "unit": "ms", "direction": "lower", "target": 76, "noise_floor_pct": 3 },
+        { "id": "weighted_update_p99", "unit": "ms", "direction": "lower", "target": 22, "noise_floor_pct": 3 },
+        { "id": "prefill_32000", "unit": "tok/s", "direction": "higher", "target": 6798.2, "noise_floor_pct": 11.33 },
+        { "id": "prefill_64000", "unit": "tok/s", "direction": "higher", "target": 6757.72, "noise_floor_pct": 4.84 },
+        { "id": "prefill_128000", "unit": "tok/s", "direction": "higher", "target": 6659.66, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_exact_pipeline_prefill",
+      "profile": "flashnext-2card",
+      "protocol": "fixed_text",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "on",
+      "evidence": "rc4_exact",
+      "metrics": [
+        { "id": "prefill_32768", "unit": "tok/s", "direction": "higher", "target": 6629.98, "noise_floor_pct": 3.58 },
+        { "id": "prefill_65536", "unit": "tok/s", "direction": "higher", "target": 6549.89, "noise_floor_pct": 3 },
+        { "id": "prefill_131072", "unit": "tok/s", "direction": "higher", "target": 6528.81, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_exact_pipeline_gain",
+      "profile": "flashnext-2card",
+      "protocol": "fixed_text",
+      "comparison": "pipeline_bracket",
+      "mode": "claim",
+      "pipeline": "off_on_off",
+      "evidence": "rc4_exact",
+      "metrics": [
+        { "id": "gain_32768", "unit": "percent", "direction": "higher", "target": 10, "noise_floor_pct": 3.58, "recorded_value": 11.63 },
+        { "id": "gain_65536", "unit": "percent", "direction": "higher", "target": 10, "noise_floor_pct": 3, "recorded_value": 11.49 },
+        { "id": "gain_131072", "unit": "percent", "direction": "higher", "target": 10, "noise_floor_pct": 3, "recorded_value": 11.52 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_exact_pipeline_decode",
+      "profile": "flashnext-2card",
+      "protocol": "ttft_c8",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "on",
+      "evidence": "rc4_c8",
+      "metrics": [
+        { "id": "output_c8", "unit": "tok/s", "direction": "higher", "target": 554.88, "noise_floor_pct": 3 },
+        { "id": "client_ttft_p50_c8", "unit": "ms", "direction": "lower", "target": 96.04, "noise_floor_pct": 4.97 },
+        { "id": "client_ttft_p99_c8", "unit": "ms", "direction": "lower", "target": 132.93, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_exact_pipeline_decode_screen",
+      "profile": "flashnext-2card",
+      "protocol": "ttft_c8",
+      "comparison": "pipeline_off",
+      "mode": "measured",
+      "pipeline": "off_on",
+      "evidence": "rc4_c8",
+      "metrics": [
+        { "id": "output_c8", "unit": "tok/s", "direction": "higher", "target": 559.36, "noise_floor_pct": 3 },
+        { "id": "client_ttft_p50_c8", "unit": "ms", "direction": "lower", "target": 97.18, "noise_floor_pct": 4.97 },
+        { "id": "client_ttft_p99_c8", "unit": "ms", "direction": "lower", "target": 135.29, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_pipeline_prefill",
+      "profile": "flashnext-2card-fast",
+      "protocol": "fixed_text",
+      "comparison": "previous_release",
+      "mode": "measured",
+      "pipeline": "on",
+      "evidence": "rc4_fast",
+      "metrics": [
+        { "id": "prefill_32768", "unit": "tok/s", "direction": "higher", "target": 7149.76, "noise_floor_pct": 5.37 },
+        { "id": "prefill_65536", "unit": "tok/s", "direction": "higher", "target": 7064.61, "noise_floor_pct": 6.32 },
+        { "id": "prefill_131072", "unit": "tok/s", "direction": "higher", "target": 7004.77, "noise_floor_pct": 3.51 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_pipeline_gain",
+      "profile": "flashnext-2card-fast",
+      "protocol": "fixed_text",
+      "comparison": "pipeline_bracket",
+      "mode": "claim",
+      "pipeline": "off_on_off",
+      "evidence": "rc4_fast",
+      "metrics": [
+        { "id": "gain_32768", "unit": "percent", "direction": "higher", "target": 5, "noise_floor_pct": 5.37, "recorded_value": 5.69 },
+        { "id": "gain_65536", "unit": "percent", "direction": "higher", "target": 5, "noise_floor_pct": 6.32, "recorded_value": 5.66, "claim_required": false },
+        { "id": "gain_131072", "unit": "percent", "direction": "higher", "target": 5, "noise_floor_pct": 3.51, "recorded_value": 5.5 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_pipeline_standard",
+      "profile": "flashnext-2card-fast",
+      "protocol": "betterbench_standard",
+      "comparison": "previous_release",
+      "mode": "screen",
+      "pipeline": "on",
+      "evidence": "rc4_bb_on",
+      "metrics": [
+        { "id": "weighted_decode", "unit": "tok/s", "direction": "higher", "target": 172.6, "noise_floor_pct": 3.7 },
+        { "id": "aggregate_c8", "unit": "tok/s", "direction": "higher", "target": 514.8, "noise_floor_pct": 5.32 },
+        { "id": "weighted_ttft_p50", "unit": "ms", "direction": "lower", "target": 77, "noise_floor_pct": 3 },
+        { "id": "weighted_update_p99", "unit": "ms", "direction": "lower", "target": 22.5, "noise_floor_pct": 3 },
+        { "id": "prefill_32000", "unit": "tok/s", "direction": "higher", "target": 7050.44, "noise_floor_pct": 11.33 },
+        { "id": "prefill_64000", "unit": "tok/s", "direction": "higher", "target": 7074.25, "noise_floor_pct": 4.84 },
+        { "id": "prefill_128000", "unit": "tok/s", "direction": "higher", "target": 7010.59, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_fast_pipeline_standard_delta",
+      "profile": "flashnext-2card-fast",
+      "protocol": "betterbench_standard",
+      "comparison": "pipeline_off",
+      "mode": "observation",
+      "pipeline": "off_on",
+      "evidence": "rc4_bb_on",
+      "metrics": [
+        { "id": "weighted_decode", "unit": "tok/s", "direction": "higher", "target": 170.7, "noise_floor_pct": 3.7, "recorded_change_pct": 1.1 },
+        { "id": "aggregate_c8", "unit": "tok/s", "direction": "higher", "target": 518.4, "noise_floor_pct": 5.32, "recorded_change_pct": -0.7 },
+        { "id": "weighted_ttft_p50", "unit": "ms", "direction": "lower", "target": 76, "noise_floor_pct": 3 },
+        { "id": "weighted_update_p99", "unit": "ms", "direction": "lower", "target": 22, "noise_floor_pct": 3 },
+        { "id": "gain_32000", "unit": "percent", "direction": "higher", "target": 3.7, "noise_floor_pct": 11.33 },
+        { "id": "gain_64000", "unit": "percent", "direction": "higher", "target": 4.7, "noise_floor_pct": 4.84 },
+        { "id": "gain_128000", "unit": "percent", "direction": "higher", "target": 5.3, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp4_standard",
+      "profile": "flashnext-4card",
+      "protocol": "betterbench_standard",
+      "comparison": "matched_previous_release",
+      "mode": "matched",
+      "pipeline": "off",
+      "evidence": "alpha1_tp4",
+      "metrics": [
+        { "id": "weighted_decode", "unit": "tok/s", "direction": "higher", "target": null, "noise_floor_pct": null },
+        { "id": "aggregate_c8", "unit": "tok/s", "direction": "higher", "target": null, "noise_floor_pct": null },
+        { "id": "weighted_ttft_p50", "unit": "ms", "direction": "lower", "target": null, "noise_floor_pct": null },
+        { "id": "weighted_update_p99", "unit": "ms", "direction": "lower", "target": null, "noise_floor_pct": null },
+        { "id": "prefill_32000", "unit": "tok/s", "direction": "higher", "target": null, "noise_floor_pct": null },
+        { "id": "prefill_64000", "unit": "tok/s", "direction": "higher", "target": null, "noise_floor_pct": null },
+        { "id": "prefill_128000", "unit": "tok/s", "direction": "higher", "target": null, "noise_floor_pct": null }
+      ]
+    },
+    {
+      "id": "flashnext_tp4_weighted_prefill",
+      "profile": "flashnext-4card",
+      "protocol": "fixed_text",
+      "comparison": "tp4_even_baseline",
+      "mode": "measured",
+      "pipeline": "off",
+      "evidence": "tp4_measure_even",
+      "about": "The weighted four-card all-reduce (BRILLIANCE_AR4_SHARD_WEIGHTS=auto, the default), fixed-text prefill against two even-split starts A1/A2 of a build before the setting existed (same protocol, same buses, 2026-11-22). Targets are the A1/A2 midpoints: a candidate below them by more than the floor fails as a regression. The gain is reported with its own verdict, not required. The candidate's startup line 'four-rank two-shot shards weighted ...' with the table and measured rates goes into the evidence. A1/A2 ran before TP4 drafting; two drafting starts D1/D2 in the same window prefilled within 0.25% of them (6,073.5 / 6,016.5 / 5,993), so drafting does not move the comparison.",
+      "baseline": { "build": "a development build before BRILLIANCE_AR4_SHARD_WEIGHTS, 2026-11-22",
+                    "shard_weights": "even (before the setting existed)",
+                    "a1_tok_s": [6092, 6032, 6010], "a2_tok_s": [6085, 6029, 5999],
+                    "within_arm_spread_pct_max": 0.6, "drift_pct": [0.12, 0.05, 0.18] },
+      "expected_gain_pct": [5, 10],
+      "claim_required": false,
+      "if_level_or_lower": "Check the startup weights line first; then, if the window allows, one bracket with -Env BRILLIANCE_AR4_SHARD_WEIGHTS=off on the candidate to separate the weights from the rest of the release.",
+      "metrics": [
+        { "id": "prefill_32768", "unit": "tok/s", "direction": "higher", "target": 6088.5, "noise_floor_pct": 3 },
+        { "id": "prefill_65536", "unit": "tok/s", "direction": "higher", "target": 6030.5, "noise_floor_pct": 3 },
+        { "id": "prefill_131072", "unit": "tok/s", "direction": "higher", "target": 6004.5, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "deepseek_tp4",
+      "profile": "deepseek41-4card",
+      "protocol": "deepseek_probe",
+      "comparison": "previous_release",
+      "mode": "screen",
+      "pipeline": "off",
+      "evidence": "rc4_ds4",
+      "metrics": [
+        { "id": "decode_c1", "unit": "tok/s", "direction": "higher", "target": 54.29, "noise_floor_pct": 13.41 },
+        {
+          "id": "prefill_3500",
+          "unit": "tok/s",
+          "direction": "higher",
+          "target": 1934.59,
+          "noise_floor_pct": 33.95,
+          "recorded_range": [
+            1770.43,
+            2098.76
+          ]
+        },
+        { "id": "engine_load", "unit": "s", "direction": "lower", "target": 28.2, "noise_floor_pct": null },
+        { "id": "routed_expert_ssd_reads", "unit": "count", "direction": "lower", "target": 0, "noise_floor_pct": null },
+        { "id": "routed_expert_ssd_bytes", "unit": "bytes", "direction": "lower", "target": 0, "noise_floor_pct": null },
+        { "id": "available_host_ram_min", "unit": "GiB", "direction": "higher", "target": 89.97, "noise_floor_pct": null }
+      ]
+    },
+    {
+      "id": "deepseek_tp2",
+      "profile": "deepseek41-2card",
+      "protocol": "deepseek_probe",
+      "comparison": "previous_release",
+      "mode": "screen",
+      "pipeline": "off",
+      "evidence": "rc4_ds2",
+      "metrics": [
+        { "id": "decode_c1", "unit": "tok/s", "direction": "higher", "target": 16.88, "noise_floor_pct": 6.05 },
+        {
+          "id": "prefill_3500",
+          "unit": "tok/s",
+          "direction": "higher",
+          "target": 251.15,
+          "noise_floor_pct": 4.5,
+          "recorded_range": [
+            248.33,
+            253.98
+          ]
+        },
+        { "id": "engine_load", "unit": "s", "direction": "lower", "target": 30.7, "noise_floor_pct": null },
+        { "id": "routed_expert_ssd_reads", "unit": "count", "direction": "lower", "target": 0, "noise_floor_pct": null },
+        { "id": "routed_expert_ssd_bytes", "unit": "bytes", "direction": "lower", "target": 0, "noise_floor_pct": null },
+        { "id": "available_host_ram_min", "unit": "GiB", "direction": "higher", "target": 46.49, "noise_floor_pct": null },
+        { "id": "expert_ram_store", "unit": "GiB", "direction": "record", "target": 18.16, "noise_floor_pct": null }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_resend_cost",
+      "profile": "flashnext-2card",
+      "protocol": "protection_cost",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "resend_tp2",
+      "metrics": [
+        { "id": "decode_c1_cost", "unit": "percent", "direction": "lower", "target": 4, "noise_floor_pct": 3 },
+        { "id": "aggregate_c4_cost", "unit": "percent", "direction": "lower", "target": 2.2, "noise_floor_pct": 3.65 },
+        { "id": "prefill_cold_cost", "unit": "percent", "direction": "lower", "target": 1.9, "noise_floor_pct": 8.79 },
+        { "id": "prefill_warm_cost", "unit": "percent", "direction": "lower", "target": 3, "noise_floor_pct": 14.79 }
+      ]
+    },
+    {
+      "id": "flashnext_tp4_resend_cost",
+      "profile": "flashnext-4card",
+      "protocol": "protection_cost",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "resend_tp4",
+      "metrics": [
+        { "id": "decode_c1_cost", "unit": "percent", "direction": "lower", "target": 3.7, "noise_floor_pct": 3 },
+        { "id": "aggregate_c4_cost", "unit": "percent", "direction": "lower", "target": 5.5, "noise_floor_pct": 3.18 },
+        { "id": "aggregate_c8_cost", "unit": "percent", "direction": "lower", "target": 4.1, "noise_floor_pct": 3 },
+        { "id": "prefill_cold_cost", "unit": "percent", "direction": "lower", "target": 7.1, "noise_floor_pct": 19.24 },
+        { "id": "prefill_warm_cost", "unit": "percent", "direction": "lower", "target": 9.3, "noise_floor_pct": 17.3 },
+        { "id": "prefill_2048_cost", "unit": "percent", "direction": "lower", "target": 7.6, "noise_floor_pct": 22.87 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_wire_gain",
+      "profile": "flashnext-2card-fast",
+      "protocol": "wire_study",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "phase3_wire",
+      "metrics": [
+        { "id": "gain_32768", "unit": "percent", "direction": "higher", "target": 9.5, "noise_floor_pct": 7.23, "second_recorded_value": 11.7, "second_noise_floor_pct": 11.33 },
+        { "id": "gain_65536", "unit": "percent", "direction": "higher", "target": 9.9, "noise_floor_pct": 7.35, "second_recorded_value": 9.9, "second_noise_floor_pct": 4.84 },
+        { "id": "gain_131072", "unit": "percent", "direction": "higher", "target": 9.4, "noise_floor_pct": 7.31, "second_recorded_value": 11.4, "second_noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_sdma_effect",
+      "profile": "flashnext-2card-fast",
+      "protocol": "sdma_study",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "phase3_sdma",
+      "metrics": [
+        {
+          "id": "decode_c1_gain",
+          "unit": "percent",
+          "direction": "higher",
+          "target": 0,
+          "noise_floor_pct": 9.32,
+          "recorded_range": [
+            6.4,
+            8.4
+          ]
+        },
+        {
+          "id": "decode_c8_per_stream_gain",
+          "unit": "percent",
+          "direction": "higher",
+          "target": 0,
+          "noise_floor_pct": 51.1,
+          "recorded_range": [
+            14.5,
+            18.7
+          ]
+        },
+        { "id": "prefill_32000_gain", "unit": "percent", "direction": "higher", "target": 0, "noise_floor_pct": 11.33 },
+        { "id": "prefill_64000_gain", "unit": "percent", "direction": "higher", "target": 0, "noise_floor_pct": 4.84 },
+        { "id": "prefill_128000_gain", "unit": "percent", "direction": "higher", "target": 0, "noise_floor_pct": 3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_drafting_gain",
+      "profile": "flashnext-2card",
+      "protocol": "drafting_study",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "alpha3_drafting",
+      "metrics": [
+        { "id": "decode_c1_per_stream_gain", "unit": "percent", "direction": "higher", "target": 12.9, "noise_floor_pct": 4.5 },
+        { "id": "aggregate_c8_gain", "unit": "percent", "direction": "higher", "target": 7.9, "noise_floor_pct": 5.3 }
+      ]
+    },
+    {
+      "id": "flashnext_tp2_ngram_warm",
+      "profile": "flashnext-2card",
+      "protocol": "ngram_warm_study",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "alpha3_ngram_warm",
+      "metrics": [
+        { "id": "prefill_gain_22751", "unit": "ratio", "direction": "higher", "target": 5.3, "noise_floor_pct": null },
+        { "id": "prefill_gain_6004", "unit": "ratio", "direction": "higher", "target": 5.1, "noise_floor_pct": null },
+        { "id": "prefill_gain_21830", "unit": "ratio", "direction": "higher", "target": 5.6, "noise_floor_pct": null },
+        { "id": "prefill_gain_45283", "unit": "ratio", "direction": "higher", "target": 5.0, "noise_floor_pct": null },
+        { "id": "decode_c1_per_stream_gain", "unit": "percent", "direction": "higher", "target": 11.8, "noise_floor_pct": null },
+        { "id": "aggregate_c8_gain", "unit": "percent", "direction": "higher", "target": 98, "noise_floor_pct": null },
+        { "id": "startup_delta", "unit": "s", "direction": "lower", "target": 18.7, "noise_floor_pct": null },
+        { "id": "cold_tp2_table_read", "unit": "s", "direction": "record", "target": 18.9, "noise_floor_pct": null, "recorded_range": [18.9, 21.0] },
+        { "id": "warm_tp2_table_read", "unit": "s", "direction": "record", "target": 6.0, "noise_floor_pct": null }
+      ]
+    },
+    {
+      "id": "flashnext_tp4_ngram_warm",
+      "profile": "flashnext-4card",
+      "protocol": "ngram_warm_startup",
+      "comparison": "historical_control",
+      "mode": "historical",
+      "pipeline": "off",
+      "evidence": "alpha3_ngram_warm",
+      "metrics": [
+        { "id": "table_read", "unit": "s", "direction": "record", "target": 11, "noise_floor_pct": null }
+      ]
+    }
+  ],
+  "known_observations": {
+    "alpha4_default_prefill_dip": {
+      "profile": "flashnext-2card",
+      "case": "flashnext_tp2_default_prefill",
+      "prompt_tokens": [
+        32768,
+        65536,
+        131072
+      ],
+      "alpha4_tok_s": [
+        6118,
+        6048,
+        5955
+      ],
+      "published_loss_range_pct": [
+        1.6,
+        2.8
+      ],
+      "evidence": "alpha4_safe",
+      "extra_regression_allowance_pct": 0
+    },
+    "exact_pipeline_research_goal": {
+      "case": "flashnext_tp2_exact_pipeline_gain",
+      "target_gain_pct": 15,
+      "release_gate": false
+    },
+    "fast_pipeline_64k": {
+      "case": "flashnext_tp2_fast_pipeline_gain",
+      "prompt_tokens": 65536,
+      "original_gain_pct": 6.5,
+      "original_floor_pct": 7.36,
+      "rerun_gain_pct": 5.66,
+      "rerun_floor_pct": 6.32,
+      "claim_required": false
+    },
+    "deepseek_routed_expert_reads": {
+      "required_delta_reads": 0,
+      "required_delta_bytes": 0
+    }
+  },
+  "metrics": [
+    { "id": "protocol_evidence_verified", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp2_default_prefill.prefill_32768", "better": "higher", "target": 5944.33, "noise_floor_pct": 3.58, "unit": "tok/s" },
+    { "id": "flashnext_tp2_default_prefill.prefill_65536", "better": "higher", "target": 5878.23, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_default_prefill.prefill_131072", "better": "higher", "target": 5857.42, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_default_decode.output_c8", "better": "higher", "target": 559.36, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_default_decode.client_ttft_p50_c8", "better": "lower", "target": 97.18, "noise_floor_pct": 4.97, "unit": "ms" },
+    { "id": "flashnext_tp2_default_decode.client_ttft_p99_c8", "better": "lower", "target": 135.29, "noise_floor_pct": 3, "unit": "ms" },
+    { "id": "flashnext_tp2_fast_prefill.prefill_32768", "better": "higher", "target": 6758.13, "noise_floor_pct": 5.37, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_prefill.prefill_65536", "better": "higher", "target": 6677.71, "noise_floor_pct": 6.32, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_prefill.prefill_131072", "better": "higher", "target": 6632.15, "noise_floor_pct": 3.51, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_standard.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp2_exact_pipeline_prefill.prefill_32768", "better": "higher", "target": 6629.98, "noise_floor_pct": 3.58, "unit": "tok/s" },
+    { "id": "flashnext_tp2_exact_pipeline_prefill.prefill_65536", "better": "higher", "target": 6549.89, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_exact_pipeline_prefill.prefill_131072", "better": "higher", "target": 6528.81, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_exact_pipeline_gain.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp2_exact_pipeline_decode.output_c8", "better": "higher", "target": 554.88, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp2_exact_pipeline_decode.client_ttft_p50_c8", "better": "lower", "target": 96.04, "noise_floor_pct": 4.97, "unit": "ms" },
+    { "id": "flashnext_tp2_exact_pipeline_decode.client_ttft_p99_c8", "better": "lower", "target": 132.93, "noise_floor_pct": 3, "unit": "ms" },
+    { "id": "flashnext_tp2_exact_pipeline_decode_screen.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp2_fast_pipeline_prefill.prefill_32768", "better": "higher", "target": 7149.76, "noise_floor_pct": 5.37, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_pipeline_prefill.prefill_65536", "better": "higher", "target": 7064.61, "noise_floor_pct": 6.32, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_pipeline_prefill.prefill_131072", "better": "higher", "target": 7004.77, "noise_floor_pct": 3.51, "unit": "tok/s" },
+    { "id": "flashnext_tp2_fast_pipeline_gain.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp2_fast_pipeline_standard.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp4_standard.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "flashnext_tp4_weighted_prefill.prefill_32768", "better": "higher", "target": 6088.5, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp4_weighted_prefill.prefill_65536", "better": "higher", "target": 6030.5, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "flashnext_tp4_weighted_prefill.prefill_131072", "better": "higher", "target": 6004.5, "noise_floor_pct": 3, "unit": "tok/s" },
+    { "id": "deepseek_tp4.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "deepseek_tp2.verdict_pass", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "deepseek_tp4.zero_routed_expert_reads", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" },
+    { "id": "deepseek_tp2.zero_routed_expert_reads", "better": "higher", "target": 1, "noise_floor_pct": 0, "unit": "check" }
+  ]
+}

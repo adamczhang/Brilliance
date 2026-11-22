@@ -1,0 +1,23 @@
+2026-11-22 05:58:14.824 t=0.7 tid=13020 ARM journal pid=8292 written through to the disk record by record
+2026-11-22 05:58:15.067 t=242.6 tid=22008 NOTE test.rank_parked rank 1 after release
+2026-11-22 05:58:15.068 t=243.8 tid=22284 NOTE test.rank_issuing rank 0 step 0
+2026-11-22 05:58:15.076 t=251.6 tid=10672 STOP begin Ctrl-Break or the console closing (SIGTERM)
+2026-11-22 05:58:15.164 t=340.1 tid=13020 NOTE fleet.loop_exit the fleet's loop has ended
+2026-11-22 05:58:15.165 t=341.3 tid=13020 BEGIN fleet.history_join bound 2000 ms
+2026-11-22 05:58:15.166 t=342.2 tid=13020 END fleet.history_join ok 0.9 ms bound 2000 ms done
+2026-11-22 05:58:15.167 t=343.1 tid=13020 BEGIN model.q.op_idle bound 60000 ms
+2026-11-22 05:58:15.168 t=344.0 tid=13020 END model.q.op_idle ok 0.9 ms bound 60000 ms done
+2026-11-22 05:58:15.168 t=344.4 tid=13020 BEGIN model.q.worker_join bound 60000 ms
+2026-11-22 05:58:15.169 t=344.8 tid=13020 END model.q.worker_join ok 0.4 ms bound 60000 ms done
+2026-11-22 05:58:15.169 t=345.1 tid=13020 NOTE fleet.request_stop model q, drain 250 ms
+2026-11-22 05:58:15.169 t=345.5 tid=13020 BEGIN model.q.serve_join bound 20250 ms
+2026-11-22 05:58:15.249 t=425.0 tid=10536 NOTE engine.at_stop model q tp 2: idle; running 0, queued 0; prefill 0, decode 0, waiting 0; step 0
+2026-11-22 05:58:15.250 t=425.9 tid=10536 BEGIN model.q.drain bound 250 ms
+2026-11-22 05:58:15.502 t=678.2 tid=10536 END model.q.drain over 252.3 ms bound 250 ms the drain timed out; the open responses are ended (retire)
+2026-11-22 05:58:15.504 t=680.3 tid=10536 NOTE engine.retired model q: responses ended, server retired
+2026-11-22 05:58:15.505 t=680.8 tid=10536 NOTE engine.stopping model q: stopping the step loop (stopping_ set, barrier aborted); serve returned 0
+2026-11-22 05:58:15.505 t=681.2 tid=10536 BEGIN model.q.step_loop_stop bound 10000 ms
+2026-11-22 05:58:15.506 t=681.6 tid=10536 END model.q.step_loop_stop ok 0.4 ms bound 10000 ms done
+2026-11-22 05:58:15.506 t=681.9 tid=10536 BEGIN model.q.rank_join bound 10000 ms
+2026-11-22 05:58:15.518 t=693.7 tid=22008 NOTE test.rank_resumed rank 1
+2026-11-22 05:58:15.518 t=694.1 tid=22008 NOTE rank.exit model q rank 1 device 1: left after a full release with step 0 published and not issued by this rank (SPLIT: its peers may have issued it); last issued step -1

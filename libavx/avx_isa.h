@@ -155,7 +155,13 @@ int         avx_par_force(int threads);
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
     X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)          \
     X(dflash_tree)          X(attn_paged_tree)      X(attn_paged_anchor_window)                   \
-    X(dflash_markov_greedy) X(dflash_markov_greedy_f32)
+    X(dflash_markov_greedy) X(dflash_markov_greedy_f32)                                         \
+    /* ---- DeepSeek-V4.1's text ops (avx_ds41.cpp, avx_glm.cpp, avx_ggml.cpp) */                 \
+    X(mhc_mix)              X(mhc_collapse)         X(router_scored_topk)   X(ds41_rope_rows)     \
+    X(quant_roundtrip)      X(softmax_pool)         X(attn_sparse_sink)     X(index_score)        \
+    X(index_candidates)     X(index_topk)           X(entry_store)          X(token_map)          \
+    X(stream_gate_add)      X(embed_lookup_planes)  X(gemm_nt_ggml)         X(moe_gemm_ggml)      \
+    X(logits_gemm_ggml)     X(embed_lookup_ggml)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
  * error from that level's avx_table.cpp object. */

@@ -26,6 +26,7 @@
 #include "server/liveview.h"
 #include "text/tokenizer.h"
 #include "util/stallwatch.h"
+#include "util/stoplog.h"
 
 #include <atomic>
 #include <chrono>
@@ -812,39 +813,121 @@ Engine::~Engine() {
                  (unsigned long long)r->ctx.route_dropped());
         RAD_INFO("%s", r->mover.report().c_str());
     }
+    /* Brilliance: the stop journal's view of every rank's streams before anything waits on them
+     * (util/stoplog.h): a stream that has not drained within the bound is named, with its rank and
+     * card, before the unbounded syncs below. Observation only; nothing waits longer than the
+     * bound, and nothing here runs with the journal off. */
+    const std::string sl_name = "model." + cfg_.served_model_name;
+    if (stoplog::active()) stream_probe(sl_name);
     /* Drain the transfer streams before the contexts. Ctx::shutdown drains the compute streams
      * and frees the arena, but the mover's stream also copies into the arena (the prefill
      * stager's ring, lent slab slots) and would otherwise drain only later, with the mover. A fill
      * landing in a freed arena is a GPU memory fault. */
-    for (auto& r : ranks_) {
-        if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
-        r->tierx.quiesce();
+    {
+        stoplog::Step st(sl_name + ".transfer_sync", stoplog::bound::kCtxShutdown);
+        for (auto& r : ranks_) {
+            if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
+            r->tierx.quiesce();
+        }
     }
-    for (auto& r : ranks_) r->ctx.shutdown();
+    for (auto& r : ranks_) {
+        stoplog::Step st(sl_name + ".rank" + std::to_string(r->index) + ".ctx_shutdown",
+                         stoplog::bound::kCtxShutdown);
+        r->ctx.shutdown();
+    }
     if (cards_claimed_) {
+        stoplog::Step st(sl_name + ".cards_unclaim", stoplog::bound::kRelease);
         const std::vector<int> cards = rank_devices();
         (void)rad_dev_cards_claim(cards.data(), (int)cards.size(), 0);
         cards_claimed_ = false;
     }
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */
-    for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
-    step_state_fini();
+    {
+        stoplog::Step st(sl_name + ".kv_stream_free", stoplog::bound::kRelease);
+        for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
+        step_state_fini();
+    }
     /* The step batch's staging, events and media buffers (BatchBuilder), freed while the ranks'
      * KV managers the scheduler releases sequences into still exist. A process that unloads
      * models would otherwise keep every engine's. */
-    sched_.fini();
-    ranks_.clear();
-    for (TableCopy& c : table_copies_) table_copy_free(&c);
-    table_copies_.clear();
-    for (TableCopy& c : table_files_) ::munmap(c.base, c.bytes);
-    table_files_.clear();
-    for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
-    card_copies_.clear();
-    for (TableShare& t : table_shares_) table_share_close(&t);
-    table_shares_.clear();
-    if (reg_) reg_->close();
-    if (slot_base_ >= 0) rad_engine_release(plugins_.arch_plugin, slot_base_, cfg_.tp);
+    {
+        stoplog::Step st(sl_name + ".sched_fini", stoplog::bound::kRelease);
+        sched_.fini();
+    }
+    {
+        /* Each rank's program, pools, KV and op instances: the collectives' host mailboxes are
+         * freed here, after every rank's streams were synced above. */
+        stoplog::Step st(sl_name + ".ranks_free", stoplog::bound::kRelease);
+        ranks_.clear();
+    }
+    {
+        stoplog::Step st(sl_name + ".host_tables_free", stoplog::bound::kRelease);
+        for (TableCopy& c : table_copies_) table_copy_free(&c);
+        table_copies_.clear();
+        for (TableCopy& c : table_files_) ::munmap(c.base, c.bytes);
+        table_files_.clear();
+        for (void* p : card_copies_) rad_dev_free(p, RAD_MEM_HOST_MAPPED);
+        card_copies_.clear();
+        for (TableShare& t : table_shares_) table_share_close(&t);
+        table_shares_.clear();
+    }
+    {
+        stoplog::Step st(sl_name + ".plugins_release", stoplog::bound::kRelease);
+        if (reg_) reg_->close();
+        if (slot_base_ >= 0) rad_engine_release(plugins_.arch_plugin, slot_base_, cfg_.tp);
+    }
+}
+
+/* Brilliance: each rank's compute stream, second lane and transfer stream, asked once whether they
+ * have drained: an event recorded behind the queued work and polled, without a host wait, for at
+ * most stoplog::bound::kStreamProbe per rank (util/stoplog.h). */
+void Engine::stream_probe(const std::string& sl_name) {
+    stoplog::Step all(sl_name + ".stream_probe",
+                      stoplog::bound::kStreamProbe * (int64_t)std::max<size_t>(ranks_.size(), 1));
+    int pending_total = 0;
+    for (auto& r : ranks_) {
+        if (!r) continue;
+        if (rad_dev_set(r->device) < 0) {
+            stoplog::note("stream.probe", "%s rank %d device %d: the device cannot be bound",
+                          sl_name.c_str(), r->index, r->device);
+            continue;
+        }
+        const struct { const char* what; RadStream s; } streams[] = {
+            { "compute", r->ctx.stream() },
+            { "lane1", r->ctx.lane1_stream() },
+            { "transfer", r->mover.transfer_stream() },
+        };
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto until = t0 + std::chrono::milliseconds(stoplog::bound::kStreamProbe);
+        for (const auto& x : streams) {
+            if (!x.s) continue;
+            RadEvent e = nullptr;
+            if (rad_event_create(&e) < 0 || !e) {
+                stoplog::note("stream.probe", "%s rank %d device %d %s: no event to probe with",
+                              sl_name.c_str(), r->index, r->device, x.what);
+                continue;
+            }
+            int q = rad_event_record(e, x.s);
+            const auto s0 = std::chrono::steady_clock::now();
+            if (q >= 0) {
+                for (;;) {
+                    q = rad_event_query(e);
+                    if (q != 0 || std::chrono::steady_clock::now() >= until) break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - s0).count();
+            if (q == 0) ++pending_total;
+            stoplog::note("stream.probe", "%s rank %d device %d %s: %s after %.1f ms",
+                          sl_name.c_str(), r->index, r->device, x.what,
+                          q == 1 ? "drained" : q == 0 ? "NOT DRAINED (work still queued or running)"
+                                                      : "query failed (device error)", ms);
+            rad_event_destroy(e);
+        }
+    }
+    all.end(pending_total ? "some stream had not drained; the syncs below wait on it" : "every stream drained");
 }
 
 /* ================================================================== 7. serve */
@@ -1164,12 +1247,44 @@ void Engine::rank_loop(int index) {
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
 
+#ifdef RAD_ENABLE_RANK_STOP_TEST_HOOK
+    const char* stop_gate = std::getenv("RAD_E2E_STOP_RANK_GATE");
+    if (cfg_.tp < 2 || !stoplog::active()) stop_gate = nullptr;
+#endif
+    /* Brilliance: for the stop journal only, kept in this thread (util/stoplog.h). */
+    int last_issued = -1;
+    bool released = false;
     for (;;) {
-        barrier_->arrive_and_wait();                    /* released against this step's batch */
-        if (stopping_.load(std::memory_order_acquire)) break;
+        released = barrier_->arrive_and_wait();         /* released against this step's batch */
+#ifdef RAD_ENABLE_RANK_STOP_TEST_HOOK
+        /* Test hook, host test builds only (core/CMakeLists.txt). With RAD_E2E_STOP_RANK_GATE
+         * naming a file and the stop journal on, the last rank waits after its first full release
+         * until that file exists (15 s at most), so a test can begin a stop between a step's
+         * release and this rank's wake-up (engine_e2e_test, *_finish_a_step_released_before_stop). */
+        if (stop_gate && released && index == cfg_.tp - 1 && last_issued < 0) {
+            stoplog::note("test.rank_parked", "rank %d after release", index);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            while (!std::ifstream(stop_gate) && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            stoplog::note(std::ifstream(stop_gate) ? "test.rank_resumed" : "test.rank_gate_timeout",
+                          "rank %d", index);
+        }
+#endif
+        /* Brilliance: the barrier's answer decides, not `stopping_`. Every party of one turn gets
+         * the same answer, so a step released by a full turn is issued by every rank, even when a
+         * stop began while this rank was waking; a rank that read `stopping_` on its own could
+         * leave a step its peers had issued, collectives included (the split, 2026-11-22). The
+         * stop closes the barrier (RankBarrier::close): no new step is released, and the step's
+         * join still turns for every rank. */
+        if (!released) break;
 
         const RadBatch* b = step_batch_.load(std::memory_order_acquire);
         if (b) {
+#ifdef RAD_ENABLE_RANK_STOP_TEST_HOOK
+            if (stop_gate && index == 0 && last_issued < 0)
+                stoplog::note("test.rank_issuing", "rank %d step %d", index, b->step);
+#endif
+            last_issued = b->step;
             /* This rank's view of the step, pointing at this card's staging. Its upload was issued
              * on this rank's stream, so no cross-rank fence is needed. */
             const RadBatch* mine = gen_ ? gen_->batch_for(index) : sched_.batch_for(index);
@@ -1215,6 +1330,22 @@ void Engine::rank_loop(int index) {
 
         }
         barrier_->arrive_and_wait();                    /* joined; the scheduler may read */
+    }
+    /* Brilliance: how this rank left. A rank leaves only on the barrier's abort, so the SPLIT
+     * record below (a full release with a step published and not issued by this rank) should
+     * never be written; it stays as the journal's check that it is not. */
+    if (stoplog::active()) {
+        const RadBatch* pending = released ? step_batch_.load(std::memory_order_acquire) : nullptr;
+        if (released && pending)
+            stoplog::note("rank.exit", "model %s rank %d device %d: left after a full release with "
+                          "step %d published and not issued by this rank (SPLIT: its peers may have "
+                          "issued it); last issued step %d", cfg_.served_model_name.c_str(), index,
+                          r.device, pending->step, last_issued);
+        else
+            stoplog::note("rank.exit", "model %s rank %d device %d: left on %s; last issued step %d",
+                          cfg_.served_model_name.c_str(), index, r.device,
+                          released ? "a full release with no step published" : "the barrier's abort",
+                          last_issued);
     }
 }
 
@@ -1397,6 +1528,8 @@ int Engine::step_loop() {
             if (const int fs = coll_fault_check(-1, nullptr, FaultLook::kIdle); fs < 0)
                 return fail_loop(fs);
             drain_completed();
+            /* Brilliance (fast-loop): a warm reload's settings land here, with nothing in flight. */
+            retune_service();
             sched_.publish(/*idle=*/true);
             /* Work is waiting only on the encoder: loop immediately. */
             if (sched_.encodes_pending()) { idle = 0; continue; }
@@ -3105,20 +3238,31 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
      * and an unfinished request still writes there (server.h). */
+    const std::string sl_name = "model." + cfg_.served_model_name;
+    stoplog::note("engine.stopping", "model %s: stopping the step loop (stopping_ set, barrier "
+                  "closed); serve returned %d", cfg_.served_model_name.c_str(), s);
     stopping_.store(true, std::memory_order_release);
     wake_hold();
-    barrier_->abort();
+    /* Not abort(): a step already released runs on every rank and its join turns, so the step
+     * loop collects it with every rank parked; no new step is released. */
+    barrier_->close();
     /* A step loop that does not come back holds its cards and every model waiting for them, and
      * only a restart can free them, so past five minutes the process exits as for a GPU fault. */
-    for (int t = 0; !stepped.load(std::memory_order_acquire); ++t) {
-        if (t == 30000)
-            fatal("model %s: the step loop has not come back five minutes after it was stopped; "
-                  "exiting so a restart can bring the server back", cfg_.served_model_name.c_str());
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    {
+        stoplog::Step st(sl_name + ".step_loop_stop", stoplog::bound::kStepLoopStop);
+        for (int t = 0; !stepped.load(std::memory_order_acquire); ++t) {
+            if (t == 30000)
+                fatal("model %s: the step loop has not come back five minutes after it was stopped; "
+                      "exiting so a restart can bring the server back", cfg_.served_model_name.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (stepper.joinable()) stepper.join();
     }
-    if (stepper.joinable()) stepper.join();
-    for (auto& t : rank_threads_) if (t.joinable()) t.join();
-    rank_threads_.clear();
+    {
+        stoplog::Step st(sl_name + ".rank_join", stoplog::bound::kRankJoin);
+        for (auto& t : rank_threads_) if (t.joinable()) t.join();
+        rank_threads_.clear();
+    }
     xstats_close();
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
@@ -4535,7 +4679,10 @@ int Engine::run_server() {
      * stream holds its lease until the client has it all or leaves. Past that the server ends
      * them (Server::retire stops every stream and job), and they let go at once. */
     const int64_t drain = stop_drain_ms_.load(std::memory_order_relaxed);
+    if (stoplog::active()) stop_snapshot();
+    stoplog::Step drain_step("model." + cfg_.served_model_name + ".drain", drain);
     if (!front_->detach(cfg_.served_model_name, (int)std::min<int64_t>(drain, INT32_MAX))) {
+        drain_step.end("the drain timed out; the open responses are ended (retire)");
         RAD_WARN("model %s: responses still open after %lld ms; ending them",
                  cfg_.served_model_name.c_str(), (long long)drain);
         srv.retire();
@@ -4550,10 +4697,43 @@ int Engine::run_server() {
                      cfg_.served_model_name.c_str(), min);
         }
     }
+    drain_step.end();
     srv.retire();
+    stoplog::note("engine.retired", "model %s: responses ended, server retired",
+                  cfg_.served_model_name.c_str());
     if (live) live->stop();
     const int st = loop_status_.load(std::memory_order_acquire);
     return st < 0 ? st : RAD_OK;
+}
+
+/* Brilliance: the stop journal's picture of this model at the stop (util/stoplog.h): each request
+ * with its phase (waiting, prefill with how much of the prompt is in, decode), from the scheduler's
+ * published copy, so reading it takes no step lock. */
+void Engine::stop_snapshot() const {
+    std::vector<Scheduler::ReqStat> rs(256);
+    const int n = sched_.observed_requests(rs.data(), (int)rs.size());
+    const SchedMetrics m = sched_.observed_metrics();
+    int prefill = 0, decode = 0, waiting = 0;
+    for (int i = 0; i < n; ++i) {
+        const Scheduler::ReqStat& q = rs[(size_t)i];
+        if (!q.running) ++waiting;
+        else if (q.computed_tokens < q.prompt_tokens) ++prefill;
+        else ++decode;
+    }
+    const char* phase = prefill > 0 ? "mid-prefill" : decode > 0 ? "mid-decode" : waiting > 0 ? "queued" : "idle";
+    stoplog::note("engine.at_stop", "model %s tp %d: %s; running %lld, queued %lld; prefill %d, "
+                  "decode %d, waiting %d; step %lld", cfg_.served_model_name.c_str(), cfg_.tp, phase,
+                  (long long)m.running, (long long)m.queue_depth, prefill, decode, waiting,
+                  (long long)m.step);
+    for (int i = 0; i < n && i < 16; ++i) {
+        const Scheduler::ReqStat& q = rs[(size_t)i];
+        stoplog::note("engine.request", "model %s id %llu: %s, prompt %lld, in the cache %lld, "
+                      "output %lld, age %.1f s", cfg_.served_model_name.c_str(),
+                      (unsigned long long)q.id,
+                      !q.running ? "waiting" : q.computed_tokens < q.prompt_tokens ? "prefill" : "decode",
+                      (long long)q.prompt_tokens, (long long)q.computed_tokens,
+                      (long long)q.output_tokens, q.age_s);
+    }
 }
 
 }  /* namespace rad */

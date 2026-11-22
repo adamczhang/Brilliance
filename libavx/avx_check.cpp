@@ -61,8 +61,9 @@ Err compare(const float* got, const float* ref, int64_t n) {
 }
 
 bool same_values(uint32_t dt, const void* ref, const void* got, int64_t n, double tol,
-                 double* rel, std::string* why) {
+                 double* rel, std::string* why, double* max_abs) {
     char buf[256];
+    if (max_abs) *max_abs = 0;
     if (dt == RAD_I32 || dt == RAD_U32 || dt == RAD_I64) {
         int64_t bad = 0, first = -1;
         for (int64_t i = 0; i < n; ++i)
@@ -84,6 +85,7 @@ bool same_values(uint32_t dt, const void* ref, const void* got, int64_t n, doubl
     h_widen(got, dt, n, fa.data());
     const Err e = compare(fa.data(), fr.data(), n);
     *rel = e.rel_l2;
+    if (max_abs) *max_abs = e.max_abs;
     if (e.nonfinite_gap == 0 && e.rel_l2 <= tol) return true;
     std::snprintf(buf, sizeof buf, "rel_l2=%.3e max_abs=%.3e nonfinite_gap=%lld tol=%.1e",
                   e.rel_l2, e.max_abs, (long long)e.nonfinite_gap, tol);
@@ -261,15 +263,18 @@ static void run_case(const Check& ck, const Case& c, Stats* st) {
 
     bool ok = intact(pr, true, "libref", c);
     ok = intact(pr, false, who, c) && ok;
-    double worst = 0;
+    double worst = 0, worst_abs = 0;
     const double tol = ck.tol_override >= 0 ? ck.tol_override : tolerance_for(c.op, case_dtype(c));
     for (size_t i = 0; i < pr.opd.size(); ++i) {
         const Opd& o = pr.opd[i];
         if (o.absent || o.n <= 0) continue;
         if (o.role != RAD_OPD_OUT && o.role != RAD_OPD_INOUT) continue;
-        double rel = 0;
+        double rel = 0, abs_err = 0;
         std::string why;
-        if (!same_values(o.d.dtype, o.a.data(), o.b.data(), o.n, tol, &rel, &why)) {
+        const bool same = same_values(o.d.dtype, o.a.data(), o.b.data(), o.n, tol, &rel, &why,
+                                      &abs_err);
+        worst_abs = std::max(worst_abs, abs_err);
+        if (!same) {
             ok = false;
             std::printf("  FAIL %-20s %s\n       operand %d (%s): %s\n", c.op, case_str(c).c_str(),
                         (int)i, pr.schema->operands[i].name ? pr.schema->operands[i].name : "?",
@@ -326,8 +331,8 @@ static void run_case(const Check& ck, const Case& c, Stats* st) {
         st->worst_where = std::string(c.op) + " " + case_str(c);
     }
     if (ck.verbose)
-        std::printf("  %-22s %-46s rel_l2=%.3e tol=%.1e %s\n", c.op, case_str(c).c_str(), worst,
-                    tol, ok ? "ok" : "FAIL");
+        std::printf("  %-22s %-46s rel_l2=%.3e max_abs=%.3e tol=%.1e %s\n", c.op,
+                    case_str(c).c_str(), worst, worst_abs, tol, ok ? "ok" : "FAIL");
 }
 
 /* ================================================================== zero rows
@@ -703,46 +708,23 @@ int main(int argc, char** argv) {
 
     /* ---- 2. coverage
      *
-     * Any op libref implements and libavx lacks is a failure. For another library every gap is
-     * listed.
-     *
-     * The one named exception: DeepSeek V4.1's text ops (arch/deepseek41), which run on the card
-     * (libr4d) and have no CPU row yet, so that model has no CPU mode. Each is still checked
-     * against its own description by ref_test and on the card by libr4d's tests. Listed by name,
-     * not by a rule, so any other op without a CPU row still fails; and the list is consulted only
-     * when libavx lacks the row, so an op that gains one is checked like any other. */
-    static const char* const kNoCpuRowYet[] = {
-        "mhc_mix", "mhc_collapse", "router_scored_topk", "ds41_rope_rows", "quant_roundtrip",
-        "softmax_pool", "attn_sparse_sink", "index_score", "index_candidates", "index_topk",
-        "entry_store", "token_map", "stream_gate_add", "embed_lookup_planes", "gemm_nt_ggml",
-        "moe_gemm_ggml", "logits_gemm_ggml", "embed_lookup_ggml",
-    };
-    int missing = 0, device_only = 0, pending = 0;
+     * Any op libref implements and libavx lacks is a failure, DeepSeek V4.1's text ops included
+     * (they had no CPU row until avx_ds41.cpp / avx_ggml.cpp, and were a listed exception). For
+     * another library every gap is listed. */
+    int missing = 0, device_only = 0;
     std::vector<std::string> gaps;
     for (int i = 0, n = ref.kernel_count(); i < n; ++i) {
         const RadKernelInfo* kr = ref.kernel_at(i);
         if (!kr || !kr->op) continue;
         if (lib.host_row(kr->op)) continue;
-        if (ck.own) {
-            bool listed = false;
-            for (const char* op : kNoCpuRowYet) listed = listed || !std::strcmp(op, kr->op);
-            if (listed) {
-                if (ck.verbose)
-                    std::printf("COVER   %-24s device only (DeepSeek V4.1): no CPU row yet\n", kr->op);
-                ++pending;
-                continue;
-            }
-        }
         if (lib.row(kr->op)) ++device_only;
         if (ck.own) std::printf("COVER   %-24s libref implements it, %s does not\n", kr->op, who);
         ++missing;
         gaps.push_back(kr->op);
     }
     if (ck.own) {
-        std::printf("coverage: libref %d rows, %s %d rows, %d op(s) missing", ref.kernel_count(),
+        std::printf("coverage: libref %d rows, %s %d rows, %d op(s) missing\n", ref.kernel_count(),
                     who, lib.kernel_count(), missing);
-        if (pending) std::printf(", %d device-only op(s) with no CPU row yet (DeepSeek V4.1)", pending);
-        std::printf("\n");
     } else {
         std::printf("coverage: libref %d rows, %s %d rows; %d of libref's ops have no host row "
                     "here (%d a device row only)", ref.kernel_count(), who, lib.kernel_count(),

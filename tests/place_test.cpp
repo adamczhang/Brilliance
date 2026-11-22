@@ -5091,6 +5091,43 @@ TEST(the_planner_holds_relaid_experts_in_ram_within_the_budget) {
     }
 }
 
+/* Brilliance (rc-fixes): the startup report's "weights by tier" names the RAM store apart from the
+ * container on disk, as the tiers line does; until 2026-11-22 it called the whole file tier,
+ * RAM store included, "container on disk" (DeepSeek TP2: 9.16 GiB in RAM, 0 B on the drive). */
+TEST(weights_by_tier_names_the_ram_store_apart_from_the_disk) {
+    RelaidPlan rp;
+    REQUIRE_EQ(rp.plan(3.5), RAD_OK);
+    int64_t ram = 0, disk = 0;
+    for (const MoveUnit& mu : rp.p.units) {
+        if (mu.tier != Tier::SSD) continue;
+        int64_t b = 0;
+        for (rad_weight w : mu.weights) b += rp.p.weight[w].bytes;
+        (mu.ram_held ? ram : disk) += b;
+    }
+    REQUIRE(ram > 0 && disk > 0);
+    CHECK_EQ(ram + disk, rp.p.totals.bytes[(int)Tier::SSD]);
+    const std::string line = rp.p.weights_by_tier();
+    CHECK(line.find("RAM store " + humanb(ram) + ", ") != std::string::npos);
+    CHECK(line.find("container on disk " + humanb(disk) + ", ") != std::string::npos);
+    CHECK(line.find("VRAM " + humanb(rp.p.totals.bytes[(int)Tier::VRAM]) + ", ") == 0);
+
+    /* The whole file tier in the store: nothing is on the disk, as the tiers line says. */
+    REQUIRE_EQ(rp.replan(7), RAD_OK);
+    CHECK_EQ(rp.p.disk_units, (int64_t)0);
+    const std::string all = rp.p.weights_by_tier();
+    CHECK(all.find("RAM store " + humanb(rp.p.totals.bytes[(int)Tier::SSD]) + ", ") !=
+          std::string::npos);
+    CHECK(all.find("container on disk 0 B, ") != std::string::npos);
+    CHECK(rp.p.tier_line().find("drive 0 B (0)") != std::string::npos);
+
+    /* No store: the file tier is the disk, and the line is as before (no RAM store field). */
+    REQUIRE_EQ(rp.replan(0), RAD_OK);
+    const std::string none = rp.p.weights_by_tier();
+    CHECK(none.find("RAM store") == std::string::npos);
+    CHECK(none.find("container on disk " + humanb(rp.p.totals.bytes[(int)Tier::SSD]) + ", ") !=
+          std::string::npos);
+}
+
 /* Read/pack exactness and slot reuse. The RAM store holds every layer's expert 1, relaid once at
  * load; expert 3 is read as planes from the drive and relaid on every read. Over three passes
  * (six layer reads through four windows, so every window comes round again behind its event)

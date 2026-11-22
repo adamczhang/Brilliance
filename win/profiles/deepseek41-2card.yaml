@@ -43,16 +43,21 @@
 #
 #   .\serve.ps1 deepseek41-2card -Bus 3,9
 #   bin\radiance.exe --config profiles\deepseek41-2card.yaml
-#   bin\radiance.exe --config profiles\deepseek41-2card.yaml --plan-only   the plan and the memory
-#                                 check, without loading
+#
+# For placement and host admission, copy this profile to deepseek41-plan.yaml and add
+# `plan-only: true` under deepseek-v4.1-flash, at the same indentation as `tp: 2`.
+#   .\serve.ps1 .\deepseek41-plan.yaml -Bus 3,9
+# Use your two cards' PCI buses. The plan initializes both cards and stops before allocating
+# the placement pools or loading weights. Read the admission verdict in the log: an admitted
+# plan exits 0, a refused one exits 1 with the reason. See PREVIEW.md.
 #
 # The model file: bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad on Hugging Face,
 # deepseek-v4.1-flash-1017-uncensored.rad, 269,650,269,832 bytes (251.13 GiB), reassembled from the
 # repository's six parts. Point `model:` at where it is. The separate Q8_0 DSpark sidecar beside it
 # is not used.
 #
-# The cards: name the two with -Bus (the pair on the widest links). Rank 0 follows the runtime's
-# device order, not the order the cards are named in.
+# The cards: name the two with -Bus (the pair on the widest links). Windows HIP determines device
+# order. The engine's startup report shows each serving rank and its PCI address.
 #
 # Loopback only and no key. To serve the local network: .\serve.ps1 deepseek41-2card -Listen 0.0.0.0
 # -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
@@ -79,3 +84,5 @@ models:
     num-speculative-tokens: 0
     ngram-placement: disk
     deterministic: true
+    # weight-prefetch off: Windows TP2 A/B on flashnext-2card-fast (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical; same host-staged collective path.
+    weight-prefetch: off

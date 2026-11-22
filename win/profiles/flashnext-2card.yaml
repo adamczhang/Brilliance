@@ -43,8 +43,8 @@
 # 25aff8c950f4b823bc8b77c8184ed48827cb47058ffce08ae2c83b12e021fea0. Point `model:` at where it is.
 # The timeout below allows a 10-minute load.
 #
-# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Rank 0 follows the
-# runtime's device order, not the order the cards are named in. Without -Bus the first two discrete
+# The cards: name TWO with serve.ps1's -Bus (PCI buses) or -Device (HIP indices). Windows HIP
+# determines device order. The startup report lists the ranks. Without -Bus the first two discrete
 # cards HIP shows are used and the rest stay visible,
 # which lowers the pin limit (SUPPORT.md, known issue 3); name the two. Cards talk
 # through pinned host memory (no peer-to-peer on Windows), and HIP virtual memory is off with more
@@ -86,3 +86,5 @@ models:
     max-num-batched-tokens: 6144
     prefill-span: 3
     ngram-warm: true
+    # weight-prefetch off: Windows TP2 A/B on flashnext-2card-fast (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical; same host-staged collective path.
+    weight-prefetch: off

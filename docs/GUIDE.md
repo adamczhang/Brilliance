@@ -799,7 +799,7 @@ radiance --config radiance.yaml
 ```
 
 It claims the card less `memory.gpu-headroom-mib` (default 96 MiB), splits it between weights and KV
-cache, loads, and serves on `http://0.0.0.0:8000`. The startup log states every budget before
+cache, loads, and serves on `http://127.0.0.1:8000`. The startup log states every budget before
 anything is allocated.
 
 ```yaml
@@ -1873,8 +1873,12 @@ Exactness: the choice reads the committed text and nothing else, never a draw. A
 coupled row (`Request::draft_suffix`): the sampler binds none of the head's staged states to its rows (a
 proposal that equals the head's unused draw `x` would otherwise select the coupling by the value of that
 draw). Each row is the target's plain draw from `(seed, position)` and the walk follows the proposal iff
-the draw equals it: greedy text is the head-only run's (up to the last-bit differences a different row
-count makes to the logits, as between any two window sizes) and the sampled law is the target's.
+the draw equals it, so the sampled law is the target's. Greedy text is not guaranteed to equal the
+head-only run's: a suffix step verifies different tokens from the ones the head would have drafted, and on
+some models the verify kernels round differently depending on which tokens share the step (SUPPORT known
+issues 5 and 8), so where two tokens are nearly tied the text can part. On Qwen3.8-Flash-Next with two
+cards (2026-11-22), 2 of 8 short greedy probes parted, at gaps of 0.007-0.21 nat between the two leading
+tokens; prompts on which no suffix step ran were bit-identical. Both texts are the model's answer.
 `tests/mtp_rrs_test.cpp` checks the law (chi-square over the first three tokens, alone and mixed with
 adaptive-depth steps, under the row-wise and the traversal verify, with a negative control that exposes
 the variant in which the coupled rows see the suffix chain), `tests/sched_test.cpp` the selection, the
@@ -2617,7 +2621,11 @@ by 0.002-0.003 nats.
 under that level; every other key belongs to a model's entry under `models:` (or to `defaults:`). A
 switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`, `pin`, `ttl`,
 `flex` and `park`, `memory.host-mib`, `memory.disk-tier`, and the `cards:`, `scheduler:` and
-`groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Grouped by purpose:
+`groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Brilliance (the Windows port): every
+setting in one table, with its default, valid values, the source line that reads it and who should
+change it, is [REFERENCE.md](../REFERENCE.md), along with the launcher's parameters and every
+environment variable. The [Windows known-issue table](../win/SUPPORT.md#known-issues) covers
+platform limits and qualification gaps. Grouped by purpose:
 
 **Model and plugins**
 
@@ -2659,7 +2667,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `memory.host-headroom-mib: N` | 4096 | host RAM left free for the system when startup pins host memory, kept for the unpooled allocations, staging and page cache (§4.3). A snapshot store's floor takes back the shortfall from it, down to 1 GiB, rather than come up with none (`checkpoint-slots`, §4.8) |
 | `embedding-placement: WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `host-pool-mib` and read in place, or on the card (§4.3) |
 | `ngram-placement: WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3); `ram=DIR` shares the RAM copy between engines, `disk=DIR` reads the table from its own file in `DIR` |
-| `ngram-warm: true` | off | Brilliance: read an n-gram table on the `disk` tier once at load into the OS file cache, so rows are not read from the drive mid-step (Windows, where the gather reads the container's mapping; skipped on Linux). Not locked or pinned; skipped, with the reason, without the table's size plus 24 GiB available (§4.3) |
+| `ngram-warm: true` | off | Brilliance: read an n-gram table on the `disk` tier once at load into the OS file cache (Windows, where the gather reads the container's mapping; skipped on Linux). The cache remains reclaimable. Startup skips warming and logs why unless available memory covers the table plus the larger of 24 GiB and the configured host headroom (§4.3). |
 | `vision-tower-placement: WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `host-pool-mib` and read in place once an image (§4.3) |
 | `weights-disk-tier: true` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
 
@@ -2704,7 +2712,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 | `tp: N` | 1 | tensor-parallel ranks |
 | `tp-wire: MODE` | exact | `exact` or `wht6`, the lossy wire (§4.7) |
 | `tp-wire-min-kb: N` | 128 | smallest all-reduce, in KiB, the lossy wire is used for |
-| `weight-prefetch: MODE` | on | `on` or `off`: whether a plugin reads a GEMM's weight into the cache beside the collective before it, at decode heights. `off` for an engine that shares its cards with another server (§8, two engines on one set of cards); alone it costs a few percent of decode |
+| `weight-prefetch: MODE` | on | `on` or `off`: whether a plugin reads a GEMM's weight into the cache beside the collective before it, at decode heights. `off` for an engine that shares its cards with another server (§8, two engines on one set of cards). Where the cards exchange directly (peer access), the reads can hide behind the collective, which is why the engine default stays `on`. On Windows the cards exchange through pinned host memory, and there the reads lengthen the step: Qwen3.8-Flash-Next at TP2 on two R9700s (`flashnext-2card-fast`) updated in 13.1 ms with `off` against 18.2 ms with `on` (median), 232.6 against 170.0 tok/s combined single-stream decode (+37%), c8 +4%, prefill unchanged, greedy text identical. Every shipped two- and four-card Windows profile sets `off` (four cards not yet measured) |
 | `tp-attn-split: MODE` | heads | `heads` or `rows`: how a prefill-sized step's attention splits over the ranks, on a plugin that serves the row split (§4.7) |
 | `p2p: MODE` | auto | `auto` asks the driver, `on` requires peer access, `off` exchanges through host memory (§4.7) |
 
@@ -2742,7 +2750,7 @@ switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`
 
 | key | default | |
 |---|---|---|
-| `server.host: ADDR` | 0.0.0.0 | listen address |
+| `server.host: ADDR` | 127.0.0.1 | listen address. Set it explicitly to serve beyond loopback. |
 | `server.port: N` | 8000 | listen port |
 | `server.api-key: KEY` | none | require `Authorization: Bearer KEY` or `X-Api-Key: KEY` on every request but `/health`, `/v1/health`, `/ping` and the dashboard page (§6.6); the key must be non-empty |
 | `server.api-key-env: NAME` | — | read the API key from the environment variable `NAME` instead of the file, so the key is not written where the configuration is kept or shown; an unset or empty `NAME` refuses startup like an empty `server.api-key` |
@@ -2866,7 +2874,7 @@ keys are refused on it, and so are the pixel bands.
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
 | `GET /v1/models`, `/v1/models/:id` | what is loaded, with `max_model_len` (the context it serves) and `root` (the `model` path) as vLLM reports them, and `capabilities` (the same object `/server_info` reports); `:id` returns the entry itself, as OpenAI's retrieve does |
-| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness; 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back. The exit is armed once the first model has finished loading: a stall during that first load is logged with the queue state and reported by `/health`, and does not end the process |
+| `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness (with a key, a caller without it gets `{"status": ...}` alone, §6.6; with a `models:` file a `/ping` naming no model answers as `/health` does (with one model, that model's own answer while it is loaded), and Brilliance's `/ping?model=NAME` (or a POST body naming one) as `/health?model=NAME` does: 200 and the model's answer when it is loaded, 503 and its state when it is not, 404 for a name not served; a probe never loads a model, retries a failed load or counts as a use); 503 with `"status": "stuck"` once the device has advanced nothing for a minute. A device stuck for `scheduler.stuck-exit` (60s; `0` never) ends the process (exit status 70, the queues it is stuck on in the log), so a restart policy brings the server back. The exit is armed once the first model has finished loading: a stall during that first load is logged with the queue state and reported by `/health`, and does not end the process |
 | `GET /load` | current load |
 | `GET /version` | server version |
 | `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names. Keyless, `model_path` and the template source answer the local operator only (§6.6); the capability flags stay open — clients build requests from them |
@@ -4646,7 +4654,17 @@ With a key, every request must carry `Authorization: Bearer KEY` (or Anthropic's
 or it is answered 401, `/tokenize` and `/server_info` included. Exempt are `/health`, `/v1/health` and
 `/ping`, because load balancers cannot send a bearer token, and the dashboard page (`/`,
 `/dashboard`), which holds no data: on a 401 it asks for the key, keeps it in the browser's storage
-and sends it on every data fetch. The exemption follows those paths' methods -- reads, plus the
+and sends it on every data fetch. Brilliance also exempts its terms-of-use pages (`/terms`,
+`/terms/licenses` and each licence under it): the people a server's terms bind must be able to read
+them before they have a key. Brilliance: a caller without the key (or with a wrong one) reads only
+the liveness there -- `{"status": ...}` with the code a key holder gets (200, or 503 while a required
+model loads or the device is stuck) -- and none of the detail: no model names or states, no `in_flight`
+or `queue_cap`, no `stuck_s`, and no failed model's load reason. `/health?model=NAME` and
+`/ping?model=NAME` answer it the same way: that model's status and code, nothing else. The key holder
+reads the whole answer. Neither probe loads a model: a model that is cold, parked or failed is
+reported as it is (503 and its state), so a caller without the key cannot make the server load one or
+move another off the cards. Upstream forwards `/ping` as a request for work, which wakes the model it
+names. The exemption follows those paths' methods -- reads, plus the
 `POST /ping` of the health-check convention -- so it cannot follow a method no route answers.
 An empty `server.api-key` value is a startup error: it would guard nothing.
 
@@ -4665,6 +4683,49 @@ public name into the address bar is therefore refused; `localhost`, a `127.x` ad
 tunnel pass. If you reach the box by another name from the box itself, list it: `server.allow-host: box`
 (a list for several). A local user on the server's own console is admitted either way: the boundary is
 against remote callers, not against whoever owns the machine.
+
+The fleet's own routes follow the same rule: `GET /admin/fleet`, the fleet's `GET /history` (without
+`model`), `POST /admin/models/NAME/{load,park,unload,pin,unpin}` (the dashboard Sandbox's Start and
+Stop) and `POST /admin/reload`. So do the paths of this machine in otherwise open answers: `root` in
+`/v1/models`, `model_path` and the template source in `/props`, and `engine.container` in
+`/server_info`, which a stranger gets as the file name alone. A stranger's request to a guarded route
+for a model that is not open answers 409 and does not load the model just to refuse it.
+
+**One key, every role.** The key is a single shared secret, not an identity. Whoever holds it is the
+operator, from any address and with any `Host`: it opens inference and every route the paragraphs above
+keep for the machine itself, the fleet's admin and the file paths included. There is no lower-privileged
+inference key. Give it only to clients you would let unload your models and read the host report; a
+client that should only infer needs a proxy in front that passes the inference paths alone.
+
+**Serving beyond loopback.** The engine defaults to `http://127.0.0.1:8000`. Set `server.host` to
+`0.0.0.0` for every IPv4 interface or to a specific network address. On Windows, `serve.ps1 -Listen`
+overrides the profile's address. `radiance --config FILE --check` and `serve.ps1 <profile> -Check`
+show the resolved host and its source without serving.
+
+**What a keyless listener gives everyone who reaches it.** A keyless listener beyond loopback logs a
+startup warning about inference, model loads, operational telemetry and dashboard access. Anyone who
+can open the port gets:
+
+- inference on every configured model, under the fleet's ordinary rules: a request for a cold or parked
+  model loads it, moving others off their cards unless they are held or pinned;
+- the operational telemetry: `/metrics`, `/stats`, `/sessions`, `/server_info`, `/props`, `/load`,
+  `/version`, `/graph`, each model's `/history?model=` and `/v1/models` -- request counts and rates, live
+  request ids, cache, KV and session sizes, memory and card figures, request defaults, model names and
+  states (also in `/health`). A failed model's load reason (it can name paths, fetch errors, cards and
+  other models) answers the machine itself only, under the rule above: `/v1/models`' `error`,
+  `/health?model=` and the refusal of a request for that model tell a stranger only that it failed;
+- the dashboard's view built from those: each model's pages and the Sandbox chat, with Start and Stop off.
+
+The firewall is then the access control: open the port to the networks whose every host may do all of
+that, and to no public network.
+
+**Behind a proxy.** A reverse proxy on the same machine connects from loopback, so the socket leg
+admits all of its clients and only the `Host` still tells them from the box itself. Without a key, the
+proxy must forward each client's own `Host` unchanged and must not drop `Origin`; a proxy that rewrites
+`Host` to the backend's address (nginx's default `$proxy_host` does; set `proxy_set_header Host $host;`)
+makes every client that sends no foreign `Origin` the local operator. Do not list the proxy's public
+name in `server.allow-host`, and set `server.trusted-proxy` only for the log. The simplest supported
+setup behind a proxy is a key, with TLS at the proxy.
 
 Behind a reverse proxy every socket arrives as the proxy, and every log line names it instead of
 the caller. `server.trusted-proxy: 127.0.0.0/8` (a list for several; a numeric network with a prefix, like

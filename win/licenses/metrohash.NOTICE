@@ -1,0 +1,8 @@
+MetroHash source attribution for AMD's PAL implementation
+
+Copyright 2015-2018 J. Andrew Rogers
+Modifications Copyright© 2019 Advanced Micro Devices, Inc. All rights reserved.
+
+The Apache License, Version 2.0, is in metrohash.LICENSE.
+
+https://github.com/ROCm/rocm-systems/tree/7da43026e4f2ef7600433c38c820732f7a205d22/shared/amdgpu-windows-interop/pal/shared/metrohash/src

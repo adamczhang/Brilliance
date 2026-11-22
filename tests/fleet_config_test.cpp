@@ -389,6 +389,65 @@ TEST(args_order_is_stable_for_reload) {
     CHECK(a.models[0].args == b.models[0].args);
 }
 
+/* Brilliance (fast-loop): a reload's change, split into what a loaded engine takes in place (the
+ * drafting rule, --draft-suffix, --max-num-seqs) and what still reloads the model; every warm key
+ * is an option, so a renamed flag cannot leave one that nothing matches. */
+TEST(a_reloads_changes_split_into_warm_and_cold_keys) {
+    const std::string base =
+        "models:\n  q:\n    model: /m/q.rad\n    tp: 2\n    max-num-seqs: 16\n    num-speculative-tokens: 5\n"
+        "    draft-coupling: on\n    draft-verify: traversal\n    draft-depth: adaptive\n"
+        "    draft-depth-stop: 0.85\n    draft-depth-load: on\n";
+    fleet::FleetConfig a, b, c, d;
+    CHECK_EQ(yload(base, &a), RAD_OK);
+    CHECK_EQ(yload(base, &b), RAD_OK);
+    CHECK(fleet::diff_args(a.models[0].args, b.models[0].args).empty());
+
+    /* Warm only: the stop, the sequence cap and a key added. */
+    std::string w = base;
+    w.replace(w.find("draft-depth-stop: 0.85"), 22, "draft-depth-stop: 0.9");
+    w.replace(w.find("max-num-seqs: 16"), 16, "max-num-seqs: 8");
+    w += "    draft-depth-max: 4\n";
+    CHECK_EQ(yload(w, &c), RAD_OK);
+    const fleet::ArgDiff dw = fleet::diff_args(a.models[0].args, c.models[0].args);
+    CHECK(dw.cold.empty());
+    CHECK_EQ(dw.warm.size(), (size_t)3);
+    bool stop = false, seqs = false, max = false;
+    for (const std::string& s : dw.warm) {
+        stop |= s == "--draft-depth-stop 0.85 -> 0.9";
+        seqs |= s == "--max-num-seqs 16 -> 8";
+        max  |= s == "--draft-depth-max (unset) -> 4";
+    }
+    CHECK(stop && seqs && max);
+
+    /* A cold key beside a warm one: both reported, each on its side. */
+    std::string x = w;
+    x.replace(x.find("num-speculative-tokens: 5"), 25, "num-speculative-tokens: 3");
+    CHECK_EQ(yload(x, &d), RAD_OK);
+    const fleet::ArgDiff dx = fleet::diff_args(a.models[0].args, d.models[0].args);
+    CHECK_EQ(dx.cold.size(), (size_t)1);
+    CHECK(dx.cold.front() == "--num-speculative-tokens 5 -> 3");
+    CHECK_EQ(dx.warm.size(), (size_t)3);
+
+    /* What sizes or declares stays cold. */
+    for (const char* k : { "--num-speculative-tokens", "--draft-coupling", "--draft-verify", "--tp",
+                           "--max-num-batched-tokens", "--max-model-len", "--draft-depth-lag",
+                           "--draft-depth-stat", "--draft-window" })
+        CHECK(!fleet::warm_key(k));
+    size_t n = 0;
+    const ConfigFlag* f = config_flags(&n);
+    for (const char* k : { "--max-num-seqs", "--draft-depth", "--draft-depth-max", "--draft-depth-min",
+                           "--draft-depth-stop", "--draft-depth-load", "--draft-depth-load-from",
+                           "--draft-depth-load-min", "--draft-depth-load-late", "--draft-depth-load-calib",
+                           "--draft-depth-load-tok-ms", "--draft-depth-load-row-ms",
+                           "--draft-depth-load-round-ms", "--draft-depth-load-jump-ms", "--draft-suffix",
+                           "--draft-suffix-min-match", "--draft-suffix-max", "--draft-suffix-min-score" }) {
+        CHECK(fleet::warm_key(k));
+        bool found = false;
+        for (size_t i = 0; i < n; ++i) found |= std::string(k) == f[i].name;
+        if (!found) radtest::fail(__FILE__, __LINE__, std::string(k) + " is not an option");
+    }
+}
+
 /* ------------------------------------------------------------------ refused */
 
 TEST(refusals) {
@@ -516,6 +575,25 @@ const char* const kLayouts[] = {
 };
 
 }  // namespace
+
+TEST(the_listener_defaults_to_loopback_and_keeps_an_explicit_host) {
+    ServerEnv none(nullptr, nullptr, nullptr);
+    fleet::FleetConfig defaulted;
+    REQUIRE_EQ(yload("models: {a: {model: /m/a.rad}}\n", &defaulted), RAD_OK);
+    REQUIRE_EQ(defaulted.models.size(), 1u);
+    const Config& c = defaulted.models[0].cfg;
+    CHECK_EQ(c.host, "127.0.0.1");
+    CHECK_EQ(c.port, 8000);
+    CHECK(c.api_key.empty());
+    CHECK(!c.given.count("--host"));
+
+    fleet::FleetConfig explicit_host;
+    REQUIRE_EQ(yload("server: {host: 0.0.0.0}\nmodels: {a: {model: /m/a.rad}}\n",
+                     &explicit_host), RAD_OK);
+    REQUIRE_EQ(explicit_host.models.size(), 1u);
+    CHECK_EQ(explicit_host.models[0].cfg.host, "0.0.0.0");
+    CHECK_EQ(explicit_host.models[0].cfg.given.at("--host"), "server.host");
+}
 
 TEST(the_file_is_read_whatever_its_layout) {
     ServerEnv none(nullptr, nullptr, nullptr);

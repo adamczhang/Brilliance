@@ -1,0 +1,237 @@
+{
+  "schema": "brilliance-profile-scope/1",
+  "models": {
+    "deepseek-v4.1-flash": {
+      "file": "bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad/deepseek-v4.1-flash-1017-uncensored.rad",
+      "licence": "deepseek-mit",
+      "gated": false,
+      "index_row": "DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container)",
+      "terms_row": "DeepSeek-V4.1-Flash-1017",
+      "use_restrictions": []
+    },
+    "gemma4-12b": {
+      "file": "keptn/gemma4-12b-i8g/gemma4-12b-i8g.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Gemma 4 31B and 12B",
+      "use_restrictions": []
+    },
+    "gemma4-31b": {
+      "file": "keptn/gemma4-31b-a4/gemma4-31b-a4.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Gemma 4 31B and 12B",
+      "use_restrictions": []
+    },
+    "ltx-2.5": {
+      "file": "StillDeadcode/radiance-ltx-2.5-distilled-iq8r/ltx-2.5-distilled-iq8r.rad",
+      "licence": "ltx-2.x-community-license",
+      "notices": [
+        "ltx-2.5-distilled-iq8r-notice"
+      ],
+      "gated": true,
+      "index_row": "LTX-2.5 distilled (video)",
+      "use_restrictions": [
+        "Pass through and enforce all of Section 4 and Attachment A, including the Acceptable Use Policy, for model use and outputs.",
+        "Preserve AI disclosure markings and disclose that published videos are machine-generated.",
+        "Entities with annual revenue of at least US$10 million need a paid licence except for solely non-commercial use."
+      ],
+      "terms": {
+        "heading": "LTX-2.5 (video)",
+        "required_text": [
+          "they are an enforceable part of these terms",
+          "Do not remove, disable or alter that marking",
+          "say plainly that it is machine generated"
+        ],
+        "quoted_licence_sections": [
+          ["4. Use-based restrictions.", "5. The Output You Generate."],
+          ["Attachment A Use Restrictions", null]
+        ]
+      }
+    },
+    "minicpm5-2b": {
+      "file": "StillDeadcode/minicpm5-2b-iq8r/minicpm5-2b-iq8r.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "MiniCPM5-2B",
+      "use_restrictions": []
+    },
+    "qwen-image": {
+      "file": "StillDeadcode/radiance-qwen-image-2.1-iq8r/qwen-image-2.1-iq8r.rad",
+      "licence": "qwen-research",
+      "gated": false,
+      "index_row": "Qwen-Image 2.1 (pictures)",
+      "use_restrictions": [
+        "Use only for research or evaluation unless separately licensed for commercial use.",
+        "Pass through Section 4 on laws, attribution in documentation for derived models, and use of the Qwen name.",
+        "When redistributing, include the agreement and attribution notice, and mark modified files."
+      ],
+      "terms": {
+        "heading": "Qwen-Image 2.1 (pictures)",
+        "required_text": [
+          "you agree to use it for research or evaluation only",
+          "section 4 of the licence (\"Rules of use\")",
+          "Qwen is licensed under the Qwen RESEARCH LICENSE AGREEMENT, Copyright (c) 2026 Hangzhou Tongyi Laboratory Technology Co., Ltd. All Rights Reserved."
+        ],
+        "quoted_licence_sections": [
+          ["a. You are granted a non-exclusive", "3. Redistribution"]
+        ]
+      }
+    },
+    "qwen3.6-35b-a3b": {
+      "file": "StillDeadcode/qwen3.6-35b-a3b-iq8r/qwen3.6-35b-a3b-iq8r.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Qwen3.6-35B-A3B",
+      "use_restrictions": []
+    },
+    "qwen3.8-27b-iq4r": {
+      "file": "StillDeadcode/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq4r-l-v4.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Qwen3.8-27B",
+      "use_restrictions": []
+    },
+    "qwen3.8-27b-iq8r": {
+      "file": "StillDeadcode/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq8r-v4.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Qwen3.8-27B",
+      "use_restrictions": []
+    },
+    "qwen3.8-next-flash": {
+      "file": "StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad",
+      "licence": "qwen-community-1.0",
+      "gated": false,
+      "index_row": "Qwen3.8-Flash-Next",
+      "use_restrictions": [
+        "Require lawful use that respects third-party intellectual property.",
+        "Keep the copyright and permission notices with copies or substantial portions.",
+        "Commercial products or services with more than 100 million monthly active users or US$20 million monthly revenue must display the model name prominently.",
+        "A Model as a Service or AI Work Assistant business and its affiliates need a separate licence before commercial use, except qualifying internal use."
+      ],
+      "terms": {
+        "heading": "Qwen3.8-Flash-Next",
+        "required_text": [
+          "By using Qwen3.8-Flash-Next here you agree to do so.",
+          "THE USE OF THE SOFTWARE MUST COMPLY WITH APPLICABLE LAWS AND REGULATIONS, AND MUST NOT INFRINGE THE INTELLECTUAL PROPERTY RIGHTS OF ANY THIRD PARTY."
+        ],
+        "quoted_licence_sections": [
+          ["1. The above copyright notice", "THE SOFTWARE AND ANY OUTPUT"]
+        ]
+      }
+    }
+  },
+  "profiles": {
+    "deepseek41-2card": {
+      "support": "Runs, not yet qualified",
+      "models": {
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash"
+      }
+    },
+    "deepseek41-4card": {
+      "support": "Runs, not yet qualified",
+      "models": {
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash"
+      }
+    },
+    "flashnext-2card": {
+      "support": "Supported",
+      "models": {
+        "qwen3.8-next-flash": "qwen3.8-next-flash"
+      }
+    },
+    "flashnext-2card-fast": {
+      "support": "Runs",
+      "models": {
+        "qwen3.8-next-flash": "qwen3.8-next-flash"
+      }
+    },
+    "flashnext-4card": {
+      "support": "Supported",
+      "models": {
+        "qwen3.8-next-flash": "qwen3.8-next-flash"
+      }
+    },
+    "gemma4-12b-1card": {
+      "support": "Qualified",
+      "models": {
+        "gemma4-12b": "gemma4-12b"
+      }
+    },
+    "gemma4-31b-1card": {
+      "support": "Qualified",
+      "models": {
+        "gemma4-31b": "gemma4-31b"
+      }
+    },
+    "ltx-2.5-1card": {
+      "support": "Qualified",
+      "models": {
+        "ltx-2.5": "ltx-2.5"
+      }
+    },
+    "minicpm5-2b-1card": {
+      "support": "Qualified",
+      "models": {
+        "minicpm5-2b": "minicpm5-2b"
+      }
+    },
+    "qwen-image-1card": {
+      "support": "Qualified",
+      "models": {
+        "qwen-image": "qwen-image"
+      }
+    },
+    "qwen27-8k-plain": {
+      "support": "Qualified",
+      "models": {
+        "qwen3.8-27b": "qwen3.8-27b-iq4r"
+      }
+    },
+    "qwen27-iq8r-1card": {
+      "support": "Soak-clean",
+      "models": {
+        "qwen3.8-27b": "qwen3.8-27b-iq8r"
+      }
+    },
+    "qwen27-iq8r-2card": {
+      "support": "Soak-clean",
+      "models": {
+        "qwen3.8-27b": "qwen3.8-27b-iq8r"
+      }
+    },
+    "qwen27-preview": {
+      "support": "Qualified",
+      "models": {
+        "qwen3.8-27b": "qwen3.8-27b-iq4r"
+      }
+    },
+    "qwen36-35b-2card": {
+      "support": "Qualified",
+      "models": {
+        "qwen3.6-35b-a3b": "qwen3.6-35b-a3b"
+      }
+    },
+    "sandbox": {
+      "support": "Preview",
+      "models": {
+        "deepseek41-2card": "deepseek-v4.1-flash",
+        "deepseek41-4card": "deepseek-v4.1-flash",
+        "flashnext-2card": "qwen3.8-next-flash",
+        "flashnext-2card-fast": "qwen3.8-next-flash",
+        "flashnext-4card": "qwen3.8-next-flash",
+        "gemma4-12b-1card": "gemma4-12b",
+        "gemma4-31b-1card": "gemma4-31b",
+        "ltx-2.5-1card": "ltx-2.5",
+        "minicpm5-2b-1card": "minicpm5-2b",
+        "qwen-image-1card": "qwen-image",
+        "qwen27-8k-plain": "qwen3.8-27b-iq4r",
+        "qwen27-iq8r-1card": "qwen3.8-27b-iq8r",
+        "qwen27-iq8r-2card": "qwen3.8-27b-iq8r",
+        "qwen27-preview": "qwen3.8-27b-iq4r",
+        "qwen36-35b-2card": "qwen3.6-35b-a3b"
+      }
+    }
+  }
+}

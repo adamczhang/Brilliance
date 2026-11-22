@@ -286,6 +286,13 @@ public:
      * preempted request re-enters at the front). Returns how many were written. */
     int      queue_snapshot(uint64_t* out, int max) const;
 
+    /* Brilliance (fast-loop): a warm reload's scheduler keys (Engine::retune). `max_seqs` caps
+     * admission at or below the slots init sized (which stay); the --draft-suffix keys take effect
+     * for the next request. Applied under the lock only while no request is waiting or running, so
+     * no sequence sees two settings: false, and nothing changed, otherwise. */
+    bool     retune(int64_t max_seqs, bool suffix, int suffix_min_match, int suffix_max,
+                    float suffix_min_score);
+
     /* ---------------------------------------------------------- who is in flight
      *
      * Per-request state for the dashboard and for debugging a stall. Copied out under the step
@@ -723,6 +730,7 @@ private:
     int64_t              pub_at_us_ = 0;
 
     std::vector<std::unique_ptr<SchedReq>> reqs_;   /* by slot */
+    int64_t init_max_seqs_ = 0;   /* the max_seqs init sized for (retune) */
     std::vector<int32_t> free_slots_;
     std::vector<int32_t> free_cards_;   /* card indices not held by any sequence; see SchedReq::card */
     std::unordered_map<uint64_t, int32_t> by_id_;
