@@ -198,7 +198,7 @@ AVX_KERNEL(moe_scatter) {
  *
  * Qwen3.8-Flash-Next's served experts (docs/MOE-W4.md): u4 or u5 codes indexing a table of 16 or
  * 32 f32 levels, a scale per (row, group of K), bf16 per 128 (w4nla8h) or E4M3 per 64 or 32 times
- * one fixed f32 (w4nl64a8h, w4nl32a8h, w5nl64a8h). The codes view, and the two-level forms' scale
+ * one fixed f32 (w4nl64a8h, w4nl32a8h, w5nl64a8h, w6nl64a8h; u6 codes index 64 entries). The codes view, and the two-level forms' scale
  * view, arrive in the joined form of abi/rad_planes.h, which the registry rows' layout hooks ask
  * for; the planes accepted and refused are libref's (libref/ref_moe.cpp).
  *
@@ -245,7 +245,7 @@ struct CbExp {
     const uint8_t* codes = nullptr;
     int64_t row_bytes = 0, n = 0, k = 0;
     int     bits = 0;
-    float   tab[32];
+    float   tab[64];
     Scales  s{};              /* the scale plane; `s.p` null for none */
     float   mul = 1.0f;       /* the level above the scale, 1 for none */
     int64_t group = 0;        /* K elements a scale covers */
@@ -278,16 +278,36 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
     return rad_planes_header(t.data);
 }
 
+/* NVFP4's e2m1 levels as the 16-entry table the u4 decode reads (libref's kE2m1Table): the code's
+ * sign is bit 3, so code 8 is negative zero. */
+static const float kCbE2m1[16] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+
 /* An expert's codes from its joined form: 1, 0 for a plain plane (any dtype but u4 and u5),
- * RAD_E_DTYPE for planes these kernels do not read, RAD_E_SHAPE for codes not covering [n, k]. */
-static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out) {
-    if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
+ * RAD_E_DTYPE for planes these kernels do not read, RAD_E_SHAPE for codes not covering [n, k].
+ * With `fp4` the expert is an NVFP4 plane instead: a plain e2m1 plane, two codes a byte, read
+ * through kCbE2m1 as a u4 codebook; it must be dense (a row is k / 2 bytes). */
+static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out, bool fp4 = false) {
+    if (fp4) {
+        if (w.dtype != RAD_FP4E2M1) return RAD_E_DTYPE;
+        if (!w.data || w.rank < 2 || w.shape[0] < n || w.shape[1] < k || k % 2 ||
+            w.stride[1] != 1 || w.stride[0] != k)
+            return RAD_E_SHAPE;
+        out->codes = (const uint8_t*)w.data;
+        out->row_bytes = k / 2;
+        out->n = n;
+        out->k = k;
+        out->bits = 4;
+        std::memcpy(out->tab, kCbE2m1, sizeof kCbE2m1);
+        return 1;
+    }
+    if (w.dtype != RAD_U4 && w.dtype != RAD_U5 && w.dtype != RAD_U6) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
     const void* codes = h ? rad_planes_find(w.data, "codes", &ec) : nullptr;
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
-    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : ec->dtype == RAD_U6 ? 6 : 0;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
         et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
         et->rows * et->cols != ((int64_t)1 << bits))
@@ -341,21 +361,21 @@ static int cb_scale(const RadTensor* ws, CbExp* x) {
  * table registers hold the table times the current group's scale. */
 #if AVX_LEVEL == 3
 struct CbDec {
-    __m512 t0, t1;            /* entries 0..15 and 16..31 */
+    __m512 t0, t1, t2, t3;    /* entries 0..15, 16..31, 32..47 and 48..63 */
     __m512i shuf, shift;      /* u5: each lane's two source bytes, and its bit offset in them */
 };
-static inline CbDec cb_dec_init() {
+template <int BITS> static inline CbDec cb_dec_init() {
     alignas(64) int8_t sh[64];
     alignas(64) int32_t sv[16];
     for (int j = 0; j < 16; ++j) {
-        const int b = (5 * j) >> 3;
+        const int b = (BITS * j) >> 3;
         sh[4 * j] = (int8_t)b;
         sh[4 * j + 1] = (int8_t)(b + 1);
         sh[4 * j + 2] = sh[4 * j + 3] = (int8_t)0x80;
-        sv[j] = (5 * j) & 7;
+        sv[j] = (BITS * j) & 7;
     }
     CbDec d;
-    d.t0 = d.t1 = _mm512_setzero_ps();
+    d.t0 = d.t1 = d.t2 = d.t3 = _mm512_setzero_ps();
     d.shuf = _mm512_load_si512(sh);
     d.shift = _mm512_load_si512(sv);
     return d;
@@ -363,7 +383,11 @@ static inline CbDec cb_dec_init() {
 template <int BITS> static inline void cb_dec_scale(CbDec& d, const float* tab, float s) {
     const __m512 vs = _mm512_set1_ps(s);
     d.t0 = _mm512_mul_ps(_mm512_loadu_ps(tab), vs);
-    if (BITS == 5) d.t1 = _mm512_mul_ps(_mm512_loadu_ps(tab + 16), vs);
+    if (BITS >= 5) d.t1 = _mm512_mul_ps(_mm512_loadu_ps(tab + 16), vs);
+    if (BITS == 6) {
+        d.t2 = _mm512_mul_ps(_mm512_loadu_ps(tab + 32), vs);
+        d.t3 = _mm512_mul_ps(_mm512_loadu_ps(tab + 48), vs);
+    }
 }
 template <int BITS> static inline void cb_dec(const uint8_t* p, const CbDec& d, vf& v0, vf& v1);
 template <> inline void cb_dec<4>(const uint8_t* p, const CbDec& d, vf& v0, vf& v1) {
@@ -380,30 +404,44 @@ template <> inline void cb_dec<5>(const uint8_t* p, const CbDec& d, vf& v0, vf& 
     v1 = _mm512_permutex2var_ps(d.t0, _mm512_srlv_epi32(_mm512_shuffle_epi8(b1, d.shuf), d.shift),
                                 d.t1);
 }
+/* u6: 16 codes in 12 bytes, lane j at bit 6j (shift 0, 6, 4, 2 over bytes 3j/4 and the next).
+ * vpermt2ps reads the low five index bits; bit 5 picks between the two table pairs. Reads 16 bytes
+ * at `p` and at `p + 12`: 4 past the chunk's 24. */
+static inline __m512 cb_u6_half(const uint8_t* p, const CbDec& d) {
+    const __m512i b = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)p));
+    const __m512i x = _mm512_srlv_epi32(_mm512_shuffle_epi8(b, d.shuf), d.shift);
+    return _mm512_mask_blend_ps(_mm512_test_epi32_mask(x, _mm512_set1_epi32(32)),
+                                _mm512_permutex2var_ps(d.t0, x, d.t1),
+                                _mm512_permutex2var_ps(d.t2, x, d.t3));
+}
+template <> inline void cb_dec<6>(const uint8_t* p, const CbDec& d, vf& v0, vf& v1) {
+    v0 = cb_u6_half(p, d);
+    v1 = cb_u6_half(p + 12, d);
+}
 #elif AVX_LEVEL == 2
 struct CbDec {
-    __m256 t[4];              /* entries 0..7, 8..15, 16..23, 24..31 */
+    __m256 t[8];              /* entries 0..7, 8..15, ... 56..63 */
     __m256i shuf, shift;      /* u5, as at AVX-512, eight lanes over 5 bytes */
 };
-static inline CbDec cb_dec_init() {
+template <int BITS> static inline CbDec cb_dec_init() {
     alignas(32) int8_t sh[32];
     alignas(32) int32_t sv[8];
     for (int j = 0; j < 8; ++j) {
-        const int b = (5 * j) >> 3;
+        const int b = (BITS * j) >> 3;
         sh[4 * j] = (int8_t)b;
         sh[4 * j + 1] = (int8_t)(b + 1);
         sh[4 * j + 2] = sh[4 * j + 3] = (int8_t)0x80;
-        sv[j] = (5 * j) & 7;
+        sv[j] = (BITS * j) & 7;
     }
     CbDec d;
-    d.t[0] = d.t[1] = d.t[2] = d.t[3] = _mm256_setzero_ps();
+    for (int i = 0; i < 8; ++i) d.t[i] = _mm256_setzero_ps();
     d.shuf = _mm256_load_si256((const __m256i*)sh);
     d.shift = _mm256_load_si256((const __m256i*)sv);
     return d;
 }
 template <int BITS> static inline void cb_dec_scale(CbDec& d, const float* tab, float s) {
     const __m256 vs = _mm256_set1_ps(s);
-    for (int i = 0; i < (BITS == 5 ? 4 : 2); ++i)
+    for (int i = 0; i < (BITS == 6 ? 8 : BITS == 5 ? 4 : 2); ++i)
         d.t[i] = _mm256_mul_ps(_mm256_loadu_ps(tab + 8 * i), vs);
 }
 /* Entry x & 15 of the 16 in (a, b): vpermps reads the low three bits, bit 3 picks the half. */
@@ -428,6 +466,21 @@ template <> inline void cb_dec<5>(const uint8_t* p, const CbDec& d, vf& v0, vf& 
     v0 = cb_u5_half(p, d);
     v1 = cb_u5_half(p + 5, d);
 }
+/* u6: as u5, 8 lanes over 6 bytes, a third and fourth 16-entry lookup blended on bit 5. Reads 8
+ * bytes at `p` and at `p + 6`: 2 past the chunk's 12. */
+static inline __m256 cb_u6_half(const uint8_t* p, const CbDec& d) {
+    const __m256i b = _mm256_broadcastsi128_si256(_mm_loadl_epi64((const __m128i*)p));
+    const __m256i x = _mm256_srlv_epi32(_mm256_shuffle_epi8(b, d.shuf), d.shift);
+    const __m256 lo = _mm256_blendv_ps(cb_lut16(d.t[0], d.t[1], x), cb_lut16(d.t[2], d.t[3], x),
+                                       _mm256_castsi256_ps(_mm256_slli_epi32(x, 27)));
+    const __m256 hi = _mm256_blendv_ps(cb_lut16(d.t[4], d.t[5], x), cb_lut16(d.t[6], d.t[7], x),
+                                       _mm256_castsi256_ps(_mm256_slli_epi32(x, 27)));
+    return _mm256_blendv_ps(lo, hi, _mm256_castsi256_ps(_mm256_slli_epi32(x, 26)));
+}
+template <> inline void cb_dec<6>(const uint8_t* p, const CbDec& d, vf& v0, vf& v1) {
+    v0 = cb_u6_half(p, d);
+    v1 = cb_u6_half(p + 6, d);
+}
 #endif
 
 #if AVX_LEVEL >= 2
@@ -438,7 +491,7 @@ static inline const uint8_t* cb_chunk(const uint8_t* row, int64_t c, int64_t nch
                                       uint8_t* bounce) {
     constexpr int64_t cb = kCbCH * BITS / 8;
     const uint8_t* q = row + c * cb;
-    if (BITS == 5 && c + 1 == nch) {
+    if (BITS >= 5 && c + 1 == nch) {
         std::memcpy(bounce, q, (size_t)cb);
         return bounce;
     }
@@ -455,7 +508,7 @@ static void cb_fused(const CbExp& x, int64_t wr, const float* const* ar, const f
     for (int w = 0; w < W; ++w)
         for (int r = 0; r < R; ++r) acc[w][r][0] = acc[w][r][1] = vf_zero();
     CbDec d[W];
-    for (int w = 0; w < W; ++w) d[w] = cb_dec_init();
+    for (int w = 0; w < W; ++w) d[w] = cb_dec_init<BITS>();
     const int64_t nch = x.k / kCbCH, cpg = x.group / kCbCH;
     alignas(16) uint8_t bounce[W][32] = {};
     for (int64_t c = 0; c < nch;) {
@@ -491,7 +544,7 @@ static void cb_panel(const CbExp& x, int64_t wr, int64_t nr, int64_t c0, int64_t
                      const float* sv, int64_t ng, float* P, int64_t ldp) {
     const int64_t nch = x.k / kCbCH, cpg = x.group / kCbCH;
     alignas(16) uint8_t bounce[32] = {};
-    CbDec d = cb_dec_init();
+    CbDec d = cb_dec_init<BITS>();
     for (int64_t i = 0; i < nr; ++i) {
         const uint8_t* row = x.codes + (wr + i) * x.row_bytes;
         float* dst = P + i * ldp;
@@ -620,6 +673,7 @@ static inline void cb_block(const float* const* A, const float* B, int64_t ldb, 
 
 /* A call's operands and geometry, as moe_gemm_impl read them. */
 struct CbCall {
+    bool fp4 = false;   /* NVFP4 codes (cb_codes) rather than u4 or u5 */
     const RadTensor *A = nullptr, *sorted = nullptr, *off = nullptr, *Y = nullptr;
     const RadTensor* Wq[4] = {};
     const RadTensor* wsq[4] = {};
@@ -749,6 +803,7 @@ static void cb_compute(const CbExp& x, const CbItem& it, int64_t R, const float*
         };
         using I4 = std::integral_constant<int, 4>;
         using I5 = std::integral_constant<int, 5>;
+        using I6 = std::integral_constant<int, 6>;
         /* AVX2's sixteen registers hold two weight rows' accumulators for up to two rows. */
         using W2 = std::integral_constant<int, 2>;
         using WB = std::integral_constant<int, AVX_LEVEL == 3 ? 2 : 1>;
@@ -760,8 +815,9 @@ static void cb_compute(const CbExp& x, const CbItem& it, int64_t R, const float*
                 default: run(bits, WB{}, std::integral_constant<int, 4>{}); break;
             }
         };
-        if (x.bits == 5) by_r(I5{});
-        else             by_r(I4{});
+        if (x.bits == 6)      by_r(I6{});
+        else if (x.bits == 5) by_r(I5{});
+        else                  by_r(I4{});
         return;
     }
     /* The panel form: kCbNR weight rows over all of K, against every row in kCbMR blocks, so each
@@ -774,7 +830,8 @@ static void cb_compute(const CbExp& x, const CbItem& it, int64_t R, const float*
         if (path == kCbLines)  cb_panel_lines(x, wr0, nr, rs(wr0), ng, P, k);
         else
 #endif
-        if (x.bits == 5) cb_panel<5>(x, wr0, nr, 0, nch, rs(wr0), ng, P, k);
+        if (x.bits == 6) cb_panel<6>(x, wr0, nr, 0, nch, rs(wr0), ng, P, k);
+        else if (x.bits == 5) cb_panel<5>(x, wr0, nr, 0, nch, rs(wr0), ng, P, k);
         else             cb_panel<4>(x, wr0, nr, 0, nch, rs(wr0), ng, P, k);
         int64_t r0 = 0;
         for (; r0 + kCbMR <= R; r0 += kCbMR) {
@@ -888,7 +945,7 @@ static int moe_codebook(const CbCall& c) {
         }
         CbExp& x = ex[e];
         x = CbExp{};
-        const int jc = cb_codes(w, n, k, &x);
+        const int jc = cb_codes(w, n, k, &x, c.fp4);
         if (jc < 0) return jc;
         if (jc == 0) return RAD_E_DTYPE;
         const int js = cb_scale(c.wsq[q] ? &s : nullptr, &x);
@@ -1042,9 +1099,11 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     const int64_t y_cs = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
 
     /* u4 or u5 codes are the codebook experts' joined form, which only their own path reads. */
-    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5)) {
+    const bool fp4 = quant && std::strcmp(p_str(a, "dtype", ""), "nvfp4a8i8") == 0;
+    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5 || Wq[0]->dtype == RAD_U6 || fp4)) {
         CbCall c;
         c.A = A; c.sorted = sorted; c.off = off; c.Y = Y;
+        c.fp4 = fp4;
         for (int q = 0; q < 4; ++q) {
             c.Wq[q] = Wq[q]; c.wsq[q] = wsq[q]; c.Nq[q] = Nq[q]; c.Kq[q] = Kq[q];
         }

@@ -1,0 +1,40 @@
+# hy4-flash-iqr-gptq.recipe -- Tencent Hy4-flash in IQR's trellis forms, fitted by GPTQ against the Grams
+# of a calibration run (docs/ARCHITECTURES.md, "Calibrating Hy4-flash"): the routed experts' gate_up
+# as the rotated computed trellis at u4 under one f32 scale a row (libquant's tcq_code=mad, read by
+# moe_gemm_iqr against rotated int8 activations, docs/IQR.md), their down projection as the w6nl64
+# codebook (docs/MOE-W6.md, read against the rotated E4M3 pair of the clamped product); the wide
+# trunk projections as the u5 trellis and the narrow ones as rotated int8, both read at i8a8h (not
+# kv_a: its 576 rows are not whole 128-row tiles of libr4d's trellis GEMM nor of its int8 prefill
+# tile, so it stays bf16, as in hy4-flash-i8.recipe); the
+# lm_head as int8; the Engram tables as E4M3 rows. The form of qwen4exp-u4-w6nl-bf16ple.recipe.
+#
+#   CALIB=<grams dir> rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-iqr-gptq.recipe -o hy4-flash-iqr.rad
+#
+# Left as shipped, as in hy4-flash-i8.recipe: kv_b, the indexer, router, hyper-connections, norms,
+# sinks, Engram projections, the token embedding and the tower, and DFly2 (hy4-flash-dfly-i8.recipe, hy4-flash-dfly-iq8r.recipe). The trellis is decoded by
+# libr4d only (no host kernel reads it): a container of this recipe serves on the cards.
+#
+# The trellis is tail-biting over runs of tcq_rows rows, and a tensor-parallel rank can only take
+# whole runs (the loader refuses a shard that cuts one). Row-sharded parts must therefore be a
+# multiple of tcq_rows a rank: the dense and shared gate_up's runs are 128 (Hy4-flash at TP4 takes
+# 3456 of 13824 and 384 of 1536 rows a part; gpu-mini's shared expert 128 of 256 at TP2), the
+# head-sharded q_nope / q_rope / attn_gate keep 256 (whole heads of 192 / 64 / 256 rows, 1536 /
+# 512 / 2048 rows a rank at TP4), q_a and latent_in are replicated.
+#
+# PATTERN                          QUANTISER  OPTIONS
+blk.*.attn_q_a.weight              gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.attn_q_nope.weight           gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.attn_q_rope.weight           gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.attn_gate.weight             gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.ffn_gate_up.weight           gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.ffn_gate_up_shexp.weight     gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.ffn_latent_in.weight         gptq       codes=u5 tcq=16 tcq_code=mad tcq_rows=256 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.16 calib=$CALIB tcq_order=1
+blk.*.attn_output.weight           gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
+blk.*.ffn_down.weight              gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
+blk.*.ffn_down_shexp.weight        gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
+blk.*.ffn_latent_out.weight        gptq       codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB
+blk.*.ffn_gate_up_exps.*.weight    gptq       codes=u4 tcq=16 tcq_code=mad tcq_rows=128 block=1x* scale=f32 transform=fwht128 damp=0.01 tcq_gain=1.12 calib=$CALIB tcq_order=1
+blk.*.ffn_down_exps.*.weight       gptq       table=w6nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+output.weight                      gptq       codes=i8 group=128 scale=bf16 damp=0.01 calib=$CALIB
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

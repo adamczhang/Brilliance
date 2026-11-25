@@ -247,14 +247,12 @@ static value tojson(const func_args & args) {
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
+    const bool sort_keys = val_sort->as_bool(); // undefined == false
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
     std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
-    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep);
+    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep, sort_keys);
     if (ensure_ascii) {
         json_str = json_ensure_ascii_preserving_format(json_str);
     }
@@ -764,6 +762,42 @@ const func_builtins & value_string_t::get_builtins() const {
             std::string str = args.get_pos(0)->as_string().str();
             std::string suffix = args.get_pos(1)->as_string().str();
             return mk_val<value_bool>(string_endswith(str, suffix));
+        }},
+        /* str.format with positional fields: "{}" (auto-numbered), "{0}", and "{{" / "}}" for
+         * the braces. Names, attribute access and format specs are refused by name, not guessed
+         * at. Hy4's template builds every special token with it ('<｜hy_start{}｜>'.format(HYTK)). */
+        {"format", [](const func_args & args) -> value {
+            value val_input = args.get_pos(0);
+            if (!is_val<value_string>(val_input)) {
+                throw raised_exception("format() first argument must be a string");
+            }
+            const std::string fmt = val_input->as_string().str();
+            const size_t n_args = args.count() - 1;
+            std::string out;
+            size_t next_auto = 0;
+            for (size_t i = 0; i < fmt.size(); ++i) {
+                const char c = fmt[i];
+                if (c == '{' && i + 1 < fmt.size() && fmt[i + 1] == '{') { out += '{'; ++i; continue; }
+                if (c == '}' && i + 1 < fmt.size() && fmt[i + 1] == '}') { out += '}'; ++i; continue; }
+                if (c == '}') throw raised_exception("format(): single '}' encountered in the string");
+                if (c != '{') { out += c; continue; }
+                const size_t close = fmt.find('}', i + 1);
+                if (close == std::string::npos)
+                    throw raised_exception("format(): expected '}' before end of string");
+                const std::string field = fmt.substr(i + 1, close - i - 1);
+                size_t idx;
+                if (field.empty()) {
+                    idx = next_auto++;
+                } else if (field.find_first_not_of("0123456789") == std::string::npos) {
+                    idx = static_cast<size_t>(std::stoull(field));
+                } else {
+                    throw not_implemented_exception("format(): only positional fields are implemented, got '{" + field + "}'");
+                }
+                if (idx >= n_args) throw raised_exception("format(): replacement index " + std::to_string(idx) + " out of range for positional args");
+                out += args.get_pos(idx + 1)->as_string().str();
+                i = close;
+            }
+            return mk_val<value_string>(out);
         }},
         {"split", [](const func_args & args) -> value {
             args.ensure_count(1, 3);
@@ -1474,7 +1508,7 @@ void global_set_from_json(context & ctx, const std::string & key,
 
 // recursively convert value to JSON string
 // TODO: avoid circular references
-static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };
@@ -1519,7 +1553,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
             oss << newline();
             for (size_t i = 0; i < arr.size(); ++i) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < arr.size() - 1) {
                     oss << item_sep;
                 }
@@ -1530,16 +1564,25 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
         oss << "]";
     } else if (is_val<value_object>(val)) {
         const auto & obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        std::vector<std::pair<std::string, value>> items;
+        items.reserve(obj.size());
+        for (const auto & pair : obj) {
+            items.emplace_back(pair.first->as_string().str(), pair.second);
+        }
+        if (sort_keys) {
+            // same order as python json.dumps(sort_keys=True): utf-8 byte order is code point order
+            std::stable_sort(items.begin(), items.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+        }
         oss << "{";
-        if (!obj.empty()) {
+        if (!items.empty()) {
             oss << newline();
             size_t i = 0;
-            for (const auto & pair : obj) {
+            for (const auto & [key, item] : items) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string().str()), curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, mk_val<value_string>(key), curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 oss << key_sep;
-                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep);
-                if (i < obj.size() - 1) {
+                value_to_json_internal(oss, item, curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
+                if (i < items.size() - 1) {
                     oss << item_sep;
                 }
                 oss << newline();
@@ -1553,9 +1596,9 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     }
 }
 
-std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     std::ostringstream oss;
-    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
+    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep, sort_keys);
     JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
     return oss.str();
 }

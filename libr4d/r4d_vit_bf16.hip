@@ -13,6 +13,7 @@
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_gdn_wmma.h"
 
@@ -187,7 +188,9 @@ __device__ __forceinline__ void cpe_taps(int at, int d, int side, int* t, float*
     w[0] = 1.0f - w[1];
 }
 
-template <bool TF32>
+// SQUARE: grid_embed_cpe's target, the square of the grid's larger side; otherwise
+// grid_embed_hw's, each axis onto the grid's own extent (Inkling 2).
+template <bool TF32, bool SQUARE = true>
 __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
     unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
     uint32_t n, int side, uint32_t x_ld, uint32_t plane, const unsigned short* __restrict__ pre,
@@ -206,14 +209,58 @@ __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
     const int d = g[2] > g[3] ? g[2] : g[3];
     int th[2], tw[2];
     float wh[2], ww[2];
-    cpe_taps(g[0], d, side, th, wh);
-    cpe_taps(g[1], d, side, tw, ww);
+    cpe_taps(g[0], SQUARE ? d : g[2], side, th, wh);
+    cpe_taps(g[1], SQUARE ? d : g[3], side, tw, ww);
     for (uint32_t i = threadIdx.x; i < n; i += kThr) {
         const float r0 = ww[0] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[0]) * n + i) +
                          ww[1] * ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[1]) * n + i);
         const float r1 = ww[0] * ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[0]) * n + i) +
                          ww[1] * ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[1]) * n + i);
         const float pe = bf2f(f32_to_bf16(wh[0] * r0 + wh[1] * r1));
+        xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
+    }
+}
+
+// ---------------------------------------------------------------------------- grid_embed_sf
+// ref_grid_embed_sf: Hy4-flash's position embedding, torch's half-pixel bilinear without
+// antialias at the stated scale factor (size + offset) / side an axis. A segment's size is in its
+// coordinate planes, so each row forms 1 / scale itself, in f64 rounded to f32 as torch's
+// area_pixel_compute_scale does; the row blended first, as libref.
+__device__ __forceinline__ void sf_taps(int at, int size, int side, double offset, int* t,
+                                        float* w) {
+    size = size < 1 ? 1 : size;
+    at = at < 0 ? 0 : (at >= size ? size - 1 : at);
+    /* An axis that keeps its size is torch's identity (scale 1), whatever the stated factor. */
+    const float inv = size == side ? 1.0f : (float)(1.0 / (((double)size + offset) / (double)side));
+    float src = inv * ((float)at + 0.5f) - 0.5f;
+    src = src < 0.0f ? 0.0f : src;
+    int i0 = (int)src;
+    i0 = i0 > side - 1 ? side - 1 : i0;
+    t[0] = i0;
+    t[1] = i0 < side - 1 ? i0 + 1 : i0;
+    float l = src - (float)i0;
+    l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    w[1] = l;
+    w[0] = 1.0f - l;
+}
+
+template <bool TF32>
+__global__ __launch_bounds__(kThr) void grid_embed_sf_kernel(
+    unsigned short* __restrict__ x, const void* __restrict__ tab, const int32_t* __restrict__ crd,
+    uint32_t n, int side, uint32_t x_ld, uint32_t plane, double offset) {
+    const uint32_t m = blockIdx.x;
+    const int g[4] = { crd[m], crd[plane + m], crd[2 * plane + m], crd[3 * plane + m] };
+    unsigned short* __restrict__ xr = x + (size_t)m * x_ld;
+    int th[2], tw[2];
+    float wh[2], ww[2];
+    sf_taps(g[0], g[2], side, offset, th, wh);
+    sf_taps(g[1], g[3], side, offset, tw, ww);
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) {
+        const float r0 = __fadd_rn(__fmul_rn(ww[0], ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[0]) * n + i)),
+                                   __fmul_rn(ww[1], ldw<TF32>(tab, (uint32_t)(th[0] * side + tw[1]) * n + i)));
+        const float r1 = __fadd_rn(__fmul_rn(ww[0], ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[0]) * n + i)),
+                                   __fmul_rn(ww[1], ldw<TF32>(tab, (uint32_t)(th[1] * side + tw[1]) * n + i)));
+        const float pe = bf2f(f32_to_bf16(__fadd_rn(__fmul_rn(wh[0], r0), __fmul_rn(wh[1], r1))));
         xr[i] = f32_to_bf16(bf2f(xr[i]) + pe);
     }
 }
@@ -225,11 +272,14 @@ __global__ __launch_bounds__(kThr) void grid_embed_cpe_kernel(
 // TM x TN WMMA tiles per wave, eight waves as 2 x 4: BM = 2*TM*16, BN = 4*TN*16. ACT: 0 none,
 // 1 exact GELU, 2 tanh GELU. Serves grids under 32 blocks of 128 x 128 at TM 2, TN 1 (64 x 64);
 // larger grids take vit_gemm_wa_kernel below.
-template <int TM, int TN, int ACT, bool RES, bool BF32>
+// CH `r4dchain`: the chained form (r4d_chain.h), taken at decode heights (M <= 64: one row of
+// blocks); no block returns early.
+template <int TM, int TN, int ACT, bool RES, bool BF32, class CH = R4dUnchained>
 __global__ __launch_bounds__(256) void vit_gemm_kernel(
     const unsigned short* __restrict__ A, unsigned lda, const unsigned short* __restrict__ W,
     unsigned ldw_, const void* __restrict__ bias, const unsigned short* R, unsigned ldr,
     unsigned short* C, unsigned ldc, int M, int K, int N) {
+    if (CH::on) r4d_chain_wait();
     constexpr int BM = 2 * TM * 16, BN = 4 * TN * 16;
     constexpr int CPR = VB_BK / 8;                      // 16-byte chunks a staged row
     constexpr int AL = BM * CPR / 256, WL = BN * CPR / 256;
@@ -334,6 +384,7 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
                 C[(size_t)m * ldc + n] = t;
             }
         }
+    if (CH::on) r4d_chain_done();
 }
 
 
@@ -669,8 +720,10 @@ extern "C" int r4d_rad_grid_embed_aa(const RadArgs* a, RadStream stream) {
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane);
 }
 
-/* grid_embed_cpe: grid_embed's operands and checks, RADIO's cropped resample. */
-extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
+/* grid_embed_cpe: grid_embed's operands and checks, RADIO's cropped resample; grid_embed_hw the
+ * same with each axis onto the grid's own extent. */
+template <bool SQUARE>
+static int grid_embed_bilinear(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = r4d_opt(a, GE_X);
     const RadTensor* tab = r4d_opt(a, GE_TAB);
     const RadTensor* crd = r4d_opt(a, GE_CRD);
@@ -696,12 +749,52 @@ extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
         return R4D_NO(pre && pre->dtype != RAD_BF16 ? RAD_E_DTYPE : RAD_E_SHAPE);
     const unsigned short* pp = pre ? (const unsigned short*)r4d_p(pre) : nullptr;
     if (tab->dtype == RAD_F32)
-        return R4D_EMIT(stream, grid_embed_cpe_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+        return R4D_EMIT(stream, (grid_embed_cpe_kernel<true, SQUARE>), dim3((uint32_t)M),
+                        dim3(kThr), 0,
                         (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                         (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
-    return R4D_EMIT(stream, grid_embed_cpe_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+    return R4D_EMIT(stream, (grid_embed_cpe_kernel<false, SQUARE>), dim3((uint32_t)M), dim3(kThr),
+                    0,
                     (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
                     (uint32_t)n, (int)side, (uint32_t)x_ld, plane, pp, (int)npre);
+}
+
+extern "C" int r4d_rad_grid_embed_cpe(const RadArgs* a, RadStream stream) {
+    return grid_embed_bilinear<true>(a, stream);
+}
+
+extern "C" int r4d_rad_grid_embed_hw(const RadArgs* a, RadStream stream) {
+    return grid_embed_bilinear<false>(a, stream);
+}
+
+/* grid_embed_sf: grid_embed's operands and checks, the scale-factor resample. */
+extern "C" int r4d_rad_grid_embed_sf(const RadArgs* a, RadStream stream) {
+    const RadTensor* x   = r4d_opt(a, GE_X);
+    const RadTensor* tab = r4d_opt(a, GE_TAB);
+    const RadTensor* crd = r4d_opt(a, GE_CRD);
+    if (!x || !tab || !crd) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || crd->dtype != RAD_I32) return R4D_NO(RAD_E_DTYPE);
+    if (tab->dtype != RAD_BF16 && tab->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(tab)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(tab, (int)tab->rank - 1));
+    const long long side = r4d_geti_or(a, "side", 0);
+    const double offset = r4d_getf(a, "offset", 0.0);
+    if (n <= 0 || side <= 0 || r4d_numel(tab) < side * side * n) return R4D_NO(RAD_E_SHAPE);
+    if (!(offset > -1.0) || offset != offset) return R4D_NO(RAD_E_INVAL);
+    long long M = 0;
+    const long long x_ld = r4d_rows_pitch(x, n, &M);
+    if (x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (crd->rank != 2 || crd->shape[0] < 4 || crd->shape[1] < M || !r4d_contig(crd))
+        return R4D_NO(RAD_E_SHAPE);
+    if (M <= 0) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t plane = (uint32_t)crd->shape[1];
+    if (tab->dtype == RAD_F32)
+        return R4D_EMIT(stream, grid_embed_sf_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
+                        (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                        (uint32_t)n, (int)side, (uint32_t)x_ld, plane, offset);
+    return R4D_EMIT(stream, grid_embed_sf_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
+                    (unsigned short*)r4d_wp(x), r4d_p(tab), (const int32_t*)r4d_p(crd),
+                    (uint32_t)n, (int)side, (uint32_t)x_ld, plane, offset);
 }
 
 /* ------------------------------------------------------------------ gemm_nt_bias */
@@ -778,10 +871,14 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
 #undef VB_L
     }
     const dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64)), block(256);
+    const bool vch = r4d_geti_or(a, "chain", 0) != 0 && M <= 64;
 #define VB_L(AC, RS, BF)                                                                          \
-    return R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF>), grid, block, 0, Ap,             \
-                    (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,      \
-                    (int)M, (int)K, (int)N)
+    return vch ? R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF, r4dchain>), grid, block, 0,  \
+                          Ap, (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp,         \
+                          (unsigned)ldc, (int)M, (int)K, (int)N)                                  \
+               : R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF>), grid, block, 0, Ap,       \
+                          (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc, \
+                          (int)M, (int)K, (int)N)
 #define VB_ACT(RS, BF)                                                                            \
     do {                                                                                          \
         if (act == 1) VB_L(1, RS, BF);                                                            \

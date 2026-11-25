@@ -9,7 +9,7 @@ server, the person or organisation that runs it, sets them and is responsible fo
 > models you do not serve, add your own terms, and set `terms-file:` under `server:` to your copy.
 > Then remove this note. Some model licences require whoever serves the model to other people to
 > pass the licence's use restrictions on to them as enforceable terms. The sections below carry
-> those restrictions for the models Brilliance 0.3.0 lists. Other licences set conditions on you,
+> those restrictions for the models Brilliance 0.3.1 lists. Other licences set conditions on you,
 > the operator, before you serve the model commercially: Qwen3.8-Flash-Next's licence is one
 > (its section below). Read those conditions before you serve the model to anyone.
 
@@ -36,12 +36,14 @@ The full text of each licence is at `/terms/licenses` on this server.
 | Qwen3.8-27B | Apache 2.0 | None |
 | Qwen3.8-Flash-Next | Qwen Community License 1.0 | Yes, below: lawful use that infringes no one's intellectual property; commercial-use and attribution conditions on the operator |
 | MiniCPM5-2B | Apache 2.0 | None |
+| Inkling 2 Mini | Apache 2.0 | None |
 | Qwen3-ASR 1.7B (transcription) | Apache 2.0 | None |
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | None |
 | Gemma 4 31B and 12B | Apache 2.0 | None |
 | Qwen3.6-35B-A3B | Apache 2.0 | None |
 | Qwen-Image 2.1 (pictures) | Qwen RESEARCH LICENSE AGREEMENT | Yes, below: non-commercial use only |
 | DeepSeek-V4.1-Flash-1017 | MIT | None |
+| Hy4-flash | Tencent Hy License 1.0 | Yes, below: a separate licence for large Model-as-a-Service businesses; the licence and notices kept with copies |
 
 ## LTX-2.5 (video)
 
@@ -228,6 +230,68 @@ Deployments must adhere to the [Gemma Prohibited Use Policy](https://ai.google.d
 
 By using EmbeddingGemma 2 here you agree to follow the Gemma Prohibited Use Policy:
 https://ai.google.dev/gemma/prohibited_use_policy
+
+## Hy4-flash
+
+Hy4-flash is Tencent's model, licensed under the Tencent Hy License, Version 1.0. That licence is
+derived from the Apache License 2.0, with additional commercial terms for large Model-as-a-Service
+("MaaS") businesses in its Section 10, quoted below as the licence states it. The whole licence is
+at `/terms/licenses/tencent-hy-1.0` on this server, and in the model's repository, https://huggingface.co/keptn/hy4-flash-iqr-v4.
+The container served here is keptn's quantised form of tencent/Hy4-flash; its NOTICE says the
+quantisation changed the weights.
+
+```text
+10. Additional Commercial Terms.
+
+   10.1 MaaS. "MaaS" means giving third parties remote access to model
+        inference or fine-tuning (e.g., via API), allowing them to
+        submit inputs or specify parameters or training data. This
+        excludes (i) end-user products with model capabilities confined
+        to specific features or workflows, without general-purpose
+        model access, or (ii) merely relaying requests to an
+        independently operated third-party model service.
+
+   10.2 Separate License Required. Notwithstanding Sections 2 and 3,
+        and except as provided in Section 10.3, if You operate a MaaS
+        business, You must obtain a separate written license to use the
+        Work or any Derivative Works from Licensor (including by email),
+        in either of the following cases:
+
+        (a) if Your aggregate worldwide gross revenue exceeds
+            US$50 million (or the equivalent in other currencies) in
+            any consecutive 12-month period, whether or not such
+            revenue is derived from the Work or any Derivative Works,
+            before using (or continuing to use) the Work or any
+            Derivative Works; or
+
+        (b) before using the Work or any Derivative Works in or for any
+            product or service provided by You that has more than
+            100 million monthly active users in any calendar month.
+
+   10.3 Internal Use. Section 10.2 does not apply to Your use of the
+        Work or any Derivative Works solely for internal purposes,
+        provided that neither the Work, any Derivative Works, nor their
+        outputs are made available to third parties.
+
+   10.4 Contact. For licensing requests or questions, please contact
+        hy_partners@tencent.com.
+
+END OF TERMS AND CONDITIONS
+```
+
+What it means in practice:
+
+- **A separate licence for large MaaS businesses.** If the operator runs a MaaS business (giving
+  third parties general-purpose remote access to model inference, as serving this server's API to
+  other people can be), it needs a separate written licence from Tencent before using the model
+  when its worldwide gross revenue exceeds US$50 million in any 12 months, or before using the
+  model in a product or service with more than 100 million monthly active users. Use solely for
+  internal purposes, with neither the model nor its outputs made available to third parties, is
+  excepted. Tencent's contact for licences is hy_partners@tencent.com.
+- **The notices.** Copies of the model or of derivative works keep the licence, the copyright and
+  attribution notices, and a readable copy of the NOTICE file's attribution notices.
+
+By using Hy4-flash here you agree to its licence.
 
 ## Qwen3.8-Flash-Next
 

@@ -15,7 +15,7 @@
 # depending on core/build/'s builder. With the archive linked, a new ABI call missing from the fake
 # would pull in rad_builder.cpp.o and collide on every rad_decl_* symbol; without it the error is a
 # single undefined reference.
-set(RAD_TESTS_NO_CORE minimaxh3_limits_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
+set(RAD_TESTS_NO_CORE minimaxh3_limits_test wan_arch_test wan_vae_test wan_denoiser_test wan_conditioning_test arch_test bailing_hybrid_arch_test breeze_arch_test flint_arch_test glm5next_test hyv4flash_arch_test hyv4flash_calib_test museglimmer_test nemotron35_test spark25_arch_test nemotronh_test)
 
 # fixture_test tests tools/kfixture.cpp and tools/opshapes.cpp (the seeded draw, the reduction and
 # the on-disk recording) directly, kbench_test tools/kbench_core.cpp (rad-kbench's rules), and
@@ -41,7 +41,7 @@ add_library(rad_legacy_toolparse STATIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy/toolp
                                         ${CMAKE_CURRENT_SOURCE_DIR}/legacy/chatdiff.cpp)
 target_link_libraries(rad_legacy_toolparse PUBLIC rad_core)
 target_include_directories(rad_legacy_toolparse PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy)
-set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
+set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test chatparse_inkling2_test)
 
 # relayout_parity_test checks each kernel library's relayout of libquant's planes against a
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
@@ -188,13 +188,19 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 
 # shipped_plugins_test loads the shipped architecture plugins, which bind the plugin-facing C ABI
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
-set(RAD_TESTS_WHOLE_CORE shipped_plugins_test deepseek41_test deepseek41_hip_test)
+set(RAD_TESTS_WHOLE_CORE shipped_plugins_test generator_lora_engine_test deepseek41_test
+    deepseek41_hip_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
-  list(FILTER RAD_TESTS EXCLUDE REGEX "/dspark_device_test\\.cpp$")
+  list(FILTER RAD_TESTS EXCLUDE REGEX "/(dspark|attn_rel)_device_test\\.cpp$")
   list(FILTER RAD_TESTS EXCLUDE REGEX "/deepseek41_hip_test\\.cpp$")
 endif()
+# A card test takes a plugin's path and is registered below, on the card only.
+list(FILTER RAD_TESTS EXCLUDE REGEX "/sconv_device_test\\.cpp$")
+list(FILTER RAD_TESTS EXCLUDE REGEX "/l2clip_device_test\\.cpp$")
+list(FILTER RAD_TESTS EXCLUDE REGEX "/r3d_iqr_device_test\\.cpp$")
+list(FILTER RAD_TESTS EXCLUDE REGEX "/posemb_device_test\\.cpp$")
 foreach(t ${RAD_TESTS})
   get_filename_component(n ${t} NAME_WE)
   if(n IN_LIST RAD_TESTS_NO_CORE)
@@ -232,6 +238,30 @@ foreach(t ${RAD_TESTS})
         target_compile_definitions(${n} PRIVATE RAD_NEMOTRON_TEST_AVX=1)
       endif()
     endif()
+  elseif(n STREQUAL "r3d_iqr_test")
+    add_executable(${n} ${t} ${CMAKE_SOURCE_DIR}/libr3d/r3d_iqr_layout.cpp)
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+  elseif(n STREQUAL "r3d_iqr_selection_test")
+    add_library(r3d_iqr_fixture MODULE r3d_iqr_fixture.cpp)
+    target_link_libraries(r3d_iqr_fixture PRIVATE radiance::abi)
+    if(TARGET libr3d)
+      get_target_property(r3d_targets libr3d HIP_ARCHITECTURES)
+    endif()
+    if(r3d_targets STREQUAL "gfx1100")
+      target_compile_definitions(r3d_iqr_fixture PRIVATE R3D_IQR_SHIPPED_CATALOGUE)
+      target_link_libraries(r3d_iqr_fixture PRIVATE -Wl,--no-as-needed $<TARGET_FILE:libr3d> -Wl,--as-needed)
+      add_dependencies(r3d_iqr_fixture libr3d)
+    else()
+      target_sources(r3d_iqr_fixture PRIVATE ${CMAKE_SOURCE_DIR}/libr3d/r3d_iqr_layout.cpp
+                                              ${CMAKE_SOURCE_DIR}/libr3d/r3d_shapes.cpp)
+      target_include_directories(r3d_iqr_fixture PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+      target_compile_definitions(r3d_iqr_fixture PRIVATE R3D_DENSE_IQR)
+    endif()
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
+    target_include_directories(${n} PRIVATE ${CMAKE_SOURCE_DIR}/libr3d)
+    target_compile_definitions(${n} PRIVATE R3D_IQR_FIXTURE="$<TARGET_FILE:r3d_iqr_fixture>")
+    add_dependencies(${n} r3d_iqr_fixture)
   elseif(n IN_LIST RAD_TESTS_HARNESS)
     add_executable(${n} ${t})
     add_dependencies(${n} harness_fixture)
@@ -338,6 +368,18 @@ foreach(t ${RAD_TESTS})
         TIMEOUT ${RAD_TEST_TIMEOUT}
         ENVIRONMENT "${RAD_TEST_CARD_ENV}")
     endif()
+  elseif(n STREQUAL "attn_rel_device_test")
+    # attn_paged_rel's libr4d rows against libref on the card (tests/attn_rel_device_test.cpp).
+    if(RAD_HIP_FOUND AND TARGET libr4d AND TARGET libref)
+      add_dependencies(${n} libr4d libref)
+      add_test(NAME ${n} COMMAND ${n} ${RAD_PLUGIN_OUT}/kernels/libr4d.so
+                                 ${RAD_PLUGIN_OUT}/kernels/libref.so)
+      set_tests_properties(${n} PROPERTIES
+        LABELS gpu
+        SKIP_RETURN_CODE 77
+        TIMEOUT ${RAD_TEST_TIMEOUT}
+        ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+    endif()
   else()
     if(DEFINED RAD_TEST_SHARDS_${n})
       math(EXPR last "${RAD_TEST_SHARDS_${n}} - 1")
@@ -362,14 +404,74 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/rad_perf_tests.cmake "${RAD_PERF_SCRIPT}"
 set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
              ${CMAKE_CURRENT_BINARY_DIR}/rad_perf_tests.cmake)
 
+if(TARGET libr3d)
+  get_target_property(r3d_targets libr3d HIP_ARCHITECTURES)
+  if(r3d_targets STREQUAL "gfx1100")
+    add_executable(r3d_iqr_device_test r3d_iqr_device_test.cpp)
+    target_link_libraries(r3d_iqr_device_test PRIVATE ${RAD_TEST_CORE} ${CMAKE_DL_LIBS})
+    target_compile_options(r3d_iqr_device_test PRIVATE -ffp-contract=off)
+    set_target_properties(r3d_iqr_device_test PROPERTIES ENABLE_EXPORTS ON RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+    add_dependencies(r3d_iqr_device_test libr3d)
+    add_test(NAME r3d_iqr_catalogue_test COMMAND r3d_iqr_device_test $<TARGET_FILE:libr3d> --catalogue-only)
+    set_tests_properties(r3d_iqr_catalogue_test PROPERTIES LABELS unit ENVIRONMENT "${RAD_TEST_ENV}")
+    add_test(NAME r3d_iqr_device_test_card COMMAND r3d_iqr_device_test $<TARGET_FILE:libr3d>)
+    set_tests_properties(r3d_iqr_device_test_card PROPERTIES LABELS gpu RESOURCE_LOCK card
+      SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT} ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+  endif()
+endif()
+
+# sconv_res on the card: libr4d's exported launcher against the formula, over the model's shapes.
+if(RAD_HIP_FOUND AND TARGET libr4d)
+  add_executable(sconv_device_test ${CMAKE_CURRENT_SOURCE_DIR}/sconv_device_test.cpp)
+  set_target_properties(sconv_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  target_link_libraries(sconv_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  add_dependencies(sconv_device_test libr4d)
+  add_test(NAME sconv_device_test_card COMMAND sconv_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+  set_tests_properties(sconv_device_test_card PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
+
+# l2_clip on the card: libr4d's exported launcher against the formula, at the model's shapes.
+if(RAD_HIP_FOUND AND TARGET libr4d)
+  add_executable(l2clip_device_test ${CMAKE_CURRENT_SOURCE_DIR}/l2clip_device_test.cpp)
+  set_target_properties(l2clip_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  target_link_libraries(l2clip_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  add_dependencies(l2clip_device_test libr4d)
+  add_test(NAME l2clip_device_test_card COMMAND l2clip_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+  set_tests_properties(l2clip_device_test_card PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
+
+# posemb_resample on the card: libr4d's row against libref's over the vision tower's grids and the
+# dtype pairs (tests/posemb_device_test.cpp).
+if(RAD_HIP_FOUND AND TARGET libr4d AND TARGET libref)
+  add_executable(posemb_device_test ${CMAKE_CURRENT_SOURCE_DIR}/posemb_device_test.cpp)
+  set_target_properties(posemb_device_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+  target_link_libraries(posemb_device_test PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+  add_dependencies(posemb_device_test libr4d libref)
+  add_test(NAME posemb_device_test_card COMMAND posemb_device_test ${RAD_PLUGIN_OUT}/kernels/libr4d.so
+                                        ${RAD_PLUGIN_OUT}/kernels/libref.so)
+  set_tests_properties(posemb_device_test_card PROPERTIES
+    LABELS gpu
+    RUN_SERIAL TRUE
+    TIMEOUT ${RAD_TEST_TIMEOUT}
+    ENVIRONMENT "${RAD_TEST_CARD_ENV}")
+endif()
+
 # ================================================================== the device tests on a card
 #
 # The unit entries run on the host backend. These run the tests whose code differs on a card (the
-# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ) on the
-# card, one at a time: a test that commits device memory fails beside another holding it, or beside
-# a server.
+# AQL backend, the driver's elastic commit, the mover's copies, libquant's trellis GPTQ, and the
+# n-gram table a --ngram-placement ram=DIR engine pins in a shared file) on the card, one at a
+# time: a test that commits device memory fails beside another holding it, or beside a server.
 if(RAD_HIP_FOUND)
-  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test)
+  foreach(n device_test mem_test place_test runtime_test quant_tcq_gpu_test glm_device_test table_fill_test)
     add_test(NAME ${n}_card COMMAND ${n} -perf_)
     set_tests_properties(${n}_card PROPERTIES
       LABELS gpu
@@ -377,6 +479,23 @@ if(RAD_HIP_FOUND)
       TIMEOUT ${RAD_TEST_TIMEOUT}
       ENVIRONMENT "${RAD_TEST_CARD_ENV}")
   endforeach()
+endif()
+
+# glm_device_test holds the GLM plugin's fused device rows to libr4d's chains byte for byte on a
+# card (skips without one, or without the device rows); it needs both libraries' paths.
+if(TARGET glm AND TARGET glm_device_test)
+  target_link_libraries(glm_device_test PRIVATE ${CMAKE_DL_LIBS})
+  target_compile_definitions(glm_device_test PRIVATE
+    RAD_GLM_LIB="${RAD_PLUGIN_OUT}/kernels/glm.so"
+    RAD_R4D_LIB="${RAD_PLUGIN_OUT}/kernels/libr4d.so"
+    RAD_REF_LIB="${RAD_PLUGIN_OUT}/kernels/libref.so")
+  add_dependencies(glm_device_test glm)
+  if(TARGET libref)
+    add_dependencies(glm_device_test libref)
+  endif()
+  if(TARGET libr4d)
+    add_dependencies(glm_device_test libr4d)
+  endif()
 endif()
 
 # plugin_test's libr4d cases run against the shipped RDNA4 library. Only a build whose GPU
@@ -426,7 +545,12 @@ set(RAD_E2E_DEPS radiance rad-convert libref libquant nemotron35_embed qwen35_bf
 if(TARGET libavx)
   list(APPEND RAD_E2E_DEPS libavx)
 endif()
-foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test deepseek41_test)
+if(TARGET hyv4flash_calib_test)
+  target_compile_definitions(hyv4flash_calib_test PRIVATE
+    RAD_CALIB_ST2GRAM="${CMAKE_SOURCE_DIR}/tools/calib_st2gram.py")
+endif()
+foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spark25_convert_test deepseek41_test
+          hyv4flash_convert_test)
   if(TARGET ${t})
     target_compile_definitions(${t} PRIVATE
       RAD_E2E_SERVER="$<TARGET_FILE:radiance>" RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>"
@@ -443,6 +567,9 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
       endif()
     elseif(t STREQUAL "spark25_convert_test")
       add_dependencies(${t} rad-convert libref spark25_bf16)
+    elseif(t STREQUAL "hyv4flash_convert_test")
+      # The plugin a Hy4-flash checkpoint selects, and the quantisers its recipes name.
+      add_dependencies(${t} rad-convert libref libquant hyv4flash)
     elseif(t STREQUAL "clef_decision_test")
       # The tiny clef's golden (tests/mkclefgolden.py) and the one plugin a clef container selects.
       target_compile_definitions(${t} PRIVATE
@@ -458,6 +585,14 @@ foreach(t engine_e2e_test convert_test clef_decision_test laya_decision_test spa
     endif()
   endif()
 endforeach()
+# This test loads a tiny generator in process and holds real adapter slots through replacement
+# and unload. Export its core callbacks and build only the model/plugin it exercises.
+if(TARGET generator_lora_engine_test)
+  target_compile_definitions(generator_lora_engine_test PRIVATE
+    RAD_E2E_CONVERT="$<TARGET_FILE:rad-convert>" RAD_E2E_HOME="${RAD_PLUGIN_OUT}")
+  add_dependencies(generator_lora_engine_test rad-convert libref libquant qwenimage21)
+  set_tests_properties(generator_lora_engine_test PROPERTIES LABELS "e2e" TIMEOUT 90)
+endif()
 # 6 to 17 s by build type and load, mostly libref's GEMMs and decode steps and the engine's own
 # startups, so labelled `e2e` and kept out of the fast tier; the host and full tiers run it.
 if(TARGET engine_e2e_test)
@@ -496,6 +631,11 @@ foreach(t arch_test breeze_arch_test glm5next_test nemotronh_test)
     add_dependencies(${t} libref)
   endif()
 endforeach()
+# glm5next_test also loads plugin/glm's glm.so when it is configured, for its schemas and its
+# machine check.
+if(TARGET glm AND TARGET glm5next_test)
+  add_dependencies(glm5next_test glm)
+endif()
 
 # kbench_mutant_test runs rad-kbench against the deliberately defective kernel libraries
 # (core/plugin/testplugin/kbmutant.cc) on the host backend, so it needs the tool, libref and the
@@ -513,6 +653,16 @@ if(TARGET kbench_mutant_test AND TARGET rad-kbench AND TARGET libref)
   if(TARGET libavx)
     add_dependencies(kbench_mutant_test libavx)
   endif()
+endif()
+
+# ================================================================== rad-heat-replay's floor
+#
+# heat_replay_test runs rad-heat-replay itself on a synthetic route trace, so it needs the tool
+# built. It touches no card (the tool models heat on the host).
+if(TARGET heat_replay_test AND TARGET rad-heat-replay)
+  target_compile_definitions(heat_replay_test PRIVATE
+    RAD_HEAT_REPLAY_BIN="$<TARGET_FILE:rad-heat-replay>")
+  add_dependencies(heat_replay_test rad-heat-replay)
 endif()
 
 # ================================================================== the device selftest
@@ -627,13 +777,16 @@ set_tests_properties(isa_tools PROPERTIES TIMEOUT ${RAD_TEST_TIMEOUT})
 # ================================================================== libr4d's kernels, on the host
 #
 # Some libr4d ops (the sandwich-norm joins, expert_scale) have no libref oracle by design
-# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of sixteen units
+# (docs/OPS.md), so rad-kbench never checks them. r4d_emu runs the source of eighteen units
 # written against r4d_launch.h on the host: the windowed paged attention, pair_argmax, the joins,
 # expert_scale, the QSA block selection, the runtime-LoRA pair, the F32 routing projection's tile
 # forms, GLM's mHC read with its chunk split, the F32-scale E4M3 GEMM's forms, GLM's KDA
-# recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings, GLM's MoE decode
-# fusions and GLM's DSA scoring split by query rows, whose kernels a card-less build otherwise
-# never runs. emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
+# recurrence, the MXFP4 expert GEMM's forms, the MLA matrix row's pairings and its sink, the KV
+# resolve, the buffer-keyed device blocks, LiLiCorr's candidate correlator, Muse Glimmer's
+# vision-tower taps, GLM's MoE decode fusions and its gather's quantising forms (r4d_moe.hip: the
+# publish entry points themselves, so the launcher's choice of wave form and its refusals run too)
+# and GLM's DSA scoring split by query rows, whose kernels a card-less build otherwise never runs.
+# emu/hip/hip_runtime.h supplies the HIP names, each GPU thread is a fiber, and
 # __syncthreads and cross-lane ops are barriers (one not reached uniformly is reported as a
 # deadlock). Checked against ports of libref's ref_attn_paged and ref_qsa_select, the host
 # arithmetic in ref_host.cpp, for the joins the unfused chain bit for bit, for the LoRA pair libref
@@ -654,18 +807,25 @@ set(R4D_EMU_HIP ${R4D_DIR}/r4d_attn_paged_window.hip ${R4D_DIR}/r4d_pair_argmax_
                 ${R4D_DIR}/r4d_qsa_select_bf16.hip ${R4D_DIR}/r4d_lora_bf16.hip ${R4D_DIR}/r4d_glm.hip
                 ${R4D_DIR}/r4d_mhc.hip ${R4D_DIR}/r4d_kda.hip
                 ${R4D_DIR}/r4d_mla.hip ${R4D_DIR}/r4d_quant_act_fp8.hip
+                ${R4D_DIR}/r4d_mla_sink.hip
                 ${R4D_DIR}/r4d_kv_resolve.hip ${R4D_DIR}/r4d_dsa.hip
                 ${R4D_DIR}/r4d_keyed.hip ${R4D_DIR}/r4d_lili.hip
-                ${R4D_DIR}/r4d_vit_muse.hip)
-set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres
-                  dsa lili vit)
+                ${R4D_DIR}/r4d_vit_muse.hip ${R4D_DIR}/r4d_posemb.hip ${R4D_DIR}/r4d_ple_conv_bf16.hip
+                ${R4D_DIR}/r4d_l2_clip_bf16.hip ${R4D_DIR}/r4d_attn_rel.hip ${R4D_DIR}/r4d_moe_nvfp4.hip ${R4D_DIR}/r4d_attn_res.hip ${R4D_DIR}/r4d_situ.hip
+                ${R4D_DIR}/r4d_gated_quant_i8.hip ${R4D_DIR}/r4d_inkling.hip ${R4D_DIR}/r4d_moe.hip)
+list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_attn_kv_sink_h256.hip)
+list(APPEND R4D_EMU_HIP ${R4D_DIR}/r4d_ihc_bf16.hip ${R4D_DIR}/r4d_engram_bf16.hip
+                        ${R4D_DIR}/r4d_mla_kv_bf16.hip ${R4D_DIR}/r4d_dfly.hip)
+set(R4D_EMU_TESTS attn pick norm escale qsa lora f32 mhc kda mla moefuse kvres gated_quant
+                  dsa lili vit sconv l2clip rel nvfp4 attnres inkling)
+list(APPEND R4D_EMU_TESTS attn_kv_sink hy4 mla_sink mla_kv)
 set(R4D_EMU_BUILT OFF)
 if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
   # No fiber switch for this ISA.
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT RAD_ASAN AND NOT RAD_TSAN)
   set_source_files_properties(${R4D_EMU_HIP} PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-x;c++")
   add_library(r4d_emu_kernels OBJECT ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp
-                                     ${R4D_EMU}/emu/emu.cpp)
+                                     ${R4D_EMU}/emu/emu.cpp ${R4D_EMU}/emu/tune_defaults.cpp)
   target_include_directories(r4d_emu_kernels PUBLIC ${R4D_EMU}/emu ${R4D_EMU} ${R4D_DIR})
   target_link_libraries(r4d_emu_kernels PUBLIC rad_abi)
   # As in libr4d: the joins must match the unfused chain bit for bit, so no FMA contraction.
@@ -694,13 +854,18 @@ else()
               -I${CMAKE_SOURCE_DIR}/abi -I${R4D_DIR})
     set(objs "")
     foreach(src ${R4D_EMU_HIP} ${R4D_EMU}/ref_host.cpp ${R4D_EMU}/emu/emu.cpp
+                ${R4D_EMU}/emu/tune_defaults.cpp
                 ${R4D_EMU}/test_attn.cpp ${R4D_EMU}/test_pick.cpp ${R4D_EMU}/test_norm.cpp
                 ${R4D_EMU}/test_escale.cpp ${R4D_EMU}/test_qsa.cpp ${R4D_EMU}/test_lora.cpp
                 ${R4D_EMU}/test_f32.cpp ${R4D_EMU}/test_mhc.cpp
                 ${R4D_EMU}/test_kda.cpp ${R4D_EMU}/test_mla.cpp
                 ${R4D_EMU}/test_moefuse.cpp ${R4D_EMU}/test_kvres.cpp
                 ${R4D_EMU}/test_dsa.cpp ${R4D_EMU}/test_lili.cpp
-                ${R4D_EMU}/test_vit.cpp)
+                ${R4D_EMU}/test_vit.cpp ${R4D_EMU}/test_sconv.cpp
+                ${R4D_EMU}/test_l2clip.cpp ${R4D_EMU}/test_rel.cpp ${R4D_EMU}/test_nvfp4.cpp ${R4D_EMU}/test_attnres.cpp
+                ${R4D_EMU}/test_gated_quant.cpp ${R4D_EMU}/test_inkling.cpp ${R4D_EMU}/test_attn_kv_sink.cpp
+                ${R4D_EMU}/test_hy4.cpp ${R4D_EMU}/test_mla_sink.cpp
+                ${R4D_EMU}/test_mla_kv.cpp)
       get_filename_component(stem ${src} NAME_WE)
       set(lang "")
       if(src MATCHES "\\.hip$")
@@ -737,9 +902,12 @@ else()
   endif()
 endif()
 if(R4D_EMU_BUILT)
-  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit)
+  foreach(t pick norm escale qsa lora f32 mhc kda mla moefuse kvres dsa lili vit sconv l2clip rel nvfp4 attnres gated_quant inkling hy4 mla_sink mla_kv)
     add_test(NAME r4d_emu_${t} COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_${t})
   endforeach()
+  # Hy4-flash's non-absorbed prefill (attn_kv_sink_h256): about 4 s.
+  add_test(NAME r4d_emu_attn_kv_sink COMMAND ${CMAKE_BINARY_DIR}/tests/r4d_emu_attn_kv_sink)
+  set_tests_properties(r4d_emu_attn_kv_sink PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The attention cases take about 11 s, 7 of them in the two long prefills on the WMMA kernel,
   # which three shards put in different entries.
   foreach(k 0 1 2)
@@ -748,12 +916,15 @@ if(R4D_EMU_BUILT)
   endforeach()
   set_tests_properties(r4d_emu_attn_shard0 r4d_emu_attn_shard1 r4d_emu_attn_shard2 r4d_emu_pick
                        r4d_emu_norm r4d_emu_escale r4d_emu_qsa r4d_emu_lora r4d_emu_mla r4d_emu_moefuse
-                       r4d_emu_dsa r4d_emu_lili
+                       r4d_emu_dsa r4d_emu_lili r4d_emu_sconv r4d_emu_l2clip r4d_emu_rel r4d_emu_nvfp4 r4d_emu_attnres
+                       r4d_emu_gated_quant r4d_emu_inkling r4d_emu_mla_sink
                        PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
   # The LoRA pair has a libref oracle, and the test holds the emulated kernels to it when it can
   # load one -- expand bit for bit, shrink to its bound. kda_update is held to libref's within
   # rounding, and that test needs it.
-  set_tests_properties(r4d_emu_lora r4d_emu_kda PROPERTIES
+  # r4d_emu_mla_kv: the kv_b projections on WMMA against libref, their law and the fused gate.
+  set_tests_properties(r4d_emu_mla_kv PROPERTIES LABELS "r4d_emu" TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(r4d_emu_lora r4d_emu_kda r4d_emu_hy4 r4d_emu_mla_kv PROPERTIES
                        ENVIRONMENT "RADIANCE_HOME=${CMAKE_BINARY_DIR}/radiance_home")
   # A seeded random sweep, mostly prefill shapes on the WMMA kernel, which the emulator runs at
   # about 2 s a case: `slow`. `r4d_emu_attn sweep 200` is a longer run by hand, a superset of it.
@@ -896,14 +1067,17 @@ endif()
 #
 # docs/OPS.md is the authoritative op table, so this test checks it against what the plugins dump
 # (dropped optional operands, a missing `:inout`, parameters moved into `params`, undeclared
-# parameters). Cheap, so in the fast tier. libr4d.so is added when built; the script reports
-# "  SKIP " rather than passing when a plugin will not dump.
+# parameters). Cheap, so in the fast tier. libr4d.so and glm.so are added when built; the script
+# reports "  SKIP " rather than passing when a plugin will not dump.
 set(RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libref.so)
 if(TARGET spechub)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/spechub.so)
 endif()
 if(RAD_HIP_FOUND AND TARGET libr4d)
   list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/libr4d.so)
+endif()
+if(TARGET glm)
+  list(APPEND RAD_OPSDOC_PLUGINS ${RAD_PLUGIN_OUT}/kernels/glm.so)
 endif()
 if(WIN32)
   # Brilliance: the plugins are .dll files on Windows. The script reads them by path with sh's test,
@@ -956,11 +1130,22 @@ endif()
 add_test(NAME artifact_sums
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/artifact_sums.sh ${CMAKE_SOURCE_DIR})
 set_tests_properties(artifact_sums PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
+# The page rules that were each broken in production and are not visible to any C++ test: a tile
+# figure that goes stale, a drift clause that fires on a prefill sample, a tile that clips its own
+# figures. Cheap, and it needs neither Node nor a browser.
+add_test(NAME page_rules
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/page_rules.sh ${CMAKE_SOURCE_DIR})
+set_tests_properties(page_rules PROPERTIES LABELS "fast;unit" TIMEOUT ${RAD_TEST_TIMEOUT})
 if(RAD_PYTHON3)
   add_test(NAME vhead_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/vhead_test.py)
-  set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT})
+  set_tests_properties(vhead_test PROPERTIES LABELS "unit;fast" SKIP_RETURN_CODE 77 TIMEOUT ${RAD_TEST_TIMEOUT}
+                       ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
   add_test(NAME rad_export_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/rad_export_test.py)
   set_tests_properties(rad_export_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  # tools/hf_logits_to_kld.py: HF logits -> a radiance KL reference (numpy only)
+  add_test(NAME hf_logits_to_kld_test COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/hf_logits_to_kld_test.py)
+  set_tests_properties(hf_logits_to_kld_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT}
+                       SKIP_RETURN_CODE 77 ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
   add_test(NAME spark25_validation_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/spark25_validation_test.py)
   set_tests_properties(spark25_validation_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
@@ -1002,10 +1187,12 @@ add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh
                  ${CMAKE_BINARY_DIR} ${CMAKE_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oot "${RAD_OOT_COMPILER}" "${RAD_OOT_TARGETS}"
                  "${RAD_HIP_VOPD_REPEATABLE}" "${CMAKE_CXX_COMPILER}" "${CMAKE_BUILD_TYPE}")
+# TIMEOUT 7200: a cold rebuild of the 51 plugins plus the kbench replay took 59 min on the 48-thread build host while it was busy (measured, hy4-close);
+# 3600 s left no margin.
 # RESOURCE_LOCK kbench_memory: its replay holds operands in host memory as the kbench entries do.
 set_tests_properties(oot_plugins PROPERTIES
   LABELS "oot"
-  TIMEOUT 3600
+  TIMEOUT 7200
   RESOURCE_LOCK kbench_memory
   ENVIRONMENT "CMAKE_GENERATOR=${CMAKE_GENERATOR};${RAD_TEST_OMP_ENV};${RAD_OOT_ENV}")
 

@@ -1,0 +1,22 @@
+# hy4-flash-w4nl64-rtn.recipe -- Tencent Hy4-flash (hy_v4_flash) from its bf16 checkpoint: the routed
+# experts as rotated u4 codes into the w4nl codebook with one E4M3 scale a (row, 64 of K) under a
+# fixed f32 of 2^-13, the form of qwen4exp-w4nl64-i8-hc8m.recipe and nemotron74-w4nl64-gptq.recipe
+# (libr4d's w4nl64a8h, docs/MOE-W4.md); the Engram tables as hy4-flash-bf16.recipe stores them; the
+# rest as the checkpoint holds it.
+#
+#   rad-convert <Hy4-flash checkpoint> --recipe data/recipes/hy4-flash-w4nl64-rtn.recipe \
+#       -o hy4-flash-w4nl64.rad
+#
+# Round to nearest with a searched scale, uncalibrated: a size and plumbing baseline, and the boot
+# container a calibration run can record from (hy4-flash-w4nl64-gptq.recipe is the fitted form).
+# Served clamped in every layer (swiglu_clamped, then had_quant_act_fp8 into the down projection's
+# rotated E4M3 codes), whole a rank at one rank and a slice of every expert (768 / 384 columns) at
+# two and four. Measured only on the harness's random-weight minis (PLAN A8).
+#
+# The experts are 41 layers of 512, each a gate_up of [3072, 1536] and a down of [1536, 1536] in the
+# 1536-wide latent: 148.6B of the trunk's 155.5B parameters, 277 GiB in bf16 and 71.3 GiB here.
+# Both K are 1536, twelve whole rotation blocks.
+#
+# PATTERN                     QUANTISER  OPTIONS
+blk.*.ffn_*_exps.*.weight     rtn        table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

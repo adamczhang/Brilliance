@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_emit.h"
 #include "r4d_moe_sort.h"
@@ -13,15 +14,18 @@ namespace {
 // k before their FMAs: at a decode pass's few rows a wave streams its weight row with no other
 // work to hide the load behind, and one step in flight left the router at 150 GB/s. Tail rows and
 // columns read a clamped valid address and are never stored.
-template <int R, int C, int U>
-__global__ void __launch_bounds__(128)
-    gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long long xp, long long wp, long long yp,
-                            int m, int n, int k) {
+__device__ __forceinline__ float weight_f32(float v) { return v; }
+__device__ __forceinline__ float weight_f32(uint16_t v) { return bf16_to_f32(v); }
+
+template <int R, int C, int U, class W = float>
+__device__ __forceinline__ void
+    gemm_nt_f32_tile_body(const uint16_t* x, const W* w, float* y, long long xp, long long wp, long long yp,
+                          int m, int n, int k) {
     const int lane = threadIdx.x & 31, c0 = (blockIdx.x * 4 + (threadIdx.x >> 5)) * C,
               r0 = blockIdx.y * R;
     if (c0 >= n) return;
     const uint16_t* xr[R];
-    const float* wc[C];
+    const W* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
@@ -38,7 +42,7 @@ __global__ void __launch_bounds__(128)
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
-            for (int c = 0; c < C; ++c) weight[u][c] = wc[c][j + 32 * u];
+            for (int c = 0; c < C; ++c) weight[u][c] = weight_f32(wc[c][j + 32 * u]);
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
@@ -57,7 +61,7 @@ __global__ void __launch_bounds__(128)
         for (int q = 0; q < R; ++q) {
             const float v = bf16_to_f32(xr[q][j]);
 #pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, wc[c][j], sum[q][c]);
+            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, weight_f32(wc[c][j]), sum[q][c]);
         }
     }
 #pragma unroll
@@ -76,20 +80,34 @@ __global__ void __launch_bounds__(128)
                 if (c0 + c < n) y[(long long)(r0 + q) * yp + c0 + c] = sum[q][c];
 }
 
+template <int R, int C, int U, class CH = R4dUnchained, class W = float>
+__global__ void __launch_bounds__(128)
+    gemm_nt_f32_tile_kernel(const uint16_t* x, const W* w, float* y, long long xp, long long wp, long long yp,
+                            int m, int n, int k) {
+    if (CH::on) r4d_chain_wait();
+    gemm_nt_f32_tile_body<R, C, U>(x, w, y, xp, wp, yp, m, n, k);
+    if (CH::on) r4d_chain_done();
+}
 template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
-                  long long n, long long k) {
+                  long long n, long long k, bool chain) {
     const long long m = x.shape[0];
-    return R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U>),
-                    dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)),
-                    dim3(128), 0, (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
-                    x.stride[0], w.stride[0], y.stride[0], (int)m, (int)n, (int)k);
+    /* Brilliance: the fork's bf16 weights (a packed router projection, Hy4-flash) beside upstream's
+     * f32, each with upstream's chained form. */
+#define R4D_GF32(CH_, W_)                                                                              \
+    R4D_EMIT(stream, (gemm_nt_f32_tile_kernel<R, C, U, CH_, W_>),                                      \
+             dim3((unsigned)((n + 4 * C - 1) / (4 * C)), (unsigned)((m + R - 1) / R)), dim3(128),  \
+             0, (const uint16_t*)x.data, (const W_*)w.data, (float*)y.data, x.stride[0],        \
+             w.stride[0], y.stride[0], (int)m, (int)n, (int)k)
+    if (w.dtype == RAD_BF16) return chain ? R4D_GF32(r4dchain, uint16_t) : R4D_GF32(R4dUnchained, uint16_t);
+    return chain ? R4D_GF32(r4dchain, float) : R4D_GF32(R4dUnchained, float);
+#undef R4D_GF32
 }
 int gemm_f32_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &w = a->t[1], &y = a->t[2];
     const long long n = r4d_geti_or(a, "N", 0), k = r4d_geti_or(a, "K", 0);
-    if (x.dtype != RAD_BF16 || w.dtype != RAD_F32 || y.dtype != RAD_F32) return RAD_E_DTYPE;
+    if (x.dtype != RAD_BF16 || (w.dtype != RAD_F32 && w.dtype != RAD_BF16) || y.dtype != RAD_F32) return RAD_E_DTYPE;
     if (!x.data || !w.data || !y.data) return RAD_E_INVAL;
     if (n < 1 || n > 65536 || k < 1 || k > 16384 || x.rank != 2 || w.rank != 2 || y.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > 65535 || x.shape[1] != k || w.shape[0] != n ||
@@ -105,18 +123,21 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
      * at every count below 64; at N 288 from 17 rows 8x1 with 8 steps is faster.
      * A projection of a few columns has too few waves for wide tiles at any M. */
     const long long rows = x.shape[0];
-    if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
-    if (rows <= 16 || (rows < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k);
-    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k);
-    return gemm_f32_tile<8, 4>(stream, x, w, y, n, k);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k, chain);
+    if (rows <= 16 || (rows < 64 && n < 128))
+        return gemm_f32_tile<2, 2, 16>(stream, x, w, y, n, k, chain);
+    if (rows < 64) return gemm_f32_tile<8, 1, 8>(stream, x, w, y, n, k, chain);
+    return gemm_f32_tile<8, 4>(stream, x, w, y, n, k, chain);
 }
 // router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias
 // in descending order, equal ranks to the lower expert, as a serial scan with a strict `>` takes
 // them. Lane l holds experts l, l+32, ... as 64-bit keys: the rank's order-preserving bits (-0
-// folded to +0) over ~e, so equal ranks order to the lower expert. Round j takes the largest key
-// below round j-1's winner and parks it on lane j (top_k <= 32). `total` sums the selected p in
-// round order, mult = norm ? factor / (total + 1e-20) : factor, and a weight is p * mult. A NaN
-// rank is never selected.
+// folded to +0) over ~e, so equal ranks order to the lower expert. A lane sorts its own keys once
+// and round j takes the largest remaining head and parks it on lane j (top_k <= 32). `total` sums
+// the selected p in round order, mult = norm ? factor / (total + 1e-20) : factor, and a weight is
+// p * mult. A NaN rank is never selected: its key is 0, which sorts below every rank key and so is
+// only taken once the wave's ranks have run out, the last round the scan did with `below = 0`.
 // OWN is a template bound because the keys are registers; a lane-derived trip count would index
 // them divergently, which gfx12 lowers to a v_movrels loop.
 __device__ __forceinline__ unsigned long long router_rank_key(float rank, int e) {
@@ -139,6 +160,59 @@ __device__ __forceinline__ unsigned long long router_wave_max(unsigned long long
     b = b > o ? b : o;
     return b;
 }
+// Batcher's odd-even mergesort of 16 keys, descending: 63 compare-exchanges in 10 dependent stages
+// (Knuth, TAOCP 5.2.2, Figure 51), independent compare-exchanges side by side and so 10 deep where
+// an insertion into a 16-entry list would be 16. A lane holds at most 16 experts, so one network
+// serves both OWN bounds; a slot past the lane's keys holds 0, which sorts to the tail.
+#define R4D_ROUTER_CS(a, b)                                                                        \
+    do {                                                                                           \
+        const unsigned long long hi = t[a] > t[b] ? t[a] : t[b];                                   \
+        t[b] = t[a] > t[b] ? t[b] : t[a];                                                          \
+        t[a] = hi;                                                                                 \
+    } while (0)
+__device__ __forceinline__ void router_sort16_desc(unsigned long long (&t)[16]) {
+    R4D_ROUTER_CS(0, 1); R4D_ROUTER_CS(2, 3); R4D_ROUTER_CS(0, 2); R4D_ROUTER_CS(1, 3);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(4, 5); R4D_ROUTER_CS(6, 7); R4D_ROUTER_CS(4, 6);
+    R4D_ROUTER_CS(5, 7); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(0, 4); R4D_ROUTER_CS(2, 6);
+    R4D_ROUTER_CS(2, 4); R4D_ROUTER_CS(1, 5); R4D_ROUTER_CS(3, 7); R4D_ROUTER_CS(3, 5);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(3, 4); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(8, 9);
+    R4D_ROUTER_CS(10, 11); R4D_ROUTER_CS(8, 10); R4D_ROUTER_CS(9, 11); R4D_ROUTER_CS(9, 10);
+    R4D_ROUTER_CS(12, 13); R4D_ROUTER_CS(14, 15); R4D_ROUTER_CS(12, 14); R4D_ROUTER_CS(13, 15);
+    R4D_ROUTER_CS(13, 14); R4D_ROUTER_CS(8, 12); R4D_ROUTER_CS(10, 14); R4D_ROUTER_CS(10, 12);
+    R4D_ROUTER_CS(9, 13); R4D_ROUTER_CS(11, 15); R4D_ROUTER_CS(11, 13); R4D_ROUTER_CS(9, 10);
+    R4D_ROUTER_CS(11, 12); R4D_ROUTER_CS(13, 14); R4D_ROUTER_CS(0, 8); R4D_ROUTER_CS(4, 12);
+    R4D_ROUTER_CS(4, 8); R4D_ROUTER_CS(2, 10); R4D_ROUTER_CS(6, 14); R4D_ROUTER_CS(6, 10);
+    R4D_ROUTER_CS(2, 4); R4D_ROUTER_CS(6, 8); R4D_ROUTER_CS(10, 12); R4D_ROUTER_CS(1, 9);
+    R4D_ROUTER_CS(5, 13); R4D_ROUTER_CS(5, 9); R4D_ROUTER_CS(3, 11); R4D_ROUTER_CS(7, 15);
+    R4D_ROUTER_CS(7, 11); R4D_ROUTER_CS(3, 5); R4D_ROUTER_CS(7, 9); R4D_ROUTER_CS(11, 13);
+    R4D_ROUTER_CS(1, 2); R4D_ROUTER_CS(3, 4); R4D_ROUTER_CS(5, 6); R4D_ROUTER_CS(7, 8);
+    R4D_ROUTER_CS(9, 10); R4D_ROUTER_CS(11, 12); R4D_ROUTER_CS(13, 14);
+}
+#undef R4D_ROUTER_CS
+// The k largest of the wave's keys, in the order the strict scan takes them: lane j gets the j-th
+// and the others get 0. Each lane's keys are sorted once, so a round is one wave max and the drop
+// of the winner's head, not a compare-select over OWN keys ahead of it. Keys are unique (the low
+// word is ~e), so at most one lane holds the round's winner and equal 0 heads are the tail, which
+// the scan's `below = 0` round also could not take.
+template <int OWN>
+__device__ __forceinline__ unsigned long long router_select_topk(
+    const unsigned long long (&key)[OWN], int lane, int k) {
+    unsigned long long t[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) t[i] = i < OWN ? key[i] : 0ull;
+    router_sort16_desc(t);
+    unsigned long long mine = 0;
+    for (int j = 0; j < k; ++j) {
+        const unsigned long long best = router_wave_max(t[0]);
+        if (lane == j) mine = best;
+        if (best == t[0] && best) {
+#pragma unroll
+            for (int i = 0; i < 15; ++i) t[i] = t[i + 1];
+            t[15] = 0ull;
+        }
+    }
+    return mine;
+}
 // One row in one wave, from any grid: the standalone select and the fused one below run this. A
 // lane below `k` returns its slot's expert as written to `ids`.
 template <int OWN>
@@ -154,18 +228,7 @@ __device__ __forceinline__ int router_sigmoid_row(const float* logits, const flo
         p[i] = 1.0f / (1.0f + expf(-logits[(long long)r * lp + s]));
         key[i] = e < ne ? router_rank_key(p[i] + bias[(long long)s * bp], e) : 0ull;
     }
-    unsigned long long below = ~0ull, mine = 0;
-    for (int j = 0; j < k; ++j) {
-        unsigned long long best = 0;
-#pragma unroll
-        for (int i = 0; i < OWN; ++i) {
-            const unsigned long long c = key[i] < below ? key[i] : 0ull;
-            best = c > best ? c : best;
-        }
-        best = router_wave_max(best);
-        if (lane == j) mine = best;
-        below = best;
-    }
+    unsigned long long mine = router_select_topk<OWN>(key, lane, k);
     const int e = mine ? (int)~(uint32_t)mine : 0;
     float chosen = 0;
 #pragma unroll
@@ -241,19 +304,7 @@ __global__ void __launch_bounds__(128)
         const int e = lane + 32 * i;
         key[i] = e < ne && ((kept >> (e / gs)) & 1u) ? router_rank_key(rank[i], e) : 0ull;
     }
-    unsigned long long mine = 0;
-    below = ~0ull;
-    for (int j = 0; j < k; ++j) {
-        unsigned long long best = 0;
-#pragma unroll
-        for (int i = 0; i < OWN; ++i) {
-            const unsigned long long c = key[i] < below ? key[i] : 0ull;
-            best = c > best ? c : best;
-        }
-        best = router_wave_max(best);
-        if (lane == j) mine = best;
-        below = best;
-    }
+    unsigned long long mine = router_select_topk<OWN>(key, lane, k);
     const int e = mine ? (int)~(uint32_t)mine : 0;
     float chosen = 0;
 #pragma unroll
@@ -270,28 +321,31 @@ __global__ void __launch_bounds__(128)
         weights[(long long)r * wp + lane] = chosen * mult;
     }
 }
-template <int OWN>
+template <int OWN, class CH = R4dUnchained>
 __global__ void __launch_bounds__(128)
     router_sigmoid_wave_kernel(const float* logits, const float* bias, int* ids, float* weights,
                                long long lp, long long bp, long long ip, long long wp, int m, int ne, int k, int norm,
                                float factor) {
+    if (CH::on) r4d_chain_wait();
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
-    if (r >= m) return;
-    (void)router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k, norm,
-                                  factor, lane);
+    if (r < m)
+        (void)router_sigmoid_row<OWN>(logits, bias, ids, weights, lp, bp, ip, wp, r, ne, k, norm,
+                                      factor, lane);
+    if (CH::on) r4d_chain_done();
 }
 // router_sigmoid_topk, then moe_scatter over its ids, then the `fill` of an ungated shared arm's
 // gate with 1, in one workgroup. Rows wrap over the NW waves; each leaves its slots in the sort's
 // LDS list instead of re-reading `ids`. A slot carries the expert its row wrote, including the
 // expert 0 of a row with fewer finite ranks than top_k, so every output equals the three launches'.
 // INV also writes the inverse, as moe_scatter_inv does.
-template <int OWN, uint32_t NW, bool INV>
+template <int OWN, uint32_t NW, bool INV, class CH = R4dUnchained>
 __global__ void __launch_bounds__(NW * 32)
     router_sigmoid_scatter_kernel(const float* logits, const float* bias, int* ids, float* weights,
                                   int32_t* sorted, int32_t* off, int32_t* cnt, uint16_t* gate,
                                   int32_t* inv, long long lp, long long bp, long long ip, long long wp, long long gp, int m,
                                   int ne, int n_local, int k, int norm, float factor, int base,
                                   r4d_moesort::Protect prot) {
+    if (CH::on) r4d_chain_wait();
     __shared__ r4d_moesort::ScatterLds<NW> sl;
     const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
     for (int e = threadIdx.x; e < n_local; e += (int)(NW * 32)) sl.cnt[e] = 0;
@@ -307,6 +361,7 @@ __global__ void __launch_bounds__(NW * 32)
     lds_barrier();
     r4d_moesort::scatter_small_place<NW, INV>(sorted, off, cnt, (uint32_t)(m * k),
                                               (uint32_t)n_local, sl, inv);
+    if (CH::on) r4d_chain_done();
 }
 int router_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 4) return RAD_E_INVAL;
@@ -324,13 +379,20 @@ int router_body(const RadArgs* a, RadStream stream) {
         bias.stride[0] < 1)
         return RAD_E_SHAPE;
     const int norm = (int)(r4d_geti_or(a, "norm", 0) != 0);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
     const dim3 grid((unsigned)((lg.shape[0] + 3) / 4));
     if (ne <= 9 * 32)
-        return R4D_EMIT(stream, router_sigmoid_wave_kernel<9>, grid, dim3(128), 0,
+        return R4D_EMIT(stream,
+                        (chain ? router_sigmoid_wave_kernel<9, r4dchain>
+                               : router_sigmoid_wave_kernel<9, R4dUnchained>),
+                        grid, dim3(128), 0,
                         (const float*)lg.data, (const float*)bias.data, (int*)ids.data,
                         (float*)w.data, lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0],
                         (int)lg.shape[0], (int)ne, (int)k, norm, factor);
-    return R4D_EMIT(stream, router_sigmoid_wave_kernel<16>, grid, dim3(128), 0,
+    return R4D_EMIT(stream,
+                    (chain ? router_sigmoid_wave_kernel<16, r4dchain>
+                           : router_sigmoid_wave_kernel<16, R4dUnchained>),
+                    grid, dim3(128), 0,
                     (const float*)lg.data, (const float*)bias.data, (int*)ids.data, (float*)w.data,
                     lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0], (int)lg.shape[0],
                     (int)ne, (int)k, norm, factor);
@@ -404,9 +466,12 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
     const int norm = (int)(r4d_geti_or(a, "norm", 0) != 0);
     // A wave a row up to 32 rows, as router_topk_scatter: the rows a wave serves run back to back.
     const int nw = m <= 8 ? 8 : m <= 16 ? 16 : 32;
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
 #define R4D_RSS_I(OWN, NW, INV)                                                                    \
-    return R4D_EMIT(stream, (router_sigmoid_scatter_kernel<OWN, NW, INV>), dim3(1),                \
-                    dim3((NW) * 32), 0, (const float*)lg.data, (const float*)bias.data,            \
+    return R4D_EMIT(stream,                                                                        \
+                    (chain ? router_sigmoid_scatter_kernel<OWN, NW, INV, r4dchain>                 \
+                           : router_sigmoid_scatter_kernel<OWN, NW, INV, R4dUnchained>),           \
+                    dim3(1), dim3((NW) * 32), 0, (const float*)lg.data, (const float*)bias.data,   \
                     (int*)ids.data, (float*)w.data, (int32_t*)sorted->data, (int32_t*)off->data,   \
                     (int32_t*)cnt->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,        \
                     inv ? (int32_t*)inv->data : (int32_t*)nullptr, lg.stride[0], bias.stride[0],   \
@@ -428,14 +493,18 @@ int router_scatter_body(const RadArgs* a, RadStream stream) {
 #undef R4D_RSS
 #undef R4D_RSS_I
 }
+template <class CH>
 __global__ void swiglu_clamped_kernel(const uint16_t* gu, uint16_t* y, long long gp, long long yp, int n,
                                       float limit) {
+    if (CH::on) r4d_chain_wait();
     const long long r = blockIdx.x;
     const int i = blockIdx.y * 256 + threadIdx.x;
-    if (i >= n) return;
-    const float g = fminf(bf16_to_f32(gu[r * gp + i]), limit);
-    const float u = fminf(fmaxf(bf16_to_f32(gu[r * gp + n + i]), -limit), limit);
-    y[r * yp + i] = f32_to_bf16((g / (1.0f + expf(-g))) * u);
+    if (i < n) {
+        const float g = fminf(bf16_to_f32(gu[r * gp + i]), limit);
+        const float u = fminf(fmaxf(bf16_to_f32(gu[r * gp + n + i]), -limit), limit);
+        y[r * yp + i] = f32_to_bf16((g / (1.0f + expf(-g))) * u);
+    }
+    if (CH::on) r4d_chain_done();
 }
 // swiglu_step: the SiLU first, its value clipped above (Ling-3.0; vLLM's SwigluStepAndMul).
 __global__ void swiglu_step_kernel(const uint16_t* gu, uint16_t* y, long long gp, long long yp, int n,
@@ -455,7 +524,7 @@ int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
     const float limit = (float)r4d_getf(a, "limit", 0);
     if (gu.dtype != RAD_BF16 || y.dtype != RAD_BF16) return RAD_E_DTYPE;
     if (n < 1 || n > INT_MAX / 2 || !std::isfinite(limit) || limit <= 0 || !gu.data || !y.data ||
-        gu.rank != 2 || y.rank != 2 || y.shape[0] < 1 || y.shape[0] > 65535 ||
+        gu.rank != 2 || y.rank != 2 || y.shape[0] < 1 || y.shape[0] > INT_MAX ||
         gu.shape[0] != y.shape[0] || gu.shape[1] != 2 * n || y.shape[1] != n || gu.stride[1] != 1 ||
         y.stride[1] != 1 || gu.stride[0] < 2 * n || y.stride[0] < n)
         return RAD_E_SHAPE;
@@ -463,9 +532,13 @@ int clamped_body(const RadArgs* a, RadStream stream, bool step = false) {
         return R4D_EMIT(stream, swiglu_step_kernel, dim3(y.shape[0], (n + 255) / 256), dim3(256), 0,
                         (const uint16_t*)gu.data, (uint16_t*)y.data, gu.stride[0], y.stride[0],
                         (int)n, limit);
-    return R4D_EMIT(stream, swiglu_clamped_kernel, dim3(y.shape[0], (n + 255) / 256), dim3(256), 0,
-                    (const uint16_t*)gu.data, (uint16_t*)y.data, gu.stride[0], y.stride[0], (int)n,
-                    limit);
+    if (r4d_geti_or(a, "chain", 0) != 0 && y.shape[0] <= 64)   /* decode heights */
+        return R4D_EMIT(stream, (swiglu_clamped_kernel<r4dchain>), dim3(y.shape[0], (n + 255) / 256),
+                        dim3(256), 0, (const uint16_t*)gu.data, (uint16_t*)y.data, gu.stride[0],
+                        y.stride[0], (int)n, limit);
+    return R4D_EMIT(stream, (swiglu_clamped_kernel<R4dUnchained>),
+                    dim3(y.shape[0], (n + 255) / 256), dim3(256), 0, (const uint16_t*)gu.data,
+                    (uint16_t*)y.data, gu.stride[0], y.stride[0], (int)n, limit);
 }
 // swiglu_clamped, then quant_act_fp8 over its product, in one pass: a wave per (row, 128 columns),
 // four columns a lane, as the quantiser maps them. Each element is swiglu_clamped_kernel's
@@ -518,7 +591,7 @@ int clamped_quant_body(const RadArgs* a, RadStream stream) {
         return RAD_E_DTYPE;
     if (r4d_geti_or(a, "group", 128) != 128 || n < 4 || n % 4 || n > INT_MAX / 2 ||
         !std::isfinite(limit) || limit <= 0 || !gu.data || !q.data || !sc.data || gu.rank != 2 ||
-        q.rank != 2 || sc.rank != 2 || gu.shape[0] < 1 || gu.shape[0] > 65535 ||
+        q.rank != 2 || sc.rank != 2 || gu.shape[0] < 1 || gu.shape[0] > INT_MAX ||
         gu.shape[1] != 2 * n || q.shape[0] != gu.shape[0] || q.shape[1] != n ||
         sc.shape[0] != gu.shape[0] || sc.shape[1] != nkb || gu.stride[1] != 1 || q.stride[1] != 1 ||
         sc.stride[1] != 1 || gu.stride[0] < 2 * n || q.stride[0] < n || sc.stride[0] < nkb ||

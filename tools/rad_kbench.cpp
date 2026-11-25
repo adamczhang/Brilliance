@@ -806,6 +806,12 @@ void check_margins(const std::vector<DevBuf>& dev, const DevBuf& scratch,
     ++st->guarded;
 }
 
+/* --chain-forms: every device launch of a row under test carries `chain` 1, so a row that has a
+ * chained form (r4d_chain.h) runs that form. Outside the engine no record follows the arguments,
+ * the wait and the add are skipped and the body runs as the plain form does: the bytes are the
+ * body's, which the oracle then compares like any other launch. */
+bool g_chain_forms = false;
+
 /* The launch arguments of a single-rank case. */
 RadArgs case_args(std::vector<RadTensor>& t, const Geometry& g) {
     RadArgs a{};
@@ -2273,6 +2279,9 @@ void usage() {
         "      --no-fusion    skip the fusion oracle: a kernel that declares the chain it\n"
         "                     replaces is otherwise run against that chain, out of its own\n"
         "                     plugin, and the outputs compared byte for byte\n"
+        "      --chain-forms  launch every device row with `chain` 1 so a row's chained form is the\n"
+        "                     one that runs (no engine record follows: the wait is skipped, the\n"
+        "                     body is compared to the oracle as usual)\n"
         "      --max-cases N  runs per distinct (op, kernel, library, domain, geometry, operand\n"
         "                     shapes); 0 means every one (default 4). A 62-layer model presents the\n"
         "                     same kernel at the same shape sixty times and only the weights differ.\n"
@@ -2418,6 +2427,7 @@ int main(int argc, char** argv) {
             max_case_bytes = rad_flag_int("rad-kbench", "--max-bytes", next("--max-bytes"), 1,
                                           INT32_MAX) << 20;
         else if (a == "--no-fusion") fuse_check = false;
+        else if (a == "--chain-forms") g_chain_forms = true;
         else if (a == "--bench")   bench = true;
         else if (a == "--timing-only") timing_only = true;
         else if (a == "--bench-flush") {
@@ -3210,6 +3220,12 @@ int main(int argc, char** argv) {
                 /* Device launch, with device scratch. */
                 auto launch_dev = [&](const KernelRow* row, std::vector<RadTensor>& tv) -> int {
                     RadArgs a = case_args(tv, g);
+                    std::vector<RadParam> chain_ps;
+                    if (g_chain_forms) {
+                        chain_ps.assign(g.params(), g.params() + g.n_params());
+                        chain_ps.push_back(RAD_INT("chain", 1));
+                        a.p = chain_ps.data(); a.n_p = (int)chain_ps.size();
+                    }
                     if (row->info->scratch) {
                         const int64_t need = row->info->scratch(&a);
                         if (need > 0) {

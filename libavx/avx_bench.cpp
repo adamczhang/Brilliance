@@ -212,6 +212,7 @@ const Form kForms[] = {
     { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true },
     { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true },
     { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true },
+    { "w6nl64a8h", 6, 64,  RAD_F8E4M3, true },
 };
 const float kW4nl[16] = { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0f, 18.0f, 22.0f,
                           -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f, -22.0f };
@@ -219,6 +220,12 @@ const float kW5nl[32] = { 0.8125f, 2.5f, 4.0f, 5.5f, 7.5f, 9.0f, 11.0f, 12.0f,
                           14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                           -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                           -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
+
+float kW6nl[64];
+const bool kW6nlInit = [] {
+    for (int i = 0; i < 32; ++i) { kW6nl[i] = (1.0f + (float)(i % 8) / 8.0f) * (float)(1 << (i / 8)) * 0.5f; kW6nl[32 + i] = -kW6nl[i]; }
+    return true;
+}();
 
 constexpr int64_t kEmbd = 2560, kFF = 640, kExperts = 512, kTopK = 10;
 
@@ -256,7 +263,7 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
     rad_enc_copy_str(e.transform, "fwht128");
-    const uint32_t cdt = f.bits == 5 ? RAD_U5 : RAD_U4;
+    const uint32_t cdt = f.bits == 6 ? RAD_U6 : f.bits == 5 ? RAD_U5 : RAD_U4;
     const int ic = rad_enc_add_plane(&e, "codes", cdt, 1, 1);
     const int is = rad_enc_add_plane(&e, "scale", f.sdt, 1, f.group);
     const int il = f.level ? rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0) : -1;
@@ -266,7 +273,7 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
     std::vector<uint8_t> pc((size_t)(N * rbc)), ps((size_t)(N * rbs)), pl(4), pt(4u << f.bits);
     const float lv = 0x1p-13f;
     std::memcpy(pl.data(), &lv, 4);
-    std::memcpy(pt.data(), f.bits == 5 ? kW5nl : kW4nl, pt.size());
+    std::memcpy(pt.data(), f.bits == 6 ? kW6nl : f.bits == 5 ? kW5nl : kW4nl, pt.size());
     const RadParam p[] = { RadParam{ "dtype", RAD_P_STR, 0, 0, f.dtype, 0 },
                            RadParam{ "a_order", RAD_P_STR, 0, 0, order, 0 } };
     auto plane = [](void* d, uint32_t dt, int64_t r, int64_t c) {

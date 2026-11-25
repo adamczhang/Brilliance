@@ -462,6 +462,78 @@ TEST(a_table_copied_into_locked_memory_is_the_mapping_byte_for_byte) {
     f.close();
 }
 
+/* B-01: the four Engram tables read at once, not one after the other. Two fills started before
+ * either is waited on land their own bytes into their own memory, a fill dropped without a wait
+ * joins before its memory is freed, and a fill that reads the wrong bytes fails where it is waited
+ * on, not where it was started. */
+TEST(tables_filling_apart_land_their_own_bytes) {
+    const std::string p = radtest::tmp_path("tfill");
+    RadWriter w;
+    REQUIRE(w.begin(p.c_str()) >= 0);
+    w.set_arch("radtest");
+    const RadWriter::Weight a = mkw("ngram.a", plain_bf16(), 1500, 999, -1, -1, 0);
+    const Planes awant = planes_of(a, 5);
+    REQUIRE(w.add_weight(a, awant.ptr.data()) >= 0);
+    const RadWriter::Weight b = mkw("ngram.b", plain_bf16(), 4000, 7, -1, -1, 0);
+    const Planes bwant = planes_of(b, 6);
+    REQUIRE(w.add_weight(b, bwant.ptr.data()) >= 0);
+    REQUIRE(w.finish() >= 0);
+
+    RadFile f;
+    REQUIRE(f.open(p.c_str()) >= 0);
+    const RadFilePlane& pa = f.plane(*f.find("ngram.a"), 0);
+    const RadFilePlane& pb = f.plane(*f.find("ngram.b"), 0);
+    const uint8_t* sa = f.data(pa);
+    const uint8_t* sb = f.data(pb);
+    const int64_t na = (int64_t)pa.bytes, nb = (int64_t)pb.bytes;
+    REQUIRE(na > 0);
+    REQUIRE(nb > 0);
+
+    TableCopy ca, cb;
+    std::string why;
+    const int rc = table_copy_reserve(na, &ca, &why);
+    /* A locked-memory limit below the copy is the machine's setting, not a defect. */
+    if (rc == RAD_E_NOMEM && why.find("mlock2") != std::string::npos) SKIP("%s", why.c_str());
+    REQUIRE_EQ(rc, (int)RAD_OK);
+    REQUIRE_EQ(table_copy_reserve(nb, &cb, &why), (int)RAD_OK);
+
+    TableFill fa, fb;
+    CHECK_EQ(fa.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)ca.base), (int)RAD_OK);
+    CHECK_EQ(fb.start(f, sb, nb, (int64_t)pb.offset, (uint8_t*)cb.base), (int)RAD_OK);
+    std::string bwhy, awhy;
+    CHECK_EQ(fb.wait(&bwhy), (int)RAD_OK);   /* the table started second is waited on first */
+    CHECK_EQ(fa.wait(&awhy), (int)RAD_OK);
+    CHECK(fa.seconds() > 0.0);
+    CHECK(fb.seconds() > 0.0);
+    CHECK(std::memcmp(cb.base, sb, (size_t)nb) == 0);
+    CHECK(std::memcmp(ca.base, sa, (size_t)na) == 0);
+
+    /* Dropped without a wait: the destructor joins, so the bytes are there before the free. */
+    TableCopy dropped;
+    REQUIRE_EQ(table_copy_reserve(na, &dropped, &why), (int)RAD_OK);
+    {
+        TableFill g;
+        REQUIRE_EQ(g.start(f, sa, na, (int64_t)pa.offset, (uint8_t*)dropped.base), (int)RAD_OK);
+    }
+    CHECK(std::memcmp(dropped.base, sa, (size_t)na) == 0);
+
+    /* Read from the wrong file offset (16 bytes on, still inside the container): real bytes,
+     * wrong ones, caught by the wait's check. */
+    TableCopy bad;
+    REQUIRE_EQ(table_copy_reserve(na, &bad, &why), (int)RAD_OK);
+    TableFill fbad;
+    REQUIRE_EQ(fbad.start(f, sa, na, (int64_t)pa.offset + 16, (uint8_t*)bad.base), (int)RAD_OK);
+    std::string fwhy;
+    CHECK_EQ(fbad.wait(&fwhy), (int)RAD_E_IO);
+    CHECK(fwhy.find("does not match") != std::string::npos);
+
+    table_copy_free(&bad);
+    table_copy_free(&dropped);
+    table_copy_free(&ca);
+    table_copy_free(&cb);
+    f.close();
+}
+
 /* --ngram-placement disk=DIR (#130): the first open fills the table's own file from the container,
  * renamed into place whole; the mapping holds the container's bytes and is that file's (the disk
  * gather finds the file behind its mapping); a second open reuses it unfilled; a file that is not
@@ -480,7 +552,16 @@ TEST(a_table_file_on_another_disk_is_filled_once_and_mapped_in_place_of_the_cont
     const RadFilePlane& pl = f.plane(*f.find("ngram.weight"), 0);
     const uint8_t* src = f.data(pl);
     const int64_t n = (int64_t)pl.bytes;
-    const std::string tab = radtest::tmp_path("tfile-table");
+    /* /proc/self/maps names a mapping by its resolved path, so compare against the resolved
+     * directory: $RAD_TEST_TMPDIR may go through a symlink (the build directory is one). */
+    const std::string tab_raw = radtest::tmp_path("tfile-table");
+    std::string tab = tab_raw;
+#if !defined(_WIN32)   /* Brilliance: Windows compares the mapped file's own name (below), not a path */
+    if (char* r = ::realpath(tab_raw.substr(0, tab_raw.rfind('/')).c_str(), nullptr)) {
+        tab = std::string(r) + tab_raw.substr(tab_raw.rfind('/'));
+        std::free(r);
+    }
+#endif
     ::unlink(tab.c_str());
 
     TableCopy a;
@@ -1356,6 +1437,44 @@ TEST(an_in_place_extension_that_fails_leaves_the_container_as_it_was) {
         w.abort();
     }
     CHECK(slurp(b.path) == before);
+}
+
+/* ------------------------------------------------------------------ skeleton (rad-convert --skeleton) */
+/* A container whose planes were never written: finish() refuses it, unless the caller asked for a skeleton (allow_unwritten_planes), then the
+ * file is complete in structure at its full length and its data are holes, which a sparse file stores for free. */
+TEST(a_skeleton_leaves_its_planes_as_holes_and_otherwise_an_unwritten_plane_refuses) {
+    auto build = [&](const char* stem, bool holes, bool seal, std::string* path) {
+        *path = radtest::tmp_path(stem);
+        RadWriter w;
+        CHECK_OK(w.begin(path->c_str()));
+        w.set_arch("radtest");
+        w.set_model_name("skeleton-test");
+        const RadWriter::Weight x = mkw("blk.0.attn_qkv.weight", plain_bf16(), 4096, 1024, 0, -1, 0);
+        CHECK(w.add_weight(x) >= 0);          /* reserved, never written: 8 MiB of codes */
+        if (seal) CHECK_OK(w.seal());
+        if (holes) w.allow_unwritten_planes();
+        return w.finish();
+    };
+    std::string p1, p2;
+    CHECK(build("skel-refused", false, true, &p1) < 0);
+    CHECK_OK(build("skel-ok", true, true, &p2));
+    RadFile f;
+    REQUIRE(f.open(p2.c_str()) >= 0);
+    const RadFileEntry* e = f.find("blk.0.attn_qkv.weight");
+    REQUIRE(e != nullptr);
+    struct stat st {};
+    REQUIRE(::stat(p2.c_str(), &st) == 0);
+    CHECK(st.st_size >= (off_t)(4096 * 1024 * 2));       /* the data's length is there ... */
+#if !defined(_WIN32)
+    CHECK(st.st_blocks * 512 < (off_t)(4096 * 1024));    /* ... and its blocks are not */
+#endif
+    /* Brilliance: Windows' stat has no st_blocks, and an NTFS file extended past its data is not
+     * sparse unless marked so; the skeleton's holes are a Linux saving, its structure is checked
+     * the same on both. */
+    const RadFilePlane& pl = f.plane(*e, 0);
+    CHECK((int64_t)pl.bytes == 4096 * 1024 * 2);
+    std::string p3;
+    CHECK(build("skel-unsealed", true, false, &p3) < 0);
 }
 
 /* ------------------------------------------------------------------ refusals */

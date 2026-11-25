@@ -21,6 +21,10 @@ struct DeriveInput {
     const int32_t*  conv_slot = nullptr;    /* [n_seq] the conv group's state slot, -1 if none */
     int64_t         n_tok = 0;
     int64_t         n_seq = 0;
+    const int32_t*  out_ids = nullptr;
+    int64_t         n_out = 0;
+    const int32_t*  rope_pos = nullptr;
+    int32_t         ckpt_cut = 0;
     int64_t         state_chunk = 1;        /* the resolved linear-state chunk length */
     int32_t         conv_window = 1;        /* conv_width - 1 + max_spec */
 };

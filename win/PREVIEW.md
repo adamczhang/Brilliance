@@ -1,8 +1,10 @@
-# Brilliance 0.3.0 for Windows
+# Brilliance 0.3.1 for Windows
 
 A Windows build of [Radiance](https://codeberg.org/StillDeadcode/radiance) 2.2 on its native HIP
-backend, for **Radeon AI PRO R9700** cards. This is Brilliance 0.3.0, the fork's first stable
-release after five alpha previews. Each model and layout carries its own status word: some are
+backend, for **Radeon AI PRO R9700** cards. This is Brilliance 0.3.1: initial Hy4-flash and
+Inkling 2 support. Hy4-flash IQR-V4 u3 runs on two and four cards as a preview, and Inkling 2 Mini
+on one card is supported. 0.3.0 was the fork's first stable release, after five alpha previews.
+Each model and layout carries its own status word: some are
 qualified, some soak-clean or supported, some previews, and some not yet qualified (`SUPPORT.md`
 has the table). The limits below apply.
 
@@ -313,7 +315,7 @@ and agents have not been checked; one that lets you set the base URL and model n
 
 Report bugs and ask questions about this Windows build in the issue tracker of
 github.com/adamczhang/Brilliance, after checking `SUPPORT.md`'s known issues. Include the release
-(`0.3.0`, or the commit in `MANIFEST.json`), the Adrenalin driver version, the cards and
+(`0.3.1`, or the commit in `MANIFEST.json`), the Adrenalin driver version, the cards and
 the `-Bus` you gave, the profile and anything you changed in it, the exact command (with any key
 removed) and the server's log from its start to the failure. For a server that stopped making
 progress, read it with `bin\brl-stacks.exe` first (`tools\STACKS.md`) and attach what it prints.
@@ -345,7 +347,7 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
     `Host` header unchanged (nginx rewrites it by default: add `proxy_set_header Host $host;`). A proxy
     that rewrites it to the server's address makes its remote clients the local operator. Put TLS at
     the proxy; the key is not encrypted on its own.
-- **Windows service (preview in 0.3.0).** Host tests and dry runs cover setup and simulated
+- **Windows service (preview in 0.3.1).** Host tests and dry runs cover setup and simulated
   service controls, plus health, API-key and stop checks in console mode with no model loaded.
   Elevated Service Control Manager (SCM) install, key file permissions (ACL), graceful stop
   and detachment, boot and preshutdown, reinstall, and one-restart recovery remain unverified.
@@ -391,6 +393,11 @@ Upstream Radiance (codeberg.org/StillDeadcode/radiance) is for problems its Linu
 | `flashnext-2card-fast.yaml` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | Runs, fastest option. [Functional, performance and fault-injection evidence](SUPPORT.md#models-and-card-counts) | 256K | 8 | MTP, adaptive depth to 5 | int8 |
 | `gemma4-31b-1card.yaml` | Gemma 4 31B a4 | 1 | Qualified | 32K | 2 | MTP, depth 3 | bf16 |
 | `gemma4-12b-1card.yaml` | Gemma 4 12B i8g | 1 | Qualified | 32K | 4 | MTP, depth 3 | bf16 |
+| `inkling2-mini-1card.yaml` | Inkling 2 Mini IQ8R (text, tools, pictures) | 1 | Supported: loads and serves; API checks pass. No soak or concurrency qualification yet | 32K | 4 | off | int8 |
+| `inkling2-mini-dspark-1card.yaml` | Inkling 2 Mini, NVFP4 experts, DSpark (text, tools, pictures) | 1 | Supported: loads and serves; API checks pass. No soak or concurrency qualification yet | 128K | 4 | DSpark, depth 7, adaptive window | int8 |
+| `hy4-4card-dfly.yaml` | Hy4-flash IQR-V4 u3 (text, tools) | 4 (TP4), every expert on the cards | Preview: loads and serves; smoke and greedy consistency checks pass | 64K | 8 | DFly2, five positions, adaptive depth | bf16 |
+| `hy4-2card.yaml` | Hy4-flash IQR-V4 u3 (text, tools) | 2 (TP2), experts tiered to host memory | Preview: loads and serves; smoke and greedy consistency checks pass | 8K | 1 | off | bf16 |
+| `hy4-2card-dfly.yaml` | Hy4-flash IQR-V4 u3 (text, tools) | 2 (TP2), experts tiered to host memory | Preview: loads and serves; smoke and greedy consistency checks pass; slower on prose than hy4-2card | 32K | 2 | DFly2, five positions, adaptive depth | bf16 |
 | `qwen36-35b-2card.yaml` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | Qualified | 32K | 4 | MTP, depth 3 | int8 |
 | `qwen-image-1card.yaml` | Qwen-Image 2.1 IQ8R (pictures) | 1 | Qualified for generation; edits: `SUPPORT.md`, known issue 13 | Pictures to 2048x2048, the default | - | off | - |
 | `ltx-2.5-1card.yaml` | LTX-2.5 distilled IQ8R (video with sound) | 1 | Qualified for standalone jobs with `h264_mf`. AMD AMF encoding is not yet qualified. [RC4 evidence](SUPPORT.md#alpha5-rc4-qualification) | Videos to 6.7 s, 960x544 by default | 1 | off | - |
@@ -529,12 +536,16 @@ The [known-issue table](SUPPORT.md#known-issues) records each Windows support li
     `BRILLIANCE_H264_ENCODER=h264_mf` to select the tested encoder. `h264_amf` encodes on the first
     display adapter Windows lists, which can be the AMD integrated GPU.
     [RC4 evidence](SUPPORT.md#alpha5-rc4-qualification)
-  - **Speech synthesis (TTS) is not supported** in 0.3.0: `/v1/audio/speech` answers 501 ("not
+  - **Speech synthesis (TTS) is not supported** in 0.3.1: `/v1/audio/speech` answers 501 ("not
     supported in this build"). Music generation, on the same endpoint, is not served either.
   - **Image generation** works (`SUPPORT.md`).
 - **No peer-to-peer access between cards on Windows.** Multi-card collectives pass through pinned
   host memory. A process can pin about the shared-memory budget divided by the cards it sees,
-  less 2 GiB. A table too large to pin is read from the file instead (`--ngram-placement disk`). Leave `p2p:` at
+  less 2 GiB, and a pin larger than the RAM available at that moment (less 1 GiB) is refused
+  rather than made. `ngram-placement: auto` reads an n-gram table from the file instead of pinning
+  it when the table is larger than a quarter of RAM, or when a pinned copy would leave less than
+  24 GiB of host memory free (Qwen3.8-Flash-Next's 47.7 GiB table is read from the file on every
+  layout); its rows are prefetched, so a cold prefill runs at the warm speed. Leave `p2p:` at
   `auto`, the default, in profiles of your own: `auto` exchanges through host memory, while
   `p2p: on`, which some upstream recipes set, refuses to start here. `tp-wire: wht6` is a separate
   setting, a lossy compressed exchange with the same two-card resend and stop protection as the
@@ -551,6 +562,20 @@ The [known-issue table](SUPPORT.md#known-issues) records each Windows support li
   - The startup log says which, in a line that begins `device: HIP virtual memory is on` or
     `is off`. `BRILLIANCE_VMM=0` turns it off; `=1` forces it on and is not qualified with
     several devices.
+- **Other programs that use a serving card share its memory.** A browser, an editor or another
+  desktop app whose graphics preference is an R9700 holds part of that card's VRAM, and its use
+  grows and shrinks. The server plans around what other programs hold when it reads the card, and
+  its startup log lists them, a line that begins `device: VRAM other processes hold on the serving
+  cards` (program, process id and MiB a card). What they take after that reading comes out of
+  `gpu-headroom-mib`. If it leaves a card short, startup stops with an error naming each program
+  that took more and the reserve that would leave room for it, instead of failing later on an
+  allocation. Set such programs to Power saving in Windows Settings > System > Display > Graphics so
+  they use another GPU, and restart them; `flashnext-4card` leaves about 445 MiB a card. If one card
+  must stay busy (it drives the display), give it alone a larger reserve with
+  `memory.card-headroom-mib: {CARD: MiB}` (CARD as the startup report counts the cards); the other
+  cards keep `gpu-headroom-mib` and, under `expert_tiered`, put the difference into resident experts
+  (`docs/GUIDE.md` in the source, section 4.3, "One card busier than the others"). Windows only: the counters it reads are
+  Windows'.
 - **The dashboard reads each card's load and power from the AMD driver's ADL.**
   Without ADL, load and power show as not available on Windows. The dashboard uses ADL junction
   temperature when available and falls back to the adapter temperature when Windows supplies it.
@@ -624,6 +649,11 @@ The [known-issue table](SUPPORT.md#known-issues) records each Windows support li
       its user interface.
   - **MiniCPM5-2B IQ8R** (`StillDeadcode/minicpm5-2b-iq8r`): Apache 2.0. No use restrictions to
     pass on.
+  - **Inkling 2 Mini** (`StillDeadcode/inkling-2-mini-iq8r` and
+    `gostar77/inkling2-mini-i8-dspark-radiance`): Apache 2.0, as Thinking Machines' Inkling 2 Mini.
+    Thinking Machines' Model Acceptable Use Policy applies to its use
+    (https://thinkingmachines.ai/model-acceptable-use-policy/; `/terms/licenses` links it).
+    Neither repository is gated.
   - **EmbeddingGemma 2** (`google/embeddinggemma-2`): Apache 2.0. Its model card says deployments
     must adhere to the Gemma Prohibited Use Policy, which `TERMS-OF-USE.md` passes on.
   - **Qwen3-ASR 1.7B** (`Qwen/Qwen3-ASR-1.7B-hf`): Apache 2.0. No use restrictions to pass on.
@@ -684,6 +714,21 @@ The [known-issue table](SUPPORT.md#known-issues) records each Windows support li
     types, its Engram table is generated from the tokenizer, and 18 attention-output projections
     are edited to remove the model's refusal direction ("abliterated"), so it refuses less than
     DeepSeek's model.
+  - **Hy4-flash IQR-V4** (`keptn/hy4-flash-iqr-v4`, text): the **Tencent Hy License 1.0**
+    (`LICENSE` and `NOTICE` in that repository; `/terms/licenses/tencent-hy-1.0`), derived from
+    Apache 2.0 with commercial terms in its Section 10. The repository is not gated.
+    - **Model as a Service.** If you run a business that gives third parties general-purpose
+      remote access to model inference or fine-tuning (for example through an API), you need a
+      separate written licence from Tencent before using the model once your worldwide gross
+      revenue exceeds US$50 million in any 12 months, or before using it in a product or service
+      with more than 100 million monthly active users. Use solely for internal purposes, with
+      neither the model nor its outputs made available to third parties, is excepted. Tencent's
+      contact for it is hy_partners@tencent.com.
+    - **Passing it on.** A copy of the model or a derivative keeps the licence, the copyright and
+      attribution notices, and the attribution notices of its `NOTICE` file. No use-based
+      restrictions to pass on.
+    - **The container** is keptn's quantised form of tencent/Hy4-flash (its `NOTICE` says the
+      quantisation changed the weights), not a Tencent release.
 - **H.264** (`THIRD-PARTY.md`, "H.264", has the whole of it):
   - This package ships no H.264 encoder implementation (no OpenH264, no x264). Its FFmpeg,
     Brilliance's own built with vcpkg, keeps only two thin wrappers over encoders their makers

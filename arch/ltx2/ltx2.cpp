@@ -94,7 +94,14 @@ enum { kMaxSteps = 64, kDefSteps = 30 };
 /* Time: 24 frames a second; a video of n chunks is 8 n + 1 frames over n + 1 latent frames. A
  * decode pass is a chunk of frames; chunk 0 decodes the whole video, a tile at a time. */
 enum { kFps = 24, kFpc = 8, kFtail = 1, kLpc = 1, kLtail = 1, kDecLat = 2 };
+#if defined(_WIN32)
+/* Brilliance: the activation arena is sized from kMaxChunks (9.21 GiB at 20, 9.88 GiB at 40, per
+ * 515de819). With the 21.10 GiB DiT that is more than a 32 GB R9700 can give one card under
+ * Windows' budget, so Windows keeps the 20-chunk ceiling (161 frames, 6.7 s); Linux keeps 40. */
 enum { kMinChunks = 2, kMaxChunks = 20, kDefChunks = 15 };
+#else
+enum { kMinChunks = 2, kMaxChunks = 40, kDefChunks = 15 };
+#endif
 /* Space: 32 pixels a latent; sides multiples of 32 from 256, 3:1 at most; the release's 960 x 544
  * canvas by default, and four times its area at most -- the two-stage recipe's 1920 x 1088. A
  * step holds at most the video rows of 121 frames at that size. */

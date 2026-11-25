@@ -58,8 +58,8 @@ std::vector<Row> cpp_rows() {
     };
 }
 
-/* The layout at RAD_ABI_VERSION 43 / RAD_FORMAT_VER 2 (see the file header). */
-constexpr uint32_t kTableAbi = 43, kTableFormat = 2;
+/* The layout at RAD_ABI_VERSION 44 / RAD_FORMAT_VER 2 (see the file header). */
+constexpr uint32_t kTableAbi = 44, kTableFormat = 2;
 const AbiRow kTable[] = {
 #include "abi_layout_table.h"
 };
@@ -226,13 +226,36 @@ TEST(the_span_pass_field_is_appended_past_the_build_contexts_end) {
 }
 
 /* ABI 43: a checkpoint inside the step. The probe's flag takes the tail padding behind gen_shape
- * (the probe keeps its 128 bytes); the batch's cut and bounds sit past its old end. */
+ * (the probe keeps its 128 bytes until ABI 44 appends past it); the batch's cut and bounds sit past
+ * its old end. */
 TEST(the_checkpoint_cut_fields_are_appended_past_the_old_ends) {
     CHECK_EQ(offsetof(RadArchProbe, ckpt_snap_ok), (size_t)124);
-    CHECK_EQ(sizeof(RadArchProbe), (size_t)128);
     CHECK_EQ(offsetof(RadBatch, ckpt_cut), (size_t)480);
     CHECK_EQ(offsetof(RadBatch, ckpt_cu), (size_t)488);
-    CHECK_EQ(sizeof(RadBatch), (size_t)496);
+}
+
+/* ABI 44: a chunk planned as layer-sliced sub-steps, and the prefill tail's host mirror. The probe's
+ * slicing flag is appended past the old 128-byte probe, the build context's declared slice set past
+ * span_pass_step, and the batch's tail mirror and layer range past the checkpoint cut -- all read at
+ * these offsets by a plugin built against these headers. */
+TEST(the_slice_layer_fields_are_appended_past_the_old_ends) {
+    CHECK_EQ(offsetof(RadArchProbe, slice_layers_ok), (size_t)128);
+    CHECK_EQ(sizeof(RadArchProbe), (size_t)136);
+    CHECK_EQ(offsetof(RadBuildCtx, layer_slices), (size_t)204);
+    CHECK_EQ(sizeof(RadBuildCtx), (size_t)208);
+    CHECK_EQ(offsetof(RadBatch, prefill_tail_h), (size_t)496);
+    CHECK_EQ(offsetof(RadBatch, layer_lo), (size_t)504);
+    CHECK_EQ(offsetof(RadBatch, layer_hi), (size_t)508);
+    CHECK_EQ(sizeof(RadBatch), (size_t)512);
+}
+
+/* Krea 2 reference attention: the generator batch's bias and per-span timestep pointers sit past
+ * its old 408-byte end, in that order, at the offsets a plugin built against these headers reads
+ * them from. */
+TEST(the_reference_fields_are_appended_past_the_generator_batchs_end) {
+    CHECK_EQ(offsetof(RadGenBatch, ref_log_bias), (size_t)408);
+    CHECK_EQ(offsetof(RadGenBatch, mode_sigma), (size_t)416);
+    CHECK_EQ(sizeof(RadGenBatch), (size_t)424);
 }
 
 RAD_TEST_MAIN()

@@ -40,6 +40,7 @@ set(AVX_KERNEL_SRC
   avx_glm.cpp
   avx_dsa.cpp
   avx_mla.cpp
+  avx_hy4.cpp
   avx_quant.cpp
   avx_gemm.cpp
   avx_gemm_tile.cpp
@@ -64,6 +65,7 @@ set(AVX_KERNEL_SRC
   avx_lili.cpp
   avx_ds41.cpp
   avx_ggml.cpp
+  avx_attn_res.cpp
 )
 
 # The flag sets, written out because each states which instructions the object may contain.

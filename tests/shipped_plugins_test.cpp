@@ -99,7 +99,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "glm5next", "" },
         { "hunyuan3d2", "" }, { "hyv3", "" }, { "hyv3", "fp8" }, { "hyv3", "gguf_ftype_15" },
-        { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
+        { "hyv4flash", "" },
+        { "inkling2", "" }, { "laya", "" }, { "lfm2", "" }, { "lfm3", "" }, { "llama", "" }, { "mistral3", "" },
         { "llama", "fp8_e4m3" }, { "nemotronh", "" }, { "nomicbert", "" }, { "qwen35", "" },
         { "museglimmer", "" },
         { "museglimmer", "compressed-tensors" },
@@ -108,7 +109,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "qwen3asr", "" }, { "krea2", "" }, { "ltx2", "" }, { "minimaxh3", "" },
         { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" },
         { "spark25", "" }, { "spark25", "w8a8_fwht128" }, { "sdxl", "" },
-        { "unlimitedocr", "" } };
+        { "unlimitedocr", "" },
+        { "wan", "" } };   /* Brilliance (upstream defect): arch/wan, new in 4fc8dda6, claims it */
     std::set<std::pair<std::string, std::string>> got;
     for (const auto& [k, name] : keys) got.insert(k);
     if (got != want)

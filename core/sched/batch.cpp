@@ -615,11 +615,16 @@ void BatchBuilder::fini() {
 }
 
 /* ------------------------------------------------------------------ derivations */
-int BatchBuilder::run_derivations(const StepPlan& plan, Set& s) {
+int BatchBuilder::run_derivations(const StepPlan& plan, Set& s, int64_t n_out,
+                                  const int32_t*& tail) {
     if (derived_.empty()) return RAD_OK;
 
     DeriveInput in;
     in.plan = &plan;
+    in.n_out = n_out;
+    in.out_ids = s.h_out;
+    in.rope_pos = mm_on_ ? s.h_rope : nullptr;
+    in.ckpt_cut = s.h_ckcu[1];
     in.cu_seqlens = s.h_cu;
     in.positions = s.h_pos;
     in.n_tok = plan.n_tok;
@@ -656,6 +661,12 @@ int BatchBuilder::run_derivations(const StepPlan& plan, Set& s) {
             last_fn = d.fn_index;
             last_grp = d.conv_grp;
             last = &d;
+        }
+
+        if (!std::strcmp(d.name, "prefill_tail") || !std::strcmp(d.name, "prefill_tail_anchors")) {
+            if (!d.produced) continue;
+            tail = host;
+            if (d.produced == 1) continue;  /* the empty/full decision is host-only */
         }
 
         /* Copy into every rank's arena on that rank's stream; each rank has its own slot. */
@@ -1062,7 +1073,10 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
                 s.h_rope[2 * n_tok + k + j] = v[2];
                 if (v[1] != v[0] || v[2] != v[0]) rope_mixed = 1;
             }
-            if (e.req && e.req->media && !e.req->media->items.empty()) {
+            if (e.req && e.req->media && !e.req->media->items.empty() &&
+                !(plan.slice_m > 0 && plan.slice_j > 0)) {
+                /* (S-02) The chunk's media rows are scattered on the group's first sub-step only:
+                 * the plugin holds them once, and a later sub-step must not scatter them again. */
                 /* Wait until the last upload from the staging has run. */
                 if (mm_ev_live_) {
                     if (rad_event_sync(mm_ev_) < 0) return nullptr;
@@ -1281,7 +1295,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     }
 
     /* Derivations read the host staging: after the fills, before the event. */
-    RAD_TRY_NULL(run_derivations(plan, s));
+    const int32_t* tail = nullptr;
+    RAD_TRY_NULL(run_derivations(plan, s, n_out, tail));
 
     /* ---------------------------------------------------------- encoder rows
      * Behind the slab on every rank's stream. Rank 0 gets the staged rows, the others zeros, so the
@@ -1322,11 +1337,14 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         RadBatch& B = o.batch[r];
         B.phase = plan.phase;
         B.step = step;
+        B.layer_lo = plan.layer_lo;
+        B.layer_hi = plan.layer_hi;
         B.n_tok = n_tok;
         B.n_seq = n_seq;
         B.token_ids = on_rank(base, b0, s.d_tok);
         B.positions = on_rank(base, b0, s.d_pos);
         B.positions_h = s.h_pos;
+        B.prefill_tail_h = tail;
         B.cu_seqlens = on_rank(base, b0, s.d_cu);
         B.seq_ids = on_rank(base, b0, s.d_sid);
         B.n_out = n_out;
@@ -1383,9 +1401,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.enc_max_seg = 0;
         B.enc_seg_h = nullptr;
         B.enc_seg_w = nullptr;
-        B.n_checkpoints = n_ck;
-        B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
-        B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
+        B.n_checkpoints = plan.slice_m > 0 && !plan.slice_last ? 0 : n_ck;
+        B.checkpoint_tok = B.n_checkpoints ? on_rank(base, b0, s.d_cktok) : nullptr;
+        B.checkpoint_slot = B.n_checkpoints ? on_rank(base, b0, s.d_ckslot) : nullptr;
         B.ckpt_cut = ck_cut;
         B.ckpt_cu = ck_cut > 0 ? on_rank(base, b0, s.d_ckcu) : nullptr;
         B.n_ahead = n_ahead;

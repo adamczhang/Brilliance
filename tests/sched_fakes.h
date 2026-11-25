@@ -471,13 +471,25 @@ struct FakePC : IPrefixCache {
     }
 
     mutable int64_t lookups = 0;
+    /* The kept chain each lookup was handed (SchedReq::chain), as a block count; -1 for none. The
+     * fake fills it the way the real cache does, one hash a whole block of the prompt, so a test
+     * can see that a request that waits kept its chain instead of starting over (S-09). */
+    mutable std::vector<int64_t> chain_blocks;
     /* A cap (HitCap) as prefix.cpp applies one: attention ends at a block at or below it, the
      * linear state at the deepest checkpoint under that (checkpoints at multiples of `interval`,
      * none below `ckpt_lo`), and the whole hit stands if that gives back too much. */
     int64_t ckpt_lo = 0;
-    CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out,
-                    const HitCap* cap) const override {
+    CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
+                    const HitCap* cap, PrefixChain* chain = nullptr) const override {
         ++lookups;
+        if (chain) {
+            chain_blocks.push_back((int64_t)chain->hs.size());
+            const int64_t bs = kv && !groups.empty() ? kv->block_tokens(groups[0]) : 16;
+            const size_t n = (size_t)((int64_t)r.prompt.size() / (bs > 0 ? bs : 16));
+            if (chain->hs.size() < n) chain->hs.resize(n);
+        } else {
+            chain_blocks.push_back(-1);
+        }
         if (out) {
             out->resize(groups.size());
             for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
@@ -508,13 +520,14 @@ struct FakePC : IPrefixCache {
     /* What the scheduler published and asked to be evicted, recorded rather than acted on: these
      * tests check that the scheduler publishes before it frees and evicts before it preempts, not
      * the cache's own indexing, which prefix.cpp's tests cover. */
-    struct Published { uint64_t seq; int64_t n_tokens; size_t n_groups; };
+    struct Published { uint64_t seq; int64_t n_tokens; size_t n_groups; int64_t chain_blocks; };
     std::vector<Published> published;
     int64_t evict_calls = 0, evict_grant = 0;
 
     int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
-               int64_t n_tokens) override {
-        published.push_back({ r.id, n_tokens, blocks.size() });
+               int64_t n_tokens, PrefixChain* chain = nullptr) override {
+        published.push_back({ r.id, n_tokens, blocks.size(),
+                              chain ? (int64_t)chain->hs.size() : -1 });
         return RAD_OK;
     }
     /* Grants only what a test asked for, so "the cache had nothing to give" is reachable and the

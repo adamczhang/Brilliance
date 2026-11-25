@@ -1,0 +1,1 @@
+<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are terse.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What is 2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>

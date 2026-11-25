@@ -61,8 +61,25 @@ double state_code(const std::string& s) {
 
 History::Row History::model_row(const json& s, const json* prev, double dt) {
     Row row;
-    put(row, "decode", num(s, "decode_tps"));
-    put(row, "prefill", num(s, "prefill_tps"));
+    /* The engine's decode rate is its own recent average, so it keeps reporting the last
+     * healthy number while the device has advanced nothing: emit it only where the decode
+     * step counter proves the model stepped since the last sample, so a frozen queue reads
+     * as a gap in the chart and not as a plausible rate. A zero is a reading -- idle, or
+     * nothing accepted -- and never a leftover, so it always passes. */
+    if (const double d = num(s, "decode_tps");
+        std::isfinite(d) && (d == 0.0 || !prev || num0(s, "steps_decode") > num0(*prev, "steps_decode")))
+        put(row, "decode", d);
+    /* The same trap as decode, from the other side. The scheduler's idle decay is keyed to the last
+     * step of ANY kind, so while the model only decodes the prefill window is never aged and
+     * prefill_tps keeps reporting the last prompt's rate: on a live lane that drew a flat
+     * ~3,500 tok/s prefill line across four minutes the model spent decoding. Emit it only where a
+     * prefill-bearing step proves prefill ran, or where it reads a true zero -- a zero is a reading
+     * and never a leftover. A mixed step carries a prefill chunk too, so it counts as progress. */
+    if (const double p = num(s, "prefill_tps");
+        std::isfinite(p) && (p == 0.0 || !prev
+                             || num0(s, "steps_prefill") + num0(s, "steps_mixed")
+                                    > num0(*prev, "steps_prefill") + num0(*prev, "steps_mixed")))
+        put(row, "prefill", p);
     put(row, "running", num(s, "running"));
     put(row, "waiting", num(s, "waiting"));
     put(row, "preempted", num(s, "preempted"));
@@ -105,8 +122,24 @@ History::Row History::model_row(const json& s, const json* prev, double dt) {
         }
         if (n) put(row, "prefillRate", sum / n);
     }
+    put(row, "encWait", num(s, "encode_pending"));
     if (!prev || !(dt > 0)) return row;
     const json& p = *prev;
+
+    /* The encoder's share of the time between samples, and its items and patches a second. A
+     * counter that went back (a reload under the same start) is a gap, not a negative rate.
+     * encode_ns grows while a pass runs (Scheduler::take_encodes), so a long pass reads busy on
+     * every sample it spans; the clamp only absorbs the jitter between the sampler's clock and
+     * the server's. Items and patches count when their pass ends. */
+    {
+        auto d = [&](const char* f) {
+            const double v = num(s, f) - num(p, f);
+            return v >= 0 ? v : kNone;
+        };
+        put(row, "encBusy", std::clamp(d("encode_ns") / (dt * 1e9), 0.0, 1.0));
+        put(row, "encRate", d("encode_items") / dt);
+        put(row, "encPatch", d("encode_patches") / dt);
+    }
 
     if (jobs)
         if (const json* pj = member(p, "jobs"); pj && num0(*jobs, "done") > num0(*pj, "done"))
@@ -172,6 +205,11 @@ History::Row History::fleet_row(const json& f) {
         if (const double v = num(c, "busy"); std::isfinite(v)) row.emplace_back(name("busy"), v);
         if (const double v = num(c, "power_w"); std::isfinite(v)) row.emplace_back(name("power"), v);
         if (const double v = num(c, "temp_c"); std::isfinite(v)) row.emplace_back(name("temp"), v);
+        if (const double v = num(c, "mem_busy"); std::isfinite(v)) row.emplace_back(name("memb"), v);
+        if (const double v = num(c, "sclk_mhz"); std::isfinite(v)) row.emplace_back(name("sclk"), v);
+        if (const double v = num(c, "mclk_mhz"); std::isfinite(v)) row.emplace_back(name("mclk"), v);
+        if (const double v = num(c, "temp_mem_c"); std::isfinite(v)) row.emplace_back(name("tmem"), v);
+        if (const double v = num(c, "fan_pct"); std::isfinite(v)) row.emplace_back(name("fan"), v);
         if (const double v = num(c, "free_bytes"); std::isfinite(v)) row.emplace_back(name("free"), v);
         if (!models || !models->is_array()) continue;
         /* A model's bytes on this card, 0 where it holds none: the stacked memory chart draws a
@@ -250,6 +288,7 @@ void History::track_requests(Model& m, const json& stats, double t) {
         const double pf = num(r, "prefill_s"), ttft = num(r, "ttft_s"), tps = num(r, "tps");
         json h;
         h["id"] = text(r, "id");
+        if (!text(r, "lora").empty()) h["lora"] = text(r, "lora");
         h["prompt"] = num0(r, "prompt");
         h["out"] = num0(r, "output");
         h["ctx"] = num0(r, "ctx");
@@ -291,7 +330,21 @@ void History::model_sample(const std::string& id, const json& stats, double t, s
         m.live.clear();
         m.done.clear();
     }
-    m.series.push(t, model_row(stats, same ? &m.prev : nullptr, t - m.prev_t));
+    Row row = model_row(stats, same ? &m.prev : nullptr, t - m.prev_t);
+    /* The model's cards' figures under the fleet's own column names (busy<c>, memb<c>, ...), from the
+     * latest fleet sample: a page that may read this model but not the fleet still sees what its
+     * cards are doing while no step runs (an encode, a load). */
+    if (const auto it = model_cards_.find(id); it != model_cards_.end() && cards_.is_array())
+        for (const json& c : cards_) {
+            const std::string card = text(c, "card");
+            if (std::find(it->second.begin(), it->second.end(), card) == it->second.end()) continue;
+            static const std::pair<const char*, const char*> kCols[] = {
+                { "busy", "busy" }, { "power_w", "power" }, { "temp_c", "temp" }, { "mem_busy", "memb" },
+                { "sclk_mhz", "sclk" }, { "mclk_mhz", "mclk" }, { "temp_mem_c", "tmem" }, { "fan_pct", "fan" } };
+            for (const auto& [k, col] : kCols)
+                if (const double v = num(c, k); std::isfinite(v)) row.emplace_back(col + card, v);
+        }
+    m.series.push(t, row);
     track_requests(m, stats, t);
     m.prev = stats;
     m.prev_t = t;
@@ -300,6 +353,14 @@ void History::model_sample(const std::string& id, const json& stats, double t, s
 void History::fleet_sample(const json& fleet, double t, std::string body) {
     std::lock_guard<std::mutex> lk(mu_);
     fleet_.push(t, fleet_row(fleet));
+    cards_ = json();
+    if (const json* c = member(fleet, "cards"); c && c->is_array()) cards_ = *c;
+    model_cards_.clear();
+    if (const json* ms = member(fleet, "models"); ms && ms->is_array())
+        for (const json& m : *ms)
+            if (const json* on = member(m, "cards"); on && on->is_array())
+                for (const json& x : *on)
+                    if (x.is_number()) model_cards_[text(m, "id")].push_back(std::to_string(x.get<long long>()));
     fleet_live_ = std::move(body);
 }
 

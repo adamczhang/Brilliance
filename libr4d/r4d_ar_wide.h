@@ -13,6 +13,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <cstdint>
+#include <type_traits>
 #include <stdexcept>
 #include <string>
 #include "r4d_ar_seq.h"
@@ -29,8 +30,20 @@ template <typename S, int NPEERS>
 struct R4DArWidePeers {
   S* scratch[NPEERS];
   unsigned int* flags[NPEERS];
-  int rank[NPEERS];
+  // Passed by value as a kernel argument: a recorded pass's audit (core/runtime/ctx.cpp
+  // tapes_agree) compares the argument bytes, so there must be no padding. Two pointer arrays and
+  // NPEERS ints leave 4 bytes of tail padding at an odd count; the rank array is rounded up to an
+  // even count instead (the extra slot is never read, and is zero from a `{}` construction).
+  int rank[NPEERS + (NPEERS & 1)];
 };
+static_assert(std::has_unique_object_representations_v<R4DArWidePeers<int4, 1>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<int4, 3>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<int4, 7>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<char, 3>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<char, 7>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<int4, 5>> &&
+                  std::has_unique_object_representations_v<R4DArWidePeers<int4, 2>>,
+              "R4DArWidePeers is a kernel argument by value and carries no padding");
 
 __device__ __forceinline__ void r4d_ar_store_sys_rel(unsigned int* p, unsigned int v) {
   __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);

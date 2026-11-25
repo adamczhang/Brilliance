@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
@@ -123,8 +124,8 @@ std::vector<std::string> serving_argv(const std::string& model,
  * times, so on a loaded host the four sequences may never overlap enough to preempt. The room
  * gate is off: it admits a prompt only when the whole of it fits, which is what keeps a serving
  * pool from preempting, and these cases exercise the preemption. */
-std::vector<std::string> small_pool_args() {
-    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", "512",
+std::vector<std::string> small_pool_args(const char* max_len = "512") {
+    return { "--max-num-seqs", "4", "--max-num-batched-tokens", "256", "--max-model-len", max_len,
              "--prefill-interleave", "0", "--prefill-room-gate", "off" };
 }
 std::vector<std::string> device_env(int device_mib) {
@@ -396,12 +397,13 @@ World& world() {
 /* small_device()'s probe for the KL mode: record the 40-token probe document on a device of `mib`
  * MiB in the preemption shape, each probe into its own directory under `d`, and read the pool from
  * the startup report. */
-std::function<int64_t(int)> kl_pool_at(const std::string& model, const tiny::TempDir& d) {
+std::function<int64_t(int)> kl_pool_at(const std::string& model, const tiny::TempDir& d,
+                                       const char* max_len = "512") {
     auto n = std::make_shared<int>(0);
-    return [model, &d, n](int mib) -> int64_t {
+    return [model, &d, n, max_len](int mib) -> int64_t {
         std::vector<std::string> a = { "--kld-record", d / ("p" + std::to_string((*n)++)),
                                        "--kld-corpus", world().corpus_probe };
-        for (const std::string& s : small_pool_args()) a.push_back(s);
+        for (const std::string& s : small_pool_args(max_len)) a.push_back(s);
         const Ran r = radiance(model, a, device_env(mib));
         return r.status == 0 ? pool_tokens(r.log) : -1;
     };
@@ -876,19 +878,24 @@ TEST(qwen35_batching_documents_together_changes_no_logit) {
 /* A KV pool smaller than the documents running at once forces preemption by recompute: the victim's
  * blocks and state slots go back and it is prefilled again from its first token. The recomputed
  * rows must equal the first computation, and the run must actually have preempted. The pool holds
- * the longest document (420 tokens) and less than the first four, admitted together (1190). */
+ * the longest document (420 tokens) and less than the first four, admitted together (1190).
+ *
+ * The context limit is 448, just above that document: the cache never holds less than one
+ * --max-model-len sequence, rounded up to whole MiB (vram_budget.cpp), so at 512 the smallest pool
+ * this model gets is 752 tokens, which these documents run through without preempting. At 448 it
+ * is about 500 tokens, the pool this case ran at before that round-up. */
 TEST(qwen35_preemption_by_recompute_changes_no_logit) {
     World& w = world();
     REQUIRE(w.ok);
     tiny::TempDir d("e2e_probe");
     int64_t pool = 0;
     std::string why;
-    const int mib = small_device(kl_pool_at(w.qwen35_kv, d), 420, 420 + 400 + 150 + 220, false,
-                                 &pool, &why);
+    const int mib = small_device(kl_pool_at(w.qwen35_kv, d, "448"), 420, 420 + 400 + 150 + 220,
+                                 false, &pool, &why);
     if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
     REQUIRE(mib > 0);
     std::string log;
-    check_recording_matches(w.qwen35_kv, w.corpus, small_pool_args(), device_env(mib), &log);
+    check_recording_matches(w.qwen35_kv, w.corpus, small_pool_args("448"), device_env(mib), &log);
     const long long n = preemptions_in(log);
     if (n <= 0)
         fprintf(stderr, "    %d MiB, a pool of %lld tokens, preempted %lld times\n%s\n", mib,
@@ -1206,6 +1213,31 @@ TEST(an_attention_row_split_no_plugin_serves_is_refused_at_startup) {
     CHECK(named);
 }
 
+/* B-03: the bring-up logs one line per phase with its own duration and the seconds since the
+ * engine's start. A KL record is the cheapest mode that starts the engine all the way through
+ * the settle and the ready line. */
+TEST(the_startup_log_times_each_bringup_phase) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_phases");
+    const Ran r = radiance(w.qwen35, { "--kld-record", d / "rec", "--kld-corpus", w.corpus_probe },
+                           {}, 120);
+    if (r.status != 0)
+        fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+    REQUIRE_EQ(r.status, 0);
+    const std::vector<std::string> want = { "startup: declare in", "startup: plan in",
+                                            "startup: weights in", "startup: kv in",
+                                            "startup: settle in", "startup: ready in" };
+    size_t at = 0;
+    for (const std::string& line : want) {
+        const size_t p = r.log.find(line, at);
+        CHECK(p != std::string::npos);
+        if (p != std::string::npos) at = p;
+    }
+    /* The arena levels line is nested inside declare, so it is not in the ordered list. */
+    CHECK(has(r.log, "startup: arena levels in"));
+}
+
 /* --draft-coupling's answers before any request: a value other than off/on is refused by the flag
  * parse, and a model whose drafter has no per-round draw to couple is refused at bringup. The same
  * model with the flag off is the control: it starts, so the refusals are the flag's and not the
@@ -1514,6 +1546,47 @@ TEST(qwen35_two_ranks_finish_a_step_released_before_stop) { check_stop_after_rel
 TEST(qwen35_four_ranks_finish_a_step_released_before_stop) { check_stop_after_release(4); }
 #endif
 
+/* Inkling 2 at two ranks (arch/inkling2, TENSOR PARALLELISM): the heads, the experts' columns and
+ * the vocabulary split, the depth mixes, controllers and router replicated, and two all-reduces a
+ * layer application. Its padded head puts the padding on the second rank only, which fills it; a
+ * fill at the first rank's offset would leave 20 untrained columns in the softmax and move the KL.
+ * At 64 tokens a chunk the convolution states and the window cross chunk boundaries on each rank's
+ * own channels.
+ *
+ * The random tiny model amplifies rounding over its 48 applications far more than a trained one:
+ * its router has near ties, and a pick flipped by the all-reduce's other rounding moves the logits
+ * by nats (mean KL 3.6 against one rank, the same as with one split alone). Its router biases are
+ * therefore spread so that the picks are fixed, and its head is gentler (logits about 1 apart).
+ * What remains is the rounding carried through the loop: a stream about 0.7% off after the first
+ * application and 15% after the 48th, mean KL about 0.008, where a wrong head, channel or vocabulary
+ * cut is wrong from the first application and scores in nats. */
+TEST(inkling2_two_ranks_agree_with_one_within_rounding) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_inkling2_tp");
+    const std::string model = d / "inkling2";
+    REQUIRE(::mkdir(model.c_str(), 0755) == 0);
+    tiny::Inkling2 s;
+    s.vocab = 320;
+    s.vocab_real = 300;
+    s.route_bias = 2.0f;
+    s.head = 1.0f;
+    REQUIRE(tiny::write_inkling2(model, s));
+    for (const char* chunk : { "512", "64" }) {
+        const json rep = score_against_reference(
+            model, w.corpus_short,
+            { "--tp", "2", "--max-num-batched-tokens", chunk, "--max-num-seqs", "1" },
+            { "RADIANCE_HOST_DEVICES=2" });
+        REQUIRE(rep.is_object() && rep.contains("all"));
+        const double mean = rep["all"]["kld"]["mean"].get<double>();
+        const double ratio = rep["all"]["ppl"]["ratio"].get<double>();
+        fprintf(stderr, "    inkling2 at two ranks, chunks of %s: mean KL %.2g, perplexity ratio %.4f\n",
+                chunk, mean, ratio);
+        CHECK(mean < 0.03);
+        CHECK(std::fabs(ratio - 1.0) < 0.02);
+    }
+}
+
 /* ================================================================== runtime LoRA */
 
 /* A PEFT adapter over the qwen35 checkpoint on every linear runtime LoRA follows (the gated
@@ -1795,6 +1868,16 @@ TEST(lfm3_iq8r_container_tracks_the_bf16_one) {
  * them by 0.5 or more and changes the top token at a tenth of the positions. So at every position
  * the top token must agree, unless transformers' own top two are within the bound, and the
  * log-probability of an agreed token must be within 0.2. */
+/* Inkling 2's loop checkpoint (tests/tiny_model.h write_inkling2, golden tests/inkling2_logp_golden.h)
+ * is not yet compared with the engine: the bf16 arithmetic the engine runs drifts from the f32 golden
+ * by about 3 nats mean over the top-16 on this tiny model, so no tolerance here is meaningful yet.
+ * The plugin declares and runs the document end to end (arch/inkling2); the comparison is blocked on
+ * finding the operation that amplifies the bf16 rounding. */
+TEST(inkling2_logits_match_the_golden) {
+    SKIP("blocked: the tiny Inkling 2 model drifts ~3 nats under bf16 (see the comment above); "
+         "the plugin runs end to end but its logits are not yet checked against the golden");
+}
+
 TEST(each_family_computes_what_transformers_computes) {
     World& w = world();
     REQUIRE(w.ok);
@@ -2358,33 +2441,51 @@ const std::vector<int32_t>& repetitive_prompt() {
 /* Prompt lookup drafts from n-grams the sequence already holds, and the model's own continuation
  * rejects some of them. Verifying a window must give exactly the tokens one-at-a-time greedy
  * decoding gives, and exactly as many: the conv window (lfm2), the sliding window (gemma4) and
- * the recurrent state (qwen35) each roll back what was rejected. */
+ * the recurrent state (qwen35) each roll back what was rejected.
+ *
+ * The check means something only when drafts were made and some were wrong, and which drafts are
+ * made rides on wall time: prompt lookup's gate (lookup.h) verifies a proposal only when it pays
+ * at the measured step cost, and a key's first samples are not clipped. On a loaded machine (the
+ * host suite at -j24) one verify step that loses the CPU can price every later proposal out, and
+ * the reply then verifies only a first proposal that came true (drafted 4, accepted 4). So every
+ * attempt must give the greedy tokens, and the drafts check needs one attempt of up to three to
+ * hold, each on a fresh server that measures its costs anew. */
 TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
     REQUIRE(world().ok);
+    constexpr int kAttempts = 3;
     for (const Family& f : kSpecFamilies) {
-        Server plain, spec;
+        Server plain;
         REQUIRE(plain.start(world().*f.model, kPlain));
-        REQUIRE(spec.start(world().*f.model, kSpec));
-        int status = 0;
         const json a = post(plain.port, "/completion", completion(repetitive_prompt(), 48));
-        const json b = post(spec.port, "/completion", completion(repetitive_prompt(), 48), &status);
-        CHECK_EQ(status, 200);
-        const std::vector<int32_t> ta = tokens_of(a), tb = tokens_of(b);
+        const std::vector<int32_t> ta = tokens_of(a);
         CHECK_EQ(ta.size(), (size_t)48);
-        if (ta != tb)
-            fprintf(stderr, "    %s plain %s\n    %s spec  %s\n", f.name, show(ta).c_str(), f.name,
-                    show(tb).c_str());
-        CHECK(ta == tb);
-        /* The check means something only when drafts were made and some were wrong. */
-        const int64_t drafted = timing(b, "draft_n");
-        const int64_t accepted = timing(b, "draft_n_accepted");
-        if (!(drafted > accepted && accepted > 0))
-            fprintf(stderr, "    %s drafted %lld, accepted %lld\n", f.name, (long long)drafted,
-                    (long long)accepted);
-        CHECK(drafted > accepted);
-        CHECK(accepted > 0);
+        bool drafts_tested = false;
+        for (int attempt = 1; attempt <= kAttempts && !drafts_tested; ++attempt) {
+            Server spec;
+            REQUIRE(spec.start(world().*f.model, kSpec));
+            int status = 0;
+            const json b =
+                post(spec.port, "/completion", completion(repetitive_prompt(), 48), &status);
+            CHECK_EQ(status, 200);
+            const std::vector<int32_t> tb = tokens_of(b);
+            if (ta != tb)
+                fprintf(stderr, "    %s plain %s\n    %s spec  %s\n", f.name, show(ta).c_str(),
+                        f.name, show(tb).c_str());
+            CHECK(ta == tb);
+            const int64_t drafted = timing(b, "draft_n");
+            const int64_t accepted = timing(b, "draft_n_accepted");
+            drafts_tested = drafted > accepted && accepted > 0;
+            if (!drafts_tested)
+                fprintf(stderr,
+                        "    %s attempt %d of %d: drafted %lld, accepted %lld; the gate held back "
+                        "%.0f of %.0f proposals\n",
+                        f.name, attempt, kAttempts, (long long)drafted, (long long)accepted,
+                        metric(spec.port, "radiance:lookup_held_total"),
+                        metric(spec.port, "radiance:lookup_proposals_total"));
+            CHECK_EQ(spec.stop(), 0);
+        }
+        CHECK(drafts_tested);
         CHECK_EQ(plain.stop(), 0);
-        CHECK_EQ(spec.stop(), 0);
     }
 }
 
@@ -2514,6 +2615,118 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* Whether a RADIANCE_LOG_STEPS log has a step line that was issued ahead (its plan made by
+ * step_next, its pass released before the loop reached the step) and carries `field`: `ctx=0` is an
+ * entry with no context, which only a sequence's first chunk has, and ` ck=` an entry that restores
+ * the recurrent half of a prefix hit. */
+bool ahead_step_has(const std::string& log, const char* field) {
+    for (size_t at = log.find(" ahead "); at != std::string::npos;
+         at = log.find(" ahead ", at + 1)) {
+        const size_t eol = log.find('\n', at);
+        if (log.substr(at, eol - at).find(field) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/* Blocks until the server has decoded a step, so a request posted next arrives while a sequence is
+ * running: the scheduler then plans its admission into a step issued ahead, where an arrival at an
+ * idle engine is planned and released by the loop itself. */
+bool decoding(int port) {
+    for (int i = 0; i < 4000; ++i) {
+        if (metric(port, "radiance:engine_steps_decode_total") > 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return false;
+}
+
+/* An admission carried by a step issued ahead starts from state slots the engine cleared, like the
+ * admission the loop releases itself. The KV manager only notes the slots a new sequence took; the
+ * zeroing runs at the top of the step loop, which for an ahead step comes after that step's pass.
+ * The slot the admission takes holds a finished request's state there, so the first chunk would
+ * read it and the zeroing would then wipe the state that chunk computed. The reply, and every
+ * probability in it, must be the one the same prompt gets on an idle engine, whose first step the
+ * loop plans itself. */
+TEST(an_admission_issued_ahead_starts_from_a_cleared_state) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> p = prompt_ids(61, 60), filler = prompt_ids(62, 40);
+    Server s;
+    REQUIRE(s.start(world().qwen35, kPlain, { "RADIANCE_LOG_STEPS=1" }));
+    /* A finished request first, so the pool's state slots hold a request's state: the admissions
+     * below take a slot the pool has handed out before. */
+    (void)post(s.port, "/completion", completion(filler, 16));
+    /* Idle: the loop plans this admission and releases it after clearing its slots. */
+    const json alone = post(s.port, "/completion", completion(p, 12, 0.0, 0, 3));
+    /* Beside a decoder, which keeps a sequence running when the request arrives. */
+    Call d;
+    REQUIRE(d.send(s.port, "POST", "/completion", completion(filler, 200).dump()));
+    REQUIRE(decoding(s.port));
+    const json together = post(s.port, "/completion", completion(p, 12, 0.0, 0, 3));
+    std::string body;
+    CHECK_EQ(d.read(&body), 200);
+    CHECK_EQ(s.stop(), 0);
+    const std::vector<int32_t> ta = tokens_of(alone), tb = tokens_of(together);
+    if (tb != ta) fprintf(stderr, "    alone    %s\n    together %s\n", show(ta).c_str(),
+                          show(tb).c_str());
+    REQUIRE(alone.contains("completion_probabilities"));
+    CHECK_EQ(ta.size(), (size_t)12);
+    CHECK(tb == ta);
+    CHECK(together["completion_probabilities"] == alone["completion_probabilities"]);
+    CHECK(ahead_step_has(s.output(), "ctx=0"));
+}
+
+/* A prefix hit's recurrent half is copied into the state slots before the release that runs the
+ * step reading them. A step issued ahead was already released when the loop reaches its restore
+ * point, so its first chunk would read a slot holding neither the snapshot nor what that chunk
+ * computed, and the restore would then wipe what it did: the reply would differ from a cold run's.
+ * Here it must be the cold server's, for the hit the loop restores itself and for the one issued
+ * ahead. */
+TEST(a_prefix_hit_issued_ahead_restores_before_the_step_that_reads_it) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> head = prompt_ids(63, 200), filler = prompt_ids(64, 40);
+    std::vector<int32_t> b = head;
+    for (int32_t t : prompt_ids(65, 90)) b.push_back(t);
+    json cold;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        cold = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35,
+                    { "--num-speculative-tokens", "0", "--checkpoint-interval", "64" },
+                    { "RADIANCE_LOG_STEPS=1" }));
+    /* The head's own request, so the cache holds a checkpoint inside b's shared head (200 tokens
+     * ends one at 192 or below, every 64 tokens). */
+    (void)post(s.port, "/completion", completion(head, 8));
+    /* Idle: the loop restores the hit before the step that reads it. */
+    const json idle = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+    /* Beside a decoder: the same hit rides a step issued ahead. */
+    Call d;
+    REQUIRE(d.send(s.port, "POST", "/completion", completion(filler, 200).dump()));
+    REQUIRE(decoding(s.port));
+    const json ahead = post(s.port, "/completion", completion(b, 12, 0.0, 0, 3));
+    std::string body;
+    CHECK_EQ(d.read(&body), 200);
+    CHECK_EQ(s.stop(), 0);
+    const int64_t c1 = timing(idle, "cache_n"), c2 = timing(ahead, "cache_n");
+    const std::vector<int32_t> tc = tokens_of(cold), ti = tokens_of(idle), t = tokens_of(ahead);
+    if (t != tc || ti != tc)
+        fprintf(stderr, "    idle     %s\n    ahead    %s\n    cold     %s\n", show(ti).c_str(),
+                show(t).c_str(), show(tc).c_str());
+    if (!(c1 > 0 && c2 > 0)) fprintf(stderr, "    cached: idle %lld, ahead %lld\n", (long long)c1,
+                                     (long long)c2);
+    REQUIRE(cold.contains("completion_probabilities"));
+    CHECK_EQ(tc.size(), (size_t)12);
+    CHECK(c1 > 0);
+    CHECK(c2 > 0);
+    CHECK(ti == tc);
+    CHECK(t == tc);
+    CHECK(idle["completion_probabilities"] == cold["completion_probabilities"]);
+    CHECK(ahead["completion_probabilities"] == cold["completion_probabilities"]);
+    CHECK(ahead_step_has(s.output(), " ck="));
+}
+
 /* What a -v server's block drafter proposed ("drafter 'dflash2': sequence N proposes t1 .. tk"),
  * by request in the order they were sent: the server numbers requests consecutively, and the
  * first one proposes in every case below. Read after stop(), so every line is in. */
@@ -2598,6 +2811,32 @@ TEST(a_block_drafter_after_a_prefix_hit_proposes_what_a_cold_run_does) {
         CHECK_EQ(d, dc);
         CHECK(wp == cp);
         CHECK(tokens_of(warm[i]) == tokens_of(cold[i]));
+    }
+}
+
+/* The block levers' refusals on a block drafter that proposes a tree (the tiny 31B's DFlash2, whose
+ * plugin turns trees on and which declares no coupled walk): the suffix selector replaces a chain,
+ * and the adaptive prefix needs a coupled chain, so both are refused at startup by name rather than
+ * served as something else. The
+ * levers themselves are mtp_rrs_test's (the rule over the real coupled walk) and sched_test's (a
+ * block drafter's suffix step, per-row prefixes issued ahead). */
+TEST(a_tree_proposing_block_drafter_refuses_the_suffix_selector_and_the_adaptive_prefix) {
+    REQUIRE(world().ok);
+    struct Case { std::vector<std::string> args; const char* want; };
+    const Case cases[] = {
+        { { "--draft-suffix", "on" }, "it needs a drafter's chain, not a block drafter's tree" },
+        { { "--draft-coupling", "on", "--kernels", "libref,spechub", "--draft-depth", "adaptive" },
+          "declared no coupled MTP planes" },
+    };
+    for (const Case& k : cases) {
+        std::vector<std::string> a = { "--num-speculative-tokens", "7", "--no-prefix-cache" };
+        a.insert(a.end(), k.args.begin(), k.args.end());
+        const Ran r = radiance(world().g31_df2, a, {}, 120);
+        if (r.status == 0 || r.status == 124 || !has(r.log, k.want))
+            fprintf(stderr, "    %s exited %d:\n%s\n", k.args[0].c_str(), r.status, tail(r.log, 20).c_str());
+        CHECK(r.status != 0);
+        CHECK(r.status != 124);
+        CHECK(has(r.log, k.want));
     }
 }
 

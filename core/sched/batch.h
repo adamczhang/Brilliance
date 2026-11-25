@@ -96,11 +96,19 @@ struct StepPlan {
     int64_t n_tok_decode = 0;
     int32_t max_q_len = 0;
     int32_t max_ctx_len = 0;
+    /* A chunk group's sub-step (S-02): the layers [layer_lo, layer_hi) of the model's trunk that
+     * the step's prefill rows run, and which of the m sub-steps it is. slice_m 0 is an ordinary
+     * step, whose prefill rows run the whole trunk (layer_lo 0, layer_hi 0). The decode rows come
+     * before the chunk, so the chunk's row base is the same on every sub-step. */
+    int32_t layer_lo = 0, layer_hi = 0;
+    int32_t slice_j = 0, slice_m = 0;
+    bool    slice_last = false;
 
     void reset() {
         e.clear();
         n_tok = 0; phase = RAD_PHASE_DECODE; draft_pass = 0; tok_shift = 0; n_spec = 0;
         spec_is_tree = false; max_q_len = 0; max_ctx_len = 0; n_seq_decode = 0; n_tok_decode = 0;
+        layer_lo = 0; layer_hi = 0; slice_j = 0; slice_m = 0; slice_last = false;
     }
 };
 
@@ -267,7 +275,9 @@ private:
         int     ev = -1;               /* row of ev_ holding one event per rank */
     };
     static constexpr int kFlights = 64;
-    /* Worst-case builds the staging ring holds (see alloc_set). Must stay below kFlights. */
+    /* Worst-case builds the staging ring holds (see alloc_set). Meant to stay below kFlights, so a full
+     * ring retires by span clash and not by flight count; correctness does not depend on it (reserve
+     * retires the oldest flight whenever `live` reaches kFlights or no event row is free). */
     static constexpr int kRingBuilds = 16;
     struct Ring {
         char*   host = nullptr;
@@ -412,7 +422,7 @@ private:
     void carve(Set& s, char* base);
     /* Reserve `need` bytes of the ring, waiting for old uploads when it is full. */
     int  reserve(int64_t need, int64_t* off);
-    int  run_derivations(const StepPlan& plan, Set& s);
+    int  run_derivations(const StepPlan& plan, Set& s, int64_t n_out, const int32_t*& tail);
     int  build_groups(const StepPlan& plan, const IKVManager& kv, Set& s, Out& o);
 };
 

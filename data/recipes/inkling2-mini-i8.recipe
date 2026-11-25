@@ -1,0 +1,41 @@
+# inkling2-mini-i8.recipe -- Inkling 2 Mini (`inkling2_loop`) with an int8 attention trunk and head:
+# the release's NVFP4 experts (layers 0..19) kept as stored, the MXFP8 experts of layers 20..23 and
+# the attention linears as rotated int8, the lm_head as plain int8. Served by arch/inkling2.
+#
+#   rad-convert /mnt/gostar_data/models/Inkling-2-Mini \
+#       -o /mnt/gostar_data/models/inkling2-mini/inkling2-mini-i8.rad \
+#       --recipe data/recipes/inkling2-mini-i8.recipe
+#
+#   - The attention linears (q, k, v, r, the output gate and o) are the experts' i8a8h form: one bf16
+#     scale per (row, 128 of K), each 128 of K rotated by the unnormalised Hadamard before rounding,
+#     the 1/128 in the scale. gemm_nt_q reads them against had_quant_act_i8g's activation (the gated
+#     output through gate_had_quant_i8g). The sink projection (24 rows), the full layers' dynamic
+#     taps (32 rows), the router, the controllers and the convolutions stay bf16.
+#   - The head is int8 with a bf16 scale per (row, 128), unrotated: logits_gemm reads it against the
+#     bf16 hidden state. The embedding stays bf16 (one row a token).
+#   - A decode step reads the trunk 48 times (the loop), so these halve its largest share of bytes.
+
+blk.*.wq                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wk                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wv                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wr                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.gate                       rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.wo                         rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+blk.20.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.20.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.21.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.21.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.22.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.22.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.23.e*.gu                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.23.e*.dn                     rtn  codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+
+output.weight                    rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The DSpark drafter (`rad-convert ... --draft-model /mnt/gostar_data/models/Inkling-2-Mini`, its
+# mtp.safetensors): bf16 as shipped. Its Markov head's rnn_proj is read as three column ranges, each
+# computed at convert and stored here; the rest of the drafter needs no rule.
+ds.mk.wsp                        cast dtype=bf16
+ds.mk.wh                         cast dtype=bf16
+ds.mk.wf                         cast dtype=bf16

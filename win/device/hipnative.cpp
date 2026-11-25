@@ -396,12 +396,23 @@ bool card_has_room(int dev, int64_t bytes, const char* what) {
     constexpr int64_t kUnit = (int64_t)2 << 20;
     const int64_t need = (bytes + kUnit - 1) / kUnit * kUnit;
     if (need <= avail) return true;
+    /* Brilliance (issue #1): the figure that clears it. The start plans the card less the headroom,
+     * so raising memory.gpu-headroom-mib by the shortfall (or lowering memory.gpu-memory-mib by as
+     * much) leaves this allocation its room; more may be taken later, hence "at least". With
+     * several cards, this card's own reserve (memory.card-headroom-mib) does the same without
+     * taking the room from the others (per-card-vram). */
+    const long long short_mib = (long long)((need - avail + ((int64_t)1 << 20) - 1) >> 20);
     device_set_error("%s(%s) on card %d: the driver has %s left to give on it; this process already "
                      "uses %s of it. Windows would page the rest to system memory without an error, "
                      "so the allocation is refused instead. Memory another process took after the "
-                     "VRAM budget was measured is the usual cause",
+                     "VRAM budget was measured is the usual cause, and a card that also drives a "
+                     "display or runs other GPU applications loses the most. Raise "
+                     "memory.gpu-headroom-mib by at least %lld MiB (or lower memory.gpu-memory-mib "
+                     "by as much): the plan gives the card up one for one, on every card. With "
+                     "several cards, raise only this card's reserve by as much instead, "
+                     "memory.card-headroom-mib: {%d: MiB}; the other cards keep theirs",
                      what, humanb(bytes).c_str(), dev, humanb(avail).c_str(),
-                     dx ? humanb(usage).c_str() : "an unknown amount");
+                     dx ? humanb(usage).c_str() : "an unknown amount", short_mib, dev);
     return false;
 }
 
@@ -473,6 +484,15 @@ const PinLimit& pin_limit_locked() {
              g_pin.limit >= 0 ? humanb(g_pin.limit).c_str() : "an unknown amount",
              c.from_env ? "BRILLIANCE_PIN_LIMIT_GIB; otherwise the " : "the ",
              humanb(b).c_str(), n, humanb(kPinMargin).c_str());
+    /* Brilliance (issue #1): a job object's memory limit caps commit, and WDDM charges VRAM to
+     * commit, so it caps the cards' pools as well as the pins. Engine::plan checks the plan
+     * against it; this says it is there. */
+    if (const JobMemoryLimit j = os::job_memory_limit(); j.binding() >= 0)
+        RAD_WARN("device: this process runs in a Windows job object that limits its committed "
+                 "memory: %s. WDDM charges VRAM allocated with hipMalloc (every pool when more "
+                 "than one card is visible) to commit too, so the limit can cover the cards' pools "
+                 "as well as the pinned and ordinary memory",
+                 job_limit_which(j).c_str());
     return g_pin;
 }
 
@@ -483,6 +503,19 @@ bool pin_reserve(int64_t bytes) {
     std::lock_guard<std::mutex> lk(g_pin_mu);
     const PinLimit& l = pin_limit_locked();
     const int64_t before = g_pins.charged();
+    /* Brilliance: under the limit a pin still needs the physical memory to stay resident in, now:
+     * other processes may have taken it since the plan was made (pin_past_physical). */
+    if (const os::MemInfo mi = os::mem_info(); pin_past_physical(bytes, mi.avail, kPinPhysReserve)) {
+        device_set_error("rad_dev_alloc(%s pinned): only %s of RAM is available now, and a pin "
+                         "stays resident, so it would page other memory out to fit (with %s kept "
+                         "free); past that the next GPU operation can hang instead of failing, so "
+                         "the pin is refused. Another process may have taken the memory since this "
+                         "one planned its pins: start one large model at a time, or lower "
+                         "--host-pool-mib",
+                         humanb(bytes).c_str(), humanb(mi.avail).c_str(),
+                         humanb(kPinPhysReserve).c_str());
+        return false;
+    }
     if (g_pins.reserve_engine(bytes, l.limit)) return true;
     device_set_error("rad_dev_alloc(%s pinned): this process already pins %s, and Windows lets a "
                      "process pin about %s for its cards: the %s shared-memory budget divided by "
@@ -548,6 +581,22 @@ void* n_alloc(int64_t bytes, int kind) {
     }
     if (e != hipSuccess || !p) {
         hip_fail(e == hipSuccess ? hipErrorOutOfMemory : e, "rad_dev_alloc");
+        /* Brilliance (issue #1): the room check above passed, so the card had room. What else
+         * refuses VRAM on Windows is commit, which WDDM charges with it, or a job object's memory
+         * limit on commit. Say both. */
+        if (kind == RAD_MEM_DEVICE) {
+            const os::MemInfo mi = os::mem_info();
+            const std::string job = job_limit_note(os::job_memory_limit());
+            const bool commit = mi.commit_avail >= 0 && mi.commit_avail < bytes;
+            device_set_error("rad_dev_alloc(%s): %s, though the card had room for it. Now %s of "
+                             "commit is available (RAM + page file, %s in all), which WDDM charges "
+                             "this process's VRAM to%s%s%s",
+                             humanb(bytes).c_str(),
+                             hipGetErrorString(e == hipSuccess ? hipErrorOutOfMemory : e),
+                             humanb(mi.commit_avail).c_str(), humanb(mi.commit_limit).c_str(),
+                             commit ? ": commit is what ran short; a larger page file raises it" : "",
+                             job.empty() ? "" : ". ", job.c_str());
+        }
         /* Within the pin limit a pin still needs two things free at the moment: physical memory,
          * since it stays resident, and COMMIT (RAM plus page file), which WDDM also charges with
          * this process's VRAM. The message says which ran short. */
@@ -562,6 +611,8 @@ void* n_alloc(int64_t bytes, int kind) {
                              humanb(mi.avail).c_str(), humanb(mi.commit_avail).c_str(),
                              humanb(mi.commit_limit).c_str(),
                              commit ? ": commit is what ran short; a larger page file raises it" : "");
+            if (const std::string job = job_limit_note(os::job_memory_limit()); !job.empty())
+                device_set_error("%s. %s", rad_dev_last_error(), job.c_str());
         }
         return nullptr;
     }

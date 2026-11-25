@@ -6,8 +6,12 @@
 #include "r4d_q8.h"
 #include "r4d_fp8_wmma.h"
 #include <climits>
+#include <cmath>
 
 namespace {
+/* I8: the Hadamard stays f32 (no bf16 boundary), symmetric int8 codes at an f32 scale amax / 127
+ * (libref's ref_dsa_query_i8). */
+template <bool I8>
 __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, long long xp, long long qp,
                                  long long sp, int rows) {
     const int lane = threadIdx.x & 31, r = blockIdx.x * 4 + (threadIdx.x >> 5);
@@ -19,15 +23,21 @@ __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, lo
     float am = 1e-4f;
 #pragma unroll
     for (int d = 0; d < 4; ++d) {
-        v[d] = bf16_to_f32(f32_to_bf16(v[d] * 0.08838834764831845f));
+        v[d] = I8 ? v[d] * 0.08838834764831845f
+                  : bf16_to_f32(f32_to_bf16(v[d] * 0.08838834764831845f));
         am = fmaxf(am, fabsf(v[d]));
     }
 #pragma unroll
     for (int mask = 16; mask; mask >>= 1) am = fmaxf(am, __shfl_xor(am, mask, 32));
-    const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
-    const float sc = __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
+    float sc;
+    if (I8) {
+        sc = am * (1.0f / 127.0f);
+    } else {
+        const uint32_t bits = __float_as_uint(am * (1.0f / 448.0f));
+        sc = __uint_as_float((bits & 0x7f800000u) + ((bits & 0x7fffffu) ? 0x800000u : 0));
+    }
     if (!lane) scale[(long long)r * sp] = sc;
-    const uint32_t packed = q8_pack4<false>(v[0], v[1], v[2], v[3], 1.0f / sc);
+    const uint32_t packed = q8_pack4<I8>(v[0], v[1], v[2], v[3], 1.0f / sc);
     uint8_t* dst = q + (long long)r * qp + lane * 4;
     if (((uintptr_t)dst & 3) == 0)
         *(uint32_t*)dst = packed;
@@ -36,10 +46,11 @@ __global__ void dsa_query_kernel(const uint16_t* x, uint8_t* q, float* scale, lo
         for (int d = 0; d < 4; ++d) dst[d] = (uint8_t)(packed >> (8 * d));
     }
 }
-int query_body(const RadArgs* a, RadStream stream) {
+int query_body(const RadArgs* a, RadStream stream, bool i8) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
     const auto &x = a->t[0], &q = a->t[1], &s = a->t[2];
-    if (x.dtype != RAD_BF16 || q.dtype != RAD_F8E4M3 || s.dtype != RAD_F32) return RAD_E_DTYPE;
+    if (x.dtype != RAD_BF16 || q.dtype != (i8 ? RAD_I8 : RAD_F8E4M3) || s.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !q.data || !s.data) return RAD_E_INVAL;
     if (r4d_geti_or(a, "n", 0) != 128 || x.rank != 2 || q.rank != 2 || s.rank != 2 ||
         x.shape[0] < 1 || x.shape[0] > INT_MAX - 3 || x.shape[1] != 128 ||
@@ -47,30 +58,35 @@ int query_body(const RadArgs* a, RadStream stream) {
         s.shape[1] != 1 || x.stride[1] != 1 || q.stride[1] != 1 || s.stride[1] != 1 ||
         x.stride[0] < 128 || q.stride[0] < 128 || s.stride[0] < 1)
         return RAD_E_SHAPE;
-    return R4D_EMIT(stream, dsa_query_kernel, dim3((x.shape[0] + 3) / 4), dim3(128), 0,
-                    (const uint16_t*)x.data, (uint8_t*)q.data, (float*)s.data, x.stride[0],
-                    q.stride[0], s.stride[0], (int)x.shape[0]);
+#define QUERY(I8_)                                                                                 \
+    R4D_EMIT(stream, (dsa_query_kernel<I8_>), dim3((x.shape[0] + 3) / 4), dim3(128), 0,            \
+             (const uint16_t*)x.data, (uint8_t*)q.data, (float*)s.data, x.stride[0], q.stride[0],  \
+             s.stride[0], (int)x.shape[0])
+    return i8 ? QUERY(true) : QUERY(false);
+#undef QUERY
 }
 struct ScoreMeta {
     long long qr, qh, qsr, qsc, gr, gc, kr, ksr, btr, btc, cur, ncr, op;
     int rows, blocks, seqs, pages, row0;
+    float norm;   /* (heads * n)^-0.5, libref's f32 value */
 };
 __device__ uint32_t bytes4(const uint8_t* p) {
     if (!((uintptr_t)p & 3)) return *(const uint32_t*)p;
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
-/* Two waves cover all 32 heads and reuse the query across `kScoreTiles` 16-key tiles, one up to 32
- * blocks and two past them. FP8 dot products stay on WMMA; scales and the signed per-head gates
+/* `kWaves` waves cover the heads, 16 a wave (two for GLM's 32, one for Hy4-flash's 16), and reuse
+ * the query across `kScoreTiles` 16-key tiles, one up to 32 blocks and two past them. FP8 dot products stay on WMMA; scales and the signed per-head gates
  * fold only after the per-head ReLU. The query operands start at a part's first row, so only the
- * sequence lookup sees the step row (`row0 + r`). */
-template <int kScoreTiles>
+ * sequence lookup sees the step row (`row0 + r`). I8: the same tile on v_wmma_i32_16x16x16_iu8 (the
+ * fp8 rate) over int8 codes; an exact int32 sum (<= 128 * 127 * 127) is read back as a float. */
+template <int kScoreTiles, int kWaves, bool I8>
 __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float* gate,
                                  const uint8_t* k, const float* ks, const int* bt, const int* cu,
                                  const int* nc, float* out, ScoreMeta m) {
-    constexpr int kScoreKeys = 16 * kScoreTiles;
-    __shared__ __align__(16) uint8_t qa[32 * 136], kb[kScoreKeys * 136];
+    constexpr int kScoreKeys = 16 * kScoreTiles, kHeads = 16 * kWaves, kThreads = 32 * kWaves;
+    __shared__ __align__(16) uint8_t qa[kHeads * 136], kb[kScoreKeys * 136];
     __shared__ int seq, pages[kScoreKeys];
-    __shared__ float scales[kScoreKeys], coefficients[32], partial[2][kScoreKeys];
+    __shared__ float scales[kScoreKeys], coefficients[kHeads], partial[kWaves][kScoreKeys];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const int r = blockIdx.y, b0 = blockIdx.x * kScoreKeys;
     if (!tid) {
@@ -84,11 +100,11 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
     __syncthreads();
     const int live = seq >= 0 ? min(nc[(long long)seq * m.ncr], m.blocks) : 0;
     if (b0 >= live) {
-        for (int i = tid; i < kScoreKeys; i += 64)
+        for (int i = tid; i < kScoreKeys; i += kThreads)
             if (b0 + i < m.blocks) out[(long long)r * m.op + b0 + i] = -INFINITY;
         return;
     }
-    for (int i = tid; i < kScoreKeys; i += 64) {
+    for (int i = tid; i < kScoreKeys; i += kThreads) {
         const int b = b0 + i;
         int p = seq >= 0 && b < m.blocks && b < nc[(long long)seq * m.ncr]
                     ? bt[(long long)seq * m.btr + b * m.btc]
@@ -97,14 +113,14 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
         pages[i] = p;
         scales[i] = p >= 0 ? ks[(long long)p * m.ksr] : 0;
     }
-    if (tid < 32)
+    if (tid < kHeads)
         coefficients[tid] = qs[(long long)r * m.qsr + tid * m.qsc] * gate[(long long)r * m.gr + tid * m.gc];
-    for (int j = tid; j < 32 * 32; j += 64) {
+    for (int j = tid; j < kHeads * 32; j += kThreads) {
         const int h = j / 32, d = (j % 32) * 4;
         *(uint32_t*)(qa + h * 136 + d) = bytes4(q + (long long)r * m.qr + (long long)h * m.qh + d);
     }
     __syncthreads();
-    for (int j = tid; j < kScoreKeys * 32; j += 64) {
+    for (int j = tid; j < kScoreKeys * 32; j += kThreads) {
         const int b = j / 32, d = (j % 32) * 4, p = pages[b];
         *(uint32_t*)(kb + b * 136 + d) = p >= 0 ? bytes4(k + (long long)p * m.kr + d) : 0;
     }
@@ -117,22 +133,23 @@ __global__ void dsa_score_kernel(const uint8_t* q, const float* qs, const float*
         const auto a = r4d_fp8::frag<128>(qa, wave * 16, d, lane);
 #pragma unroll
         for (int tile = 0; tile < kScoreTiles; ++tile)
-            acc[tile] = r4d_fp8::mma(a, r4d_fp8::frag<128>(kb, tile * 16, d, lane), acc[tile]);
+            acc[tile] = r4d_fp8::mma8<I8>(a, r4d_fp8::frag<128>(kb, tile * 16, d, lane), acc[tile]);
     }
 #pragma unroll
     for (int tile = 0; tile < kScoreTiles; ++tile) {
         float value = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j)
-            value += fmaxf(acc[tile][j], 0.0f) * coefficients[wave * 16 + (lane >> 4) * 8 + j];
+            value += fmaxf(r4d_fp8::acc_val<I8>(acc[tile][j]), 0.0f) * coefficients[wave * 16 + (lane >> 4) * 8 + j];
         value += __shfl_xor(value, 16, 32);
         if (lane < 16) partial[wave][tile * 16 + lane] = value;
     }
     __syncthreads();
-    for (int i = tid; i < kScoreKeys; i += 64)
-        if (b0 + i < m.blocks)
-            out[(long long)r * m.op + b0 + i] =
-                pages[i] >= 0 ? (partial[0][i] + partial[1][i]) * scales[i] * 0.015625f : -INFINITY;
+    for (int i = tid; i < kScoreKeys; i += kThreads)
+        if (b0 + i < m.blocks) {
+            const float sum = kWaves == 2 ? partial[0][i] + partial[kWaves - 1][i] : partial[0][i];
+            out[(long long)r * m.op + b0 + i] = pages[i] >= 0 ? sum * scales[i] * m.norm : -INFINITY;
+        }
 }
 /* The step's cu rebased to a part's first row: an op that reads cu over the part's own rows
  * (qsa_select) then finds each row's sequence unchanged. */
@@ -140,6 +157,8 @@ __global__ void dsa_rebase_kernel(const int* cu, int* out, long long cs, long lo
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[(long long)i * os] = cu[(long long)i * cs] - row0;
 }
 int score_body(const RadArgs* a, RadStream stream) {
+    const char* dts = r4d_gets(a, "dtype");
+    const bool i8 = dts && !std::strcmp(dts, "int8");
     if (!a || a->n_t < 9) return RAD_E_INVAL;
     RadTensor q = a->t[0], qs = a->t[1], g = a->t[2];
     RadTensor k = a->t[3], ks = a->t[4];
@@ -155,7 +174,7 @@ int score_body(const RadArgs* a, RadStream stream) {
         ks.rank = 1;
         ks.shape[0] = k.shape[0];
         ks.stride[0] = k.stride[0] / 4;
-        k.dtype = RAD_F8E4M3;
+        k.dtype = i8 ? RAD_I8 : RAD_F8E4M3;
         k.rank = 2;
         k.shape[1] = 128;
         k.stride[1] = 1;
@@ -163,19 +182,22 @@ int score_body(const RadArgs* a, RadStream stream) {
     const auto &bt = a->t[5], &cu = a->t[6], &nc = a->t[7], &o = a->t[8];
     const RadTensor* cu_part = rad_arg_in(a, 9);
     const long long part = r4d_geti_or(a, "row_part", -1);
+    /* 32 heads (GLM) or 16 (Hy4-flash); the rows say which they serve. */
+    const long long H = r4d_geti_or(a, "heads", 0);
+    if (H != 16 && H != 32) return RAD_E_SHAPE;
     if (q.rank == 2 && qs.rank == 2 && qs.shape[1] == 1 && g.rank == 2 &&
-        q.shape[0] == g.shape[0] * 32 && qs.shape[0] == q.shape[0]) {
+        q.shape[0] == g.shape[0] * H && qs.shape[0] == q.shape[0]) {
         q.rank = 3;
         q.shape[0] = g.shape[0];
         q.shape[2] = q.shape[1];
-        q.shape[1] = 32;
+        q.shape[1] = H;
         q.stride[2] = q.stride[1];
         q.stride[1] = q.stride[0];
-        q.stride[0] *= 32;
+        q.stride[0] *= H;
         qs.shape[0] = g.shape[0];
-        qs.shape[1] = 32;
+        qs.shape[1] = H;
         qs.stride[1] = qs.stride[0];
-        qs.stride[0] *= 32;
+        qs.stride[0] *= H;
     }
     /* A part scores o's rows from step row part * rows; the query operands span the step. */
     const long long rows = o.rank == 2 ? o.shape[0] : 0, row0 = part > 0 ? part * rows : 0;
@@ -196,18 +218,19 @@ int score_body(const RadArgs* a, RadStream stream) {
         if (cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0] || cu_part->stride[0] < 1)
             return RAD_E_SHAPE;
     }
-    if (q.dtype != RAD_F8E4M3 || k.dtype != RAD_F8E4M3 || qs.dtype != RAD_F32 ||
+    const auto qk = i8 ? RAD_I8 : RAD_F8E4M3;
+    if (q.dtype != qk || k.dtype != qk || qs.dtype != RAD_F32 ||
         g.dtype != RAD_F32 || ks.dtype != RAD_F32 || o.dtype != RAD_F32 || bt.dtype != RAD_I32 ||
         cu.dtype != RAD_I32 || nc.dtype != RAD_I32)
         return RAD_E_DTYPE;
     for (int i = 0; i < 9; ++i)
         if (!(packed && i == 4) && !a->t[i].data) return RAD_E_INVAL;
-    if (r4d_geti_or(a, "n", 0) != 128 || r4d_geti_or(a, "heads", 0) != 32 || q.rank != 3 ||
-        q.shape[0] < 1 || q.shape[0] > 65535 || q.shape[1] != 32 || q.shape[2] != 128 ||
-        q.stride[2] != 1 || q.stride[1] < 128 || q.stride[0] < 32 * q.stride[1] || qs.rank != 2 ||
-        g.rank != 2 || qs.shape[0] != q.shape[0] || g.shape[0] != q.shape[0] || qs.shape[1] != 32 ||
-        g.shape[1] != 32 || qs.stride[1] < 1 || g.stride[1] < 1 ||
-        qs.stride[0] < 32 * qs.stride[1] || g.stride[0] < 32 * g.stride[1] || k.rank != 2 ||
+    if (r4d_geti_or(a, "n", 0) != 128 || q.rank != 3 ||
+        q.shape[0] < 1 || q.shape[0] > 65535 || q.shape[1] != H || q.shape[2] != 128 ||
+        q.stride[2] != 1 || q.stride[1] < 128 || q.stride[0] < H * q.stride[1] || qs.rank != 2 ||
+        g.rank != 2 || qs.shape[0] != q.shape[0] || g.shape[0] != q.shape[0] || qs.shape[1] != H ||
+        g.shape[1] != H || qs.stride[1] < 1 || g.stride[1] < 1 ||
+        qs.stride[0] < H * qs.stride[1] || g.stride[0] < H * g.stride[1] || k.rank != 2 ||
         k.shape[0] < 1 || k.shape[0] > INT_MAX || k.shape[1] != 128 || k.stride[1] != 1 ||
         k.stride[0] < 128 || ks.rank != 1 || ks.shape[0] != k.shape[0] || ks.stride[0] < 1 ||
         bt.rank != 2 || bt.shape[0] < 1 || bt.shape[0] > INT_MAX || bt.stride[1] < 1 ||
@@ -220,20 +243,24 @@ int score_body(const RadArgs* a, RadStream stream) {
     ScoreMeta m{ q.stride[0],      q.stride[1],    qs.stride[0], qs.stride[1],    g.stride[0],
                  g.stride[1],      k.stride[0],    ks.stride[0], bt.stride[0],    bt.stride[1],
                  cu.stride[0],     nc.stride[0],   o.stride[0],  (int)q.shape[0], (int)o.shape[1],
-                 (int)bt.shape[0], (int)k.shape[0], (int)row0 };
+                 (int)bt.shape[0], (int)k.shape[0], (int)row0,
+                 1.0f / std::sqrt((float)(H * 128)) };
     if (cu_part) {
         const int rc = R4D_EMIT(stream, dsa_rebase_kernel, dim3(1), dim3(64), 0,
                                 (const int*)cu.data, (int*)cu_part->data, cu.stride[0],
                                 cu_part->stride[0], (int)cu.shape[0], (int)row0);
         if (rc != RAD_OK) return rc;
     }
-#define SCORE(NT)                                                                                  \
-    R4D_EMIT(stream, (dsa_score_kernel<NT>), dim3((m.blocks + 16 * NT - 1) / (16 * NT), m.rows),   \
-             dim3(64), 0, (const uint8_t*)q.data, (const float*)qs.data, (const float*)g.data,     \
+#define SCORE(NT) (i8 ? (H == 16 ? SCORE1(NT, 1, true) : SCORE1(NT, 2, true))                      \
+                      : (H == 16 ? SCORE1(NT, 1, false) : SCORE1(NT, 2, false)))
+#define SCORE1(NT, NW, I8_)                                                                        \
+    R4D_EMIT(stream, (dsa_score_kernel<NT, NW, I8_>), dim3((m.blocks + 16 * NT - 1) / (16 * NT), m.rows), \
+             dim3(32 * NW), 0, (const uint8_t*)q.data, (const float*)qs.data, (const float*)g.data,     \
              (const uint8_t*)k.data, (const float*)ks.data, (const int*)bt.data,                   \
              (const int*)cu.data, (const int*)nc.data, (float*)o.data, m)
     if (m.blocks <= 32) return SCORE(1);
     return SCORE(2);
+#undef SCORE1
 #undef SCORE
 }
 /* One wave per pool: all softmax channels and the full Hadamard stay in registers. */
@@ -323,7 +350,10 @@ int pool_body(const RadArgs* a, RadStream stream) {
 }
 extern "C" int r4d_rad_dsa_pool(const RadArgs* a, RadStream stream) { return pool_body(a, stream); }
 extern "C" int r4d_rad_dsa_query(const RadArgs* a, RadStream stream) {
-    return query_body(a, stream);
+    return query_body(a, stream, false);
+}
+extern "C" int r4d_rad_dsa_query_i8(const RadArgs* a, RadStream stream) {
+    return query_body(a, stream, true);
 }
 extern "C" int r4d_rad_dsa_score(const RadArgs* a, RadStream stream) {
     return score_body(a, stream);

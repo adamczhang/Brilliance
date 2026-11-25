@@ -19,9 +19,11 @@
  * step lands, never which tokens come out. The tables key on 64-bit hashes and store 32 bits of the
  * key; a clash merges two contexts' counts.
  *
- * The index is incremental: each call indexes the tokens committed since the last one, prompt
- * included at the first, so a sequence is indexed once over its lifetime. Memory is about 8 bytes a
- * token per table and per NgramIndex pattern length (4 lengths).
+ * The index is incremental: each call indexes the tokens committed since the last one, so a
+ * sequence is indexed once over its lifetime. The scheduler indexes a prompt one committed chunk at
+ * a time (index(), from Scheduler::commit) rather than leaving the whole of it to the first decode,
+ * whose step would otherwise hold the scheduler lock for O(prompt). Memory is about 8 bytes a token
+ * per table and per NgramIndex pattern length (4 lengths).
  */
 #pragma once
 #include "ngram.h"
@@ -61,10 +63,8 @@ public:
                 int32_t* out) {
         Out r;
         if (min_match < 1 || min_match > kMaxK || max_rows < 1 || seq.size() <= min_match) return r;
-        if (ix_.owner() != owner || k_ != min_match) { reset(owner); k_ = min_match; }
+        index(seq, owner, min_match, seq.size());
         const int64_t L = seq.size();
-        if (L < filled_) { reset(owner); k_ = min_match; }
-        index_to(seq, L);
         int match = 0;
         const int n = ix_.propose(seq, min_match, min_match + kExtra, max_rows, out, &match, 64);
         if (n <= 0) return r;
@@ -90,6 +90,24 @@ public:
         r.score = m > 0 ? d : 0.0f;
         r.expect = sum;
         return r;
+    }
+
+    /* Brings the tables up to `upto` positions of `seq` (clamped to what it holds) for `min_match`
+     * contexts, and proposes nothing: what propose() does before it looks. The scheduler calls it
+     * as each committed chunk lands, so a prompt is indexed a chunk at a time and the first decode
+     * does not index the whole of it at once (S-06). Same incremental index as propose(), which
+     * indexes the rest. */
+    void index(const TokenSeq& seq, uint64_t owner, int min_match, int64_t upto) {
+        if (min_match < 1 || min_match > kMaxK) return;
+        const int64_t L = seq.size();
+        if (ix_.owner() != owner || k_ != min_match || L < filled_) {
+            reset(owner);
+            k_ = min_match;
+        }
+        if (upto > L) upto = L;
+        if (upto <= filled_) return;
+        index_to(seq, upto);
+        ix_.index(seq, min_match, min_match + kExtra, upto - 1);
     }
 
     int64_t indexed() const { return filled_; }

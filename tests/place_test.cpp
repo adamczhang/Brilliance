@@ -2072,6 +2072,158 @@ TEST(mover_promotes_and_demotes_through_the_shadow_slots) {
     rad_stream_destroy(compute);
 }
 
+/* Expert streaming X1 (a): a promotion whose copy has landed is published by publish_landed,
+ * before the next pass is issued, not only by the next dispatch's retire. */
+TEST(a_landed_promotion_is_published_before_the_next_pass) {
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, HeatParams{}));
+    Mover m;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, MoverConfig{}));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+
+    const int32_t hot = hf.unit_of_expert(7);
+    REQUIRE(h.tier(hot) != Tier::VRAM);
+    const rad_weight hw = hf.plan.units[(size_t)hot].weights.front();
+    void* const pooled = m.residency()->lookup(hw)->ptr;
+    const int32_t ids[1] = {7};
+    const int32_t counts[1] = {10};
+    CHECK_OK(m.begin_dispatch(0, &h));
+    work.run(compute);
+    h.observe_ids(0, ids, counts, 1);
+    std::vector<Swap> sw;
+    CHECK_OK(h.step(&sw));
+    REQUIRE(!sw.empty());
+    for (const Swap& s : sw) if (m.issue(s, &h) < 0) h.abandon(s);
+    CHECK_OK(m.balance(&h, false));
+    /* The copy lands; no dispatch has retired it yet. */
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK(h.tier(hot) != Tier::VRAM);
+    CHECK(m.residency()->lookup(hw)->ptr == pooled);
+    CHECK_OK(m.publish_landed(&h));
+    CHECK(h.tier(hot) == Tier::VRAM);
+    CHECK(m.residency()->lookup(hw)->ptr != pooled);
+    CHECK(m.stats().early_published >= 1);
+
+    for (Deadline dl; any_busy(h, hf.plan) && !dl.passed();) {
+        CHECK_OK(m.begin_dispatch(1, &h));
+        work.run(compute);
+        CHECK_OK(rad_stream_sync(compute));
+    }
+    rad_stream_destroy(compute);
+}
+
+/* Expert streaming X1 (b): with pacing on, a step's promotion copies are held until the next
+ * pass's marks send them (pace_units a mark); a held copy is never published, whatever its
+ * record's event says, and the bytes that land are the pool slot's. What no mark sent goes out at
+ * the next dispatch. */
+TEST(paced_promotions_go_out_at_the_marks_and_land_the_pool_bytes) {
+    HeatFixture hf;
+    HeatEngine h;
+    CHECK_OK(h.init(hf.plan, HeatParams{}));
+    Mover m;
+    MoverConfig mc;
+    mc.pace_units = 1;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    REQUIRE(m.pacing());
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+    ComputeWork work;
+    int d = 0;
+
+    /* A pattern in a pooled unit's slot, to compare with what lands. */
+    auto pattern = [&](int32_t unit, int salt, std::vector<uint8_t>* want) {
+        const MoveUnit& mu = hf.plan.units[(size_t)unit];
+        void* p = m.residency()->lookup(mu.weights.front())->ptr;
+        want->resize((size_t)mu.bytes);
+        for (size_t k = 0; k < want->size(); ++k) (*want)[k] = (uint8_t)(k * 31 + 7 * salt + 1);
+        CHECK_OK(rad_memcpy_async(p, want->data(), mu.bytes, compute));
+        CHECK_OK(rad_stream_sync(compute));
+        return p;
+    };
+    auto landed_bytes = [&](int32_t unit) {
+        const MoveUnit& mu = hf.plan.units[(size_t)unit];
+        std::vector<uint8_t> got((size_t)mu.bytes);
+        CHECK_OK(rad_memcpy_async(got.data(), m.residency()->lookup(mu.weights.front())->ptr, mu.bytes,
+                                  compute));
+        CHECK_OK(rad_stream_sync(compute));
+        return got;
+    };
+    /* One dispatch that routes `e` hard and collects its promotion, as tiering_dispatch does. */
+    auto collect = [&](int32_t e) {
+        const int32_t ids[1] = {e};
+        const int32_t counts[1] = {10};
+        CHECK_OK(m.begin_dispatch(d++, &h));
+        work.run(compute);
+        h.observe_ids(0, ids, counts, 1);
+        std::vector<Swap> sw;
+        CHECK_OK(h.step(&sw));
+        m.pace_collect(true);
+        for (const Swap& s : sw) if (m.issue(s, &h) < 0) h.abandon(s);
+        CHECK_OK(m.balance(&h, false));
+        m.pace_collect(false);
+    };
+    auto settle = [&]() {
+        for (Deadline dl; any_busy(h, hf.plan) && !dl.passed();) {
+            CHECK_OK(m.begin_dispatch(d++, &h));
+            work.run(compute);
+            CHECK_OK(rad_stream_sync(compute));
+        }
+    };
+
+    /* Paced: held until the next pass's mark sends it, never published while held. */
+    const int32_t a = hf.unit_of_expert(7);
+    REQUIRE(h.tier(a) != Tier::VRAM);
+    std::vector<uint8_t> want_a;
+    void* const pooled_a = pattern(a, 1, &want_a);
+    collect(7);
+    REQUIRE_EQ(m.pace_held(), (size_t)1);
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(m.publish_landed(&h));
+    CHECK(h.tier(a) != Tier::VRAM);
+    m.pace_begin(8);
+    work.run(compute);
+    CHECK_OK(m.pace_mark(compute));
+    CHECK_EQ(m.pace_held(), (size_t)0);
+    CHECK_EQ(m.stats().paced_units, (uint64_t)1);
+    CHECK_EQ(m.stats().paced_marks, (uint64_t)1);
+    CHECK_OK(m.pace_mark(compute));                  /* nothing left: no list */
+    CHECK_EQ(m.stats().paced_marks, (uint64_t)1);
+    CHECK_OK(rad_stream_sync(compute));
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    CHECK_OK(m.publish_landed(&h));
+    CHECK(h.tier(a) == Tier::VRAM);
+    CHECK(m.residency()->lookup(hf.plan.units[(size_t)a].weights.front())->ptr != pooled_a);
+    CHECK(landed_bytes(a) == want_a);
+    settle();
+
+    /* Not sent by any mark: the next dispatch sends it unpaced. */
+    const int32_t b = hf.unit_of_expert(6);
+    REQUIRE(h.tier(b) != Tier::VRAM);
+    std::vector<uint8_t> want_b;
+    (void)pattern(b, 2, &want_b);
+    for (Deadline dl; m.pace_held() == 0 && h.tier(b) != Tier::VRAM && !dl.passed();) collect(6);
+    REQUIRE_EQ(m.pace_held(), (size_t)1);
+    CHECK_OK(m.begin_dispatch(d++, &h));
+    CHECK_EQ(m.pace_held(), (size_t)0);
+    CHECK_EQ(m.stats().paced_late, (uint64_t)1);
+    for (Deadline dl; h.tier(b) != Tier::VRAM && !dl.passed();) {
+        CHECK_OK(rad_stream_sync(m.transfer_stream()));
+        CHECK_OK(m.begin_dispatch(d++, &h));
+    }
+    CHECK(h.tier(b) == Tier::VRAM);
+    CHECK(landed_bytes(b) == want_b);
+    settle();
+    for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) CHECK(!h.busy(u));
+    rad_stream_destroy(compute);
+}
+
 namespace {
 int32_t resident_count(const HeatEngine& h, const Plan& p) {
     int32_t n = 0;
@@ -2928,6 +3080,63 @@ TEST(a_staged_layer_is_published_at_its_copies_and_unstaged_at_its_pool_slots) {
     rad_stream_destroy(compute);
 }
 
+/* The exit report's stager line: what the prefill stager copied into a pass's buffers, in units,
+ * bytes and copies, and the units that found no buffer room. The promotion line used to print
+ * `prefetched` -- heat's copies into a slab slot -- as "staged", so a long-context prefill that
+ * staged terabytes said "0 staged" beside /stats's staged bytes (M-16). */
+TEST(the_exit_report_prints_the_stagers_units_bytes_copies_and_overflow) {
+    HeatFixture hf;
+    Mover m;
+    MoverConfig mc;
+    CHECK_OK(m.init(hf.f.prog, hf.plan, mc));
+    RadStream compute = nullptr;
+    CHECK_OK(rad_stream_create(&compute, 0));
+    CHECK_OK(m.bind_compute_stream(compute));
+
+    std::vector<int32_t> units, pooled;
+    for (int32_t u = 0; u < (int32_t)hf.plan.units.size(); ++u) {
+        if (hf.plan.units[(size_t)u].expert < 0) continue;
+        units.push_back(u);
+        if (hf.plan.units[(size_t)u].tier == Tier::HostPinned) pooled.push_back(u);
+    }
+    REQUIRE(pooled.size() >= 2);
+
+    /* Room for all but one pooled unit: the rest stage, one is counted as overflow. */
+    const int64_t each = align_up(hf.plan.units[(size_t)pooled[0]].bytes, RAD_ALIGN_UNIT);
+    const int64_t cap = each * (int64_t)(pooled.size() - 1);
+    std::vector<char> buf((size_t)cap);
+    RadEvent done = nullptr;
+    CHECK_OK(rad_event_create_local(&done));
+    std::vector<int32_t> staged;
+    CHECK_OK(m.stage_units(units, buf.data(), cap, nullptr, done, &staged));
+
+    const MoverStats st = m.stats();
+    REQUIRE(st.staged_units == (uint64_t)staged.size());
+    REQUIRE(st.staged_units > 0);
+    REQUIRE(st.stage_overflow == (uint64_t)1);
+    /* No slab prefetch here: the figure that used to stand in for "staged" is 0. */
+    CHECK(st.prefetched == (uint64_t)0);
+
+    const std::string r = m.report();
+    CHECK(r.find(fmt("stager: %llu routed layers, %llu units staged (%.2f GiB) in %llu copies, "
+                     "%llu units no buffer had room for",
+                     (unsigned long long)st.stage_layers, (unsigned long long)st.staged_units,
+                     (double)st.staged_bytes / 1073741824.0,
+                     (unsigned long long)st.stage_copies,
+                     (unsigned long long)st.stage_overflow)) != std::string::npos);
+    /* And the promotion line is prefetches, not "staged". */
+    const size_t nl = r.find('\n');
+    REQUIRE(nl != std::string::npos);
+    CHECK(r.substr(0, nl).find("staged") == std::string::npos);
+    CHECK(r.substr(0, nl).find("prefetches") != std::string::npos);
+
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    m.unstage_units(staged);
+    CHECK_OK(rad_stream_sync(m.transfer_stream()));
+    rad_event_destroy(done);
+    rad_stream_destroy(compute);
+}
+
 /* The prefill stager's order over a pass of two routed layers: at the pass's first op the first
  * layer goes out, and the second too if the ring has room; each layer returns to its pool slots
  * when the next layer starts; nothing is staged in a pass that was not armed.
@@ -3357,6 +3566,54 @@ TEST(the_stager_stages_the_next_steps_first_layers_and_never_the_draft_head) {
     CHECK(!st.staged());
     for (int l = 0; l < kL; ++l) CHECK(at_home(l));
     CHECK_EQ(m.stats().stage_overflow, (uint64_t)0);
+
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02): the early set
+     * is [first, first + lead) counted from that layer, and the pass that starts there adopts it
+     * where it lies instead of staging it again. */
+    b.n_tok = 128;
+    st.set_ring(st.ring_full());
+    const int first = std::min<int>(lead, (kL - 1) / 2);
+    REQUIRE(first >= 1 && first + lead <= kL - 1);
+    st.set_next_prefill(true, first);
+    CHECK(st.begin_pass(&b));
+    /* the slice runs the trunk's layers [first, kL - 1), whose ops start at 2*first + 1 */
+    for (int h = 2 * first + 1; h < n_ops; ++h) {
+        bool resync = false;
+        CHECK_OK(st.before_op(h, compute, &resync));
+        if (h >= 2 && h % 2 == 0) {
+            const int l = (h - 2) / 2;
+            CHECK(in_ring(l));
+            CHECK(copies_hold_the_pool(l));
+        }
+        CHECK_OK(st.after_op(h, compute));
+    }
+    CHECK_OK(st.end_pass(compute));
+    for (int l = 0; l < kL; ++l) CHECK(l >= first && l < first + lead ? in_ring(l) : at_home(l));
+    for (int l = first; l < first + lead; ++l) CHECK(copies_hold_the_pool(l));
+
+    /* The pass that begins at that layer takes them as they are: its first op copies nothing,
+     * where the same pass from home has to stage the layers it starts with. */
+    auto units_at_first_op = [&]() {
+        st.set_next_prefill(false);
+        CHECK(st.begin_pass(&b));
+        const uint64_t before = m.stats().staged_units;
+        bool resync = false;
+        CHECK_OK(st.before_op(2 * first + 1, compute, &resync));
+        const uint64_t staged = m.stats().staged_units - before;
+        CHECK(in_ring(first));
+        CHECK_OK(st.after_op(2 * first + 1, compute));
+        for (int h = 2 * first + 2; h < n_ops; ++h) {
+            CHECK_OK(st.before_op(h, compute, &resync));
+            CHECK_OK(st.after_op(h, compute));
+        }
+        CHECK_OK(st.end_pass(compute));
+        for (int l = 0; l < kL; ++l) CHECK(at_home(l));
+        return staged;
+    };
+    const uint64_t warm = units_at_first_op();
+    const uint64_t cold = units_at_first_op();
+    CHECK_EQ(warm, (uint64_t)0);
+    CHECK(cold > 0);
     CHECK_OK(rad_stream_sync(m.transfer_stream()));
     rad_stream_destroy(compute);
 }

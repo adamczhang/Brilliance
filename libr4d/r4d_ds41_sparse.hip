@@ -924,7 +924,7 @@ __host__ __device__ constexpr DsDecLds ds_dec_lds(int nkq, int hg, int nt) {
     l.u = l.tab + 32 * 8;
     l.sq = l.u;
     l.bmax = l.sq + (long long)hg * kDsAttnD * 4;
-    const long long sc = l.bmax + (long long)hg * (nkq / 32) * 4, pv = l.u + 2L * nt * 16;
+    const long long sc = l.bmax + (long long)hg * (nkq / 32) * 4, pv = l.u + 2LL * nt * 16;
     l.total = sc > pv ? sc : pv;
     return l;
 }
@@ -1985,7 +1985,7 @@ int attn_dec_go(RadStream stream, const DsAttnArgs& s) {
  * smaller form; the one-head form takes every row this op accepts. */
 template <bool LF8>
 int attn_dec_emit(RadStream stream, const DsAttnArgs& s) {
-    if (s.M > 65535 || (s.H + 0L) > 65535L * 8) return RAD_E_UNSUPPORTED;
+    if (s.M > 65535 || (long long)s.H > 65535LL * 8) return RAD_E_UNSUPPORTED;
     const long long hr = (long long)s.M * s.H;
     int c = hr <= 32 ? 0 : (hr <= 64 ? 1 : (hr <= 128 ? 2 : (hr <= 256 ? 3 : 4)));
     static const int next[8] = { -1, 0, 1, 2, 5, 6, 1, -1 };

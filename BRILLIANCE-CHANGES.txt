@@ -2,19 +2,21 @@ Brilliance: what this tree changes in Radiance
 
 Brilliance is a fork of Radiance (https://codeberg.org/StillDeadcode/radiance), under the
 Apache License 2.0 (LICENSE; NOTICE credits Radiance's authors). This tree is upstream's
-commit b6b8751cccb0e834a13ae9e5afca824ee9a487aa plus the Windows port.
+commit 1c104de400239a2c8eabb384d8ea218b30f9c9b9 plus the Windows port.
 As section 4(b) of the licence asks, this file states which of upstream's files Brilliance
-has changed: the 391 listed under "Modified" carry changes made for Brilliance. Files under
+has changed: the 515 listed under "Modified" carry changes made for Brilliance. Files under
 "Added" are Brilliance's own. Every other file is upstream's, unchanged.
 
-Modified (391)
+Modified (515)
 
   .gitignore
   CMakeLists.txt
   NOTICE
   README.md
   abi/rad_abi.h
+  abi/rad_abi_layout_rows.h
   abi/rad_builder.h
+  abi/rad_runtime.h
   arch/CMakeLists.txt
   arch/common/rad_arch.h
   arch/common/rad_block_attn_gated_fp8.h
@@ -22,7 +24,11 @@ Modified (391)
   arch/common/rad_block_glm_router.h
   arch/common/rad_block_hc.h
   arch/common/rad_block_moe_fp8.h
+  arch/common/rad_block_mtp_hc.h
   arch/common/rad_fp8.h
+  arch/common/rad_glm_tp.h
+  arch/inkling2/inkling2.cpp
+  arch/ltx2/ltx2.cpp
   arch/qwen4exp_fp8/qwen4exp_fp8.cpp
   cmake/RadAddPlugin.cmake
   cmake/radiance-config.cmake.in
@@ -51,24 +57,39 @@ Modified (391)
   core/engine_draft.cpp
   core/engine_hostmem.cpp
   core/engine_hostmem.h
+  core/engine_probe.cpp
   core/fleet/config.cpp
   core/fleet/config.h
   core/fleet/fleet.cpp
+  core/format/checkpoint.cpp
+  core/format/checkpoint.h
   core/format/radfile.cpp
+  core/format/radfile.h
+  core/format/safetensors.cpp
+  core/format/share.cpp
   core/format/table_copy.cpp
+  core/format/table_copy.h
   core/format/table_share.cpp
   core/format/tunecache.cpp
   core/hf_model.cpp
   core/kld.cpp
   core/main.cpp
-  core/mem/kv.cpp
-  core/mem/kv.h
   core/mem/pools.cpp
+  core/mem/prefix.cpp
+  core/mem/prefix.h
   core/mem/vram_budget.cpp
+  core/mem/vram_budget.h
+  core/mm/imaging.cpp
+  core/mm/imaging.h
+  core/mm/item.cpp
   core/mm/media.cpp
   core/mm/media.h
   core/mm/mp4.cpp
   core/mm/mp4.h
+  core/mm/processor.cpp
+  core/mm/processor.h
+  core/place/heat.cpp
+  core/place/heat.h
   core/place/mover.cpp
   core/place/mover.h
   core/place/planner.cpp
@@ -78,6 +99,7 @@ Modified (391)
   core/place/xstats.cpp
   core/plugin/loader.cpp
   core/plugin/registry.h
+  core/plugin/select.cpp
   core/rad_core.h
   core/rad_internal.h
   core/runtime/ctx.cpp
@@ -86,11 +108,21 @@ Modified (391)
   core/runtime/rank_barrier.cpp
   core/runtime/rank_barrier.h
   core/runtime/wtab.hip
+  core/runtime/xprefetch.cpp
   core/runtime/xprefetch.hip
   core/sched/advance.hip
+  core/sched/batch.cpp
+  core/sched/batch.h
+  core/sched/derive.cpp
+  core/sched/derive.h
+  core/sched/draft_depth.h
   core/sched/mem_iface.h
+  core/sched/metrics.h
+  core/sched/ngram.cpp
+  core/sched/ngram.h
   core/sched/scheduler.cpp
   core/sched/scheduler.h
+  core/sched/suffix.h
   core/server/adapters.h
   core/server/admin.cpp
   core/server/audio_gen.cpp
@@ -100,13 +132,23 @@ Modified (391)
   core/server/front.h
   core/server/http.cpp
   core/server/http.h
+  core/server/iface.h
   core/server/liveview.h
+  core/server/metrics.cpp
+  core/server/metrics.h
   core/server/oai.cpp
+  core/server/oai.h
   core/server/server.cpp
   core/server/server.h
+  core/server/sink.cpp
+  core/server/sink.h
   core/server/speech_stream.cpp
   core/server/videos.cpp
+  core/text/chat.cpp
   core/text/chatfmt.cpp
+  core/text/chatfmt.h
+  core/text/chatparse.cpp
+  core/text/chatparse.h
   core/util/json.h
   core/util/rad_util.cpp
   core/util/stallwatch.cpp
@@ -116,21 +158,39 @@ Modified (391)
   dashboard/src/pages/model.tsx
   dashboard/src/pages/overview.tsx
   data/kernels_moe.rkb
+  data/recipes/inkling2-mini-i8.recipe
+  data/recipes/inkling2-mini.recipe
+  docs/ARCHITECTURES.md
   docs/GUIDE.md
+  docs/MOE-W6.md
   docs/MULTIMODEL.md
+  docs/OPS.md
+  docs/TOOLS.md
+  docs/TP4.md
   libavx/CMakeLists.txt
   libavx/README.md
+  libavx/avx_attn.cpp
   libavx/avx_bench.cpp
   libavx/avx_cases.cpp
   libavx/avx_check.cpp
   libavx/avx_check.h
+  libavx/avx_check_hand.cpp
   libavx/avx_check_rows.cpp
   libavx/avx_common.h
   libavx/avx_dispatch.cpp
+  libavx/avx_dsa.cpp
+  libavx/avx_gemm.cpp
   libavx/avx_glm.cpp
   libavx/avx_isa.h
+  libavx/avx_moe.cpp
   libavx/avx_ngram.cpp
+  libavx/avx_norm.cpp
+  libavx/avx_qsa.cpp
+  libavx/avx_quant.cpp
   libavx/avx_registry.cpp
+  libavx/avx_rows.h
+  libavx/avx_sample.cpp
+  libavx/avx_vec.h
   libhalo/halo.h
   libhalo/halo_ar_entry.hip
   libhalo/halo_ar_gather_2rank.hip
@@ -224,13 +284,22 @@ Modified (391)
   libhalo/halo_sample_ngram_f32.hip
   libhalo/halo_sample_stages_f32.hip
   libhalo/halo_selftest.cpp
+  libhalo/halo_shapes.cpp
   libhalo/halo_ssd.hip
   libhalo/halo_vsa.hip
   libquant/lq_ggml.cpp
   libquant/lq_ggml_port.cpp
   libquant/lq_ggml_port.h
   libquant/lq_ggml_tables.cpp
+  libquant/lq_grid.cpp
+  libquant/lq_grid.h
+  libquant/lq_quant.h
+  libr3d/r3d_gemm_nt_f32.hip
+  libr3d/r3d_rows.cpp
+  libr3d/r3d_selftest.cpp
+  libr3d/r3d_shapes.cpp
   libr4d/CMakeLists.txt
+  libr4d/README.md
   libr4d/isa/launchreg.hip
   libr4d/isa/wmmamix.hip
   libr4d/isa/wmmapeak.hip
@@ -259,21 +328,28 @@ Modified (391)
   libr4d/r4d_attn_paged_h128_gqa4.hip
   libr4d/r4d_attn_paged_h256_gqa2.hip
   libr4d/r4d_attn_paged_h256_gqa6.hip
+  libr4d/r4d_attn_paged_window.hip
   libr4d/r4d_attn_prefill_split.h
+  libr4d/r4d_attn_rel.hip
+  libr4d/r4d_attn_res.hip
   libr4d/r4d_attn_vit_h72_bf16.hip
   libr4d/r4d_audio.hip
   libr4d/r4d_bf16_gemm_rows.h
+  libr4d/r4d_chain.h
   libr4d/r4d_dequant_w4_bf16.hip
   libr4d/r4d_dflash_conv_body.h
   libr4d/r4d_dflash_markov_bf16.hip
   libr4d/r4d_dflash_select_bf16.hip
   libr4d/r4d_dflash_tree_bf16.hip
   libr4d/r4d_dsa.hip
+  libr4d/r4d_dspark_rnn_markov.hip
   libr4d/r4d_encoder_bf16.hip
   libr4d/r4d_fp8_args.h
+  libr4d/r4d_fp8_layout.cpp
   libr4d/r4d_fuse.cpp
   libr4d/r4d_fused_quant_fp8.hip
   libr4d/r4d_gated_had_quant_i8.hip
+  libr4d/r4d_gated_quant_i8.hip
   libr4d/r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip
   libr4d/r4d_gdn_conv_w4_h128_bf16.hip
   libr4d/r4d_gdn_gated_norm_had_quant_i8.hip
@@ -282,6 +358,7 @@ Modified (391)
   libr4d/r4d_gemm_args.h
   libr4d/r4d_gemm_bf16_nt_m64.hip
   libr4d/r4d_gemm_bf16_nt_tiled.hip
+  libr4d/r4d_gemm_bf16x12_nt_m64.hip
   libr4d/r4d_gemm_fp8a16_nt_m1.hip
   libr4d/r4d_gemm_fp8a8.hip
   libr4d/r4d_gemm_iqr.hip
@@ -302,13 +379,20 @@ Modified (391)
   libr4d/r4d_glm.hip
   libr4d/r4d_gram_accum_fp8.hip
   libr4d/r4d_hc_bf16.hip
+  libr4d/r4d_iqr_layout.cpp
   libr4d/r4d_kda.hip
   libr4d/r4d_kv_resolve.hip
+  libr4d/r4d_l2_clip_bf16.hip
   libr4d/r4d_mhc.hip
   libr4d/r4d_mla.hip
   libr4d/r4d_model_bf16.hip
+  libr4d/r4d_moe.hip
+  libr4d/r4d_moe_gather.h
   libr4d/r4d_moe_iqr.hip
+  libr4d/r4d_moe_nvfp4.hip
+  libr4d/r4d_moe_sort.h
   libr4d/r4d_nemotron_bf16.hip
+  libr4d/r4d_ple_conv_bf16.hip
   libr4d/r4d_plugin.h
   libr4d/r4d_qk_norm_rope_gate.hip
   libr4d/r4d_qsa_block_key_bf16.hip
@@ -327,56 +411,91 @@ Modified (391)
   libr4d/r4d_selftest.cpp
   libr4d/r4d_shapes.cpp
   libr4d/r4d_ssd.hip
+  libr4d/r4d_vit_bf16.hip
   libr4d/r4d_vsa.hip
   libref/CMakeLists.txt
   libref/ref_attn.cpp
+  libref/ref_attn_res.cpp
+  libref/ref_dsa.cpp
+  libref/ref_elementwise.cpp
   libref/ref_gemm.cpp
   libref/ref_glm.cpp
   libref/ref_mhc.cpp
   libref/ref_ops.h
+  libref/ref_qsa.cpp
+  libref/ref_quant.cpp
   libref/ref_registry.cpp
   libref/ref_shapes.cpp
+  plugin/glm/glm_mla.hip
+  plugin/spechub/spechub.cpp
+  plugin/spechub/spechub.h
+  spec.md
   tests/ARTIFACTS
   tests/CMakeLists.txt
+  tests/abi_layout_table.h
+  tests/abi_layout_test.cpp
   tests/arch_fakes.h
   tests/arch_test.cpp
+  tests/attn_rel_device_test.cpp
   tests/build_test.cpp
+  tests/chat_test.cpp
   tests/chatparse_test.cpp
   tests/checkpoint_test.cpp
   tests/config_test.cpp
   tests/cvec_test.cpp
+  tests/dashboard_test.cpp
+  tests/data/chat/golden/cases.json
   tests/decision_e2e.h
   tests/device_test.cpp
   tests/diag_test.cpp
   tests/engine_e2e_test.cpp
+  tests/engine_memory_guard_test.cpp
   tests/fleet_config_test.cpp
   tests/format_test.cpp
   tests/front_test.cpp
+  tests/gen_lora_test.cpp
+  tests/generator_lora_engine_test.cpp
   tests/halo_emu/cfg_host.cpp
+  tests/halo_emu/test_f32.cpp
   tests/harness_test.cpp
   tests/hf_model_test.cpp
   tests/host_kargs_main.h
   tests/hostmem_test.cpp
   tests/kbench_mutant_test.cpp
   tests/kbench_test.cpp
+  tests/loader_transfer_test.cpp
   tests/mem_test.cpp
   tests/mm_test.cpp
+  tests/mtp_rrs_test.cpp
   tests/museglimmer_test.cpp
   tests/oot_plugins.sh
+  tests/paging_fence_test.cpp
   tests/place_test.cpp
   tests/plugin_test.cpp
+  tests/quant_test.cpp
+  tests/r3d_iqr_selection_test.cpp
   tests/r4d_ar_links_test.cpp
   tests/r4d_bf16_capacity_test.cpp
   tests/r4d_emu/emu/emu.cpp
   tests/r4d_emu/emu/hip/hip_runtime.h
+  tests/r4d_emu/test_attnres.cpp
+  tests/r4d_emu/test_f32.cpp
+  tests/r4d_emu/test_moefuse.cpp
+  tests/r4d_emu/test_nvfp4.cpp
+  tests/r4d_emu/test_rel.cpp
+  tests/r4d_emu/test_sconv.cpp
+  tests/r4d_emu/test_vit.cpp
   tests/rad_export_test.py
   tests/rad_test.h
+  tests/recipe_test.cpp
   tests/ref_test.cpp
   tests/runtime_test.cpp
+  tests/sample_test.cpp
   tests/sched_fakes.h
   tests/sched_test.cpp
   tests/server_test.cpp
   tests/shape_test.cpp
+  tests/share_test.cpp
   tests/shipped_plugins_test.cpp
   tests/spark25_validation.py
   tests/spark25_validation_test.py
@@ -386,6 +505,7 @@ Modified (391)
   tests/torch_zip_test.cpp
   tests/transport_test.cpp
   tests/util_test.cpp
+  tests/vhead_test.py
   tests/videos_test.cpp
   tests/work_counter.h
   tools/CMakeLists.txt
@@ -395,41 +515,83 @@ Modified (391)
   tools/kbench_timer.cpp
   tools/rad_add_vision.cpp
   tools/rad_convert.cpp
+  tools/rad_kbench.cpp
   tools/rad_tokcheck.cpp
+  tools/vhead.py
   vendor/SHA256SUMS
   vendor/UPSTREAM
+  vendor/llama/common/jinja/runtime.cpp
+  vendor/llama/common/jinja/value.cpp
   vendor/llama/common/json-partial.cpp
   vendor/llama/src/unicode.cpp
 
-Added (289)
+Added (415)
 
   .gitattributes
   RADIANCE-README.md
   REFERENCE.md
   abi/rad_kv_fp8.h
+  arch/common/rad_block_inkling2_tower.h
+  arch/common/rad_block_inkling2_vision.h
   arch/common/rad_expert_split.h
   arch/common/rad_ggml.h
+  arch/common/rad_inkling2_chat.h
   arch/deepseek41/CMakeLists.txt
   arch/deepseek41/CONTRACT.md
   arch/deepseek41/deepseek41.cpp
+  arch/hyv4flash/CMakeLists.txt
+  arch/hyv4flash/chat.h
+  arch/hyv4flash/hyv4flash.cpp
+  arch/hyv4flash/hyv4flash_attn.h
+  arch/hyv4flash/hyv4flash_calib.h
+  arch/hyv4flash/hyv4flash_common.h
+  arch/hyv4flash/hyv4flash_dfly.h
+  arch/hyv4flash/hyv4flash_engram.h
+  arch/hyv4flash/hyv4flash_indexer.h
+  arch/hyv4flash/hyv4flash_moe.h
+  arch/hyv4flash/hyv4flash_vision.h
+  arch/inkling2/inkling2_dspark.h
   core/format/table_warm.cpp
   core/format/table_warm.h
+  core/mem/vram_others.cpp
+  core/mem/vram_others.h
   core/place/host_admit.h
+  core/place/ngram_auto.h
+  core/place/rtrace.h
   core/server/terms.cpp
   core/util/stoplog.cpp
   core/util/stoplog.h
   dashboard/src/components/chat.tsx
   dashboard/src/pages/sandbox.tsx
+  data/hy4flash_engram_tables.py
+  data/kernels_hy4.py
+  data/kernels_hy4.rkb
+  data/recipes/hy4-flash-bf16-f32.recipe
+  data/recipes/hy4-flash-bf16.recipe
+  data/recipes/hy4-flash-dfly-i8.recipe
+  data/recipes/hy4-flash-dfly-iq8r.recipe
+  data/recipes/hy4-flash-i8.recipe
+  data/recipes/hy4-flash-iqr-gptq.recipe
+  data/recipes/hy4-flash-w4nl64-gptq.recipe
+  data/recipes/hy4-flash-w4nl64-rtn.recipe
+  data/recipes/hy4-flash-w5nl64-rtn.recipe
+  data/recipes/hy4-flash-w6nl64-rtn.recipe
+  data/recipes/inkling2-mini-i8-experts.recipe
+  docs/HY4FLASH-QUANT.md
   docs/img/banner.png
   libavx/avx_ds41.cpp
   libavx/avx_ggml.cpp
   libavx/avx_ggml.h
   libavx/avx_ggml_hooks.cpp
+  libavx/avx_hy4.cpp
+  libavx/avx_ngram_pf.h
   libquant/lq_ggml_dequant.cpp
   libquant/lq_ggml_dequant.h
   libquant/lq_ggml_planes.cpp
   libquant/lq_ggml_planes.h
   libr4d/r4d_ar4_weights.h
+  libr4d/r4d_ar_arc2.h
+  libr4d/r4d_ar_ihc_junction.hip
   libr4d/r4d_ar_wide_coded.h
   libr4d/r4d_ar_wide_host.h
   libr4d/r4d_ar_wide_host.hip
@@ -437,6 +599,8 @@ Added (289)
   libr4d/r4d_ar_wide_ts.hip
   libr4d/r4d_ar_wide_tw.hip
   libr4d/r4d_ar_wide_x.h
+  libr4d/r4d_attn_kv_sink_h256.hip
+  libr4d/r4d_dfly.hip
   libr4d/r4d_ds41_elem.h
   libr4d/r4d_ds41_elem.hip
   libr4d/r4d_ds41_elem.inc
@@ -450,20 +614,95 @@ Added (289)
   libr4d/r4d_ds41_sparse.hip
   libr4d/r4d_ds41_sparse.inc
   libr4d/r4d_ds41_sparse_shapes.inc
+  libr4d/r4d_engram_bf16.hip
+  libr4d/r4d_idx_pool_gated_f32.hip
+  libr4d/r4d_idx_score_bf16.hip
+  libr4d/r4d_ihc.h
+  libr4d/r4d_ihc_bf16.hip
+  libr4d/r4d_inkling.hip
   libr4d/r4d_log.h
+  libr4d/r4d_markov_rnn.hip
+  libr4d/r4d_mla_kv_bf16.hip
+  libr4d/r4d_mla_sink.hip
+  libr4d/r4d_posemb.hip
+  libref/ref_dfly.cpp
   libref/ref_ggml.cpp
+  libref/ref_hy4.cpp
   libref/ref_sparse_kv.cpp
   tests/ar_bytes_test.cpp
+  tests/chatparse_inkling2_test.cpp
+  tests/data/chat/hy4flash/LICENSE
+  tests/data/chat/hy4flash/NOTICE
+  tests/data/chat/hy4flash/chat_template.jinja
+  tests/data/chat/hy4flash/golden/a_picture_between_text.txt
+  tests/data/chat/hy4flash/golden/effort_low.err
+  tests/data/chat/hy4flash/golden/effort_the_template_refuses.txt
+  tests/data/chat/hy4flash/golden/history_with_reasoning.txt
+  tests/data/chat/hy4flash/golden/history_with_reasoning_dropped.txt
+  tests/data/chat/hy4flash/golden/history_with_reasoning_preserved.txt
+  tests/data/chat/hy4flash/golden/hy4_effort_max_refused.err
+  tests/data/chat/hy4flash/golden/hy4_effort_medium_refused.err
+  tests/data/chat/hy4flash/golden/hy4_effort_null_refused.err
+  tests/data/chat/hy4flash/golden/hy4_high_plain.txt
+  tests/data/chat/hy4flash/golden/hy4_high_tools_multi_turn.txt
+  tests/data/chat/hy4flash/golden/hy4_no_think_plain.txt
+  tests/data/chat/hy4flash/golden/hy4_no_think_tools_history.txt
+  tests/data/chat/hy4flash/golden/hy4_tool_responses_follow_call_order.txt
+  tests/data/chat/hy4flash/golden/no_generation_prompt.txt
+  tests/data/chat/hy4flash/golden/parallel_calls_with_typed_arguments.txt
+  tests/data/chat/hy4flash/golden/system_and_user.txt
+  tests/data/chat/hy4flash/golden/thinking_off.txt
+  tests/data/chat/hy4flash/golden/tool_call_answered_then_user.txt
+  tests/data/chat/hy4flash/golden/tool_call_then_result.txt
+  tests/data/chat/hy4flash/golden/tool_calls_preserving_reasoning.txt
+  tests/data/chat/hy4flash/golden/tools_and_user.txt
+  tests/data/chat/hy4flash/golden/tools_system_and_user.txt
+  tests/data/chat/hy4flash/golden/unicode_text.txt
+  tests/data/golden/inkling2_vision_tiny.safetensors
+  tests/data/hy4/gen_dfly_golden.py
+  tests/data/hy4/gen_hy4_golden.py
   tests/deepseek41_hip_test.cpp
   tests/deepseek41_test.cpp
-  tests/loader_transfer_test.cpp
+  tests/heat_replay_test.cpp
+  tests/hf_logits_to_kld_test.py
+  tests/hy4_dfly_cases.h
+  tests/hy4_dfly_golden.h
+  tests/hy4_mm_golden.h
+  tests/hy4_ref_golden.h
+  tests/hyv4flash_arch_test.cpp
+  tests/hyv4flash_calib_test.cpp
+  tests/hyv4flash_chat_test.cpp
+  tests/hyv4flash_convert_test.cpp
+  tests/inkling2_proc_golden.h
+  tests/inkling2_vision_golden.h
+  tests/inkling2_vision_test.cpp
+  tests/mkhy4mmgolden.py
+  tests/mkinkling2procgolden.py
+  tests/mkinkling2vision.py
+  tests/ngram_auto_test.cpp
+  tests/ngram_prefetch_test.cpp
   tests/ngram_warm_test.cpp
-  tests/paging_fence_test.cpp
+  tests/posemb_device_test.cpp
   tests/r4d_ar4_weights_test.cpp
+  tests/r4d_emu/emu/tune_defaults.cpp
+  tests/r4d_emu/test_attn_kv_sink.cpp
+  tests/r4d_emu/test_hy4.cpp
+  tests/r4d_emu/test_inkling.cpp
+  tests/r4d_emu/test_mla_kv.cpp
+  tests/r4d_emu/test_mla_sink.cpp
+  tests/ref_hy4_ops_test.cpp
   tests/stoplog_test.cpp
+  tests/table_fill_test.cpp
   tests/terms_test.cpp
+  tests/vram_others_test.cpp
+  tools/calib_st2gram.py
+  tools/heat_replay.cpp
+  tools/hf_logits_to_kld.py
+  tools/hy4flash_ready.py
+  tools/hy4flash_rollback_gate.py
   tools/rad_warm_bench.cpp
   vendor/patches/0023-unicode-a-16-bit-wchar_t-keeps-one-unit-per-codepoint.patch
+  vendor/patches/0024-jinja-str-format-and-none-membership.patch
   win/PREVIEW.md
   win/SERVICE.md
   win/SUPPORT.md
@@ -590,7 +829,9 @@ Added (289)
   win/model-licenses/openmdw-1.1.txt
   win/model-licenses/qwen-community-1.0.txt
   win/model-licenses/qwen-research.txt
+  win/model-licenses/tencent-hy-1.0.txt
   win/os/gpu_win32.cpp
+  win/os/job_limit.h
   win/os/os.h
   win/os/os_gpu_test.cpp
   win/os/os_win32.cpp
@@ -599,11 +840,17 @@ Added (289)
   win/package.ps1
   win/profiles/deepseek41-2card.yaml
   win/profiles/deepseek41-4card.yaml
+  win/profiles/flashnext-2card-512k.yaml
   win/profiles/flashnext-2card-fast.yaml
   win/profiles/flashnext-2card.yaml
   win/profiles/flashnext-4card.yaml
   win/profiles/gemma4-12b-1card.yaml
   win/profiles/gemma4-31b-1card.yaml
+  win/profiles/hy4-2card-dfly.yaml
+  win/profiles/hy4-2card.yaml
+  win/profiles/hy4-4card-dfly.yaml
+  win/profiles/inkling2-mini-1card.yaml
+  win/profiles/inkling2-mini-dspark-1card.yaml
   win/profiles/ltx-2.5-1card.yaml
   win/profiles/minicpm5-2b-1card.yaml
   win/profiles/qwen-image-1card.yaml
@@ -623,7 +870,9 @@ Added (289)
   win/tests/gate_lib_test.ps1
   win/tests/gate_runner_test.py
   win/tests/hub_stub.py
+  win/tests/job_limit_test.cpp
   win/tests/licence_checks_test.py
+  win/tests/msvc_toolset_test.ps1
   win/tests/pin_limit_test.cpp
   win/tests/plan_only_cli_test.cmake
   win/tests/rad_export_cmd_test.ps1
@@ -661,6 +910,7 @@ Added (289)
   win/tools/llp64_sweep.py
   win/tools/logprob_batched.py
   win/tools/logprob_repeat.py
+  win/tools/msvc-toolset.ps1
   win/tools/opencode_check.py
   win/tools/openwebui-start.ps1
   win/tools/openwebui_check.py

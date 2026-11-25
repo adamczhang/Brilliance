@@ -100,6 +100,17 @@ struct GatedOut {
     uint32_t n, q_ld, s_ld, y_ld;
 };
 
+/* gemm_nt_q_dual's second weight and its output: the pair's first part is the op's own b, b_scale,
+ * y and N, the second part's come from here. Both weights are one form and one K (the row refuses
+ * otherwise), so one Ctx shape serves both; each keeps its own N, and with it its own wave count
+ * and its own count of tiles a block. `split` is the first part's blocks in the one grid. */
+struct Dual {
+    Ctx c;              /* the second weight's codes, scales and run */
+    uint16_t* Y;        /* [M][n2] the second product */
+    uint32_t n2;        /* the second weight's N */
+    uint32_t split;     /* the first part's blocks */
+};
+
 /* Token m's gated value at column `col` from the gate and up rows' f32 sums (row scale applied). */
 __device__ __forceinline__ void gated_put(const GatedOut& go, uint32_t m, uint32_t col, float vg,
                                           float vu) {
@@ -155,39 +166,43 @@ __device__ __forceinline__ void gated_tail(const GatedOut& go, uint32_t M, uint3
  * The fold order differs from the WMMA tile's (per lane, then across lanes and waves), so the
  * output is the product within f32 rounding rather than the int8 tile's bytes. */
 /* Brilliance: the forms upstream 1d94e416's row grid covers, the U5 row-f32 computed trellis. Only
- * their single-token GEMV carries the grid.y row offset, so every other form's GEMV is upstream
- * v2.2.0's code; the row grid itself runs only under BRILLIANCE_EXACT_VERIFY (r4d_exact_verify_on). */
+ * their single-token GEMV carries the grid.y row offset (iqr_gemv_kernel, below), so every other
+ * form's GEMV is upstream's code; the row grid itself runs only under BRILLIANCE_EXACT_VERIFY
+ * (r4d_exact_verify_on). The dual launch never takes it. */
 template <class F>
 constexpr bool kRowGridForm = F::KIND == kTrellisMad && F::B == 5u && F::LRB == 0u && F::SC == kRowF32;
 
-template <class F, uint32_t MT, uint32_t KW, bool GATED, class CH>
-__global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
-void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
-                     uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
-                     GatedOut go) {
-    if (CH::on) r4d_chain_wait();
-    /* A non-gated single-token GEMV may put independent token rows on grid.y. Every block then
-     * executes exactly the M=1 arithmetic over its own row, including the chained launch. Off
-     * (the default) the grid has one row, so blockIdx.y is 0. */
-    if constexpr (!GATED && MT == 1 && kRowGridForm<F>) {
-        X  += (size_t)blockIdx.y * x_ld;
-        XS += (size_t)blockIdx.y * xs_ld;
-        Y  += (size_t)blockIdx.y * N;
-    }
+/*
+ * One block's tiles, `NW` waves in the block and `GW` of them on a tile: NW == GW is the plain
+ * launch's block, one 16-row tile; a dual launch's block of eight waves carries two tiles where
+ * its part takes four waves a tile (waves 0..3 the first, 4..7 the second) and one where it takes
+ * eight. A tile is computed by exactly the waves its own launch gives it, over the same K blocks
+ * and folded over its own group's LDS partials in ascending wave order, so a tile's output is the
+ * same however many other tiles share its block. */
+template <class F, uint32_t MT, uint32_t NW, uint32_t GW, bool GATED, class CH>
+__device__ __forceinline__ void gemv_tile(Ctx c, const int8_t* __restrict__ X,
+                                          const float* __restrict__ XS, uint16_t* __restrict__ Y,
+                                          uint32_t N, uint32_t x_ld, uint32_t xs_ld,
+                                          const GatedOut& go, uint32_t rt, uint32_t wave0,
+                                          int8_t* s_tab, float (*s_red)[16 * MT]) {
     using D = Dec<F, true>;
-    constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
-    __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
-    __shared__ float s_red[NW][16 * MT];
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
-    const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
-    Ctx c = c0;
+    /* the wave's own group: none when the block is one tile, else wave0 / GW's */
+    constexpr uint32_t NG = NW / GW;
+    const uint32_t grp = NG > 1u ? wave0 / GW : 0u, wave = NG > 1u ? wave0 % GW : wave0;
+    /* Chained, the block sits in the poll while its predecessor runs (aql.cpp's chain plan), so the
+     * wave's first unit of the weight is issued before the acquire: a static weight's bytes are
+     * not written by any op of a pass (operand role RAD_OPD_WEIGHT, core/runtime/issue.cpp's
+     * haz_note orders no read of one), so the read cannot see a partial write, and the dwords it
+     * returns stay in registers across the acquire. The activation (X, XS) and the table staged
+     * below stay behind the wait; the plain form issues the same unit as it is. */
+    typename D::Raw cur, nxt;
+    if (CH::on) cur = D::fetch(c, rt, wave, lane, wave < c.nkb);
+    if (CH::on) r4d_chain_wait();
     c.tab = s_tab;
     D::stage(s_tab, c, tid, NW * kWave);
     __syncthreads();
 
-    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
-    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
-    const uint32_t rt = blockIdx.x + half * (N / 32u);
     const uint32_t myrow = rt * 16u + (lane & 15u);
 
     float acc[16][MT];
@@ -200,9 +215,9 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
     for (uint32_t m = 0; m < MT; ++m) fsum[m] = 0.0f;
     uint32_t nflush = 0;
 
-    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
-    for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
-        if (kb + KW < c.nkb) nxt = D::fetch(c, rt, kb + KW, lane, true);
+    if (!CH::on) cur = D::fetch(c, rt, wave, lane, wave < c.nkb);
+    for (uint32_t kb = wave; kb < c.nkb; kb += GW) {
+        if (kb + GW < c.nkb) nxt = D::fetch(c, rt, kb + GW, lane, true);
         uint32_t xv[MT];
         float as[MT];
 #pragma unroll
@@ -323,31 +338,98 @@ void iqr_gemv_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restri
         for (uint32_t m = 0; m < MT; ++m) s_red[wave0][lane * MT + m] = rv[m];
     }
     __syncthreads();
+    /* The tail is the block's own where the block carries one tile, and a group's of GW waves
+     * where it carries one each: those waves' threads write their tile's rows. Under the gate the
+     * block's two halves are one tile's, so the whole block writes it. */
+    const uint32_t gtid = NG > 1u && !GATED ? wave * kWave + lane : tid;
     if constexpr (GATED) {
         if (tid < 16u * MT) {
             const uint32_t q = red16_row(tid / MT), m = tid % MT;
             float vg = 0.0f, vu = 0.0f;
 #pragma unroll
-            for (uint32_t w = 0; w < KW; ++w) vg += s_red[w][tid];
+            for (uint32_t w = 0; w < GW; ++w) vg += s_red[w][tid];
 #pragma unroll
-            for (uint32_t w = 0; w < KW; ++w) vu += s_red[KW + w][tid];
+            for (uint32_t w = 0; w < GW; ++w) vu += s_red[GW + w][tid];
             vg *= row_scale<F>(c, blockIdx.x * 16u + q);
             vu *= row_scale<F>(c, (blockIdx.x + N / 32u) * 16u + q);
             gated_put(go, m, blockIdx.x * 16u + q, vg, vu);
         }
         gated_tail(go, MT, NW);
     } else {
-        if (tid < 16u * MT) {
-            const uint32_t q = red16_row(tid / MT), m = tid % MT;
+        if (gtid < 16u * MT) {
+            const uint32_t q = red16_row(gtid / MT), m = gtid % MT;
             float v = 0.0f;
 #pragma unroll
-            for (uint32_t w = 0; w < KW; ++w) v += s_red[w][tid];
+            for (uint32_t w = 0; w < GW; ++w) v += s_red[grp * GW + w][gtid];
             /* each row's own scale, after its blocks' sums */
             v *= row_scale<F>(c, rt * 16u + q);
             Y[(size_t)m * N + rt * 16u + q] = f32_to_bf16(v);
         }
     }
     if (CH::on) r4d_chain_done();
+}
+
+/* The GEMV launch's own block: one tile, KW waves a tile. */
+template <class F, uint32_t MT, uint32_t KW, bool GATED, class CH>
+__global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
+void iqr_gemv_kernel(Ctx c, const int8_t* __restrict__ X, const float* __restrict__ XS,
+                     uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
+                     GatedOut go) {
+    using D = Dec<F, true>;
+    constexpr uint32_t NW = (GATED ? 2u : 1u) * KW;
+    __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
+    __shared__ float s_red[NW][16 * MT];
+    const uint32_t wave0 = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u;
+    /* Brilliance: a non-gated single-token GEMV may put independent token rows on grid.y. Every
+     * block then executes exactly the M=1 arithmetic over its own row, including the chained
+     * launch. Off (the default) the grid has one row, so blockIdx.y is 0. */
+    if constexpr (!GATED && MT == 1 && kRowGridForm<F>) {
+        X  += (size_t)blockIdx.y * x_ld;
+        XS += (size_t)blockIdx.y * xs_ld;
+        Y  += (size_t)blockIdx.y * N;
+    }
+    gemv_tile<F, MT, NW, KW, GATED, CH>(c, X, XS, Y, N, x_ld, xs_ld, go,
+                                        blockIdx.x + half * (N / 32u), wave0, s_tab, s_red);
+}
+
+/* ---- the dual launch: two weights of one activation's codes in one grid ----------------------
+ *
+ * gemm_nt_q_dual's two launches' blocks in one grid at one block size, eight waves. A part whose
+ * own launch takes four waves a tile (N >= 4096, the GEMV's wave count) puts two 16-row tiles in a
+ * block and each tile's partials in its own four waves' rows of the LDS tile, summed over those
+ * four in ascending order -- the fold of a block of its own launch; one that takes eight waves a
+ * tile is the plain eight-wave block. So every tile is computed and folded exactly as its own
+ * launch computes it, and the pair costs one launch and one ramp instead of two.
+ *
+ * The plugin takes the pair at a decode step's GEMV only (M <= gemv_max<F>), which is where the
+ * two launches are launch and ramp cost; wider passes keep both Lins' own launches. Blocks below
+ * `dual.split` are the first weight's tile-groups, the rest the second's, out of its own output's
+ * rows (`dual.n2`). */
+constexpr uint32_t kDualWaves = 8u;
+template <class F, uint32_t MT, uint32_t GWA, uint32_t GWB, class CH>
+__global__ __launch_bounds__(kDualWaves * kWave) R4D_WAVES(6)
+void iqr_gemv_dual_kernel(Ctx c, const int8_t* __restrict__ X, const float* __restrict__ XS,
+                          uint16_t* __restrict__ Y, uint32_t N, uint32_t x_ld, uint32_t xs_ld,
+                          Dual dual) {
+    using D = Dec<F, true>;
+    __shared__ __attribute__((aligned(16))) int8_t s_tab[D::kTab];
+    __shared__ float s_red[kDualWaves][16 * MT];
+    const uint32_t wave0 = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+    const GatedOut go = GatedOut{};
+    if (blockIdx.x < dual.split) {
+        constexpr uint32_t TPA = kDualWaves / GWA;   /* the first part's tiles a block */
+        gemv_tile<F, MT, kDualWaves, GWA, false, CH>(
+            c, X, XS, Y, N, x_ld, xs_ld, go,
+            (uint32_t)blockIdx.x * TPA + (TPA > 1u ? wave0 / GWA : 0u), wave0, s_tab, s_red);
+    } else {
+        constexpr uint32_t TPB = kDualWaves / GWB;   /* the second part's tiles a block */
+        gemv_tile<F, MT, kDualWaves, GWB, false, CH>(
+            dual.c, X, XS, dual.Y, dual.n2, x_ld, xs_ld, go,
+            ((uint32_t)blockIdx.x - dual.split) * TPB + (TPB > 1u ? wave0 / GWB : 0u), wave0, s_tab,
+            s_red);
+    }
 }
 
 /* ---- the narrow tile at M <= 16 -------------------------------------------------------------
@@ -374,7 +456,6 @@ __global__ __launch_bounds__((GATED ? 2u : 1u) * KW * kWave) R4D_WAVES(6)
 void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restrict__ XS,
                     uint16_t* __restrict__ Y, uint32_t N, uint32_t M, uint32_t x_ld, uint32_t xs_ld,
                     GatedOut go) {
-    if (CH::on) r4d_chain_wait_vec();
     using D = Dec<F>;
     static_assert(!GATED || NT == 1u, "the gated form serves one token tile");
     constexpr bool BIAS = F::SC == kRowF32;
@@ -390,15 +471,21 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     };
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave0 = __builtin_amdgcn_readfirstlane(tid / kWave);
+    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
+    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
+    const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
+    /* Chained, the wave's first unit of the weight is issued before the acquire, as
+     * iqr_gemv_kernel's is (a static weight's bytes, read by no op of the pass); the token rows
+     * and the table staged below stay behind the wait. */
+    typename D::Raw cur, nxt;
+    if (CH::on) cur = D::fetch(c0, rt, wave, lane, wave < c0.nkb);
+    if (CH::on) r4d_chain_wait_vec();
     Ctx c = c0;
     c.tab = s_tab;
     uint8_t* const tr = s_tr + wave0 * kTrBytes;
     D::stage(s_tab, c, tid, NW * kWave);
     __syncthreads();
 
-    /* Gated, waves KW and up take the up rows' tile, n rows below the gate rows'. */
-    const uint32_t half = GATED ? wave0 / KW : 0u, wave = GATED ? wave0 % KW : wave0;
-    const uint32_t rt = blockIdx.x + half * (N / 32u), row0 = rt * 16u;
     /* Token tile j is tokens 16 j .. 16 j + 15; a column past M reads token M - 1. */
     uint32_t tok[NT];
     const int8_t* xrow[NT];
@@ -427,7 +514,7 @@ void iqr_m16_kernel(Ctx c0, const int8_t* __restrict__ X, const float* __restric
     };
     /* The weight and the first token tile are asked for a unit ahead of their WMMA steps, each
      * further tile's fragments a tile ahead (gemm_i8_kpar_kernel's order). */
-    typename D::Raw cur = D::fetch(c, rt, wave, lane, wave < c.nkb), nxt;
+    if (!CH::on) cur = D::fetch(c, rt, wave, lane, wave < c.nkb);
     i2v bc[8], bn[8], bq[2][8];
     bload(0u, wave, bc, wave < c.nkb);
     for (uint32_t kb = wave; kb < c.nkb; kb += KW) {
@@ -917,12 +1004,14 @@ constexpr bool chained_form() {
            (F::KIND == kTable && F::B == 4 && F::LV == 0 && F::L == 0 && F::LRB == 0 && F::SC == 0);
 }
 
-int operands(const RadArgs* a, Operands* g) {
-    g->a = r4d_opt(a, 0);
-    g->as = r4d_opt(a, 1);
-    g->b = r4d_opt(a, 2);
-    g->bs = r4d_opt(a, 3);
-    g->y = r4d_opt(a, 4);
+/* gemm_nt_q's operands [0] a [1] a_scale [2] b [3] b_scale [4] y, and gemm_nt_q_dual's second
+ * weight's at 5, 6 and 7 after them: one parse for both, the operands it reads named by index. */
+int operands_at(const RadArgs* a, Operands* g, int oa, int oas, int ob, int obs, int oy) {
+    g->a = r4d_opt(a, oa);
+    g->as = r4d_opt(a, oas);
+    g->b = r4d_opt(a, ob);
+    g->bs = r4d_opt(a, obs);
+    g->y = r4d_opt(a, oy);
     g->chain = r4d_geti_or(a, "chain", 0) != 0;
     if (!g->a || !g->as || !g->b || !g->bs || !g->y) return R4D_NO(RAD_E_INVAL);
     if (!is_weight_dtype(g->b->dtype) || !is_scale_dtype(g->bs->dtype)) return R4D_NO(RAD_E_DTYPE);
@@ -946,6 +1035,25 @@ int operands(const RadArgs* a, Operands* g) {
     if (!r4d_aligned(g->a->data, 16) || !r4d_aligned(g->b->data, 256)) return R4D_NO(RAD_E_ALIGN);
     const Form f = form(g->word);
     if (is_trellis(f.kind) && g->N % ((long long)1 << f.lrun)) return R4D_NO(RAD_E_SHAPE);
+    return RAD_OK;
+}
+
+int operands(const RadArgs* a, Operands* g) { return operands_at(a, g, 0, 1, 2, 3, 4); }
+
+/* gemm_nt_q_dual: the same activation's codes and scales for both weights, the first weight's
+ * output first. */
+int dual_operands(const RadArgs* a, Operands* g, Operands* g1) {
+    const int rc = operands_at(a, g, 0, 1, 2, 3, 4);
+    if (rc != RAD_OK) return rc;
+    return operands_at(a, g1, 0, 1, 5, 6, 7);
+}
+
+/* The pair must be one form (the word carries the encoding's bits, scale, rot and run), one K and
+ * one token count. N is each weight's own: that is what the two parts' block geometry is built
+ * from. A pair whose run differs is refused here, at issue, before any block runs. */
+int dual_pair(const Operands& g, const Operands& g1) {
+    if (g.M != g1.M || g.K != g1.K) return R4D_NO(RAD_E_SHAPE);
+    if (g.word != g1.word) return R4D_NO(RAD_E_DTYPE);
     return RAD_OK;
 }
 
@@ -1074,6 +1182,68 @@ int m16_launch(const Operands& g, RadStream stream, const GatedOut* go = nullptr
 template <class F>
 constexpr uint32_t gemv_max() {
     return F::KIND != kTrellisMad ? kGemvMaxM : F::B <= 3u && F::SC == kRowF32 ? 2u : 1u;
+}
+
+/* gemm_nt_q_dual: both weights' GEMV blocks in one grid, a block eight waves whatever its part's
+ * wave count (iqr_gemv_dual_kernel). Each part keeps the wave count its own N gives its own
+ * launch, and with it its own tiles a block -- the first part's blocks are then two of its tiles,
+ * the second's one or two of its own -- so a part's rows are computed by the waves and folded in
+ * the order its own launch computes them. */
+template <class F>
+int dual_launch(const Operands& g, const Operands& g1, RadStream stream) {
+    const uint32_t N = (uint32_t)g.N, N2 = (uint32_t)g1.N, M = (uint32_t)g.M;
+    /* The GEMV's band, a decode step's; wider passes keep both Lins' own launches. */
+    if (M > gemv_max<F>()) return R4D_NO(RAD_E_SHAPE);
+    const uint32_t kwa = N >= 4096u ? 4u : 8u, kwb = N2 >= 4096u ? 4u : 8u;
+    const uint32_t ta = kDualWaves / kwa, tb = kDualWaves / kwb;
+    if (N % (16u * ta) || N2 % (16u * tb)) return R4D_NO(RAD_E_SHAPE);
+    const Ctx c = ctx_of(g);
+    Dual d;
+    d.c = ctx_of(g1);
+    d.Y = (uint16_t*)g1.y->data;
+    d.n2 = N2;
+    d.split = N / 16u / ta;
+    uint16_t* const y = (uint16_t*)g.y->data;
+    int rc = RAD_E_SHAPE;
+#define R4D_IQR_DV_E(mt_, ka_, kb_, ch_)                                                          \
+    rc = R4D_EMIT(stream, (iqr_gemv_dual_kernel<F, mt_, ka_, kb_, ch_>),                          \
+                  dim3(d.split + N2 / 16u / tb), dim3(kDualWaves * kWave), 0, c,                   \
+                  (const int8_t*)g.a->data, (const float*)g.as->data, y, N, (uint32_t)g.a_ld,       \
+                  (uint32_t)g.sa_ld, d)
+#define R4D_IQR_DV_KW(mt_, ch_)                                                                  \
+    do { if (kwa == 4u) {                                                                        \
+             if (kwb == 4u) R4D_IQR_DV_E(mt_, 4u, 4u, ch_);                                      \
+             else           R4D_IQR_DV_E(mt_, 4u, 8u, ch_);                                      \
+         } else {                                                                                \
+             if (kwb == 4u) R4D_IQR_DV_E(mt_, 8u, 4u, ch_);                                      \
+             else           R4D_IQR_DV_E(mt_, 8u, 8u, ch_);                                      \
+         } } while (0)
+#define R4D_IQR_DV(mt_)                                                                          \
+    do { if constexpr (chained_form<F>()) {                                                      \
+             if (g.chain) R4D_IQR_DV_KW(mt_, r4dchain);                                           \
+             else         R4D_IQR_DV_KW(mt_, R4dUnchained);                                       \
+         } else {                                                                                \
+             R4D_IQR_DV_KW(mt_, R4dUnchained);                                                    \
+         } } while (0)
+#define R4D_IQR_DVM(mt_)                                                                         \
+    do { if constexpr (mt_ > gemv_max<F>()) return R4D_NO(RAD_E_SHAPE);                          \
+         else R4D_IQR_DV(mt_); } while (0)
+    switch (M) {
+        case 1u: R4D_IQR_DVM(1u); break;
+        case 2u: R4D_IQR_DVM(2u); break;
+        case 3u: R4D_IQR_DVM(3u); break;
+        case 4u: R4D_IQR_DVM(4u); break;
+        case 5u: R4D_IQR_DVM(5u); break;
+        case 6u: R4D_IQR_DVM(6u); break;
+        case 7u: R4D_IQR_DVM(7u); break;
+        case 8u: R4D_IQR_DVM(8u); break;
+        default: return R4D_NO(RAD_E_SHAPE);
+    }
+#undef R4D_IQR_DVM
+#undef R4D_IQR_DV
+#undef R4D_IQR_DV_KW
+#undef R4D_IQR_DV_E
+    return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
 template <class F>
@@ -1279,6 +1449,12 @@ int tiled_part(const Operands& g, void* scratch, long long scratch_bytes, RadStr
     else return R4D_NO(RAD_E_UNSUPPORTED);
 }
 
+template <class F>
+int dual_part(const Operands& g, const Operands& g1, RadStream s) {
+    if constexpr (in_part<F>()) return dual_launch<F>(g, g1, s);
+    else return R4D_NO(RAD_E_UNSUPPORTED);
+}
+
 }  // namespace
 
 #if R4D_IQR_PART == 0
@@ -1333,6 +1509,22 @@ extern "C" int R4D_IQR_CAT(r4d_iqr_tiled_p, R4D_IQR_PART)(const RadArgs* a, RadS
     return R4D_NO(RAD_E_UNSUPPORTED);
 }
 
+extern "C" int R4D_IQR_CAT(r4d_iqr_dual_p, R4D_IQR_PART)(const RadArgs* a, RadStream s) {
+    Operands g, g1;
+    const int rc = dual_operands(a, &g, &g1);
+    if (rc != RAD_OK) return rc;
+    /* The two forms must be one, or the pair is refused here and the two launches run instead. */
+    const int pc = dual_pair(g, g1);
+    if (pc != RAD_OK) return pc;
+    const uint32_t kw = kernel_word(g.word);
+#define R4D_IQR_GO(...)                                                                          \
+    if (in_part<R4D_IQR_T(__VA_ARGS__)>() && kw == R4D_IQR_T(__VA_ARGS__)::word())                \
+        return dual_part<R4D_IQR_T(__VA_ARGS__)>(g, g1, s);
+    R4D_IQR_FORMS(R4D_IQR_GO)
+#undef R4D_IQR_GO
+    return R4D_NO(RAD_E_UNSUPPORTED);
+}
+
 #if R4D_IQR_PART == 0
 /* The rows' entry points: each call goes to the part that builds its weight's form, which parses
  * and checks the operands itself. */
@@ -1344,10 +1536,12 @@ using IqrPartFn = int (*)(const RadArgs*, RadStream);
 R4D_IQR_PARTS_OF(r4d_iqr_m64_p)
 R4D_IQR_PARTS_OF(r4d_iqr_gated_p)
 R4D_IQR_PARTS_OF(r4d_iqr_tiled_p)
+R4D_IQR_PARTS_OF(r4d_iqr_dual_p)
 #undef R4D_IQR_PARTS_OF
 static_assert(kIqrParts == 4, "the entry points below name every part");
 
 static int iqr_by_part(const IqrPartFn (&fn)[kIqrParts], const RadArgs* a, RadStream s) {
+    /* gemm_nt_q_dual's first weight is its [2], as gemm_nt_q's is. */
     const RadTensor* b = r4d_opt(a, 2);
     return fn[b ? iqr_part(kernel_word(b->dtype & kWordMask)) : 0](a, s);
 }
@@ -1355,6 +1549,12 @@ static int iqr_by_part(const IqrPartFn (&fn)[kIqrParts], const RadArgs* a, RadSt
 extern "C" int r4d_rad_gemm_iqr_m64(const RadArgs* a, RadStream s) {
     static constexpr IqrPartFn fn[] = { r4d_iqr_m64_p0, r4d_iqr_m64_p1, r4d_iqr_m64_p2,
                                         r4d_iqr_m64_p3 };
+    return iqr_by_part(fn, a, s);
+}
+
+extern "C" int r4d_rad_gemm_iqr_dual(const RadArgs* a, RadStream s) {
+    static constexpr IqrPartFn fn[] = { r4d_iqr_dual_p0, r4d_iqr_dual_p1, r4d_iqr_dual_p2,
+                                        r4d_iqr_dual_p3 };
     return iqr_by_part(fn, a, s);
 }
 

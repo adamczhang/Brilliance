@@ -1,0 +1,1 @@
+<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What is 2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>

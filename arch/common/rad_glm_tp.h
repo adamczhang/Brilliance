@@ -92,6 +92,15 @@ struct GlmTp {
     }
 };
 
+/* Keep existing f32 projections' declarations identical, including their graph hashes. */
+inline rad_op declare_glm_projection(RadBuilder* b, int64_t rows, int64_t n, int64_t k,
+                                     rad_weight weight, bool packed, rad_buf input, rad_buf output) {
+    const RadParam params[] = { RAD_RANGE("M", 1, rows), RAD_INT("N", n), RAD_INT("K", k),
+                                RAD_STR("dtype", "bf16"), RAD_INT("weight_bf16", 1) };
+    return rw(b, rad_decl_op(b, "gemm_nt_f32", params, packed ? 5 : 4, &weight, 1),
+              { input }, { output });
+}
+
 /* The split's ops are declared whatever the step size, and each gather's message as a range of
  * rows: the engine's arena levels declare again at a smaller max_tok and must get the same graph
  * with the same fixed parameters.
@@ -106,7 +115,7 @@ struct SplitF32Proj {
     int64_t cols = 0, k = 0, min_rows = 0, first_col = 0;
 
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows, int64_t n,
-                int64_t width, rad_weight weight, rad_buf input, rad_buf output) {
+                int64_t width, rad_weight weight, rad_buf input, rad_buf output, bool weight_bf16) {
         min_rows = GlmTp::kSplitRows;
         if (g.world < 2 || n % g.world || (n / g.world * 4) % 16) {
             min_rows = 0;
@@ -116,12 +125,7 @@ struct SplitF32Proj {
         k = width;
         first_col = g.rank * cols;
         part = decl_b(b, nm.f("%s.part", name), RAD_F32, { rows, cols });
-        op_part = rw(b,
-                     RAD_OP(b, "gemm_nt_f32",
-                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("N", cols), RAD_INT("K", k),
-                                       RAD_STR("dtype", "bf16")),
-                            RAD_WEIGHTS(weight)),
-                     { input }, { part });
+        op_part = declare_glm_projection(b, rows, cols, k, weight, weight_bf16, input, part);
         op_gather = rw(
             b,
             RAD_OP(b, "all_gather",

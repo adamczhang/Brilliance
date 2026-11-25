@@ -79,6 +79,9 @@ set(R4D_UNITS
   "r4d_attn_dense_bf16|"
   # Unlimited-OCR's SAM tower: windowed attention with decomposed relative position.
   "r4d_sam_attn_bf16|"
+  # Hy4-flash's non-absorbed prefill: dense attention over kv_b-expanded keys and values at
+  # head_dim 256, a window and a sink logit a head (attn_kv_sink).
+  "r4d_attn_kv_sink_h256|"
   "r4d_encoder_bf16|"
   "r4d_nemotron_bf16|"
   # The image generator: attention over a paged prefix plus the pass's own rows, the causal
@@ -106,6 +109,8 @@ set(R4D_UNITS
   "r4d_vit_bf16|"
   # Muse Glimmer's vision-tower coordinate ops: grid_embed_pad, window_order.
   "r4d_vit_muse|"
+  # The position table resampled to a grid as a table of its own (the vision tower's grid change).
+  "r4d_posemb|"
   # The same biased GEMM over f32 operands (a diffusion transformer's patch projections and heads,
   # a video decoder's 1x1 projections), on the f32 FMA tile r4d_audio's f32 convolutions share.
   "r4d_gemm_f32_nt_bias|"
@@ -119,15 +124,25 @@ set(R4D_UNITS
   # needs a grid-wide barrier.
   "r4d_hc_bf16|"
   "r4d_mhc|"
+  # Hy4-flash's independent hyper-connections and gate_mul, its kv_b projections and split, and
+  # Engram (kernels/ihc.md, kernels/engram.md).
+  "r4d_ihc_bf16|"
+  "r4d_mla_kv_bf16|"
+  "r4d_engram_bf16|"
+  # DFly2's draft page table (kernels/dfly2.md §4).
+  "r4d_dfly|"
   "r4d_glm|"
   "r4d_dsa|"
   "r4d_mla|"
+  # Hy4-flash: absorbed MLA with a per-head sink (paged with a window, and over a selection).
+  "r4d_mla_sink|"
   "r4d_kda|"
   # Mamba-2's selective state update (Nemotron-H), the KDA kernel's register layout.
   "r4d_ssd|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"
+  "r4d_l2_clip_bf16|"
   # The all-reduce kernels share one instance (peer scratch, IPC-equivalent pointers, per-block
   # flags, device sequence counters) set up by one rendezvous across ranks, so all entry points
   # live in r4d_ar_entry. Spreading them across the kernel units would give each its own copy.
@@ -135,6 +150,8 @@ set(R4D_UNITS
   "r4d_ar_gather_2rank|"
   "r4d_ar_gather_Nrank|"
   "r4d_ar_oneshot_2rank_exact|"
+  # Hy4-flash's iHC junction behind the exact all-reduce (two ranks, four ranks).
+  "r4d_ar_ihc_junction|"
   "r4d_ar_oneshot_2rank_wht6|"
   "r4d_ar_oneshot_Nrank_exact|"
   "r4d_ar_twoshot_Nrank_exact|"
@@ -155,6 +172,10 @@ set(R4D_UNITS
   "r4d_ar_wide_tw|"
   "r4d_gemm_bf16_nt_m16|"
   "r4d_gemm_bf16_nt_m64|"
+  # The same GEMM over bf16x12 weights (a bf16 weight in 12.25 bits a value, losslessly), all three
+  # of its rows: gemm_bf16x12_nt_m16 forwards to _m64, and _tiled unpacks the weight for
+  # r4d_gemm_bf16_nt_tiled.
+  "r4d_gemm_bf16x12_nt_m64|"
   "r4d_gemm_bf16_nt_tiled|"
   "r4d_gemm_w4a16_nt_m64|"
   "r4d_gemm_w5a16_nt_m64|"
@@ -190,6 +211,8 @@ set(R4D_UNITS
   "r4d_kv_resolve|"
   "r4d_qsa_tail_store_bf16|"
   "r4d_qsa_work_bf16|"
+  "r4d_idx_pool_gated_f32|"
+  "r4d_idx_score_bf16|"
   "r4d_sample_chain_f32|"
   "r4d_model_bf16|"
   "r4d_sample_stages_f32|"
@@ -207,6 +230,8 @@ set(R4D_UNITS
   "r4d_rmsnorm_had_quant_i8|"
   "r4d_ar_ln_had_quant_i8|"
   "r4d_gated_had_quant_i8|"
+  # gated_quant_i8: the unrotated grouped int8 sibling, one workgroup a row for any row count.
+  "r4d_gated_quant_i8|"
   "r4d_qk_norm_rope_gate|"
   "r4d_gdn_gated_norm_had_quant_i8|"
   "r4d_dequant_w4_bf16|"
@@ -219,6 +244,13 @@ set(R4D_UNITS
   "r4d_pair_argmax_f32|"
   # LiLiCorr's correlator: candidates, lattice attention, factor input, walk.
   "r4d_lili|"
+  # Inkling 2's attention (attn_paged_rel): the relative-position bias and the row sinks at head_dim
+  # 128, any gqa, a plain kernel for every band.
+  "r4d_attn_rel|"
+  # Block attention residuals (Inkling 2): a softmax over depth, one workgroup a row.
+  "r4d_attn_res|"
+  # SiTU, Inkling 2's expert activation over a fused gate_up.
+  "r4d_situ|"
   # Gemma 4's sandwich-norm joins (norm_add_norm, norm_add_norm_route, join_add_scale) and
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
@@ -228,10 +260,18 @@ set(R4D_UNITS
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"
   "r4d_dflash_markov_bf16|"
+  # Inkling 2's recurrent DSpark walk (dspark_rnn_markov_greedy).
+  "r4d_dspark_rnn_markov|"
+  # Inkling 2's recurrent DSpark head: gate, vocabulary scan and reduction a step.
+  "r4d_markov_rnn|"
   "r4d_dflash_tree_bf16|"
   # Routed MoE: router, scatter, the grouped block-scaled fp8 GEMM and gather, in one unit because
   # the other three only feed the GEMM.
   "r4d_moe|"
+  # NVFP4 experts against an int8 activation: coalesced dot4 decode + WMMA prefill.
+  "r4d_moe_nvfp4|"
+  # Inkling 2 loop controller and plane-copy fusions (device-only).
+  "r4d_inkling|"
   # Blocks a row keeps for an output buffer, freed with the memory they serve (r4d_keyed.h).
   "r4d_keyed|"
 )

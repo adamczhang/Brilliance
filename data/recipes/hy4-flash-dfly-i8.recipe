@@ -1,0 +1,29 @@
+# hy4-flash-dfly-i8.recipe -- Hy4-flash's DFly2 drafter (the `dfly.*` tensors) at eight bits: every draft
+# linear but kv_a and kv_b as int8 codes rotated by the 128-wide Hadamard with a bf16 scale a (row,
+# 128 of K) (`i8*bf16[1x128]/fwht128`), the form the trunk's int8 linears are read in
+# (hy4-flash-i8.recipe). Meant to be appended to a trunk recipe, or used alone (a bf16 trunk with an
+# int8 drafter: the drafter's linears were 11% of a decode step in bf16, docs/HY4FLASH-QUANT.md).
+#
+#   rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-dfly-i8.recipe -o hy4-flash-dfly-i8.rad
+#
+# The plugin reads whatever form of the trunk's set (plain or rotated int8, IQ8R, the rotated u4/u5 and
+# trellis forms) a draft linear is stored in; this recipe is one choice, not a requirement. Not kv_a:
+# its 576 rows are no whole 128-row tile of libr4d's int8 prefill tile, so a draft pass of more than 64
+# rows (more than 10 sequences at depth 5) would fall to the host; kv_b is read by mla_project_kv, which
+# reads bf16 only (the plugin declines a quantised one); the token embedding, the norms, the
+# confidence head and the fusion gate stay as shipped. At TP every K a rank reads is a whole number
+# of 128 blocks at the real sizes (attention output 8192 by heads, MLP down 9216 by columns: 4608 at TP2,
+# 36 blocks; at TP4 2304, 18 blocks).
+#
+# PATTERN                              QUANTISER  OPTIONS
+dfly.blk.*.attn_q_a.weight             rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_q_b.weight             rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_gate.weight            rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_output.weight          rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.blk.*.ffn_gate_up.weight          rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.blk.*.ffn_down.weight             rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.fusion.weight                     rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.correct_gate.weight               rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.correct_up.weight                 rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+dfly.correct_down.weight               rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search

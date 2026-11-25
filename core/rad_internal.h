@@ -133,6 +133,14 @@ inline int64_t align_up(int64_t v, int64_t a) { return (v + a - 1) / a * a; }
 /* Human-readable byte counts, for every report that prints a size. */
 std::string humanb(int64_t bytes);
 
+/* B-03: the bring-up's phase lines. startup_phase is "startup: <what> in <x.x> s (at <y.y> s)":
+ * `in` counts from `phase_ns`, `at` from the engine's start `begin_ns` (Engine::start's
+ * startup_begin_ns_). startup_at is the " (at <y.y> s)" part alone, for a line that already says
+ * how long it took. A zero `begin_ns`, or a phase that began at the start, leaves `at` out; a clock
+ * read before a stamp counts as no time. */
+std::string startup_phase(const char* what, uint64_t phase_ns, uint64_t begin_ns, uint64_t now_ns);
+std::string startup_at(uint64_t begin_ns, uint64_t now_ns);
+
 /* The one monotonic clock for all elapsed-time logic. The idle-session tiers stamp an entry on
  * use and compare against the stamp in another translation unit, so both sides must use the same
  * clock. Monotonic so an NTP step cannot age entries. */

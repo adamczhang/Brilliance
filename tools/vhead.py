@@ -33,6 +33,7 @@ import argparse
 import errno
 import json
 import os
+import shutil
 import struct
 import tempfile
 
@@ -147,12 +148,25 @@ def main():
                                          "yours or writable by you (fs.protected_hardlinks)") from exc
                     raise
             else:
-                os.symlink(source, target)
+                try:
+                    os.symlink(source, target)
+                except (OSError, NotImplementedError):
+                    # Brilliance: Windows refuses symlinks without the privilege (WinError 1314).
+                    # A side file is not a shard, so a hard link or, across volumes, a copy will do.
+                    if os.path.isdir(source):
+                        shutil.copytree(source, target)
+                    else:
+                        try:
+                            os.link(os.path.realpath(source), target)
+                        except OSError:
+                            shutil.copy2(source, target)
         st_write(os.path.join(stage, "vhead.safetensors"),
                  out_ids + [("lm_head.vrow", vrow, "I32")] + out_w)
         with open(os.path.join(stage, "model.safetensors.index.json"), "w") as f:
             json.dump({"metadata": idx.get("metadata", {}), "weight_map": wm}, f)
         # POSIX rename can replace an empty directory but not one that gained files meanwhile.
+        if os.name == "nt" and os.path.isdir(dst) and not os.path.islink(dst):
+            os.rmdir(dst)  # Brilliance: Windows rename never replaces a directory; rmdir keeps the check
         os.rename(stage, dst)
     print(f"vhead.py: {dst}: " + " ".join(f"k{k}:{int((cls == i).sum())}" for i, k in enumerate(widths))
           + f", mean {sum(widths[i] * int((cls == i).sum()) for i in range(len(widths))) / V:.3f} b")

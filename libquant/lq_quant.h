@@ -2,8 +2,8 @@
  * grid off a rule, and the table each algorithm file exports its quantiser through.
  *
  * lq_registry.cpp holds the plugin's exports and the short quantisers (rtn, gptq, cast). An
- * algorithm with its own loop (AWQ, AutoRound, ParoQuant) has its own file and returns its
- * RadQuantizerInfo from the function named for it below.
+ * algorithm with its own loop (AWQ, AutoRound, ParoQuant) or a format of its own (bf16x12) has its
+ * own file and returns its RadQuantizerInfo from the function named for it below.
  */
 #pragma once
 #include "lq_grid.h"
@@ -57,7 +57,10 @@
       "absmax | mx (OCP shared exponent) | fixed | search (least squared error, imatrix-"        \
       "weighted when the converter has one)" },                                                 \
     { "scale_value", RAD_P_F64, nullptr, "the scale every block takes under rule=fixed" },     \
-    { "clamp", RAD_P_STR, "full", "a signed code's range: full or sym" }
+    { "clamp", RAD_P_STR, "full", "a signed code's range: full or sym" },                     \
+    { "divide", RAD_P_INT, "0",                                                                \
+      "1: a float code is round(x / scale) in f32 rather than x * (1 / scale), the arithmetic "  \
+      "of transformers' fp8 round trips (Hy4-flash's Engram); rule=absmax, an f32 scale" }
 
 /* The calibration option every calibrated quantiser takes. */
 #define LQ_CALIB_OPTION(WITHOUT)                                                                 \
@@ -102,5 +105,6 @@ const RadQuantizerInfo& awq_info();
 const RadQuantizerInfo& autoround_info();
 const RadQuantizerInfo& paroquant_info();
 const RadQuantizerInfo& m2xfp_info();
+const RadQuantizerInfo& bf16x12_info();
 
 }  /* namespace lq */

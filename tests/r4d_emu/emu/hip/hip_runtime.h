@@ -17,7 +17,12 @@
 #define __shared__ static
 #define __constant__
 #define __forceinline__ inline
-#define __launch_bounds__(n)
+/* Brilliance: HIP's own header defines __noinline__ (r4d_attn_rel.hip's decode scorer uses it); the
+ * emulator's host compile on Windows has no definition of it. */
+#ifndef __noinline__
+#define __noinline__ __attribute__((noinline))
+#endif
+#define __launch_bounds__(...)
 /* R4D_WAVES (r4d_common.h) names a kernel attribute; on the host it becomes an empty attribute */
 #define amdgpu_waves_per_eu(lo, hi)
 #define __align__(n) __attribute__((aligned(n)))
@@ -190,7 +195,7 @@ inline float emu_fdot2(V a, V b, float c, bool) {
 #define HALO_KLAUNCH(kernel, grid, block, stream, ...) emu_launch(&kernel, grid, block, __VA_ARGS__)
 #define HALO_EMIT(stream, kernel, grid, block, lds, ...) \
     emu_emit(#kernel, (kernel), (grid), (block), (size_t)(lds), __VA_ARGS__)
-/* global_load_tr_b128: not emulated; reported when reached */
+/* global_load_tr_b128 (emu.cpp): an 8x8 transpose of 16-bit elements across each group of 8 lanes */
 emu_v8s emu_load_tr_b128(const void* p);
 #define __builtin_amdgcn_global_load_tr_b128_v8i16(p) emu_load_tr_b128((const void*)(p))
 /* v_cvt_pk_fp8_f32 (gfx12, OCP E4M3): converts a and b into the low half of `old` (hi false) or

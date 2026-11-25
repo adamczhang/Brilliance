@@ -214,6 +214,19 @@ std::string humanb(int64_t b) {
     return i == 0 ? fmt("%lld B", (long long)b) : fmt("%.2f %s", v, u[i]);
 }
 
+static double secs_between(uint64_t from_ns, uint64_t to_ns) {
+    return to_ns > from_ns ? (double)(to_ns - from_ns) / 1e9 : 0.0;
+}
+
+std::string startup_at(uint64_t begin_ns, uint64_t now_ns) {
+    return begin_ns ? fmt(" (at %.1f s)", secs_between(begin_ns, now_ns)) : std::string();
+}
+
+std::string startup_phase(const char* what, uint64_t phase_ns, uint64_t begin_ns, uint64_t now_ns) {
+    return fmt("startup: %s in %.1f s", what, secs_between(phase_ns, now_ns)) +
+           (phase_ns == begin_ns ? std::string() : startup_at(begin_ns, now_ns));
+}
+
 std::vector<std::string_view> split_ws(std::string_view s) {
     std::vector<std::string_view> out;
     size_t i = 0;

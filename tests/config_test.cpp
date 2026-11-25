@@ -612,6 +612,8 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--p2p", { "off" } }, { "--max-num-batched-tokens", { "512" } },
         { "--busy-prefill-chunk", { "256" } }, { "--prefill-interleave", { "2" } },
         { "--mixed-step-target-ms", { "150" } },
+        { "--chunk-slices", { "4" } }, { "--chunk-slice-target-ms", { "200" } },
+        { "--chunk-slice-cost-pct", { "15" } },
         { "--prefill-room-gate", { "off" } },
         { "--preempt-wait-ms", { "5000" } },
         { "--max-num-seqs", { "4" } },
@@ -643,7 +645,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--draft-depth-min", { "2" } }, { "--draft-depth-stop", { "0.7" } },
         { "--draft-depth-lag", { "0" } }, { "--draft-depth-stat", { "path" } },
         { "--draft-depth-load", { "on", "--draft-depth", "adaptive" } },
-        { "--draft-depth-load-from", { "4" } }, { "--draft-depth-load-min", { "1" } },
+        { "--draft-depth-load-from", { "4" } }, { "--draft-depth-load-min", { "1" } }, { "--draft-depth-explore", { "7" } },
         { "--draft-depth-load-late", { "off" } }, { "--draft-depth-load-calib", { "static" } },
         { "--draft-depth-load-tok-ms", { "0.23,0.36,0.43,0.51" } },
         { "--draft-depth-load-row-ms", { "1.2,0.8" } }, { "--draft-depth-load-round-ms", { "0.5" } },
@@ -1171,8 +1173,9 @@ TEST(draft_depth_load_parses_and_needs_the_adaptive_chain) {
              RAD_E_INVAL);
     /* the knobs alone change nothing and are taken */
     CHECK_EQ(parse_fresh({ "--draft-depth-load-from", "8" }), RAD_OK);
+    CHECK_EQ(parse_fresh({ "--draft-depth-load-from", "1" }), RAD_OK);
     for (const char* bad : { "auto", "1", "" }) CHECK_EQ(parse_fresh({ "--draft-depth-load", bad }), RAD_E_INVAL);
-    for (const char* bad : { "1", "65", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-from", bad }), RAD_E_INVAL);
+    for (const char* bad : { "0", "65", "x" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-from", bad }), RAD_E_INVAL);
     for (const char* bad : { "0", "17" }) CHECK_EQ(parse_fresh({ "--draft-depth-load-min", bad }), RAD_E_INVAL);
     CHECK_EQ(parse_fresh({ "--draft-depth-load-calib", "auto" }), RAD_E_INVAL);
     for (const char* bad : { "a", "1,", "1;2", "-1", "0", "1,2,3,4,5,6,7,8,9" })

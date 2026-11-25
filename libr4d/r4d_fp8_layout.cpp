@@ -257,6 +257,66 @@ extern "C" int r4d_rad_layout_i8_block(const RadParam* p, int n_p, int operand,
     return i8_enc_layout(p, n_p, operand, enc, sel, pl, n, out);
 }
 
+/* gemm_nt_q_multi's weights: operand 6 + 2 i is slice i's codes and 7 + 2 i its scale
+ * (oGemmNtQMulti in r4d_rows.cpp), each in gemm_nt_q's stored form at that slice's N, so a
+ * weight the single linear also reads is stored once. */
+namespace {
+int i8_multi_args(const RadParam* p, int n_p, int operand, std::vector<RadParam>* pp, int* opd) {
+    static const char* const kN[5] = { "N0", "N1", "N2", "N3", "N4" };
+    const int i = (operand - 6) / 2;
+    if (operand < 6 || i >= 5) return RAD_E_UNSUPPORTED;
+    const long long Ni = r4d_pgeti_or(p, n_p, kN[i], 0);
+    if (Ni <= 0) return RAD_E_SHAPE;
+    pp->assign(p, p + n_p);
+    bool set = false;
+    for (RadParam& q : *pp)
+        if (q.key && std::strcmp(q.key, "N") == 0) { q.kind = RAD_P_INT; q.ival = Ni; set = true; }
+    if (!set) {
+        RadParam q{};
+        q.key = "N";
+        q.kind = RAD_P_INT;
+        q.ival = Ni;
+        pp->push_back(q);
+    }
+    *opd = (operand - 6) % 2 ? FL_BSCALE : FL_B;
+    return RAD_OK;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_i8_multi(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_layout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_i8_multi(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_relayout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, pl, n, dst,
+                                     dst_bytes);
+}
+
+extern "C" int r4d_rad_unrelayout_i8_multi(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const void* src, int64_t src_bytes,
+                                           const RadTensor* pl, int n) {
+    std::vector<RadParam> pp;
+    int opd = 0;
+    const int rc = i8_multi_args(p, n_p, operand, &pp, &opd);
+    if (rc != RAD_OK) return rc;
+    return r4d_rad_unrelayout_i8_block(pp.data(), (int)pp.size(), opd, enc, sel, src, src_bytes,
+                                       pl, n);
+}
+
 /* The same int8 weight at one scale per (row, 128 of K), both planes row-major as stored: what
  * the grouped expert GEMM reads, which stages a run's rows through LDS and gains nothing from a
  * permutation. An expert then goes from the container or a host pool to the kernel unchanged. */
@@ -527,8 +587,9 @@ extern "C" int r4d_rad_unrelayout_mtp_e4m3(const RadParam* p, int n_p, int opera
 /* ================================================================= embed_lookup_q's table
  *
  * The gather reads the table as stored, so this hook only checks that it can: E4M3 codes with one
- * bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe), or plain bf16
- * as the checkpoint ships it. libavx's host gather (avx_layout_ngram) accepts the same two forms
+ * bf16 scale for the whole table (`fp8_e4m3*bf16[*x*]`, the n-gram table's recipe) or one bf16
+ * scale a row (`bf16[1x*]` or `f32[1x*]`, Hy4-flash's Engram: the scale plane is read at the row's index, so it
+ * stays resident beside the codes), or plain bf16 as the checkpoint ships it. libavx's host gather (avx_layout_ngram) accepts the same two forms
  * with the same checks, so neither refuses at declare a table the other reads. */
 extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
                                       const RadEncoding* enc, const int* sel,
@@ -546,12 +607,14 @@ extern "C" int r4d_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
-        sc->block[1] != 0)
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->block[1] != 0 ||
+        (sc->block[0] != 0 && sc->block[0] != 1) ||
+        !(sc->dtype == RAD_BF16 || (sc->block[0] == 1 && sc->dtype == RAD_F32)))
         return RAD_E_DTYPE;
+    const bool per_row = sc->block[0] == 1;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
     if (!r4d_enc::selects(enc, sel, n, operand == EQ_WTE ? "codes" : "scale")) return RAD_E_SHAPE;
-    if (!r4d_enc::dims(pl[0], operand == EQ_WTE ? rows : 1, operand == EQ_WTE ? dim : 1))
+    if (!r4d_enc::dims(pl[0], operand == EQ_WTE || per_row ? rows : 1, operand == EQ_WTE ? dim : 1))
         return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }

@@ -8,8 +8,8 @@ It serves Radiance's HTTP API: OpenAI-style Chat Completions and Responses, and 
 A client that lets you set its base URL and model name can use it ([Connect a client](#connect-a-client));
 Open WebUI and OpenCode tool round trips were checked on Qwen3.8-27B.
 
-**This is a new fork, based on Radiance 2.2:** upstream's `v2.2.0` tag (`b6b8751c`, 2026-11-19), with the
-Windows port on top. It is not a continuation of Brilliance 0.2.2's code. It keeps upstream's YAML
+**This is a new fork, based on Radiance 2.2:** upstream's `main` at `1c104de4` (`v2.2.0-119-g1c104de4`,
+2026-11-24, 119 commits past the `v2.2.0` tag), with the Windows port on top. It is not a continuation of Brilliance 0.2.2's code. It keeps upstream's YAML
 configuration and model implementations; the port adds a Windows device backend and platform layer, and
 some of upstream's features work differently on Windows or not at all ([Feature parity](#feature-parity)).
 Plugins are built for Windows from a source build's SDK.
@@ -18,9 +18,11 @@ Plugins are built for Windows from a source build's SDK.
 - **Brilliance 0.2.2 is archived** at its original address,
   [codeberg.org/Dad_Vibes/Brilliance](https://codeberg.org/Dad_Vibes/Brilliance). Its `.rad` containers do
   not load in this version ([from 0.2.2](#from-brilliance-022)).
-- **Brilliance 0.3.0 is this fork's current release and its first stable one,** after five alpha
-  previews (0.3.0-alpha.1 was the first public release). Its package, `Brilliance-0.3.0-<sha>-win64.zip`,
-  is on the [v0.3.0 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0).
+- **Brilliance 0.3.1 is this fork's current release: initial Hy4-flash and Inkling 2 support.**
+  Hy4-flash IQR-V4 u3 runs on two and four cards as a preview, and Inkling 2 Mini on one card is
+  supported. 0.3.0 was the first stable release, after five alpha previews (0.3.0-alpha.1 was the
+  first public release). The package, `Brilliance-0.3.1-<sha>-win64.zip`, is on the
+  [v0.3.1 release page](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.1).
   Stable means the release gates passed on the tested hardware; it does not make every model or
   feature qualified. What is qualified, what is a preview and what is not supported is listed below
   and in [win/SUPPORT.md](win/SUPPORT.md).
@@ -45,13 +47,15 @@ Upstream's own README is kept unchanged as [RADIANCE-README.md](RADIANCE-README.
 
 ## Status
 
-Release 0.3.0. What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
+Release 0.3.1. What is qualified on Windows today, from [win/SUPPORT.md](win/SUPPORT.md):
 
 - **One card:** Qwen3.8-27B (IQ4R-L-V4 qualified, IQ8R-V4 soak-clean); Gemma 4 31B a4 and Gemma 4
   12B i8g, qualified (chat, tools, pictures and video; audio too on the 12B).
 - **MiniCPM5-2B IQ8R on one card** is qualified for the local first run and tested text and tool
   APIs. Cancelling an active decode is unverified. CPU serving with drafting off is preview.
   [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification)
+- **Inkling 2 Mini on one card** is supported (two containers, one with DSpark drafting): text,
+  tools and pictures. No soak or concurrency qualification yet.
 - **Two cards:** soak-clean when the weights fit the cards (Qwen3.8-27B IQ8R-V4); Qwen3.6-35B-A3B
   IQ8R qualified, every expert on the cards. DeepSeek-V4.1-Flash-1017 runs as a preview with the experts
   that do not fit held in host memory, matching four cards in distribution within a measured numeric
@@ -61,6 +65,8 @@ Release 0.3.0. What is qualified on Windows today, from [win/SUPPORT.md](win/SUP
   them, and a stop beside a large build is untested.
   DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container) runs as a preview with every routed
   expert on the cards.
+- **Hy4-flash IQR-V4 u3** runs as a preview on four cards with every routed expert on the cards, and
+  on two cards with the experts that do not fit held in host memory (text and tools; DFly2 drafting).
 - **Model switching on one card** by parking, with HIP virtual memory.
 - **Embeddings** (`/v1/embeddings`) with EmbeddingGemma 2.
 - **Transcription and realtime** (`/v1/audio/transcriptions`, `/v1/realtime`) with Qwen3-ASR 1.7B, and
@@ -87,7 +93,7 @@ The main known issues ([all of them](win/SUPPORT.md#known-issues)):
   path uses `BRILLIANCE_H264_ENCODER=h264_mf`. [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification)
 - **The Sandbox fleet is preview.** Switching to LTX on one card produced a VRAM-admission 503.
   LTX served a video when loaded first in a fresh Sandbox. [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification)
-- **Speech synthesis (TTS) is not supported** in 0.3.0, and **music generation is not served**:
+- **Speech synthesis (TTS) is not supported** in 0.3.1, and **music generation is not served**:
   `/v1/audio/speech`, which both use, answers 501, "not supported in this build", for every model.
   A request for something the loaded model does not do (chat on an image model, say) answers 501 with the
   reason. A path the server does not have answers 404, and a missing key or a malformed request is refused
@@ -128,8 +134,8 @@ Check your hardware before you download anything:
 
 ### 2. Get the package
 
-Download `Brilliance-0.3.0-<sha>-win64.zip` from the
-[v0.3.0 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0), check it
+Download `Brilliance-0.3.1-<sha>-win64.zip` from the
+[v0.3.1 release](https://github.com/adamczhang/Brilliance/releases/tag/v0.3.1), check it
 against the `.sha256` beside it (`Get-FileHash <zip>` in PowerShell), and unzip it anywhere; a path with spaces
 works. You can also [build it from source](#building-from-source). With no usable GPU, the same package serves
 on the CPU: `serve.ps1 -Cpu` ([Serving on the CPU](#serving-on-the-cpu)). A CPU-only package
@@ -177,15 +183,18 @@ Every container is on Hugging Face:
 | Container file | Repository | Size | Profiles |
 |---|---|---|---|
 | `minicpm5-2b-iq8r.rad` | [`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r) | 3.04 GiB | `minicpm5-2b-1card` |
+| `inkling-2-mini-iq8r.rad` | [`StillDeadcode/inkling-2-mini-iq8r`](https://huggingface.co/StillDeadcode/inkling-2-mini-iq8r) | 26.14 GiB | `inkling2-mini-1card` |
+| `inkling2-mini-i8-vl-dspark.rad` | [`gostar77/inkling2-mini-i8-dspark-radiance`](https://huggingface.co/gostar77/inkling2-mini-i8-dspark-radiance) | 17.83 GiB | `inkling2-mini-dspark-1card` |
 | `qwen3.8-27b-iq4r-l-v4.rad` | [`StillDeadcode/qwen3.8-27b-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-27b-iqr-v4) | 17.42 GiB | `qwen27-preview`, `qwen27-8k-plain` |
 | `qwen3.8-27b-iq8r-v4.rad` | the same repository | 27.58 GiB | `qwen27-iq8r-1card`, `qwen27-iq8r-2card` |
-| `qwen3.8-next-flash-iqr-v4.rad` | [`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | 113.32 GiB | `flashnext-4card`, `flashnext-2card`, `flashnext-2card-fast` |
+| `qwen3.8-next-flash-iqr-v4.rad` | [`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4) | 113.32 GiB | `flashnext-4card`, `flashnext-2card`, `flashnext-2card-fast`, `flashnext-2card-512k` |
 | `gemma4-31b-a4.rad` | [`keptn/gemma4-31b-a4`](https://huggingface.co/keptn/gemma4-31b-a4) | 19.95 GiB | `gemma4-31b-1card` |
 | `gemma4-12b-i8g.rad` | [`keptn/gemma4-12b-i8g`](https://huggingface.co/keptn/gemma4-12b-i8g) | 13.79 GiB | `gemma4-12b-1card` |
 | `qwen3.6-35b-a3b-iq8r.rad` | [`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r) | 35.04 GiB | `qwen36-35b-2card` |
 | `qwen-image-2.1-iq8r.rad` | [`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r) | 16.13 GiB | `qwen-image-1card` |
 | `ltx-2.5-distilled-iq8r.rad` | [`StillDeadcode/radiance-ltx-2.5-distilled-iq8r`](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-iq8r) (gated: accept its licence with your own account) | 36.86 GiB | `ltx-2.5-1card` |
 | `deepseek-v4.1-flash-1017-uncensored.rad` | [`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad) (six parts to join, as its `RUNNING.md` says; `-Fetch` does not join them) | 251.13 GiB | `deepseek41-4card`, `deepseek41-2card` |
+| `hy4-flash-iqr-v4-u3.rad` | [`keptn/hy4-flash-iqr-v4`](https://huggingface.co/keptn/hy4-flash-iqr-v4) | 128.61 GiB | `hy4-4card-dfly`, `hy4-2card`, `hy4-2card-dfly` |
 
 Each profile's comment has its file's SHA-256 (`qwen3.8-27b-iq4r-l-v4.rad`:
 `d57d1428218e20a4cd578c3e286f30a2e566e589c832bf5004f49e164cb48ae4`). The other models in
@@ -379,19 +388,26 @@ Select-String -Path .\radiance-qwen27-preview.log -Pattern 'listening on'   # pr
 | `flashnext-4card` | Qwen3.8-Flash-Next IQR-V4 | 4 (TP4), every expert on the cards | **Supported**. Long-run stability is unproven on the current profile; its stops are bounded without CPU load beside them, and a stop beside a large build is untested. [Known issues](win/SUPPORT.md#known-issues) | 256K | 8 | MTP, adaptive depth to 5 | bf16 |
 | `flashnext-2card` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Supported**, recommended safe profile | 256K | 8 | MTP, adaptive depth to 5 | int8 |
 | `flashnext-2card-fast` | Qwen3.8-Flash-Next IQR-V4 | 2 (TP2), experts tiered to host memory | **Runs** (functional smoke), fastest option | 256K | 8 | MTP, adaptive depth to 5 | int8 |
+| `flashnext-2card-512k` | Qwen3.8-Flash-Next IQR-V4, static YaRN | 2 (TP2), experts tiered to host memory | **Runs**: loads and retrieves at 500K and 520K ([SUPPORT.md](win/SUPPORT.md#context-slots-and-the-kv-cache)) | 512K | 2 | MTP, adaptive depth to 5 | int8 |
 | `gemma4-31b-1card` | Gemma 4 31B a4 | 1 | **Qualified** | 32K | 2 | MTP, depth 3 | bf16 |
 | `gemma4-12b-1card` | Gemma 4 12B i8g | 1 | **Qualified** | 32K | 4 | MTP, depth 3 | bf16 |
+| `inkling2-mini-1card` | Inkling 2 Mini IQ8R (text, tools, pictures) | 1 | **Supported**: loads and serves; API checks pass. No soak or concurrency qualification yet | 32K | 4 | off | int8 |
+| `inkling2-mini-dspark-1card` | Inkling 2 Mini, NVFP4 experts, DSpark (text, tools, pictures) | 1 | **Supported**: loads and serves; API checks pass. No soak or concurrency qualification yet | 128K | 4 | DSpark, depth 7, adaptive window | int8 |
 | `qwen36-35b-2card` | Qwen3.6-35B-A3B IQ8R | 2 (TP2), every expert on the cards | **Qualified** | 32K | 4 | MTP, depth 3 | int8 |
 | `qwen-image-1card` | Qwen-Image 2.1 IQ8R (pictures) | 1 | **Qualified** for generation; edits: known issue 13 | Pictures to 2048x2048, the default | - | off | - |
 | `ltx-2.5-1card` | LTX-2.5 distilled IQ8R (video with sound) | 1 | **Qualified** for standalone jobs with `h264_mf`. AMD AMF encoding is not yet qualified. [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification) | Videos to 6.7 s, 960x544 by default | 1 | off | - |
 | `deepseek41-4card` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 4 (TP4), every routed expert on the cards | **Runs, not yet qualified** (preview) | 4K | 1 | off | bf16 |
 | `deepseek41-2card` | DeepSeek-V4.1-Flash-1017 (bakon3's uncensored container; text) | 2 (TP2), experts that do not fit held in host memory | **Runs, not yet qualified** (preview); matches four cards in distribution within a measured numeric tolerance ([known issue 14](win/SUPPORT.md#known-issues)) | 4K | 1 | off | bf16 |
+| `hy4-4card-dfly` | Hy4-flash IQR-V4 u3 (text, tools) | 4 (TP4), every routed expert on the cards | **Preview**: loads and serves; smoke and greedy consistency checks pass | 64K | 8 | DFly2, five positions, adaptive depth | bf16 |
+| `hy4-2card` | Hy4-flash IQR-V4 u3 (text, tools) | 2 (TP2), experts tiered to host memory | **Preview**: loads and serves; smoke and greedy consistency checks pass | 8K | 1 | off | bf16 |
+| `hy4-2card-dfly` | Hy4-flash IQR-V4 u3 (text, tools) | 2 (TP2), experts tiered to host memory | **Preview**: loads and serves; smoke and greedy consistency checks pass; slower on prose than `hy4-2card` | 32K | 2 | DFly2, five positions, adaptive depth | bf16 |
 
 - **Context and requests at once are limits, not a promise that all of them fit at full length.** Context is
   the longest one request may be; requests at once is how many the scheduler runs together. All of them
   share one KV cache, which can hold fewer tokens than the two multiplied. On the test machine: about 131K
   tokens for `qwen27-preview` and `minicpm5-2b-1card` (4 x 32K fit), about 55.6K for `qwen27-iq8r-1card`, about 262K for
-  `flashnext-2card` and about 919K for `flashnext-4card`. The startup log gives the figure on your machine
+  `flashnext-2card`, about 524K (one 512K context) for `flashnext-2card-512k` and about 919K for
+  `flashnext-4card`. The startup log gives the figure on your machine
   (`kv cache ... tokens`).
 - **Name the cards a profile needs** with `-Bus` (or `-Device`): `-Bus 6` for one card, `-Bus 3,9` for two.
   With neither, the server sees `$env:HIP_VISIBLE_DEVICES`'s cards if it is set, else every discrete card
@@ -584,7 +600,7 @@ $env:MY_KEY = Read-Host 'API key'                                 # set the key 
 
 ### 8. Optional: run as a Windows service
 
-The LocalSystem service is a **preview in 0.3.0**. Host tests and dry runs cover setup, simulated
+The LocalSystem service is a **preview in 0.3.1**. Host tests and dry runs cover setup, simulated
 stop controls, and a console-mode health, API-key and stop check with no model loaded. Elevated
 Service Control Manager (SCM) install, key file permissions (ACL), graceful stop and detachment,
 boot and preshutdown, reinstall, and one-restart recovery remain unverified. The launcher's
@@ -631,7 +647,7 @@ embedding coverage. The CPU-only package (`-win64-cpu`) can be built from source
 - **Bugs and questions about the Windows build:** open an issue at
   [github.com/adamczhang/Brilliance/issues](https://github.com/adamczhang/Brilliance/issues). Check
   [win/SUPPORT.md](win/SUPPORT.md)'s known issues first.
-- **Include:** the release (`0.3.0`, or the `MANIFEST.json` commit), the Adrenalin driver version, the
+- **Include:** the release (`0.3.1`, or the `MANIFEST.json` commit), the Adrenalin driver version, the
   cards and the `-Bus` you gave, the profile and anything you changed in it, the exact command (with any key
   removed), and the server's log from its start to the failure.
 - **A server that stopped making progress:** read it with `bin\brl-stacks.exe` before stopping it
@@ -677,9 +693,12 @@ The engine's own third-party code (cpp-httplib, yyjson, llama.cpp and the rest) 
 ### What you need to build from source
 
 - **Git.**
-- **Visual Studio Build Tools with the C++ workload:** the MSVC 14.51 toolset and the Windows SDK
+- **Visual Studio Build Tools with the C++ workload:** an MSVC toolset and the Windows SDK
   10.0.26100.0. ROCm's clang compiles against the MSVC STL, the UCRT and the Windows SDK, and links with
-  them. `setup.ps1` checks for them and does not install them.
+  them. `setup.ps1` checks for them and does not install them. MSVC 14.51 is the tested toolset and is
+  used whenever it is installed. Without it, `setup.ps1` takes the newest installed 14.x newer than 14.51
+  (a fresh Build Tools 18.12 installs 14.52 only) and says so with a warning; add MSVC 14.51 from the
+  Visual Studio Installer's Individual components to build with the tested one.
 - **Everything else is pinned and fetched by [`win\setup.ps1`](win/setup.ps1)** into `.toolchain\` in the
   checkout, each archive checked against the SHA-256 written in the script:
 
@@ -707,6 +726,8 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | Qwen3.8-27B IQ8R-V4 (same repository, `qwen3.8-27b-iq8r-v4.rad`, 27.58 GiB) | **Soak-clean**: 16K x 4, int8 KV, DFlash2 | **Soak-clean**: 32K x 4, DFlash2 | Not run |
 | Qwen3.8-Flash-Next IQR-V4 ([`StillDeadcode/qwen3.8-next-flash-iqr-v4`](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-iqr-v4), 113 GiB) | Not run (upstream lists a one-card layout with experts in host memory) | **Supported**: with production settings a lost write is re-sent, at about 4% of single-stream decode. Long-run stability is unproven on the current profile. Profile: `flashnext-2card` | **Supported**: every expert on the cards (`placement: all_vram`). Long-run stability is unproven on the current profile; its stops are bounded without CPU load beside them, and a stop beside a large build is untested. Profile: `flashnext-4card` |
 | MiniCPM5-2B IQ8R ([`StillDeadcode/minicpm5-2b-iq8r`](https://huggingface.co/StillDeadcode/minicpm5-2b-iq8r), 3.04 GiB) | **Qualified** for the local first run and tested Chat Completions, Responses and Messages text and tool APIs, including streaming. Active decode cancellation is unverified. CPU kernels are **preview** with drafting off (`-Cpu`). Profile: `minicpm5-2b-1card`. [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification) | - | - |
+| Inkling 2 Mini IQ8R ([`StillDeadcode/inkling-2-mini-iq8r`](https://huggingface.co/StillDeadcode/inkling-2-mini-iq8r), 26.14 GiB) | **Supported**: loads on one card in about 12 s (28.13 GiB of it); chat, Responses and Messages, streaming, tool calls and a picture checked on one card. 32K x 4, int8 KV, no drafting (the container's int8 drafter needs a later upstream release, and a start with drafting on is refused). No soak or concurrency qualification yet; long-run stability is unproven. Profile: `inkling2-mini-1card` | Not run | - |
+| Inkling 2 Mini with DSpark ([`gostar77/inkling2-mini-i8-dspark-radiance`](https://huggingface.co/gostar77/inkling2-mini-i8-dspark-radiance), 17.83 GiB) | **Supported**: loads on one card in 10 to 23 s (29.41 GiB of it); chat, Responses and Messages, streaming, tool calls and a picture checked on one card, and the drafter proposes and is verified. 128K x 4, int8 KV, DSpark seven deep on an adaptive window. No soak or concurrency qualification yet; long-run stability is unproven. Profile: `inkling2-mini-dspark-1card` | Not run | - |
 | EmbeddingGemma 2 bf16 (`google/embeddinggemma-2`, converted with `rad-convert`, 1.40 GiB) | **Qualified**: `/v1/embeddings` for text, pictures, video and audio; also on the CPU kernels | - | - |
 | Qwen3-ASR 1.7B bf16 (`Qwen/Qwen3-ASR-1.7B-hf` as it ships, 4.09 GB) | **Qualified**: `/v1/audio/transcriptions` (5 formats, 4 response forms) and `/v1/realtime`, 16 sequences | - | - |
 | Nemotron 3.5 Rerank 8B BF16 (`nvidia/Nemotron-3.5-Rerank-8B-BF16` as it ships, 16.78 GB) | **Qualified**: `/rerank` and `/v1/rerank`, text and picture documents, 32,768 tokens a pair | - | - |
@@ -717,6 +738,7 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
 | Qwen3.6-35B-A3B IQ8R ([`StillDeadcode/qwen3.6-35b-a3b-iq8r`](https://huggingface.co/StillDeadcode/qwen3.6-35b-a3b-iq8r), 35.04 GiB) | - | **Qualified**: chat, Responses and Anthropic Messages, whole and streamed; tools; pictures and video; 32K x 4, int8 KV, MTP; every expert on the cards. It thinks before answering by default. Audio is refused with a 501 | Not run |
 | Qwen-Image 2.1 IQ8R ([`StillDeadcode/radiance-qwen-image-2.1-iq8r`](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-iq8r), 16.13 GiB; non-commercial licence) | **Qualified** for generation: `/v1/images/generations`, PNG, JPEG and WebP; a seed repeats its picture byte for byte; sizes from 512x512 to the default 2048x2048. Edits work for most seeds ([known issue 13](win/SUPPORT.md#known-issues)) | Not run | - |
 | DeepSeek-V4.1-Flash-1017, bakon3's uncensored container ([`bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad`](https://huggingface.co/bakon3/DeepSeek-V4.1-Flash-1017-uncensored-rad), 251.13 GiB; MIT) | - | **Runs, not yet qualified** (preview): experts that do not fit the cards held in host memory (about 61 GiB less available while it serves); matches four cards in distribution within a measured numeric tolerance, while greedy text can differ token by token ([known issue 14](win/SUPPORT.md#known-issues)). Send `temperature` with each request. Profile: `deepseek41-2card` | **Runs, not yet qualified** (preview): text, chat with thinking on and off; 4K x 1, bf16 KV, no drafting; every routed expert on the cards, the 103 GiB Engram table read from the file. Send `temperature` with each request. Profile: `deepseek41-4card` |
+| Hy4-flash IQR-V4 u3 ([`keptn/hy4-flash-iqr-v4`](https://huggingface.co/keptn/hy4-flash-iqr-v4), 128.61 GiB; Tencent Hy License 1.0) | Not run | **Preview**: 8K x 1, no drafting, experts tiered to a pinned host pool; smoke and greedy consistency checks pass. With DFly2 at 32K x 2, slower on prose. Profiles: `hy4-2card`, `hy4-2card-dfly` | **Preview**: 64K x 8, DFly2 drafting, every expert on the cards; smoke and greedy consistency checks pass. Profile: `hy4-4card-dfly` |
 | Other upstream models | Not run on Windows. The package carries many of upstream's architecture plugins, but no other model has been checked. Speech-synthesis and music models cannot be served by this build | | |
 
 **The profiles** cover qualified, soak-clean, supported and preview configurations.
@@ -735,8 +757,13 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
   on the exact wire. A lost write is re-sent. Long-run stability is unproven on the current
   profile. A faster prefill for long prompts is opt-in (`-Env BRILLIANCE_TP2_PIPELINE=1`), exact
   on the exact wire.
+- Qwen3.8-Flash-Next IQR-V4, 2 cards, 512K context, **Runs**: `flashnext-2card-512k` (512K x 2, static
+  YaRN), not yet qualified. [Context, slots and the KV cache](win/SUPPORT.md#context-slots-and-the-kv-cache)
 - Gemma 4 31B a4, 1 card, **Qualified**: `gemma4-31b-1card` (32K x 2).
 - Gemma 4 12B i8g, 1 card, **Qualified**: `gemma4-12b-1card` (32K x 4).
+- Inkling 2 Mini, 1 card, **Supported**: `inkling2-mini-dspark-1card` (gostar77's container, 128K x 4,
+  DSpark drafting) and `inkling2-mini-1card` (StillDeadcode's IQ8R container, 32K x 4, no drafting);
+  text, tools and pictures. No soak or concurrency qualification yet.
 - Qwen3.6-35B-A3B IQ8R, 2 cards, **Qualified**: `qwen36-35b-2card` (32K x 4). It thinks
   before answering by default, and a client's token limit counts the reasoning too.
 - Qwen-Image 2.1 IQ8R, 1 card, **Qualified** for generation: `qwen-image-1card`. Some of its edits
@@ -752,6 +779,11 @@ Status words as [win/SUPPORT.md](win/SUPPORT.md) records them, measured on four 
   that do not fit the cards held in host memory. It matches the four-card profile in distribution within a
   measured numeric tolerance; send `temperature` with each request, and expect greedy text to differ between
   layouts ([known issue 14](win/SUPPORT.md#known-issues)).
+- Hy4-flash IQR-V4 u3, 4 cards, **Preview**: `hy4-4card-dfly` (64K, eight requests, the DFly2 drafter),
+  every routed expert on the cards. 2 cards, **Preview**: `hy4-2card` (8K, one request, no drafting),
+  the experts that do not fit held in a pinned host pool; `hy4-2card-dfly` (32K, two requests, DFly2)
+  is slower on prose than `hy4-2card`. Its licence asks large Model-as-a-Service
+  businesses for a separate licence ([Licence and credits](#licence-and-credits)).
 
 **Brilliance 0.2.2's containers do not load.** Radiance 2.2 does not read the 0.2.2-era formats: whole-model
 FP8, EXL3, the old Flash-Next FP8/IQ4R, GLM-5.3-Flash MXFP4, Brilliance 0.2.2's DeepSeek-V4.1 containers and
@@ -771,10 +803,10 @@ Radiance 2.2's features, and where each stands on Windows, from [win/SUPPORT.md]
 | Embeddings (`/v1/embeddings`) | **Yes** | EmbeddingGemma 2, on one card and on the CPU kernels; batches, `dimensions`, base64 |
 | Rerank | **Yes** | Nemotron 3.5 Rerank 8B, one card; `/rerank` and `/v1/rerank`, text and picture documents |
 | Transcription (`/v1/audio/transcriptions`), realtime | **Yes** | Qwen3-ASR 1.7B, one card; five upload formats, `/v1/realtime` over a WebSocket |
-| Speech synthesis (TTS) | **Not supported in 0.3.0** | `/v1/audio/speech`, `/audio/speech` and `/v1/audio/speech/stream` are refused (501; the socket closes 1008) |
+| Speech synthesis (TTS) | **Not supported in 0.3.1** | `/v1/audio/speech`, `/audio/speech` and `/v1/audio/speech/stream` are refused (501; the socket closes 1008) |
 | Image generation | **Yes** | SDXL base 1.0 bf16, converted on the CPU from the single-file checkpoint plus CLIP's `tokenizer.json` (9.6 s, 6.39 GiB), on one card; PNG, JPEG and WebP as `b64_json`; `url` refused; seeds repeat; `n` 1-8; about 5.4 s at 1024x1024, 28 steps |
 | Video generation | **Qualified with `h264_mf`** | LTX-2.5 distilled IQ8R standalone text and image-reference jobs on one card, including in-progress cancellation. AMD AMF encoding is not yet qualified. MP4s are marked AI-generated in their metadata. [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification) · [H.264](#h264) |
-| Music generation | **Not supported in 0.3.0** | It shares `/v1/audio/speech`, which the Windows build refuses |
+| Music generation | **Not supported in 0.3.1** | It shares `/v1/audio/speech`, which the Windows build refuses |
 | Multi-model fleet, routing, reload | **Yes** | The Sandbox fleet is **preview**. Switching to LTX on one card produced a VRAM-admission 503. Reload by `POST /admin/reload` or `tools\reload-server.ps1` (Windows' SIGHUP). [RC4 evidence](win/SUPPORT.md#alpha5-rc4-qualification) |
 | Model switching | **Yes** | One card visible: by parking. Several cards visible: by unloading and reloading; since 2026-11-18 a reload keeps its VRAM (PAL's resource cache off). Repeated switching at TP2 checked 2026-11-19 (Qwen3.8-Flash-Next and Qwen3.8-27B IQ8R, 40 alternating requests, no memory drift; queued requests and a pinned model's refusal as documented), not qualified. A fleet of several models on more than one card needs `gpu-memory-mib` on each model ([SUPPORT](win/SUPPORT.md), known issue 2) |
 | Parking (HIP virtual memory) | **Partial** | On with exactly one device visible: an elastic KV cache, and parking with no host copies. Off with more than one (rocm-systems#13232) |
@@ -790,7 +822,7 @@ Radiance 2.2's features, and where each stands on Windows, from [win/SUPPORT.md]
 | `rad-convert` | **Partial** | CPU only, by decision; `--gpus` is refused. A real model converted: SDXL, 9.6 s on the CPU |
 | `rad-export` (finetune to container) | **Yes** | With Python 3 (`bin\rad-export.cmd`), which runs the package's converter and recipes ([What you need to run it](#what-you-need-to-run-it)) |
 | Model fetch by repository id | **Yes** | `hfget.ps1`, with curl.exe and PowerShell |
-| Windows service (LocalSystem) | **Preview in 0.3.0** | Host and dry-run setup checks, simulated service controls, and console-mode health, API-key and stop checks. Elevated SCM install, key ACL, graceful stop and detachment, boot and preshutdown, reinstall, and one-restart recovery are unverified. The launcher's no-card guard blocks the no-GPU recovery drill when HIP enumeration succeeds. Start with `-Install -WhatIf`. [Service preview](win/SERVICE.md) |
+| Windows service (LocalSystem) | **Preview in 0.3.1** | Host and dry-run setup checks, simulated service controls, and console-mode health, API-key and stop checks. Elevated SCM install, key ACL, graceful stop and detachment, boot and preshutdown, reinstall, and one-restart recovery are unverified. The launcher's no-card guard blocks the no-GPU recovery drill when HIP enumeration succeeds. Start with `-Install -WhatIf`. [Service preview](win/SERVICE.md) |
 | `--ngram-placement ram=DIR` | **Partial** | Device tests pass; not run end to end |
 | Plugin SDK, out-of-tree plugins | **Partial** | From a source build's install; not in the package |
 | Linux `scripts/` (measurement, traces, Docker) | **Not on Windows** | `win/tools` has the Windows tools |
@@ -877,6 +909,12 @@ are theirs; Brilliance adds the Windows port. To support the development of Radi
     keep that marking.
   - [win/TERMS-OF-USE.md](win/TERMS-OF-USE.md), the template the server shows at `/terms`, carries the use
     restrictions to pass on ([Serve the local network](#7-serve-the-local-network)).
+  - **Hy4-flash** is under Tencent's Hy License 1.0, derived from Apache 2.0: a Model-as-a-Service business
+    with more than US$50 million a year in revenue, or a product with more than 100 million monthly active
+    users, needs a separate licence from Tencent first; use solely for internal purposes is excepted.
+- **The Hy4-flash port** (its architecture, kernels and the scheduler, placement and drafting work that came
+  with it) comes from [Code000-211/RadianceHy4Flash](https://github.com/Code000-211/RadianceHy4Flash), a
+  radiance fork by Code000 and its contributors, under Apache-2.0; [NOTICE](NOTICE) records it.
 
 Thanks to **Roberto Franchetti** for one-to-one testing of Brilliance 0.2 on a four-R9700 machine of their
 own. Those runs traced the earlier port's pinned-memory limit to the integrated GPU left visible to the
@@ -886,7 +924,7 @@ runtime.
 
 What ships for H.264 ([THIRD-PARTY.md, "H.264"](win/licenses/THIRD-PARTY.md#h264), has the whole of it):
 
-- **No H.264 encoder implementation ships in Brilliance 0.3.0.** OpenH264 and x264 are not included.
+- **No H.264 encoder implementation ships in Brilliance 0.3.1.** OpenH264 and x264 are not included.
 - **The bundled FFmpeg keeps exactly two H.264 encoders**, both thin wrappers over encoders their makers
   license:
   - `h264_amf`: AMD's hardware encoder, through AMF, whose runtime comes with the AMD driver;
@@ -899,7 +937,7 @@ What ships for H.264 ([THIRD-PARTY.md, "H.264"](win/licenses/THIRD-PARTY.md#h264
   encoders, and so does image to video's first-frame round trip. It works on one card and is not yet
   qualified. `h264_amf` encodes on the first display adapter Windows lists: on a machine with an AMD
   integrated GPU, the integrated GPU, not the card that runs the model.
-- **Speech synthesis (TTS) is not supported** in 0.3.0; its endpoint answers 501. Music
+- **Speech synthesis (TTS) is not supported** in 0.3.1; its endpoint answers 501. Music
   generation, which shares that endpoint, is not served either (no model yet); it writes WAV
   or raw PCM and needs no encoder.
 - **Decoding H.264 input** (video sent in requests) uses FFmpeg's built-in decoder. H.264 decoding is

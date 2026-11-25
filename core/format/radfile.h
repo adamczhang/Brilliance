@@ -263,6 +263,10 @@ public:
     /* `bytes` of plane `k` of weight `idx`, at byte `off` within the plane. */
     int write_plane(int64_t idx, int k, int64_t off, const void* data, int64_t bytes);
     int64_t plane_bytes(int64_t idx, int k) const;
+    /* A skeleton: planes the caller never writes stay holes (a sparse file) and finish() does not
+     * insist they were written. Only for a container that is declared and never read (rad-convert
+     * --skeleton); call before finish(). */
+    void    allow_unwritten_planes() { holes_ok_ = true; }
 
     /* Intern into the .rad's single string blob. Public for core/text's vocab writer (via
      * StringSink). */
@@ -300,7 +304,7 @@ private:
     int64_t     spill_base_ = 0;    /* where blob offset 0 is in fd_spill_: 0, append_base_ or
                                      * the sealed data_off */
     bool        began_ = false;
-    bool        sealed_ = false, late_ = false;
+    bool        sealed_ = false, late_ = false, holes_ok_ = false;
     RadFileHeader hdr_{};           /* the sealed layout */
 
     /* Append mode (begin_append). New bytes go at `append_base_`, the old length rounded up to a

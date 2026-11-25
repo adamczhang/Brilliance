@@ -549,6 +549,7 @@ dequantisation where the architecture's kernels read another form, and NVFP4 alw
 | `compressed-tensors` with an `nvfp4-pack-quantized` config group (`weights`: 4-bit float, group 16) | `fp4_e2m1*f32[1x16]` | the packed e2m1 codes beside an f32 scale per 16 of K, `weight_scale / weight_global_scale`: the global scale is a divisor, as compressed-tensors' dequantise and vLLM read it. Each piece keeps its own global, so a fused gate\|up reads both exactly. No kernel serves NVFP4, so every NVFP4 weight takes a recipe rule |
 | `compressed-tensors` whose config groups are all `float-quantized` with 8-bit `float` weights | `fp8_e4m3*<scale>[1x*]` or `[RxC]` | nothing is imported: each `X.weight` reads stock as FP8 with `X.weight_scale` beside it, one scale a row (`[N, 1]` or `[N]`, the channel strategy) or a block plane; a per-tensor scale (`[1]`) is written once a row, so it is imported rather than byte for byte. This build serves neither FP8 form, so each takes a recipe rule |
 | `modelopt` (NVIDIA ModelOpt) with `quant_algo` `NVFP4`, `FP8`, or `MIXED_PRECISION` whose `quantized_layers` are each NVFP4 (group 16) or FP8 (e.g. ukisai's Swift 1.5 27B NVFP4) | NVFP4: `fp4_e2m1*f32[1x16]`; FP8: `fp8_e4m3*f32[1x*]` | NVFP4: `X.weight` (U8 `[N, K/2]`, the even k in the low nibble) beside an f32 scale per 16 of K, `float(X.weight_scale) * X.weight_scale_2`: ModelOpt's second level multiplies, where compressed-tensors' global scale divides. FP8: `X.weight` E4M3 with its one f32 `X.weight_scale`, written once a row. `X.input_scale` (a static activation scale) is not read: activations are quantised from their own values. Any other algorithm is refused by name. No kernel serves NVFP4, and none an FP8 scale per tensor, so both take recipe rules |
+| `hf_quant_config.json` with `model.parameter_groups` (Inkling 2's per-tensor release; it takes precedence over `config.json`'s `quantization_config`) | the stacked routed experts of the `nvfp4` groups: `fp4_e2m1*fp8_e4m3[1x16]*f32[*x*]`; of the `mxfp8` groups: `fp8_e4m3*e8m0[1x32]` | each expert read whole and as shipped (`import_expert`): NVFP4's codes, its e4m3 scales and its level, amax over the one divisor, not folded; MXFP8's codes and exponents. A stacked tensor is named by expert in the map (`src_index`). Every other group reads stock. A missing companion, a scale shape that does not divide the group, a NaN scale or a zero divisor is refused by name |
 | GGUF `Q8_0`, `Q4_K` and `Q6_K` tensors (a GGUF file, not a `quantization_config`) | `i8*f16[1x32]`, `affine:codes=u4[1x1],scale=u6[1x32],scale.1=f16[1x256],min=u6[1x32],min.1=f16[1x256]` and `i6*i8[1x16]*f16[1x256]` | the blocks split into their planes, bit for bit; a rule re-quantises from the exact dequantisation. Not served as they stand: the loader refuses them with the hint to serve the container `rad-convert` writes |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
@@ -602,6 +603,14 @@ python3 data/imatrix_merge.py imatrix_unsloth.gguf_file imatrix-merged.gguf
 rad-convert /srv/models/deepseek-ai/DeepSeek-V4.1-Flash --add engram-tables.safetensors \
     --recipe data/recipes/deepseek41-ud-iq1s.recipe --imatrix imatrix-merged.gguf \
     --chat-template chat_template.jinja -o deepseek-v4.1-flash-ud-iq1s.rad
+
+# Tencent Hy4-flash from the bf16 release: the Engram hash constants computed first (the release
+# ships the tables and the token map, not the hash), the routed experts four-bit, the Engram tables
+# E4M3 rows. arch/hyv4flash declares the weights and no graph, so the container converts and
+# inspects and does not serve yet (docs/ARCHITECTURES.md)
+python3 data/hy4flash_engram_tables.py /srv/models/tencent/Hy4-flash engram-tables.safetensors
+rad-convert /srv/models/tencent/Hy4-flash --add engram-tables.safetensors \
+    --recipe data/recipes/hy4-flash-w4nl64-rtn.recipe -o hy4-flash-w4nl64.rad
 ```
 
 ### 3.3 Inspect a container
@@ -682,7 +691,7 @@ A key sits at one of these levels:
 | level | holds |
 |---|---|
 | `server:` | the listener and the process: `host`, `port`, `api-key`, `api-key-env`, `allow-host`, `trusted-proxy`, `http-threads`, `read-timeout`, `write-timeout`, `keep-alive-timeout`, `max-body-mib`, `retry-after`, `no-cors`, `live`, `radiance-home`, `kernels`, `download-dir`, `log` (`info`, `debug` or `trace`), `proceed-with-incompatible-configuration`, `debug-accept-reference-kernels` |
-| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, and `disk-tier`, a directory for parked models' copies |
+| `memory:` | the per-card budgets: `gpu-headroom-mib`, `gpu-memory-mib`, `host-headroom-mib`; `card-headroom-mib: {CARD: MiB}`, a reserve for one card in place of `gpu-headroom-mib` (the card that drives a desktop); and `host-mib`, the pinned host memory the process may hold, `disk-tier`, a directory for parked models' copies, `pinned-numa-node`, a NUMA node preferred for pinned host memory over the node nearest each card, and `queue-reserve: N` (1-24, default 8), the hardware queues each card keeps ready for its next stream at about 41 MiB of the card apiece |
 | `scheduler:` | `load-timeout`, `drain-timeout`, `keepalive` |
 | `cards:` | `all` or a list of card indices the models may use |
 | `groups:` | `together` and `exclusive` lists of model names |
@@ -774,6 +783,7 @@ refused with 503, naming the hold, instead of moving it; `/admin/fleet` and `/v1
 `held: true` meanwhile, and a failed load or any unload ends the hold. `POST /admin/reload` or
 SIGHUP re-reads the file: changed models reload,
 removed ones leave, added ones register, and a `server:` or `cards:` change needs a restart.
+Changing `memory.card-headroom-mib` also needs a restart because the loaded pools keep their split.
 Without an api key these answer loopback callers only. Every model on one card runs its own queues
 beside the others (MULTIMODEL.md §9 has the measurement against taking turns).
 
@@ -975,11 +985,17 @@ models:
 *An n-gram table* (Qwen3.8-Flash-Next's is 47.7 GiB) is read a few rows a token. `disk` reads rows
 from the container through a row cache with direct reads on the host; about half of a step's rows
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
-40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
-so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with `memory.host-headroom-mib` to spare
-(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
-`auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
+40 s of reading, run beside the container pass, depending on the page cache) and the card's gather
+kernel reads the pinned copy, so a step has no host work. `vram` puts all of it on every card.
+`ram` needs the table's size free after the pinned host pools and the prefix cache's host tier, with
+`memory.host-headroom-mib` to spare (default 4 GiB), under every memory cgroup the process sits in,
+and refuses the start otherwise.
+`auto` takes the first of `vram`, `ram` and `disk` that holds the table; for `ram` it keeps the
+larger of 24 GiB and `memory.host-headroom-mib` free, not the headroom alone, and measures again
+just before the copy is pinned, reading the table from the container if other processes have taken
+the memory since. On Windows `auto` reads a table larger than a quarter of RAM from the file even
+where a copy would fit: the gather prefetches its rows, so a cold prefill runs at the warm speed,
+and the copy would lock that RAM for the process's life. Without a device kernel
 for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
 locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
 `LimitMEMLOCK=infinity` under systemd).
@@ -1088,6 +1104,19 @@ and the line says how much. It warns when the room left for first launches is un
 engine allows for its own, naming the `memory.gpu-headroom-mib` value that clears it (what is left rises
 one for one with the key); a larger headroom that lost part of itself is reported at INFO.
 
+**One card busier than the others.** `memory.card-headroom-mib: {CARD: MiB}` gives one card its own
+reserve in place of `memory.gpu-headroom-mib` (or the headroom `memory.gpu-memory-mib` implies): the
+card that drives a display, or one that other GPU applications use. CARD is the card's number as the
+server counts its cards (the startup report lists each with its PCI address). Under tensor
+parallelism every rank pages the same tokens, so one split serves every card: the card with least
+room after its own reserve sets the KV pool, as it always has. Under `placement: expert_tiered` the
+other cards then put what they have beyond it into resident experts, and the startup log says so
+(`card N uses M MiB of room above its own headroom for resident experts`); under other placements
+that room stays unclaimed. So a busy card's extra reserve no longer costs the idle cards their
+experts, as raising `memory.gpu-headroom-mib` would. On a start of several cards, the settle warning
+and the refusal that names another process give that card's own entry, `{CARD: MiB}`; a plan whose
+fixed costs the binding card cannot cover is refused naming that card and its reserve.
+
 What the engine allocates after reading the card is charged before the split, not to the headroom:
 the step staging, the KV tiers' copy staging and the hardware queues. The driver backs each queue
 with VRAM beyond its ring (33 MiB on an R9700), so startup measures one and the receipt's `hardware
@@ -1130,9 +1159,28 @@ drafter at 1 / 4 / 8 sequences on two R9700s: Qwen3.6-35B-A3B 10.22 / 11.56 / 12
 Qwen3.8-Flash-Next 10.40 / 12.85 / 15.58. The row's layout and the kernels that read it are in
 [OPS.md](OPS.md#the-kv-cache-operand).
 
-`kv-cache-dtype: fp8` is GLM-5.3-Flash's alone (`glm5next`): it narrows the latent-attention cache
-to E4M3 at a descale of 1 (half its bf16 size); the DSA index, its key tail and the KDA caches keep
-their own widths. Every other model refuses it, naming `i8`.
+**GLM-5.3-Flash** (`arch/glm5next`) also serves `i8`: `plugin/glm` reads its 512-wide MLA latent
+as int8 codes with two f16 half scales, 516 bytes a token and layer. List the GLM library first:
+
+```yaml
+server:
+  kernels: glm,libr4d,libavx,libref
+models:
+  glm:
+    model: glm53-flash-iqr-v4.rad
+    kv-cache-dtype: i8
+    num-speculative-tokens: 0
+```
+
+The order is required: libr4d's bf16 MLA rows can otherwise match an i8 request before the GLM
+reader. `kv-cache-dtype: fp8` remains GLM-5.3-Flash's alone: E4M3 latent codes at a descale of 1.
+Both narrow only the latent cache; the DSA index, its key tail and the KDA caches keep their widths.
+Every other model refuses `fp8`, naming `i8`.
+
+Measured on TP4, four R9700s, against the 1.17 MXFP4 reference: i8 mean KL 0.149 and top-1
+agreement 87.14%, fp8 0.151 and 87.10%. These compare whole containers, not cache error alone.
+Single-stream decode was 61.8 / 62.0 tok/s for i8 / fp8; the i8 GPU reader was within 0.23% of
+libref. The matched BetterBench results and test paths are in [plugin/glm/README.md](../plugin/glm/README.md).
 
 **Many sequences.** Every model here serves `max-num-seqs` up to 32. A sequence holds only the
 blocks its tokens occupy, but two costs exist per sequence regardless:
@@ -1303,6 +1351,28 @@ A longer chunk holds the device longer per step, but the prefill a decode step w
 sooner: four decoders with a long prompt beside them finished in 29.5 s at a 2048 chunk and 31.9 s at
 512.
 
+**An interval a quantum under the batch: one step an interval.** A chunk that shares its step with
+decoding sequences has to leave them their rows, so it is the batch less those rows -- a quantum
+short of the interval boundary when the interval is the batch itself (2032 of 2048 beside one
+decoder). The next step then takes the last rows up to the boundary, and on a hybrid model that
+short step carries the checkpoint and arms its own run of decode-only interleave steps: every
+interval runs two steps, and the arrival's time to first token pays for the interleave run, not for
+the short step's 40-65 ms. `checkpoint-interval: 1984` under `max-num-batched-tokens: 2048` puts the
+boundary a quantum lower, so the chunk is the whole interval and a quantum of the batch (64 rows;
+eight sequences at five drafts take 48) stays free for decode: `RADIANCE_LOG_STEPS=1` shows one step
+an interval where it showed two (2033 · 17 · 2033 · 17 · 1601 -> 1985 · 1985 · 1729 at a 5.7K
+arrival beside one decoder). On the `iks-A` lane (TP2, u3, 210 W, `scripts/backlog/nospec.yaml`
+and the same file with the line removed, three runs a side) arrival TTFT fell from 2.63 to 2.20 s
+at one decoder (-16 %) and from 2.75 to 2.41 s at four (-12 %), with the decoders' typical gap
+unchanged (13.3 / 18.3 ms), the worst stall unchanged (573 / 594 to 563 / 583 ms) and a lone
+prefill unchanged (pf2 0.653 -> 0.667 s, pf20 7.169 -> 7.141 s). Set the interval
+to the batch less a quantum, not to some smaller number: what removes the remainder step is that the
+chunk still fills the batch. The chunks are a quantum shorter than 2048 rows, so a prompt's chunks
+are tiled differently than at 2048 and a served answer can differ the way it does between any two
+chunk sizes (a prompt that is one chunk either way comes out bit-identical, greedy with logprobs,
+and a 5.7K prompt's logprobs move as far as they do under `max-num-batched-tokens: 1984`); no dtype,
+kernel or accumulation width changes.
+
 **Decoders beside a chunk: `prefill-interleave: N`.** A step that carries a chunk takes the
 chunk's time, and every sequence decoding beside it waits that long for its next token. With
 `prefill-interleave: 2`, after a step that carried a chunk while other sequences were decoding,
@@ -1310,6 +1380,27 @@ the next two steps carry decode rows only and admit nothing, then the next chunk
 decoders keep their cadence. A lone prefill is not held, nor is the step after a prompt's last
 chunk. `0` schedules as before. `/stats` counts the decode-only steps the hold inserted as
 `steps_held`, `/metrics` as `radiance:engine_steps_held_total`.
+
+The step that carries a chunk, and the step that admits a waiting request, are planned before the
+step they follow has read back: the engine builds the next step from what the host can already know
+(the chunk's extent from the budget and the shares, the admission from the queue) while the card
+runs the last one, so their planning is off the waiters' time to first token. An ahead step carries
+one continuing chunk or the one a spent hold left over, and one admission; where two prompts want a
+chunk in the same step -- they share the step's budget -- the step is built after the commit as
+before. Everything a step must have written on the card before its pass is issued with it: the
+slots a fresh admission took are zeroed, and a prefix hit's recurrent half is copied into them, when
+the step is issued, not at the loop's own point in the next iteration, which comes after that pass.
+On the `local` lane (TP2, 2x R9700, one server a run,
+`scripts/backlog/run.sh <tag> scripts/backlog/nospec.yaml c1,c8,stall1,stall4`) arrival TTFT was
+2.353, 2.560 and 2.389 -> 2.136, 2.150, 2.111 and 2.066 s beside one decoder and 2.477, 2.608 and
+2.447 -> 2.345, 2.412, 2.365 and 2.342 s beside four; the mixed steps were ahead
+(`engine_steps_ahead_total` 411 -> 414, 415 of 420 and 411 -> 413, 414 of 421, the same 4 and 5
+mixed steps) and the hold shortened with the cheaper chunk step (`engine_steps_held_total` 53, 59 ->
+36, 39 beside one decoder, 42, 44 -> 35, 39 beside four). `c1` and `c8` were unchanged (71.2 vs
+71.4 tok/s, 302.6 vs 302.9) and greedy text was identical, so the gain is the overlap alone. With
+the clear and the restore moved to issue time, one more run of the same lane was inside all four
+ranges (`c1` 71.6 tok/s, `c8` 305.5, arrival TTFT 2.076 s beside one decoder and 2.367 s beside
+four), so the two duties cost nothing where they are now done.
 
 Served default: `prefill-interleave: auto:1` (below), so decoding sessions keep about half their
 rate while prompts prefill; `deterministic: true`, KL mode and generators keep 0, and an explicit `N`
@@ -1600,14 +1691,16 @@ teach a model-agnostic controller an aggregate prefill-row cap. The cap is share
 prefills in that step, decode rows are reserved first, and a lone prefill remains unchanged. This
 is a soft service-time target, not a request deadline: timing starts when the engine issues the
 step and ends after its forward and speculative-drafter work. Queueing, HTTP transport and the
-client are outside it, and the legal chunk quantum, fixed decode cost, media passes or host jitter
-can make the target unattainable.
+client are outside it, and the legal chunk quantum or the stager floor, fixed decode cost, media
+passes or host jitter can make the target unattainable.
 
 The controller starts at one quarter of the model's shared-step capacity, corrects an over-target
 representative chunk immediately, and grows cautiously after three clearly under-target samples.
 A true prompt tail does not change the learned cap; a checkpoint or fixed busy-chunk boundary does,
-because the prompt continues and a lower cap can shorten its next step. If the target is lower than
-one legal mixed step, the cap bottoms out at one prefill quantum and misses remain visible. Startup
+because the prompt continues and a lower cap can shorten its next step. A mixed chunk never goes
+under the smallest step the prefill stager overlaps (one quantum when the model arms no stager),
+since below it every routed layer reads its pooled experts synchronously; a target shorter than one
+such step therefore bottoms out at the stager floor and its misses remain visible. Startup
 refuses configurations whose token budget or explicit busy cap cannot carry one legal prefill
 quantum beside a decode row. When the batch budget cannot carry one quantum for every simultaneous
 prefill, equal sharing applies to the requests that fit and the scheduler's priority/arrival order
@@ -1637,6 +1730,19 @@ prefill run in a different order, and at a tie that is a different token. Each s
 byte-identical across runs and restarts; reproducibility holds per configuration, and this key is
 part of the configuration like `tp` and `num-speculative-tokens`. Pin it before recording
 anything you will compare against later.
+
+**Slicing a chunk between layers** (`chunk-slices: MODE`, default off). A mixed step that carries
+one prefill chunk can be planned as m sub-steps over layer ranges instead of one pass over the whole
+trunk, with the decoding rows between them, so a long chunk no longer holds the other streams still
+for its whole duration. `auto` picks m from the measured chunk and decode step times against
+`chunk-slice-target-ms` (default 150 ms) and `chunk-slice-cost-pct` (default 10, the share of a
+chunk step's time the decodes may wait between two slices); `N` (1-8) sets m itself, capped at the
+trunk's layers and at a chunk of at least 128 rows. A sliced pass runs whole and serial, with the
+same KV bytes and the same `final_hidden` row as the unsliced one; a checkpoint is taken only at
+the group's last sub-step. Only a model whose plugin reports it can run its trunk over a layer
+range (`RadArchProbe::slice_layers_ok`) is sliced, so the flag is a no-op until a plugin reports
+that; the scheduler logs which of the two applied. `radiance:engine_steps_sliced_total` counts
+sliced chunks and `radiance:engine_substeps_total` the sub-steps they issued.
 
 ### 4.6 Speculative decoding
 
@@ -1787,6 +1893,18 @@ sensitive between 0.80 and 0.90. The engine keeps 48 recorded passes instead of 
 chain makes more pass shapes than 24 hold: 3352 recordings per benchmark became 1472, +1.7% tokens a
 second for this mode); the other modes make no more pass shapes than 24 hold.
 
+Over a block drafter's coupled walk (a block drafter with `draft-coupling: on`, no tree) the block is
+one pass and costs the same whatever the verify carries, so the depth is the **prefix** of the block
+the next verify carries. Every law of the block is known before that verify is issued, so there is
+no lag: draft j is verified while draft j - 1 is and either j <= `draft-depth-min` or the product of
+the walk's largest probabilities up to j (`top`) or of its drawn tokens' probabilities before j
+(`path`) is at least `draft-depth-stop`; `draft-depth-lag` does not apply. Exact for the same reason
+(the rule reads Q_1 .. Q_j and the path x_1 .. x_{j-1}, never x_j's own mass, never Q_{j+1}, never the
+target; `tests/mtp_rrs_test.cpp` drives the real coupled walk with the two controls that fail). The
+host waits for the walk's state copy before it issues the next verify (`draft depth adaptive
+(block)` at startup). A greedy row has no law and verifies the whole block. `draft-depth-load: on`
+picks the prefixes of a step's rows by the same cost model, one block pass counting as one round.
+
 **Several sequences in one step: `draft-depth-load: on`.** The stop rule prices a draft as one stream pays
 for it: its verify row and the head round that makes it. With several sequences drafting in one step the
 prices part. A round is one pass for every row, a verify row is each row's own, the row that takes the
@@ -1804,7 +1922,13 @@ default) chooses each row's verified drafts again from those -- draft j by the l
 the one after it -- so a chain that turned unsure after its round was issued costs the round but no verify
 row, and the rows are cut back to a tile where the tile costs more than the drafts past it yield. A step
 with fewer sequences is decided by the stop rule exactly as without the key, so a single stream is served
-bit for bit as the stop rule serves it.
+bit for bit as the stop rule serves it. `draft-depth-load-from: 1` lets the rule decide a single stream
+too: a draft is verified when its acceptance (read off the online table) exceeds the tokens a millisecond
+times the row's price, with no threshold to tune. Below five drafting sequences every
+`draft-depth-explore`-th step (default 20) verifies the whole chain whatever the tables say, so the
+confidence bins the stop rule never reached (drafts 3 to 5 at low confidence) are learnt and not stuck at
+the built-in prior; the choice to explore counts steps and reads no draw, so the output law is
+unchanged.
 
 ```yaml
     max-num-seqs: 8
@@ -1855,7 +1979,11 @@ It works with the normal fixed MTP chain, with `draft-depth: adaptive` (the adap
 the head's `num-speculative-tokens` rounds; the suffix window only widens the verify) and with
 `draft-verify: traversal` (a suffix row carries no coupled state, so it is a leaf of the walk). It is
 refused with `draft-verify: block` (the block verify decides a head chain as a whole), with
-`draft-window: adaptive`, and on a block drafter.
+`draft-window: adaptive`, and on a block drafter that proposes a tree. Beside a block drafter's chain
+(DFlash2, Hy4-flash's DFly2) the verify window stays the block: a `draft-suffix-max` past
+`num-speculative-tokens` is cut to it (with a warning) where the plugin says its depth is fixed and
+refused otherwise; the drafter's context pass mirrors every row a suffix step verified (DFly2 keeps no
+draft cache at all), so a suffix step leaves no hole.
 
 How it is built: the verify window (`num-speculative-tokens` for every buffer, ring and kernel band)
 becomes `max(num-speculative-tokens, draft-suffix-max)` while the head keeps drafting its own
@@ -1878,7 +2006,9 @@ head-only run's: a suffix step verifies different tokens from the ones the head 
 some models the verify kernels round differently depending on which tokens share the step (SUPPORT known
 issues 5 and 8), so where two tokens are nearly tied the text can part. On Qwen3.8-Flash-Next with two
 cards (2026-11-22), 2 of 8 short greedy probes parted, at gaps of 0.007-0.21 nat between the two leading
-tokens; prompts on which no suffix step ran were bit-identical. Both texts are the model's answer.
+tokens; prompts on which no suffix step ran were bit-identical. Both texts are the model's answer. `BRILLIANCE_EXACT_VERIFY=1` does not remove this: with it, head-only drafting matched decoding without drafts
+on 6 of 6 short probes (Qwen3.8-Flash-Next, two cards, 0.3.0, 2026-11-22), but with `draft-suffix: on` 2 of 6
+still parted, at gaps of 0.02-0.14 nat; a suffix step's rounding difference is in layers the switch does not cover.
 `tests/mtp_rrs_test.cpp` checks the law (chi-square over the first three tokens, alone and mixed with
 adaptive-depth steps, under the row-wise and the traversal verify, with a negative control that exposes
 the variant in which the coupled rows see the suffix chain), `tests/sched_test.cpp` the selection, the
@@ -2386,11 +2516,18 @@ models:
     reasoning-effort: medium
 ```
 
-At startup the template is probed with `low`, `medium`, `high`, `xhigh` and `max`, and the ones it
+At startup the template is probed with `low`, `medium`, `high`, `xhigh`, `max` and `no_think`, and the ones it
 takes are logged and published on `/server_info` as `capabilities.reasoning_efforts` (with the
 server's own `none` and `minimal`; `null` when the template takes any word). A request outside the set
 gets a 400 with `param: "reasoning_effort"`, `code: "unsupported_value"` and the set in
 `error.supported`.
+
+A template that takes `no_think` (Hy4-flash's takes `no_think` and `high` and nothing else, and has no
+`enable_thinking`) gets every way of turning thinking off as `reasoning_effort: no_think`: `none`,
+`minimal`, `no_think` itself, `enable_thinking: false` (top level or in `chat_template_kwargs`),
+`thinking.type: disabled`, `reasoning.enabled: false`. Thinking off wins over a level named beside it,
+including the deployment's `reasoning-effort`. `low`, `medium`, `xhigh` and `max` get the 400 above
+naming `high` and `no_think`; `reasoning-effort-map: {low: no_think, max: high}` translates them instead.
 
 **`reasoning-effort-map: FROM=TO,...`** rewrites a request's effort before the template sees it, for
 clients that send OpenAI's levels. Qwen3.8 has no `high`, so:
@@ -2620,12 +2757,12 @@ by 0.002-0.003 nats.
 `radiance --help` prints these, by level. A key written here as `server.KEY` or `memory.KEY` belongs
 under that level; every other key belongs to a model's entry under `models:` (or to `defaults:`). A
 switch is set with `true`. The fleet's own keys (a model's `aliases`, `priority`, `pin`, `ttl`,
-`flex` and `park`, `memory.host-mib`, `memory.disk-tier`, and the `cards:`, `scheduler:` and
-`groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Brilliance (the Windows port): every
-setting in one table, with its default, valid values, the source line that reads it and who should
-change it, is [REFERENCE.md](../REFERENCE.md), along with the launcher's parameters and every
-environment variable. The [Windows known-issue table](../win/SUPPORT.md#known-issues) covers
-platform limits and qualification gaps. Grouped by purpose:
+`flex` and `park`, `memory.host-mib`, `memory.disk-tier`, `memory.pinned-numa-node`, and the
+`cards:`, `scheduler:` and `groups:` levels) are in [MULTIMODEL.md](MULTIMODEL.md). Brilliance (the
+Windows port): every setting in one table, with its default, valid values, the source line that
+reads it and who should change it, is [REFERENCE.md](../REFERENCE.md), along with the launcher's
+parameters and every environment variable. The [Windows known-issue table](../win/SUPPORT.md#known-issues)
+covers platform limits and qualification gaps. Grouped by purpose:
 
 **Model and plugins**
 
@@ -2648,6 +2785,9 @@ platform limits and qualification gaps. Grouped by purpose:
 | `prefill-room-gate: MODE` | off | `on`: a fresh prompt is admitted only when the whole prompt and one decode position fit the KV cache beside every running sequence and every prompt admitted ahead of it, and the requests behind it wait with it; a prompt that cannot fit even with nothing running fails (`idle_admission`) instead of waiting; long prompts then run one after another. `off`: a prompt is admitted when its first chunk fits, so a long one may fill the cache mid-prompt and be preempted, recomputing from its start |
 | `prefill-interleave: N` | auto:1 (0 under `deterministic: true`, KL mode, generators) | decode-only steps after each prefill chunk while other sequences decode (§4.5), at most 64; `auto` fits them in a quarter of the chunk step's measured time, `auto:SHARE` in SHARE of it (0 < SHARE <= 4); `0` lets every step carry a chunk |
 | `mixed-step-target-ms: N` | 0 (off) | soft completed-service-time target for mixed prefill/decode steps; learns one aggregate prefill cap while decoders are active and leaves uncontended prefill unchanged (§4.5) |
+| `chunk-slices: MODE` | off | `auto`: plan one prefill chunk as m layer-sliced sub-steps with the decoding rows between them, m from the measured chunk and decode step times against `chunk-slice-target-ms` and `chunk-slice-cost-pct`; `N` (1-8): m itself, capped at the trunk's layers and at a chunk of at least 128 rows. Only a model whose plugin reports it can run the trunk over a layer range (`RadArchProbe::slice_layers_ok`) is sliced; on any other a chunk keeps one step and the scheduler logs it (§4.5) |
+| `chunk-slice-target-ms: N` | 150 | the duration one layer-sliced sub-step targets, in milliseconds; `chunk-slices: auto` sizes m from it (§4.5) |
+| `chunk-slice-cost-pct: N` | 10 | the share of a chunk step's time the decodes may wait between two slices, in percent; with `chunk-slices: auto`, `0` makes the budget reject every split and keeps m at 1 (§4.5) |
 | `preempt-wait-ms: N` | 5000 | how long a preempted prefill may wait for its whole-recompute gate before reclaiming cache blocks and preempting lowest-priority running requests until one overdue request can prefill; `0` falls back on the next step. A preempted request publishes what it computed to the prefix cache, as a finished one does, so its recompute adopts its prompt instead of computing it again; under pressure the cache gives those blocks back, the newest last, before another request is preempted |
 | `busy-prefill-chunk: MODE` | auto | a prefill chunk's share of a step that has other work: `auto` leaves decode rows and waiting requests their room (§4.5), `off` takes the whole step, `N` holds it to N tokens |
 | `max-num-seqs: N` | 256 | largest number of sequences one step may carry |
@@ -2660,7 +2800,7 @@ platform limits and qualification gaps. Grouped by purpose:
 |---|---|---|
 | `memory.gpu-headroom-mib: N` | 96 | VRAM left unclaimed on every card |
 | `memory.gpu-memory-mib: N` | 0 (use `memory.gpu-headroom-mib`) | VRAM claimed on every card; inverse of `memory.gpu-headroom-mib`. Give one (§4.3) |
-| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`, the int8 cache at half the bytes; `fp8` on GLM-5.3-Flash alone (§4.4) |
+| `kv-cache-dtype: T` | bf16 | `bf16` or `i8`; GLM i8 needs `server.kernels: glm,libr4d,libavx,libref` in that order. `fp8` remains GLM-5.3-Flash only (§4.4) |
 | `state-cache-dtype: T` | f32 | `f32` or `f16`: the recurrent (delta-net) state cache; f16 halves the state memory and is lossy, `qwen35` plugins only (§4.4) |
 | `host-pool-mib: N` | 0 | pinned host tier for weights, in all: the ranks of a model pin equal shares of it (N / `tp` each) |
 | `kv-resident: N` | 0 (off) | stream the sparse attention group's KV from pinned host memory, keeping a ring of N tokens on the card. Raised to 32 768 and to one decode step's selection; a ring that covers the context streams nothing. Ignored with a warning on an architecture that cannot stream (§4.4.1, [KV-STREAMING.md](KV-STREAMING.md)) |
@@ -2694,7 +2834,7 @@ platform limits and qualification gaps. Grouped by purpose:
 |---|---|---|
 | `placement: MODE` | auto | `all_vram`, `layer_offload`, `expert_tiered`, `auto` |
 | `deterministic: true` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
-| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens |
+| `checkpoint-interval: N` | 2048 | linear-attention state checkpoint interval, in tokens. It also caps a prompt's chunk (§4.5), so under a `max-num-batched-tokens: 2048` a chunk that shares its step with decoding sequences leaves a remainder step every interval; `1984` (a quantum less) keeps one step an interval with a quantum of the batch free for decode (the `iks-A` lane: -16 % arrival TTFT at one decoder, -12 % at four) |
 | `prefill-span: N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on (several prompts prefilling with nothing decoding take such steps one at a time, the fewest tokens left first); needs `max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
 | `prefill-span-pass: MODE` | piece | the routed (MoE) block's pass of a spanned step: `piece`, a pass a checkpoint interval; `step`, one pass over the whole step where the model runs such a step serially (Flash-Next at one and two ranks), so each expert's weight is read once for all the step's rows. More arena (the expert planes are a step tall) and output that differs from piece passes at tie level; needs `prefill-span` above 1 (§4.5) |
 | `prefill-span-min: N` | auto | the shortest prompt, in tokens, a prefill spans for. `auto`: eight intervals where routed experts are staged from host memory, 0 elsewhere; `0` spans every lone prefill from its second interval on (§4.5) |
@@ -2724,14 +2864,15 @@ platform limits and qualification gaps. Grouped by purpose:
 | `spec-ngram: K` | 0 | prompt lookup alone: up to K drafts a step from the sequence's own n-grams, each proposal verified when it pays at the measured step cost; a container that declares a draft head is refused; sets the window to K (§4.6) |
 | `spec-ngram-min: N`, `spec-ngram-max: N` | 2, 4 | the pattern lengths prompt lookup tries, longest first (at most 15), wherever it drafts |
 | `draft-window: MODE` | fixed | `fixed` drafts N every step; `adaptive` follows each sequence's acceptance and the measured step cost, for a serial draft head or prompt lookup alone (§4.6) |
-| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made (§4.6). Needs `draft-coupling: on` and `draft-window: fixed` |
+| `draft-depth: MODE` | fixed | `adaptive` stops a coupled serial chain within the step once the product of the head's probabilities along it falls below `draft-depth-stop`; the next verify carries only the drafts made; over a coupled block drafter's walk it verifies the prefix of the block the same rule admits, with no lag (§4.6). Needs `draft-coupling: on`, `draft-window: fixed` and no draft tree |
 | `draft-depth-max: N` | auto | `draft-depth: adaptive`: the deepest chain (auto: `num-speculative-tokens`) |
 | `draft-depth-min: N` | 1 | `draft-depth: adaptive`: rounds that always run |
 | `draft-depth-stop: P` | 0.85 | `draft-depth: adaptive`: the chain goes on while its confidence is at least P |
 | `draft-depth-lag: K` | 1 | `draft-depth: adaptive`: rounds the decision trails the chain (0 or 1); 1 hides the host's decision behind a running round |
 | `draft-depth-stat: S` | top | `draft-depth: adaptive`: `top` multiplies each round's largest probability, `path` the probability of the token it drew |
 | `draft-depth-load: MODE` | off | `on`: a step that drafts for `draft-depth-load-from` sequences or more runs draft round j only for the rows whose expected accepted drafts pay their verify rows, the kernel tile they open and the round, at the measured throughput (§4.6). Needs `draft-depth: adaptive` with `draft-depth-stat: top`. Same output law; fewer sequences keep the stop rule |
-| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (2..64) |
+| `draft-depth-load-from: N` | 5 | `draft-depth-load: on`: the fewest drafting sequences of a step the load-aware rule decides (1..64; 1 = from one sequence, the rule priced at the margin in place of a stop threshold) |
+| `draft-depth-explore: N` | 20 | `draft-depth-load: on`: every Nth load-aware step of fewer than five drafting sequences verifies the whole chain, so the acceptance bins the stop rule never visited (drafts 3-5 at low confidence) are learnt; counted by steps alone, same output law; 0 = never |
 | `draft-depth-load-min: N` | 2 | `draft-depth-load: on`: rounds a load-aware step always runs, and drafts its late choice never cuts |
 | `draft-depth-load-late: MODE` | on | `draft-depth-load: on`: choose each row's verified drafts again when the next verify is issued, from the laws read by then |
 | `draft-depth-load-calib: MODE` | online | `draft-depth-load: on`: `online` keeps the rule's tables (acceptance by confidence, tokens a millisecond, row / round / tile prices) on the running server's own verifies and step times; `static` serves the built-in or given tables |
@@ -2739,7 +2880,7 @@ platform limits and qualification gaps. Grouped by purpose:
 | `draft-depth-load-row-ms: LIST` | built in | `draft-depth-load: on`: a verify row's milliseconds by drafting sequences 1..8 |
 | `draft-depth-load-round-ms: LIST` | built in | `draft-depth-load: on`: a draft round's milliseconds by drafting sequences 1..8 |
 | `draft-depth-load-jump-ms: LIST` | built in | `draft-depth-load: on`: what a verify of more than 16, 32, 48, 64 query rows costs on top, in milliseconds (up to four numbers) |
-| `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a serial head's chain: a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
+| `draft-suffix: MODE` | off | SuffixDecoding as a step selector on a drafter's chain (a serial head's, or a block drafter's whose window stays its block): a step whose sequence's own history recurs (the last `draft-suffix-min-match` tokens occurred before) verifies the earlier continuation instead of the head's draft; lossless; with the fixed chain, `draft-verify: traversal` and `draft-depth: adaptive`, not `draft-verify: block` (§4.6) |
 | `draft-suffix-min-match: L`, `draft-suffix-max: N`, `draft-suffix-min-score: D` | 6, 7, 0.3 | the shortest match (1..12), the most rows of a suffix step (1..32; widens the verify window to max(`num-speculative-tokens`, N); at most 7 on Flash-Next), and the path score under which the chain is cut |
 | `draft-short-from: N` | auto | a block drafter that declares a shorter block runs it from N decoding sequences on, its own block again two below or at one sequence; 0 never; auto never for a chain and 2 for a tree drafter, which then verifies the short block's nodes (§4.6) |
 | `draft-coupling: MODE` | off | `on`: a linear MTP drafter with a 2-bit candidate head (Qwen3.8-Flash-Next) samples each proposal from its reranked top-8 and the sampler maximally couples the target's draw to it. The output distribution is unchanged and a fixed seed yields other tokens than `off`. The head's law is taken at temperature 1, so it pays at high request temperatures and costs at low ones: on Flash-Next TP2 at 2x R9700, tokens per decode step +18% at temperature 1.0 and c1, +11% at 0.7 and c4, -4% at 0.3. Greedy rows are unchanged by coupling. Qwen35's native U2 head couples its global top eight without reranking ([IQR-V4 conversion](IQR.md#keeping-the-native-mtp-head-with-a-split-target)). A DFlash2 drafter (Qwen3.5/3.8) couples its candidate walk instead: each position is sampled from the softmax of the walk's own scores over its best eight candidates, at temperature 0.6 (fixed in `qwen35_fp8`, where acceptance peaked); on Qwen3.8-27B MXFP4 TP2 at 2x R9700 and request temperature 1, tokens per verify step +8% on held-out prompts at c4 (3.53 to 3.82) and decode +2..8% per stream at c1/c4. Any other drafter is refused at startup |
@@ -2836,7 +2977,7 @@ keys are refused on it, and so are the pixel bands.
 
 | key | |
 |---|---|
-| `debug-graph: true` | print the declared graph and the selection table, and exit |
+| `debug-graph: true` | print the declared graph and the selection table, and exit. It loads no weight and launches nothing, so on the host backend (`RADIANCE_HOST_DEVICES=N` fake ranks, no card) the device rows of `libr4d` stay in selection and no kernel's `init()` runs: the table shows what N cards would resolve to, over a container of the real size that is only a skeleton (`rad-convert --skeleton`, sparse). The exit status keeps the host rule; a device question answered `-- none` in the selection table is the hole a card would have |
 | `debug-selection: true` | print the selection table |
 | `debug-placement: true` | print the placement plan |
 | `debug-draft-oracle: FILE` | a verify-path test, not a drafter: with `spec-ngram`, prompt lookup proposes from the token ids in `FILE` (a plain greedy run's continuation of the one prompt the test sends) with 30% of the drafts corrupted, so verifies accept and reject at every depth; the text must stay the plain run's |
@@ -3463,7 +3604,7 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
   "prompt_per_token_ms": 4.0, "prompt_per_second": 250.0,
   "predicted_n": 64, "predicted_ms": 711.0,
   "predicted_per_token_ms": 11.29, "predicted_per_second": 88.6,
-  "draft_n": 78, "draft_n_accepted": 37,
+  "draft_n": 78, "draft_n_accepted": 37, "draft_steps": 26,
   "ttft_ms": 297.5, "total_ms": 1008.5
 }
 ```
@@ -3478,6 +3619,7 @@ names, so tools built against llama-server (llama-swap's activity view, for one)
 | `predicted_ms` | from the first generated token to the last |
 | `predicted_per_second`, `predicted_per_token_ms` | the `predicted_n − 1` tokens after the first, over `predicted_ms` (the first token is the prefill's product). The same figure as `/metrics`' time per output token; with speculative decoding it counts every token a step accepts |
 | `draft_n`, `draft_n_accepted` | speculative tokens proposed for this request and how many were accepted. Present when any were proposed, as in llama.cpp |
+| `draft_steps` | the verify steps that carried those drafts; `draft_n / draft_steps` is the request's mean draft depth. Present with `draft_n`. The request's own, since it has left the `/stats` table by the time a client reads it |
 | `ttft_ms` | the server's time to first token: from having the whole request body to the first generated token, covering parsing, chat template rendering, tokenising, the wait for admission and the prefill. The time the body took to arrive is not in it, so a client on a slow link can separate the server's share from the network's. Not a llama.cpp field |
 | `total_ms` | from the same moment to the last generated token: `ttft_ms + predicted_ms`. Not a llama.cpp field |
 
@@ -4206,9 +4348,17 @@ workflow, and is otherwise read off the parts:
   and a video keeps at most 289 frames, soundtracks at most 15.6 s. The pictures are shown to the
   text encoder as well, as `<Picture N>` in front of the prompt, so the container needs its vision
   tower for them.
+- **Song guide**: `guide_audio`, a soundtrack pinned from frame **`guide_frame`** of the video on
+  (0 by default; a negative frame counts from the end, -1 the last), as ComfyUI's
+  `MiniMaxH3AddGuide` pins one: the model takes it as the clip's own sound, so mouths follow its
+  words. It is read in stereo, as ComfyUI's guide reads it (a mono song is copied to both
+  channels), at most 15.6 s, and cut where the video ends. It is not named in the prompt, and it goes with any task: with text alone, with
+  keyframes or with reference media. A frame outside the video is refused naming `guide_frame`.
 
-A request carries keyframes or reference media, not both. `capabilities` reports the counts a
-model takes (`video_max_ref_images` and the rest). Every reference adds rows to each step, so
+A request carries keyframes or reference media, not both: each is shown to the text encoder as a
+`<Picture N>` counted from 1. A song guide goes with either. `capabilities` reports the counts a
+model takes (`video_max_ref_images` and the rest) and whether it takes a song guide
+(`video_guide_audio`). Every reference adds rows to each step, so
 many large ones may need a larger `max-model-len`; a request that does not fit, or whose
 references alternate kinds too often for the model's modulation table (group them by kind), is
 refused naming why.
@@ -4216,6 +4366,8 @@ refused naming why.
 ```sh
 curl -s http://localhost:8000/v1/videos -F task=fl2va -F first_frame=@start.png \
   -F last_frame=@end.png -F size=1344x768 -F 'prompt=...'
+curl -s http://localhost:8000/v1/videos -F task=ref2va -F ref_image_1=@singer.png \
+  -F guide_audio=@verse.wav -F guide_frame=0 -F size=1344x768 -F 'prompt=...'
 ```
 
 **FastH3.** FastVideo's FastH3 8-Step V2 (`FastVideo/FastVideo-FastH3-8-Step-V2`) is the same model
@@ -4234,7 +4386,7 @@ full-size step's, so most of the time goes to the refinement. The video object o
 video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
 size. Reference media ride it unchanged. Keyframes ride it too: each is encoded at the small size
 before the prompt and again at the full size after the upscale, into the same slot, so every step
-pins it on its own grid.
+pins it on its own grid. A song guide does not depend on the size and is encoded once.
 
 ```sh
 curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{
@@ -4271,15 +4423,16 @@ curl -s http://localhost:8000/v1/videos -F 'prompt=the fox turns and runs into t
 
 - **`prompt`** is read as written (no template), at most 1024 tokens; **`negative_prompt`** is
   what guidance steers away from, empty by default.
-- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 161
-  (6.7 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
+- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 321
+  (13.4 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
   implies, as diffusers does when `num_frames` is omitted: its prediction held to 1 to 20 seconds,
-  rounded to frames and down to the 8-frame steps, then to the 161 frames this server makes. The
+  rounded to frames and down to the 8-frame steps, then to the 321 frames this server makes. The
   video object says `"seconds": "auto"` until the prompt is read, then the length chosen. A
   container without the head makes 121 frames (5.04 s). **`size`**: both sides multiples of 32 from 256, at most
   1920 x 1088 pixels of area, at most 3:1; 960x544 by default, the release's own. A step carries at
-  most 121 frames at 1920x1088 (a longer video at that size is refused). Up to 960 x 544 of area
-  the VAE decodes each frame whole, as the pipeline does by default; a larger frame is decoded in
+  most 121 frames at 1920x1088 and 249 at 1344x768 (a longer video at those sizes is refused).
+  Up to 960 x 544 of area the VAE decodes each frame whole, as the pipeline does by default; a
+  larger frame is decoded in
   diffusers' tiles (`vae.enable_tiling()`: 512 pixels every 448) and blended where they overlap,
   as the release's two-stage README does at 1920x1088.
 - **`input_reference`** is the first frame, resized and cropped to `size` and put through H.264
@@ -4509,6 +4662,30 @@ position is verified only when every earlier one passed. `draft_accept` on `/sta
 `radiance:draft_acceptance_ratio` on `/metrics` report accepted / drafted, the share of every drafted
 token that became text, since the process started, which is never the higher of the two.
 
+**Drafts by request**: each row of the request table (`requests` on `/stats`) carries
+`draft`, the drafts standing for its next step, and `draft_steps`, `draft_tokens` and
+`draft_accepted`, the verify steps that carried drafts for it, the drafts they carried and the drafts
+they accepted, since it arrived (kept across a preemption). Their growth between two reads, over the
+steps, is the request's drafts and accepted drafts a step: under `--draft-depth adaptive`, its mean
+depth over that time. `draft` alone is one step's. `draft_ceiling` on `/stats` is the deepest chain
+the latest step with a drafting row allowed: the head's depth after `--draft-depth-max`, 0 before the
+first such step and under a block drafter (DFly2), which never begins a serial chain. A finished
+request is gone from the table; its totals are `draft_n`, `draft_n_accepted` and `draft_steps` in the
+response's `timings` (§5).
+
+**Steps not issued ahead** (`steps_ahead`, `steps_ahead_refused` on `/stats`): the engine builds the
+next step while this one runs, and `steps_ahead` counts the steps built that way. Each time it does
+not, `steps_ahead_refused` adds one under the reason of the scheduler's first refusal: `waiting` (the
+queue head cannot be admitted yet: a prefill room gate, no card or slot, an encode owed), `held`
+(`--prefill-interleave` or `--mixed-step-target` left the step to the commit, or the step's own
+shares held a chunk back), `mid_prompt` (a second prompt chunk wants the step, or the next step
+would carry a prefill row with no decode row beside it), `grammar` (a grammar that cannot rewind
+decides at the commit), `suffix_hot` (`--draft-suffix`: the history ended in a recurring pattern),
+`ends_every` (the step in flight likely ends every request it carries, or brings a scored row to its
+last token) and `kv` (the context limit, the KV pool, or a snapshot the store dropped). `steps_ahead`
+plus the seven is every step the engine offered to issue ahead, so a gap between `steps` and
+`steps_ahead` is explained here.
+
 ### 6.2 The JSON behind it
 
 ```sh
@@ -4530,6 +4707,29 @@ the requests of a model that finished in the range, `live` the `/stats` object (
 is as open as `/stats`; the fleet's is behind the API key like `/admin/fleet`. In the fleet's form
 each model's state is the figure `s:<id>`, a code: 0 cold, 1 parked, 2 loading or closing,
 3 resident, 4 failed, 5 waiting for room.
+
+**Expert residency on `/stats`** (`experts`, present where experts move between tiers): `routed` is
+the experts the router picked, `routed_res` how many of them were resident in VRAM when picked, so
+`routed_res / routed` is the hit rate of the traffic (residency alone describes the plan, not the
+traffic); the rest were read in place across the link. `layer_routed` and `layer_missed` give the same
+counts per routed layer (rank 0). `promotions` and `demotions` count the moves; `distinct_promoted` the
+units ever promoted. `readmits` counts promotions of a unit that was demoted at *any* earlier time
+(cumulative over the server's life), so it grows slowly even without thrash. `readmit_16`,
+`readmit_128` and `readmit_1024` count the re-promotions proper: a unit promoted again within 16, 128
+or 1024 heat steps of its own demotion (nested: every `readmit_16` is also in the other two).
+`heat_steps` is that step count, the unit of the windows. A high `readmit_128 / promotions` means the
+heat guards ping-pong units. `early_published`, `paced_units`, `paced_marks` and `paced_late` describe
+expert streaming (a promotion published before the next pass; promotion copies spread over a pass's
+routed layers, `RADIANCE_XS_PACE`: -1 spread, N per layer, 0 off; default spread without a drafter,
+off with one; `RADIANCE_XS_EARLY_PUBLISH=0` restores the old order). The heat engine's parameters can be
+set for A/B runs with `RADIANCE_HEAT_DECAY`, `_HYSTERESIS`, `_MIN_GAIN`, `_CREDIT_CAP` and `_MOVES`;
+the startup log says what is in force. `RADIANCE_ROUTE_TRACE=<file>` records rank 0's routing for
+`rad-heat-replay`, whose `--layer-min N` replays the trace with every layer held at N resident units
+(the thin layers raised at the start from the layers above N, so the slab does not grow, clamped to
+what the slab can hold; a swap whose demotion would take a layer under N is abandoned) and prints
+what the floor costs the hit rate. The exit report's `mover:` line counts promotions, demotions and
+prefetches, and a `stager:` line follows it whenever the prefill stager ran: the routed layers, the
+units it staged and their bytes, the copies, and the units no buffer had room for (read in place).
 
 `/server_info` reports what a running process serves: the model, the cards, the KV cache, the draft
 depth and the wire, as the startup log does.
@@ -4825,6 +5025,15 @@ sleeping card to do it.
 curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findings'
 ```
 
+Before the report the bring-up logs one `startup: <phase> in <x.x> s (at <y.y> s)` line per phase:
+`declare` (with `arena levels` in it), `plan` (with `host pool pin` in it), `weights` (the one pass
+over the container, which the Engram table copies run beside), `kv`, `contexts`, `settle` and
+`ready`, where `in` is the phase's own duration and `at` the seconds since the engine started; each
+n-gram table's line gives that table's own fill duration (`filled beside the container pass`) and
+the container-pass line its own, both taking only the `(at <y.y> s)` suffix. The tables start
+reading as the pass meets them and are joined after it, so the phase is the longer of the pass and
+the tables rather than their sum.
+
 ### 7.2 Messages and what they mean
 
 | Message | Meaning | Action |
@@ -4835,11 +5044,13 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | `this kernel's amdgpu interface is 3.N ... a map here would never return` | The HIP 7.16 (ROCm 10.1) runtime waits for the kernel to finish every virtual-memory map on a page-table timeline, which amdgpu signals only from interface 3.64 (Linux 6.16) on; an older kernel never signals it, so the card runs without virtual memory management: the KV cache holds its whole carve and lends nothing to the experts (§4.3) | A 6.16 or later kernel, or an amdgpu-dkms driver of interface 3.64 or later |
 | `chat is 501` in the `serving on` line | The container carries no chat template | Re-convert with `--tokenizer`, and check that a `chat_template.jinja` sits beside `tokenizer_config.json` in the checkpoint. Meanwhile use `/v1/completions` |
 | `does not read '<weight>' encoded <encoding>` at startup | No loaded kernel takes that weight's encoding for the op that reads it | Convert with a recipe that writes an encoding a loaded kernel reads, or load the library that reads it |
-| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can spare: a larger `host-pool-mib` (RAM permitting), `kv-cache-dtype: fp8`, or fewer or shorter sessions (§4.3) |
+| Prefix hit rate 0% and every turn re-prefills | The KV pool cannot hold the live sessions, so the cache evicts what the next turn wanted | The cache already has everything the experts can spare: a larger `host-pool-mib` (RAM permitting), `kv-cache-dtype: i8` (§4.4), or fewer or shorter sessions (§4.3) |
 | The server dies with no log line, on a request it had been serving fine | A kernel's first launch could not load its code object for lack of VRAM; HIP faults inside the launch instead of returning an error | Set `memory.gpu-headroom-mib` to the value the startup warning names (§4.3). `coredumpctl info` names the kernel; `AMD_LOG_LEVEL=1` prints `HSA_STATUS_ERROR_OUT_OF_RESOURCES` just above the fault |
 | KV in VRAM stays high with one session and nothing moves | The host tier is off: it is sized, and without a size nothing is copied | Pass `prefix-cache-mib: N` |
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi` and stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates, so a card that refuses its weights pool lost that memory to another process in between (the next line says how much is free now). A refused `host_pool` is pinned memory: every rank pins its own `host-pool-mib` (twice at `tp: 2`), and the amdgpu driver caps what all processes together pin at RAM less 1/64 and 1.5 GiB. It is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `tp` × `host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
+| Windows: `pool allocation refused` and then `card N has … free now, room for the … refused, so the card is not what refused it` | WDDM charges a process's VRAM to its commit, as it does pinned memory, so a pool can be refused with room on the card. A Windows job object that limits the process's committed memory is the usual cause (a wrapper, sandbox or service manager that starts radiance with one); the line names the limit, and startup logs it beside the pin limit. Without a job limit, commit itself (RAM plus page file) ran short | Raise or remove the job's memory limit: it must cover every rank's VRAM and the pinned memory together, about 85 GiB for `flashnext-2card`. A start whose pools pass the limit is refused before any is allocated, naming the figure. Otherwise enlarge the page file |
+| Windows: `the driver has … left to give on it` and `Raise memory.gpu-headroom-mib by at least N MiB` | VRAM went from the card after the budget read it: another process, or a card that also drives a display. The plan gives every card the same KV split, sized from the card with the least room after its reserve | With several cards, raise only that card's reserve by the figure named: `memory.card-headroom-mib: {CARD: MiB}` (CARD as the error names it); under `expert_tiered` the other cards keep their room for resident experts (§4.3, "One card busier than the others"). With one card, raise `memory.gpu-headroom-mib` by the figure, rather than setting `gpu-memory-mib`. Or move the desktop to another GPU. A `plan-only: true` start shows the split without loading |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode can refuse a single pin above about 2.5 GiB; a failing piece means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through, but on such a host it can also remove peer access between the cards, moving every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
 | `device: a synchronisation has seen no queue advance for 5 s; the queues:` with the packet each queue is on, then `device: no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue; the kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps moves under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits on a queue that never drains. Clock instability (a voltage offset) is the other cause seen on R9700s. A wait that is only long (a deep prefill, a video's denoising pass) reports nothing while any queue advances | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset restores the power cap, fan curve and voltage offset to firmware defaults; re-apply them before every start. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`, which a reboot loses. `docker inspect` shows exit code 0 for a container Docker already restarted, whatever ended the old process |
 | `--draft-model is not implemented` | The file sets `draft-model`; the engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
@@ -4909,6 +5120,7 @@ process, so that a restart policy brings the server back; `0` turns that off.
 | `RADIANCE_HOME` | where `kernels/`, `architectures/` and `quantizers/` live; a `:`-separated search path, the first home winning. Same as `server.radiance-home`; set but empty is unset |
 | `RADIANCE_KERNELS` | default kernel libraries, separated by `,` or `:`. Same as `server.kernels`, read by the engine and every tool by one rule, so a plugin validated with `rad-kbench` serves the same way without editing launchers; set but empty is unset |
 | `RADIANCE_LOG` | `error` \| `warn` \| `info` \| `debug` \| `trace` (default `info`) |
+| `RADIANCE_PINNED_NUMA_NODE` | same as `memory.pinned-numa-node` (below, §4.0) for a tool that reads no configuration file; the server's value comes from the file. Not a number, empty, or unset is unset |
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `model: <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `model: <owner/name>` fetches to without `server.download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |

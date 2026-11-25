@@ -10,6 +10,7 @@
 // operands themselves, and each sequence is padded on its own.
 #include "r4d.h"
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 #include "r4d_f32_tile.h"
 #include "r4d_gdn_wmma.h"
@@ -1236,10 +1237,13 @@ __global__ __launch_bounds__(kT) void interleave2_kernel(
 // ---------------------------------------------------------------------------- indices
 // y[i] = start + i step, or with `period` > 0 start + (i % period) step: positions that restart
 // every `period` rows.
+template <class CH>
 __global__ __launch_bounds__(kT) void iota_kernel(int* __restrict__ y, int n, int start, int step,
                                                   int period) {
+    if (CH::on) r4d_chain_wait();
     const int i = blockIdx.x * kT + threadIdx.x;
     if (i < n) y[i] = start + (period > 0 ? i % period : i) * step;
+    if (CH::on) r4d_chain_done();
 }
 
 // y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j], the lists by value.
@@ -2072,7 +2076,9 @@ extern "C" int r4d_rad_iota(const RadArgs* a, RadStream s) {
     if (!r4d_contig(y)) return R4D_NO(RAD_E_STRIDE);
     const long long n = r4d_numel(y), period = r4d_geti_or(a, "period", 0);
     if (n <= 0 || period < 0) return R4D_NO(RAD_E_SHAPE);
-    hipLaunchKernelGGL(iota_kernel, dim3(blocks_for(n)), dim3(kT), 0, (hipStream_t)s, (int*)y->data,
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && n <= 4096;   /* decode heights */
+    hipLaunchKernelGGL(ch ? iota_kernel<r4dchain> : iota_kernel<R4dUnchained>, dim3(blocks_for(n)),
+                       dim3(kT), 0, (hipStream_t)s, (int*)y->data,
                        (int)n, (int)r4d_geti_or(a, "start", 0), (int)r4d_geti_or(a, "step", 1),
                        (int)period);
     return st_of(hipGetLastError());

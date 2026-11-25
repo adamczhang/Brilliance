@@ -913,6 +913,17 @@ int Ctx::issue_body(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
                                           "returned", i, wh));
             tt      = w_tmpl_[wh];
             tt.data = resolve_weight(wh);
+            if (gen_lora_slot_ >= 0 && !program_->lora_replacements.empty()) {
+                const auto bias = program_->lora_replacements.find(wh);
+                if (bias != program_->lora_replacements.end()) {
+                    const auto& slot = bias->second;
+                    const auto& buffer = buf_tmpl_[slot.slots];
+                    if (!buffer.data || gen_lora_slot_ >= buffer.shape[0])
+                        return abort_step_msg(h, RAD_E_STATE, "generator LoRA replacement slot is unavailable");
+                    tt.data = static_cast<char*>(buffer.data) +
+                              2 * gen_lora_slot_ * slot.rows;
+                }
+            }
             w_direct_[wh] = 1;
             if (!tt.data)
                 return abort_step_msg(h, RAD_E_STATE,
@@ -1587,6 +1598,12 @@ int             rad_ctx_wgp_count(RadCtx* c) {
     return c ? static_cast<rad::Ctx*>(c)->wgp_count() : 32;
 }
 RadStream       rad_stream(RadCtx* c)     { return c ? static_cast<rad::Ctx*>(c)->stream() : nullptr; }
+
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST.
+ * See abi/rad_runtime.h. */
+int rad_op_domain(RadCtx* c, rad_op op) {
+    return c ? static_cast<rad::Ctx*>(c)->op_domain(op) : RAD_E_INVAL;
+}
 
 /* The second lane. `rad_lane` selects the lane subsequent issues launch on; `rad_lane_join`
  * orders one behind the other with an event, blocking neither the host nor a stream. The runtime

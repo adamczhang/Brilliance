@@ -1,6 +1,6 @@
 # Brilliance as a Windows service (preview)
 
-The LocalSystem service is a **preview in Brilliance 0.3.0**. Host tests check the launcher's
+The LocalSystem service is a **preview in Brilliance 0.3.1**. Host tests check the launcher's
 install and uninstall dry runs, including the planned YAML copy, environment, key handling and
 recovery settings. They also cover log rotation, simulated service controls and exit codes, and
 console runs of `radiance --service` with no model loaded. The console runs verify health, API-key
@@ -249,7 +249,7 @@ In an elevated PowerShell:
 ## Qualification, in an elevated PowerShell
 
 This checklist records the expected results for future qualification. The elevated steps and
-the Windows restart were deferred for 0.3.0.
+the Windows restart were deferred for 0.3.0 and 0.3.1.
 
 The service in these steps is `Brilliance-qwen27-preview`, the preview profile on the card on
 PCI bus 3, loopback, no key. Adjust `-Bus`, `-Listen` and `-ApiKey` to the machine's policy; a

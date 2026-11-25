@@ -517,6 +517,10 @@ extern std::atomic<bool> dev_engine_ready;
  * Windows only this way, by decision: it never uses a GPU there. */
 void dev_host_only();
 #endif
+/* The NUMA node GPU-accessible pinned host memory prefers, -1 for the node nearest each card.
+ * Set from `memory.pinned-numa-node` before serving (the fleet validates the number); the AQL
+ * backend reads it wherever it pins. A reload moves only what it pins after. */
+extern std::atomic<int> dev_pinned_numa_node;
 
 /* Longest run of dispatches a played tape leaves unordered. Of any kTapeOverlapRun + 1
  * consecutive packets on a queue one carries the barrier bit, so a launched packet still proves
@@ -644,6 +648,10 @@ public:
     /* Whether every byte of [off, off+bytes) is backed; check before handing a range to a
      * kernel. */
     bool is_committed(int64_t off, int64_t bytes) const;
+    /* Actual backing inside a range, and the contiguous backed suffix. A sum alone cannot
+     * prove that every address a top-down expert loan exposes is mapped. */
+    int64_t committed_bytes(int64_t off, int64_t bytes) const;
+    int64_t committed_suffix() const;
 
     /* Parking (dev_page_out): every backed extent copied to pinned host memory on `s`, then
      * unbacked; the bytes held on the host, or an error. page_in backs the same extents again and

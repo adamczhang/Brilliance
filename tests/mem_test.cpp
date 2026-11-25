@@ -433,6 +433,29 @@ TEST(without_a_lender_the_experts_come_first_and_the_cache_keeps_one_sequence) {
     CHECK_EQ(b.experts, b.elastic - f.kv_one);
 }
 
+/* Brilliance (issue #1): the MiB the pools are written in never leave the one-sequence cache short.
+ * Without a lender the cache is exactly kv_one, a whole number of MiB (pool_mib_for_tokens), and
+ * the weights' share is not, so rounding the weights up and taking that back from the cache used
+ * to write a pool one MiB under kv_one: Flash-Next on two cards held 262,120 of 262,144 tokens. */
+TEST(the_one_sequence_cache_is_never_rounded_below_its_floor) {
+    for (const bool lends : { false, true }) {
+        VramFacts f = big_moe_facts();
+        f.lends        = lends;
+        f.expert_floor = f.experts;              /* the cache is at its one-sequence floor */
+        f.arena        = (144LL << 20) + 12288;  /* a claimable that is not a whole MiB */
+        Config c = derive_config();
+        VramBudget b;
+        CHECK_OK(vram_budget_resolve(c, { f }, &b));
+        CHECK_EQ(b.kv, f.kv_one);
+        CHECK(b.weights % (1LL << 20) != 0);     /* the case: the weights round up */
+        CHECK(c.vram_kv_mib * (1LL << 20) >= f.kv_one);
+        CHECK(c.vram_weights_mib * (1LL << 20) >= b.weights);
+        /* What the rounding claims beyond the split is under two MiB, out of the headroom. */
+        CHECK(c.vram_weights_mib * (1LL << 20) + c.vram_kv_mib * (1LL << 20) - (b.weights + b.kv) <
+              (2LL << 20));
+    }
+}
+
 /* The cache always gets at least one full-length sequence: an accepted context no pool can hold
  * would be a configuration error, and any expert shortfall is the planner's to report. */
 TEST(the_cache_keeps_one_full_length_sequence_even_against_the_expert_floor) {
@@ -2276,6 +2299,51 @@ TEST(prefix_cache_hits_the_shared_prefix_only) {
 
     /* A full hit backs off one block: the step needs a token to compute a logit from. */
     CHECK_EQ(f.pc.lookup(p1, {}).n_attn_tokens, 48);
+}
+
+/* A request's chain, kept between calls (SchedReq::chain): the lookup that admits it and the
+ * publish that hands its blocks back walk the same prompt blocks, and a request that waits asks
+ * again on every scheduling round. Only blocks the kept chain does not cover are hashed. */
+TEST(a_kept_chain_hashes_only_the_blocks_past_what_it_covers) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/false));
+    auto prompt = tok_run(10, 1024);                     /* 64 blocks */
+    publish(f, 1, prompt, 1024);
+    CHECK_EQ(f.pc.stats().chain_blocks, 64ll);
+
+    /* Nobody kept the publish's chain: a lookup hashes the prompt's blocks again. */
+    const CacheHit cold = f.pc.lookup(prompt, {});
+    CHECK_EQ(f.pc.stats().chain_blocks, 128ll);
+
+    /* Handed a chain, a lookup hashes the prompt's blocks into it once; handed the same chain
+     * again, it hashes none, and the hit is the cold lookup's. */
+    PrefixChain chain;
+    const CacheHit first = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    const CacheHit kept = f.pc.lookup(prompt, {}, nullptr, nullptr, 0, &chain);
+    CHECK_EQ(f.pc.stats().chain_blocks, 192ll);
+    CHECK_EQ(kept.n_attn_tokens, cold.n_attn_tokens);
+    CHECK_EQ(kept.n_attn_tokens, first.n_attn_tokens);
+    CHECK_EQ(kept.n_linear_tokens, cold.n_linear_tokens);
+    CHECK_EQ(kept.branch_at, cold.branch_at);
+    CHECK(chain.hs == chain_of(prompt));
+
+    /* A publish goes on from there: the prompt's blocks are held, and only the two whole blocks
+     * of the reply are hashed. */
+    auto text = prompt;
+    for (int i = 0; i < 40; ++i) text.push_back(700 + i);        /* 1064 tokens, 66 blocks */
+    CHECK_OK(f.kv.add_sequence(2));
+    CHECK_OK(f.kv.ensure(2, (int64_t)text.size()));
+    std::vector<std::vector<int32_t>> bt;
+    for (int32_t g : f.pc.cached_groups()) bt.push_back(f.kv.block_table(2, g));
+    CHECK_OK(f.pc.insert(2, text, {}, bt, (int64_t)text.size(), "", -1, &chain));
+    CHECK_EQ(f.pc.stats().chain_blocks, 194ll);
+    CHECK(chain.hs == chain_of(text));
+
+    /* What it published under the kept chain is what a cold walk of the reply finds: its 66 whole
+     * blocks, which leave the last 8 tokens to compute from. */
+    CHECK_EQ(f.pc.lookup(text, {}).n_attn_tokens, 1056);
+    CHECK_EQ(f.pc.stats().chain_blocks, 260ll);
 }
 
 /* Where a hit ends at a head two cached prompts already left differently (CacheHit::branch_at):
@@ -7585,6 +7653,140 @@ TEST(gpu_memory_mib_is_the_inverse_of_gpu_headroom_mib) {
         CHECK_EQ(c.gpu_headroom_mib, 96ll);
         CHECK_EQ(c.vram_kv_mib, 300ll);
     }
+}
+
+/* A fleet with one TP model still bypasses the load broker. Its card override must reach the
+ * ordinary budget, or the desktop card will settle near the global 96 MiB reserve. */
+/* Brilliance (issue #1): the settle check's fix. A start of several cards keeps a short card's
+ * extra reserve on that card alone; one card, and a card already named, keep the advice they had. */
+TEST(a_short_card_is_told_its_own_reserve_on_a_multi_card_start) {
+    Config c = derive_config();
+    c.devices = { 0, 1 };
+    /* One card, --gpu-headroom-mib: unchanged. */
+    CHECK_EQ(vram_budget_settle_fix(c, 0, 32624, 1290, 1),
+             std::string("Set --gpu-headroom-mib to at least 1290: what is left here rises with it one for one."));
+    /* Two cards: the card's own entry; the flag is named as costing every card. */
+    c.placement = "expert_tiered";
+    const std::string two = vram_budget_settle_fix(c, 1, 32624, 1290, 2);
+    CHECK(two.find("Set memory.card-headroom-mib to {1: 1290} to keep that on this card alone") == 0);
+    CHECK(two.find("the other cards spend what they have beyond it on resident experts") != std::string::npos);
+    CHECK(two.find("(Setting --gpu-headroom-mib to at least 1290 would cost every card the same.)") !=
+          std::string::npos);
+    c.placement = "all_vram";
+    CHECK(vram_budget_settle_fix(c, 1, 32624, 1290, 2).find("resident experts") == std::string::npos);
+    /* --gpu-memory-mib: the inverse figure. */
+    Config g = c;
+    g.gpu_memory_mib = 32256;
+    CHECK(vram_budget_settle_fix(g, 1, 32624, 1290, 2).find("--gpu-memory-mib to at most 31334") !=
+          std::string::npos);
+    CHECK_EQ(vram_budget_settle_fix(g, 1, 32624, 1290, 1),
+             std::string("Set --gpu-memory-mib to at most 31334: what is left here falls with it one for one."));
+    /* A named card raises its own entry. */
+    c.card_headroom_mib[1] = 1024;
+    CHECK_EQ(vram_budget_settle_fix(c, 1, 32624, 1290, 2),
+             std::string("Set memory.card-headroom-mib for card 1 to at least 1290."));
+}
+
+/* Brilliance (issue #1): a TP plan that the card with least room cannot carry is refused naming
+ * that card and its own reserve, whichever card has the largest reserve. */
+TEST(a_per_card_refusal_names_the_card_that_binds) {
+    constexpr int64_t MiB = 1 << 20;
+    /* The named card's own reserve leaves it too little. */
+    {
+        Config c = derive_config();
+        c.devices = { 0, 1 };
+        c.card_headroom_mib[1] = 15300;
+        VramBudget b;
+        CHECK_EQ(vram_budget_trial(c, { hand_facts(false), hand_facts(false) }, &b), RAD_E_NOMEM);
+        CHECK(b.claimable < 0);
+        CHECK(b.report.find("card reserve (max)") != std::string::npos);
+        CHECK(b.report.find("Card 1 binds: it has least room after its own 15300 MiB reserve "
+                            "(memory.card-headroom-mib). Lower memory.card-headroom-mib for card 1") !=
+              std::string::npos);
+    }
+    /* Card 0 is the busy one, with the default reserve; card 1 is named. */
+    {
+        Config c = derive_config();
+        c.devices = { 0, 1 };
+        c.card_headroom_mib[1] = 512;
+        VramFacts busy = hand_facts(false);
+        busy.free = 200 * MiB;
+        VramBudget b;
+        CHECK_EQ(vram_budget_trial(c, { busy, hand_facts(false) }, &b), RAD_E_NOMEM);
+        CHECK(b.report.find("Card 0 binds: it has least room after its own 96 MiB reserve "
+                            "(--gpu-headroom-mib). Lower --gpu-headroom-mib") != std::string::npos);
+    }
+    /* No per-card reserve: the refusal reads as it always has. */
+    {
+        Config c = derive_config();
+        c.devices = { 0, 1 };
+        VramFacts busy = hand_facts(false);
+        busy.free = 200 * MiB;
+        VramBudget b;
+        CHECK_EQ(vram_budget_trial(c, { busy, hand_facts(false) }, &b), RAD_E_NOMEM);
+        CHECK(b.report.find("  --gpu-headroom-mib ") != std::string::npos);
+        CHECK(b.report.find("Lower --gpu-headroom-mib, lower --max-num-batched-tokens") != std::string::npos);
+        CHECK(b.report.find("binds") == std::string::npos);
+    }
+}
+
+/* Brilliance (issue #1, the reporter's case in miniature): a busier card keeps more on its own while
+ * the idle card spends the difference on resident experts, against the same reserve on both. The
+ * KV pool is common either way. */
+TEST(a_busy_cards_own_reserve_leaves_the_idle_card_its_room) {
+    constexpr int64_t MiB = 1 << 20;
+    VramFacts idle = hand_facts(true), busy = hand_facts(true);
+    idle.free = idle.capacity - 800 * MiB;
+    busy.free = busy.capacity - 1600 * MiB;
+    Config own = derive_config();
+    own.devices = { 0, 1 };
+    own.placement = "expert_tiered";
+    own.gpu_headroom_mib = 160;
+    own.card_headroom_mib[1] = 1536;
+    Config both = own;
+    both.card_headroom_mib.clear();
+    both.gpu_headroom_mib = 1536;
+    VramBudget a, b;
+    CHECK_OK(vram_budget_trial(own, { idle, busy }, &a));
+    CHECK_OK(vram_budget_trial(both, { idle, busy }, &b));
+    /* The common split is the same: card 1 binds in both. */
+    CHECK_EQ(a.claimable, b.claimable);
+    CHECK_EQ(a.kv, b.kv);
+    /* Card 0 keeps 160 MiB rather than 1536 and has 800 MiB less held: 2176 MiB more for experts. */
+    CHECK_EQ(vram_budget_rank_spare_mib(own, { idle, busy }, 0), 2176ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(own, { idle, busy }, 1), 0ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(both, { idle, busy }, 0), 0ll);
+}
+
+TEST(a_single_model_fleet_reserves_the_named_card_headroom) {
+    constexpr int64_t MiB = 1 << 20;
+    Config c = derive_config();
+    c.devices = { 0, 1 };
+    c.card_headroom_mib[1] = 1536;
+    VramBudget b;
+    CHECK_OK(vram_budget_trial(c, { hand_facts(false), hand_facts(false) }, &b));
+    CHECK_EQ(b.headroom, 1536 * MiB);
+    CHECK_EQ(b.claimable, 13656 * MiB);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 0), 1440ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(c, { hand_facts(false), hand_facts(false) }, 1), 0ll);
+
+    Config global = c;
+    global.card_headroom_mib.clear();
+    global.gpu_headroom_mib = 1536;
+    VramBudget all;
+    CHECK_OK(vram_budget_trial(global, { hand_facts(false), hand_facts(false) }, &all));
+    CHECK_EQ(b.claimable, all.claimable);
+    CHECK_EQ(vram_budget_rank_spare_mib(global, { hand_facts(false), hand_facts(false) }, 0), 0ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 0), 96ll);
+    CHECK_EQ(vram_budget_headroom_mib(c, 1), 1536ll);
+
+    /* A broker grant has already left each card's reserve outside the claim. */
+    Config broker = c;
+    broker.vram_claim = 12000 * MiB;
+    VramBudget claimed;
+    CHECK_OK(vram_budget_trial(broker, { hand_facts(false), hand_facts(false) }, &claimed));
+    CHECK_EQ(claimed.headroom, 0ll);
+    CHECK_EQ(vram_budget_rank_spare_mib(broker, { hand_facts(false), hand_facts(false) }, 0), 0ll);
 }
 
 /* Over random cards and programs the split either refuses by name or hands out no more than the

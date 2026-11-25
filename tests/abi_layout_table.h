@@ -1,8 +1,8 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 43 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 44 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
-{ "RadArchProbe", "", 0, 128 },
+{ "RadArchProbe", "", 0, 136 },
 { "RadArchProbe", "draft_depth", 0, 4 },
 { "RadArchProbe", "draft_depth_fixed", 4, 4 },
 { "RadArchProbe", "shape_probe_ok", 8, 4 },
@@ -24,6 +24,7 @@
 { "RadArchProbe", "gen_max_refs", 112, 8 },
 { "RadArchProbe", "gen_shape", 120, 4 },
 { "RadArchProbe", "ckpt_snap_ok", 124, 4 },
+{ "RadArchProbe", "slice_layers_ok", 128, 4 },
 { "RadArgs", "", 0, 72 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -36,7 +37,7 @@
 { "RadArgs", "world_size", 60, 4 },
 { "RadArgs", "kv_used_max_h", 64, 4 },
 { "RadArgs", "wgp_count", 68, 4 },
-{ "RadBatch", "", 0, 496 },
+{ "RadBatch", "", 0, 512 },
 { "RadBatch", "phase", 0, 4 },
 { "RadBatch", "step", 4, 4 },
 { "RadBatch", "n_tok", 8, 8 },
@@ -104,6 +105,9 @@
 { "RadBatch", "anchor_rows", 472, 8 },
 { "RadBatch", "ckpt_cut", 480, 4 },
 { "RadBatch", "ckpt_cu", 488, 8 },
+{ "RadBatch", "prefill_tail_h", 496, 8 },
+{ "RadBatch", "layer_lo", 504, 4 },
+{ "RadBatch", "layer_hi", 508, 4 },
 { "RadBufDecl", "", 0, 80 },
 { "RadBufDecl", "dtype", 0, 4 },
 { "RadBufDecl", "rank", 4, 4 },
@@ -146,6 +150,7 @@
 { "RadBuildCtx", "expert_file_tier", 192, 4 },
 { "RadBuildCtx", "slot_base", 196, 4 },
 { "RadBuildCtx", "span_pass_step", 200, 4 },
+{ "RadBuildCtx", "layer_slices", 204, 4 },
 { "RadAudioGenBatch", "", 0, 352 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },

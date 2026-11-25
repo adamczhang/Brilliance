@@ -41,10 +41,14 @@
 #include <windows.h>
 #include <winternl.h>
 #include <d3dkmthk.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <tlhelp32.h>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -52,6 +56,7 @@
 #include "os.h"
 
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "pdh.lib")
 
 namespace rad {
 namespace os {
@@ -101,6 +106,7 @@ constexpr int64_t kAdlKeepMs = 500;   /* an ADL reading is reused for this long 
 struct Adapter {
     D3DKMT_HANDLE handle = 0;
     std::string   bdf;        /* "0000:bb:dd.f", the engine's spelling */
+    uint64_t      luid = 0;   /* LowPart | HighPart << 32, as the counters' instance names carry it */
     int           adl = -1;   /* its ADL adapter index, -1 when ADL does not know it */
     /* The last ADL reading and when it was taken (steady clock, ms; -1 before the first). */
     int64_t       adl_at_ms = -1;
@@ -205,9 +211,72 @@ void enumerate() {
         Adapter ad;
         ad.handle = info[i].hAdapter;
         ad.bdf = bdf;
+        ad.luid = (uint64_t)info[i].AdapterLuid.LowPart |
+                  ((uint64_t)(uint32_t)info[i].AdapterLuid.HighPart << 32);
         g_adapters.push_back(std::move(ad));
     }
     adl_open();
+}
+
+std::string utf8(const wchar_t* w) {
+    if (!w || !*w) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return std::string();
+    std::string s((size_t)n, 'x');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), n, nullptr, nullptr);
+    s.resize((size_t)n - 1);   /* the terminator the call wrote */
+    return s;
+}
+
+/* Every process's dedicated use of every adapter, from the counters: luid -> pid -> bytes. False
+ * when the counters do not answer (no GPU counter set on this system, or PDH failed). */
+bool dedicated_by_process(std::map<uint64_t, std::map<uint32_t, int64_t>>* out) {
+    PDH_HQUERY q = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return false;
+    struct Closer { PDH_HQUERY q; ~Closer() { PdhCloseQuery(q); } } closer{ q };
+    PDH_HCOUNTER c = nullptr;
+    /* The English name, whatever the system's language. */
+    if (PdhAddEnglishCounterW(q, L"\\GPU Process Memory(*)\\Dedicated Usage", 0, &c) != ERROR_SUCCESS)
+        return false;
+    if (PdhCollectQueryData(q) != ERROR_SUCCESS) return false;
+    DWORD bytes = 0, count = 0;
+    const DWORD fmt = PDH_FMT_LARGE | PDH_FMT_NOSCALE;
+    PDH_STATUS st = PdhGetFormattedCounterArrayW(c, fmt, &bytes, &count, nullptr);
+    if (st == ERROR_SUCCESS && count == 0) return true;   /* no process holds any GPU memory */
+    if (st != (PDH_STATUS)PDH_MORE_DATA || bytes == 0) return false;
+    /* Instances can appear between the two calls: a little more room, and one retry. */
+    std::vector<unsigned char> buf;
+    for (int tries = 0; tries < 2; ++tries) {
+        bytes += 4096;
+        buf.assign(bytes, 0);
+        st = PdhGetFormattedCounterArrayW(c, fmt, &bytes, &count,
+                                          reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data()));
+        if (st != (PDH_STATUS)PDH_MORE_DATA) break;
+    }
+    if (st != ERROR_SUCCESS) return false;
+    const auto* items = reinterpret_cast<const PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
+    for (DWORD i = 0; i < count; ++i) {
+        const PDH_FMT_COUNTERVALUE& v = items[i].FmtValue;
+        if (v.CStatus != PDH_CSTATUS_VALID_DATA && v.CStatus != PDH_CSTATUS_NEW_DATA) continue;
+        uint32_t pid = 0;
+        uint64_t luid = 0;
+        if (!gpu_process_instance(utf8(items[i].szName), &pid, &luid)) continue;
+        (*out)[luid][pid] += (int64_t)v.largeValue;
+    }
+    return true;
+}
+
+/* Every running process's executable name, by pid, from one snapshot. */
+std::map<uint32_t, std::string> process_names() {
+    std::map<uint32_t, std::string> names;
+    const HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (h == INVALID_HANDLE_VALUE) return names;
+    PROCESSENTRY32W e{};
+    e.dwSize = sizeof e;
+    for (BOOL ok = Process32FirstW(h, &e); ok; ok = Process32NextW(h, &e))
+        names[(uint32_t)e.th32ProcessID] = utf8(e.szExeFile);
+    CloseHandle(h);
+    return names;
 }
 
 bool wanted(const std::vector<std::string>* only, const std::string& bdf) {
@@ -218,6 +287,48 @@ bool wanted(const std::vector<std::string>* only, const std::string& bdf) {
 }
 
 }  // namespace
+
+bool gpu_process_instance(const std::string& instance, uint32_t* pid, uint64_t* luid) {
+    unsigned long p = 0, hi = 0, lo = 0;
+    int phys = 0, end = 0;
+    if (std::sscanf(instance.c_str(), "pid_%lu_luid_0x%lx_0x%lx_phys_%d%n", &p, &hi, &lo, &phys, &end) != 4 ||
+        end <= 0 || (size_t)end != instance.size())
+        return false;
+    *pid = (uint32_t)p;
+    *luid = ((uint64_t)(uint32_t)hi << 32) | (uint32_t)lo;
+    return true;
+}
+
+std::vector<GpuHolders> gpu_vram_holders(const std::vector<std::string>& bdfs) {
+    std::vector<GpuHolders> out(bdfs.size());
+    std::vector<uint64_t> luids(bdfs.size(), 0);
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        enumerate();
+        for (size_t i = 0; i < bdfs.size(); ++i) {
+            out[i].bdf = bdfs[i];
+            for (const Adapter& ad : g_adapters)
+                if (ad.bdf == bdfs[i]) luids[i] = ad.luid;
+        }
+    }
+    /* The counters' read and the snapshot outside the lock: they take far longer than a sample. */
+    std::map<uint64_t, std::map<uint32_t, int64_t>> by;
+    if (!dedicated_by_process(&by)) return out;
+    const std::map<uint32_t, std::string> names = process_names();
+    const uint32_t self = (uint32_t)GetCurrentProcessId();
+    for (size_t i = 0; i < bdfs.size(); ++i) {
+        if (luids[i] == 0) continue;   /* no adapter at that address: unknown */
+        out[i].known = true;
+        const auto it = by.find(luids[i]);
+        if (it == by.end()) continue;
+        for (const auto& [pid, b] : it->second) {
+            if (pid == self || b <= 0) continue;
+            const auto n = names.find(pid);
+            out[i].procs.push_back(GpuProcVram{ pid, n == names.end() ? std::string() : n->second, b });
+        }
+    }
+    return out;
+}
 
 std::vector<GpuSample> gpu_samples(const std::vector<std::string>* only) {
     std::lock_guard<std::mutex> lk(g_mu);

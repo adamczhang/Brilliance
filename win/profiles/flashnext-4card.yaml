@@ -20,11 +20,10 @@
 #   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
 #   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
 #                                 memory, their VRAM given to the KV cache.
-#   ngram-warm: true              the n-gram table (below) read once at load into the Windows file
-#                                 cache, so rows are not read from the drive mid-step (cold
-#                                 rows cost two cards about 9% of one-stream decode). Not pinned;
-#                                 skipped, with the reason in the log, without the table's size
-#                                 plus 24 GiB of memory available. It adds 7 s or more to the load.
+#   ngram-warm: false             no warm read at load: since 0.3.1 the gather prefetches its rows
+#                                 (BRILLIANCE_NGRAM_PREFETCH), and cold decode, 8-stream and prefill
+#                                 measured within ~1% with and without the warm on four cards (prefill ~1% lower without it)
+#                                 (2026-11-22), while the warm added ~9 s to every load.
 # No host prefix cache (prefix-cache-mib not set): a 14.25 GiB one beside the pinned encoders exceeds
 # what Windows lets this process pin with the integrated GPU visible too (16.93 GiB). The minute log
 # line's flag/ack re-store counts run about 6x higher than at 2,048-token steps; that is harmless
@@ -59,6 +58,10 @@ server:
   port: 8000
 memory:
   gpu-headroom-mib: 160
+  # A card that also drives a display or runs other GPU applications can keep more free on its
+  # own: card-headroom-mib: {1: 1536}, by its card number in the startup report (0, 1, ...).
+  # The other cards keep 160 MiB and put the room they have beyond the busy card into resident
+  # experts; the KV cache is the same on every card.
 scheduler:
   load-timeout: 600s
 models:
@@ -84,6 +87,6 @@ models:
     draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
-    ngram-warm: true
+    ngram-warm: false
     # weight-prefetch off: not measured at TP4; same host-staged collective path as TP2, where an A/B (prefetch-ab, 2026-11-22) measured update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical. The G6 gate measures it.
     weight-prefetch: off

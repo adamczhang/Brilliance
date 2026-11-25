@@ -53,6 +53,13 @@ struct SchedReq {
                                   * the wait for admission (GUIDE); this excludes it. */
     int64_t  preempted_us = 0;   /* when this state became Preempted; 0 otherwise. Bounds the
                                   * whole-recompute admission wait (--preempt-wait-ms). */
+    /* The verify steps that carried drafts for this request, the drafts they carried and the drafts they accepted,
+     * since it arrived (counted at commit, kept across a preemption), for the live request table: their growth
+     * between two reads is the request's drafts and accepted drafts a step, its depth under --draft-depth
+     * adaptive. Not drafter state: drafter_reset() keeps them; add_locked() clears them for a new request. */
+    uint64_t spec_steps = 0;
+    uint64_t spec_tokens = 0;
+    uint64_t spec_accepted = 0;
 
     /* The drafter's proposal for the next step, and the conv-window read cursor a rejection
      * moves rather than rolls back (§10). */
@@ -140,6 +147,14 @@ struct SchedReq {
      * fit would inflate the prompt and hit totals. */
     int32_t  hit_attn = 0;
     bool     hit_owed = false;
+
+    /* This request's block chain, hashed once and kept (PrefixChain): the lookup that admits it
+     * and the publish that hands its blocks back walk the same blocks, and a request that waits
+     * for room is looked up again on every scheduling round -- a 64K prompt is 4096 block hashes,
+     * spent under the scheduler's lock. The chain describes the text, so preemption keeps it; it
+     * is stamped by request id, so a recycled slot starts over, and PCBinding checks the stamp. A
+     * cache, filled from a const gate: it changes no decision. */
+    mutable PrefixChain chain;
     /* Why that hit was cut, for the counters (SchedMetrics::hit_cut_*): to nothing, or to a
      * snapshot more than an interval below it. */
     enum class HitCut : uint8_t { None, NoSnapshot, Window, Adopt, ResumedBelow };
@@ -313,7 +328,13 @@ public:
         int64_t  kv_blocks = 0;
         int64_t  kv_tokens = 0;
         int32_t  n_draft = 0;          /* the proposal standing for the next step */
+        int64_t  draft_steps = 0;      /* SchedReq::spec_steps */
+        int64_t  draft_tokens = 0;     /* SchedReq::spec_tokens */
+        int64_t  draft_accepted = 0;   /* SchedReq::spec_accepted */
         int32_t  slot = -1;
+        /* The runtime LoRA slot this row runs with, -1 for the base. The name is the caller's:
+         * rad::Engine::lora_names() indexes by slot. */
+        int32_t  lora_slot = -1;
         double   age_s = 0;
         double   ttft_s = -1;          /* negative until the first token */
         double   prefill_s = -1;       /* first token minus admission; negative until both */
@@ -334,6 +355,9 @@ public:
      * (take_encodes) and encodes them between steps, which keeps the encoder off the step path. */
     bool     encodes_pending() const;
     void     take_encodes(std::vector<std::shared_ptr<mm::Item>>* out);
+    /* The end of the run take_encodes began: its items and patches are added to the counters
+     * with the time since it began (SchedMetrics::encode_items). */
+    void     encodes_done(int64_t items, int64_t patches);
     /* An encoder pass over whole segments; see BatchBuilder::build_encoder. */
     const RadBatch* build_encoder(const std::vector<BatchBuilder::EncoderPart>& parts, int step,
                                   const RadEncoderDecl& enc) {
@@ -372,18 +396,23 @@ public:
 
     /* ---------------------------------------------------- the next step, before this one commits
      *
-     * A decode step's successor needs nothing the host learns from it: every row continues where
-     * the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card, and the
-     * host can bound how far that is. So the next forward pass is issued while this one runs.
+     * A decode step's successor needs almost nothing the host learns from it: every row continues
+     * where the card's acceptance leaves it (sched/advance.h), with drafts proposed on the card,
+     * and the host can bound how far that is. A request admitted, or a prompt chunk continued, is
+     * likewise known at issue time -- the prompt is in the request and a chunk advances n_computed
+     * by its rows. So the next forward pass, mixed or not, is issued while this one runs.
      *
      *   expect_draft   after the drafter is issued: how many drafts the next step verifies for a
      *               sequence, capped at its window (under the adaptive policy possibly fewer
      *               than the rounds that ran).
-     *   step_next      plans and builds that step: every row of this one, as a device row, at
-     *               the furthest context it can reach. Null (step() runs after the commit
-     *               instead) when only committed state can decide: a request awaiting admission,
-     *               a prefill chunk to continue, a grammar, the context's end, or a pool that
-     *               cannot grow.
+     *   step_next      plans and builds that step: every row of this one that produces a token, as
+     *               a device row, at the furthest context it can reach, plus the head waiter's
+     *               admission and at most one prompt chunk -- the one this step continues, or the
+     *               one a spent hold left over. Null (step() runs after the commit instead) when
+     *               only committed state can decide: media still encoding, a grammar, the
+     *               context's end, a pool that cannot grow, an admission the pool's room or a
+     *               recompute's extent makes wait, a chunk the step's own shares hold
+     *               back, or more than one prompt chunk to place.
      *   promote_next   once this step has committed: the next step becomes the open one.
      *
      * While the next step is open, commit() leaves continuing requests' blocks in place, and a
@@ -391,6 +420,23 @@ public:
     void            expect_draft(uint64_t id, int n);
     const RadBatch* step_next();
     const RadBatch* step_next_locked();
+    /* S-02: one prefill chunk planned as m layer-sliced sub-steps, with the frozen decode rows
+     * between them. plan_group_slice() builds the next sub-step at the top of step(); start_group()
+     * turns a freshly planned mixed step into a group; plan_group_ahead() builds the next sub-step
+     * in step_next_locked(); chunk_slice_count() is the m law. Refusals live in start_group(). */
+    bool            plan_group_slice();
+    bool            start_group();
+    bool            plan_group_ahead();
+    /* Fill `p` with the group's next sub-step (the frozen decode rows, then the carried chunk)
+     * and advance the group; `ahead` picks entry_next over entry. */
+    void            fill_group_step(StepPlan& p, bool ahead);
+    int32_t         chunk_slice_count(int64_t tokens) const;
+    /* Why step_next_locked did not issue the next step ahead of the commit, counted per reason in
+     * SchedMetrics::ahead_refused_* (S-07). The first check that refuses names it; a staging
+     * failure is not one of these. */
+    enum class AheadRefused : uint8_t {
+        Waiting, Held, MidPrompt, Grammar, SuffixHot, EndsEvery, Kv };
+    const RadBatch* refuse_ahead(AheadRefused why);
     /* Whether the step just issued likely ends every request it carries; step_next_locked then
      * issues nothing behind it. */
     bool            ends_every_request() const;
@@ -492,6 +538,9 @@ public:
     void block_end();
 
     const StepPlan&      plan() const { return plan_; }
+    /* The step step_next() planned, from its return until promote_next() makes it plan(): the step
+     * released ahead of its commit, whose entries the engine must set up before that release. */
+    const StepPlan&      next_plan() const { return plan_next_; }
     const ChunkGeometry& geometry() const { return geo_; }
     DraftController&     draft() { return draft_; }
     LookupGate&          lookup_gate() { return lookup_; }
@@ -499,9 +548,11 @@ public:
 
     /* The observers' copy. Dashboards, scrapers and admin calls read what the engine thread last
      * published, never the scheduler's state behind the step lock, so an observer cannot slow
-     * the step. publish() runs on the engine thread once a step (at most every 20 ms while idle),
-     * builds the copy under mu_ and swaps it in only if no reader holds the copy's lock; a
-     * skipped swap happens at the next call. */
+     * the step. publish() runs on the engine thread once a step: the metrics copy is cheap and
+     * goes every call, the request table beside it is a walk of reqs_ with a block-table lookup
+     * per group, so it is rebuilt at most every 20 ms (idle or stepping, as it always was while
+     * idle). The copy is built under mu_ and swapped in only if no reader holds the copy's lock;
+     * a skipped swap happens at the next call. */
     void                 publish(bool idle);
     SchedMetrics         observed_metrics() const;
     int                  observed_requests(ReqStat* out, int max) const;
@@ -545,8 +596,16 @@ public:
      * by the engine after init; false keeps every checkpoint at a chunk's end. */
     void    set_ckpt_inside(bool on) { ckpt_inside_ = on; builder_.set_ckpt_cut(on); }
     /* Whether the step just planned leaves a prompt with at least the stager's smallest pass still
-     * to prefill, so the next step most likely carries a chunk the stager arms for. */
-    bool    prefill_continues() const;
+     * to prefill, so the next step most likely carries a chunk the stager arms for -- and that next
+     * step is not a held one (--prefill-interleave), which would drop what was staged. With
+     * `next_plan`, the step issued ahead (`plan_next_`) is the one being released; its hold is
+     * counted from its own shape, since promote_next() arms it after the release. */
+    bool    prefill_continues(bool next_plan = false) const;
+    /* S-02: the first trunk layer of the step after the one being released (the plan's own when
+     * `next_plan` is false, the issued-ahead one's when true), which is the layer the open sub-step
+     * ends at. 0 everywhere else, a whole trunk. The stager paces its early staged layers on this
+     * base, so a slice that starts at layer L stages [L, L + lead) paced on the layers before it. */
+    int32_t next_prefill_first_layer(bool next_plan = false) const;
     /* Visible for tests: the most a prefill chunk at `n_computed` of a `n_target`-token sequence
      * may take of `budget` when `reserve` tokens of other work are still to be planned in the step
      * and `shared` says rows are already planned ahead of it. Returns `budget` when
@@ -688,6 +747,10 @@ private:
     /* --draft-suffix: the suffix proposal for `s`'s next step, over its committed history, into
      * `out` (RAD_SCHED_MAX_SPEC entries). Returns its length, 0 for none. */
     int suffix_propose(SchedReq& s, int32_t* out, int* match = nullptr);
+    /* --draft-suffix: indexes `r`'s committed history in `s`'s suffix index, proposing nothing.
+     * Called as each prefill chunk commits, so the first decode does not index the whole prompt
+     * (suffix.h). */
+    void suffix_index(SchedReq& s, const Request& r);
     /* Prompt lookup is the deployment's only drafter and --draft-window adaptive is on: its
      * proposals feed each sequence's estimate and are capped by its window, as a head's are. */
     bool lookup_adapt_ = false;
@@ -706,6 +769,8 @@ private:
      * any model. A test harness; empty when not given. */
     std::vector<int32_t>    debug_oracle_;
     static constexpr double kDebugMiss = 0.3;
+    /* RADIANCE_DEBUG_ORACLE_MODE: 0 miss (the hash), 1 right, 2 wrong, 3 random, 4 close, 5 close2, 6 after. */
+    int debug_oracle_mode_ = 0;
 
     mutable std::mutex mu_;
 
@@ -719,6 +784,7 @@ private:
 
     SchedMetrics metrics_locked() const;
     int          requests_locked(ReqStat* out, int max) const;
+    void         publish_held();
     /* The published copy and its lock (publish()). The scratch pair is the engine thread's, filled
      * under mu_ and then swapped with the published pair, so a publication allocates nothing once
      * the vectors have grown to the request count. */
@@ -727,7 +793,29 @@ private:
     std::vector<ReqStat> pub_reqs_;
     SchedMetrics         scratch_m_;
     std::vector<ReqStat> scratch_reqs_;
-    int64_t              pub_at_us_ = 0;
+    int64_t              pub_at_us_ = 0;      /* the last publication */
+    int64_t              pub_tbl_us_ = 0;     /* the last request-table rebuild in one */
+    /* The encoder run under way, under mu_: its items and its start, 0 when none (take_encodes). */
+    int64_t              enc_active_ = 0;
+    int64_t              enc_started_ns_ = 0;
+
+    /* The sinks a commit owes a wake: it pushes with the wake deferred (Sink::push) because it
+     * holds mu_ while it pushes, and flush_wakes issues them once the lock is gone, so a woken
+     * HTTP thread does not land on the step lock. Cleared at the start of every commit and sized
+     * at init, so a step allocates nothing. See WakeFlush. */
+    std::vector<void*>   wake_sinks_;
+    bool                 push_deferred(void* sink, int32_t token, const TokenLogprobs* lp,
+                                       int64_t now);
+    void                 push_progress(void* sink, int32_t processed, int32_t total,
+                                       int32_t cached);
+    void                 flush_wakes();
+    /* commit declares one before its lock, so it is destroyed after it: the deferred wakes go
+     * out with mu_ released. */
+    struct WakeFlush {
+        Scheduler& sch;
+        explicit WakeFlush(Scheduler& s) : sch(s) { s.wake_sinks_.clear(); }
+        ~WakeFlush() { sch.flush_wakes(); }
+    };
 
     std::vector<std::unique_ptr<SchedReq>> reqs_;   /* by slot */
     int64_t init_max_seqs_ = 0;   /* the max_seqs init sized for (retune) */
@@ -783,7 +871,8 @@ private:
     bool     next_open_ = false;
     /* Is a step the card may still be running holding this request? */
     bool in_step(const SchedReq& s) const {
-        return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0);
+        return (step_open_ && s.entry >= 0) || (next_open_ && s.entry_next >= 0) ||
+               group_.holds(s.slot);
     }
 
     /* The serial drafter's rows, valid between serial_begin() and serial_end(). */
@@ -848,6 +937,38 @@ private:
     int      step_ = 0;
     uint64_t arrival_ = 0;
 
+    /* ---------------------------------------------------- the layer-sliced chunk (S-02)
+     *
+     * One prefill chunk planned as m sub-steps, each running the chunk's rows over the layers
+     * [L_j, L_{j+1}) with the same decode rows in front of them. The decode rows are frozen: the
+     * group's steps run no admission, preemption, window growth, interleave, target step or
+     * drafting, so the same slots are planned in the same order and the chunk's row base does not
+     * move. A request that finishes, cancels or is reaped inside a group keeps its slot and its
+     * blocks (holds()) until the group's last sub-step has committed; its row is still issued and
+     * commit drops it as it drops any row whose request left Running. m is fixed at admission and
+     * not learned from the sub-steps' times, which are not a chunk step's. */
+    struct ChunkGroup {
+        bool     active = false;
+        int32_t  slot = -1;        /* the chunk's request slot */
+        int32_t  n_tokens = 0;     /* the chunk's rows, the same on every sub-step */
+        int32_t  n_slices = 0;
+        int32_t  next = 0;         /* the sub-step index the next plan builds */
+        int32_t  lo = 0, hi = 0;   /* its layers: [lo, hi) */
+        bool     produces_token = false;  /* planned once, masked to the last sub-step */
+        StepEntry entry;           /* the chunk's row, carried to every sub-step */
+        std::vector<int32_t> dec;  /* the frozen decode rows' slots, in plan order */
+        bool holds(int32_t s) const {
+            if (!active) return false;
+            if (s == slot) return true;
+            for (int32_t d : dec) if (d == s) return true;
+            return false;
+        }
+    };
+    ChunkGroup group_;
+    int32_t    n_layers_ = 0;     /* Program::meta.n_layers, the trunk's depth */
+    bool       slice_ok_ = false; /* the plugin reports it can run the trunk over a layer range
+                                   * (RadArchProbe::slice_layers_ok, read into cfg by the engine) */
+
     SchedMetrics m_{};
     std::chrono::steady_clock::time_point step_start_{};
     /* When the last step ended. An idle engine runs no steps, so nothing adds time to the
@@ -862,8 +983,9 @@ private:
     void (Scheduler::*record_step_)(int64_t, int64_t) = &Scheduler::record_no_step;
     diag::StepRing step_ring_;
     /* --prefill-interleave: decode-only steps still owed before the next chunk, and how many
-     * prefilling requests the last step() held back. step_next_locked stops issuing ahead once
-     * the hold is spent, or the chunk would wait as long as the decoders keep stepping ahead. */
+     * prefilling requests the last step() held back. step_next_locked issues the hold's decode-only
+     * steps ahead while it runs, and the step that carries the chunk once it is spent, so the
+     * chunk is planned while the card runs rather than in the waiters' time to first token. */
     int64_t interleave_left_ = 0;
     int64_t held_prefill_ = 0;
     /* --prefill-interleave auto: the decode-only steps after a chunk (interleave_steps), sized by

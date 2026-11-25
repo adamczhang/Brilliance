@@ -82,12 +82,44 @@ struct MMContentKey {
     int32_t  tok_begin = 0;    /* [begin, end) in prompt-token coordinates */
     int32_t  tok_end = 0;
     uint64_t hash = 0;
+    bool operator==(const MMContentKey& o) const {
+        return tok_begin == o.tok_begin && tok_end == o.tok_end && hash == o.hash;
+    }
+    bool operator!=(const MMContentKey& o) const { return !(*this == o); }
 };
 
 /* The chained hash of one block. `parent` is the previous block's hash (a zeroed BlockHash for
  * block 0), `block_begin` is the block's first token position. */
 BlockHash chain_block_hash(const BlockHash& parent, const int32_t* toks, int32_t n,
                            const MMContentKey* mm, int32_t n_mm, int64_t block_begin);
+
+/* The chain of a request's blocks, kept between calls (SchedReq::chain): `hs[b]` is the chained
+ * hash of block b, over tokens [0, (b+1) * block_size), so the chain a lookup walks over the
+ * prompt is a prefix of the one a publish walks over prompt ++ output, and a request that waits
+ * for room asks for it again on every scheduling round. A 64K prompt is 4096 block hashes, and
+ * the scheduler asks under its lock: hashing them once and keeping them is the difference.
+ *
+ * The tokens of a request only grow -- the prompt is fixed and output is appended -- so a hash
+ * taken once stays right and only the blocks past hs.size() are ever computed. Whose chain it is
+ * is the caller's to check (mine), since a SchedReq slot outlives its request. */
+struct PrefixChain {
+    std::vector<BlockHash> hs;    /* whole blocks only: hs.size() * block_size tokens covered */
+    uint64_t id = 0;              /* the request it was taken for */
+    int64_t prompt = -1;          /* and that request's prompt length, as the chain runs past it */
+    std::vector<MMContentKey> mm; /* and the media keys that went into it */
+
+    void reset() {
+        hs.clear();
+        id = 0;
+        prompt = -1;
+        mm.clear();
+    }
+    bool holds() const { return !hs.empty(); }
+    /* Whether the chain is this request's, as a lookup or publish of it would key its blocks. */
+    bool mine(uint64_t rid, int64_t n_prompt, const std::vector<MMContentKey>& keys) const {
+        return id == rid && prompt == n_prompt && mm == keys;
+    }
+};
 
 /* ------------------------------------------------------------------ the split lookup */
 struct CacheHit {
@@ -278,11 +310,13 @@ public:
      * Never returns the whole prompt: one token must remain to compute a logit from, so a full
      * hit is backed off by one entry. `cap`, when given, ends the hit early (HitCap). `session`,
      * when not 0, is the request being admitted: it takes over the snapshots on the chain it hit
-     * (take_over). */
+     * (take_over). `chain`, when given, is the request's kept chain: the blocks it already covers
+     * are not hashed again. */
     CacheHit lookup(const std::vector<int32_t>& tokens,
                     const std::vector<MMContentKey>& mm,
                     std::vector<std::vector<int32_t>>* blocks_out = nullptr,
-                    const HitCap* cap = nullptr, uint64_t session = 0) const;
+                    const HitCap* cap = nullptr, uint64_t session = 0,
+                    PrefixChain* chain = nullptr) const;
 
     /* Publish the whole entries a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */
@@ -291,7 +325,9 @@ public:
                const std::vector<MMContentKey>& mm,
                const std::vector<std::vector<int32_t>>& blocks,
                int64_t n_tokens,
-               const std::string& label = std::string());
+               const std::string& label = std::string(),
+               int32_t lora_slot = -1,
+               PrefixChain* chain = nullptr);
 
     /* Release up to `n_entries` least recently used entries' KV references; returns how many went.
      * Entries a live sequence also holds are skipped, since releasing them frees nothing. With the
@@ -449,6 +485,10 @@ public:
         int64_t lookups = 0, block_hits = 0, block_misses = 0;
         int64_t ckpt_hits = 0, ckpt_misses = 0;
         int64_t evictions = 0, ckpt_evictions = 0;
+        /* Block hashes the chain walker itself computed. A chain a request keeps
+         * (PrefixChain) costs only the blocks it does not cover, so this is what a turn spends
+         * hashing its own prompt, and what a kept chain saves. */
+        int64_t chain_blocks = 0;
         /* ckpt_evictions by reason: released by the retention policy, or taken as the least
          * recently used of a store retention left full. `ckpt_refused` counts reservations that
          * found every slot handed out this step and went without a snapshot. */
@@ -498,6 +538,11 @@ private:
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
                                      int64_t n_blocks) const;
+    /* chain_all() over a chain a caller keeps (PrefixChain): only the blocks past what it holds
+     * are hashed. A chain taken for a prefix of `tokens` stays right as the sequence grows past
+     * it, so a prompt's blocks serve a lookup over the prompt and a publish over the reply. */
+    void chain_upto(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                    int64_t n_blocks, PrefixChain* chain) const;
     void touch(Entry& e, uint64_t now_ns) const;
     void touch(const BlockHash& h, uint64_t now_ns) const;
     /* trim(), leaving the entries in `spare` (when given) where they are. */

@@ -104,6 +104,8 @@ struct SchedMetrics {
     int64_t prefill_tokens = 0;
     int64_t decode_tokens = 0;
     double  draft_acceptance = 0.0;   /* 0..1, spec §10 */
+    /* The deepest chain the latest step with a drafting row allowed (rad::SchedMetrics::draft_ceiling). */
+    int     draft_ceiling = 0;
     /* The exact pair the ratio is computed from. */
     int64_t draft_tokens = 0;
     int64_t draft_accepted = 0;
@@ -116,12 +118,22 @@ struct SchedMetrics {
     int64_t lookup_held = 0;
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
-    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts, and the
-     * decode steps kept from being issued ahead by a recurring pattern. */
+    /* --draft-suffix: verifies that carried a suffix chain, their rows and accepted drafts. A
+     * decode step kept from being issued ahead by a recurring pattern is counted in
+     * ahead_refused_suffix_hot. */
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
-    int64_t suffix_held_ahead = 0;
+    /* Why the next step was not issued ahead of the commit (rad::SchedMetrics::ahead_refused_*,
+     * S-07), one counter per reason; only the first check that refuses counts. Reported by
+     * /stats, with steps_ahead, as `steps_ahead_refused`. */
+    int64_t ahead_refused_waiting = 0;
+    int64_t ahead_refused_held = 0;
+    int64_t ahead_refused_mid_prompt = 0;
+    int64_t ahead_refused_grammar = 0;
+    int64_t ahead_refused_suffix_hot = 0;
+    int64_t ahead_refused_ends_every = 0;
+    int64_t ahead_refused_kv = 0;
     /* Per-position draft acceptance. The pooled `draft_acceptance` cannot tell a drafter that
      * decays with depth from one whose later rounds are broken. Per position j: verifies that
      * reached j (every earlier position accepted) and how many of those took j. */
@@ -148,10 +160,23 @@ struct SchedMetrics {
     int64_t steps_ahead = 0;          /* issued behind the step before, ahead of its commit */
     int64_t prefill_chunks_capped = 0; /* held back for other work in the step (--busy-prefill-chunk) */
     int64_t steps_held = 0;           /* decode-only steps --prefill-interleave inserted */
+    /* --chunk-slices (S-02): prefill chunks planned as layer-sliced sub-steps, and the sub-steps
+     * those groups planned. */
+    int64_t steps_sliced = 0;
+    int64_t substeps = 0;
     int64_t mixed_step_target_steps = 0; /* mixed steps observed by --mixed-step-target-ms */
     int64_t mixed_step_target_misses = 0;      /* those whose completed wall time exceeded the target */
     int64_t mixed_step_target_prefill_cap = 0; /* current learned mixed-prefill row cap */
     int64_t decode_rows_unspeculated = 0;
+    /* Runtime LoRA, by slot index (rad::SchedMetrics::loras): what completed under each slot
+     * and what runs there now. The dashboard's adapter rows read these; the names come from
+     * IScheduler::lora_names(), which indexes the same slots. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0, prompt_tokens = 0, output_tokens = 0, running = 0;
+    };
+    int        n_loras = 0;
+    LoraCount  loras[MAX_LORA_SLOTS] = {};
     /* Cumulative nanoseconds inside steps, all shapes and decode-only. Wall clock over a step
      * count is not a step time: the engine idles between turns, and a prefill chunk costs an
      * order of magnitude more than a decode step. `step_ns_decode / steps_decode` is the cost of
@@ -161,6 +186,12 @@ struct SchedMetrics {
     /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+    /* The encoder: cumulative items, patches and nanoseconds, and the items waiting or being
+     * encoded now (rad::SchedMetrics::encode_items). */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
 };
 
 
@@ -187,6 +218,9 @@ struct SessionStat {
     /* The prefix a return skips: the deepest snapshot's position (IdleTiers::SessionInfo). */
     int64_t     resume_tokens = 0;
     bool        moving = false;   /* a transfer is outstanding */
+    /* The runtime LoRA the conversation's last turn ran under; "" for the base. A session's
+     * turns may name different adapters -- this is the newest one, not a constraint. */
+    std::string lora;
 };
 
 /* What stored conversations occupy off the card, blocks and snapshots each counted once (the
@@ -222,7 +256,14 @@ struct RequestStat {
     /* Context held, on the token axis the paged groups share (not their sum). */
     int64_t     kv_tokens = 0;
     int32_t     n_draft = 0;
+    /* The verify steps that carried drafts for this request, the drafts they carried and the drafts they accepted,
+     * since it arrived (the scheduler's SchedReq::spec_steps, spec_tokens and spec_accepted). */
+    int64_t     draft_steps = 0;
+    int64_t     draft_tokens = 0;
+    int64_t     draft_accepted = 0;
     int32_t     slot = -1;
+    /* The runtime LoRA this row runs under; "" for the base. */
+    std::string lora;
     double      age_s = 0;
     double      ttft_s = -1;       /* negative until the first token */
     double      prefill_s = -1;    /* first token minus admission; negative until both */
@@ -276,6 +317,10 @@ public:
 
     /* The live request table, oldest first; returns the count. Default: none kept. */
     virtual int requests(std::vector<RequestStat>* /*out*/) const { return 0; }
+
+    /* The runtime LoRA names by slot index (the scheduler's ReqStat::lora_slot and the metrics'
+     * loras array index the same slots). Default: none. */
+    virtual std::vector<std::string> lora_names() const { return {}; }
 
     /* The stored conversations and where they are held. Default: no idle tiers, so an empty
      * table (everything the cache holds is in VRAM). */
@@ -429,6 +474,9 @@ struct ChatRender {
      * means no reasoning block. The server maps these to token ids (ReasoningSpan) to count the
      * block and enforce a budget. */
     std::string think_open, think_close;
+    /* The message header the reply may write before `think_open` (Inkling 2's
+     * <|message_model|>); empty for none. */
+    std::string think_frame;
     bool        think_starts_open = false;
 };
 
@@ -633,9 +681,9 @@ public:
         return RAD_E_UNSUPPORTED;
     }
 
-    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                              std::vector<float>* out, std::string* why) {
-        (void)bytes; (void)n; (void)rate; (void)max_samples; (void)out;
+    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                              int64_t max_samples, std::vector<float>* out, std::string* why) {
+        (void)bytes; (void)n; (void)rate; (void)channels; (void)max_samples; (void)out;
         if (why) *why = "this server prepares no reference media for an audio encoder";
         return RAD_E_UNSUPPORTED;
     }
@@ -700,6 +748,7 @@ struct ImageGenInfo {
     /* The pictures are not read by the conditioning network: they go to the generator's own
      * encoder only (RAD_GEN_LAYOUT_JOINT_STEP). */
     bool    refs_encoder_only = false;
+    bool    refs_fit_output = false;
     /* A reference picture is shrunk to `ref_area` only when larger, then centre-cropped to the
      * size multiple; otherwise resized to `ref_area` at its aspect. */
     bool    ref_shrink_only = false;
@@ -807,9 +856,11 @@ struct VideoGenInfo {
     int64_t max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0, enc_ratio = 0;
     /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
     bool    step_evals = false;
+    bool    unipc_only = false;
     /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
      * negative prompt a guided request gets when it names none. */
     bool    guidance = false;
+    bool    guidance_cfg_only = false;
     double  guidance_default[8] = {};
     std::string default_negative;
     /* Image to video: a first frame is taken, after an H.264 round trip at image_crf when > 0. */

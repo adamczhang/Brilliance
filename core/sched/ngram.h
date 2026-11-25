@@ -60,6 +60,13 @@ public:
     int propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
                 int* match = nullptr, int match_cap = 0);
 
+    /* Indexes the n-grams the sequence added since the last call, up to `upto` positions of it
+     * (clamped to seq.size() - 1), for pattern lengths nmin..nmax: propose() without the lookup.
+     * For a caller that wants the work done before the first lookup -- the scheduler indexes each
+     * committed chunk, so the first decode does not index a whole prompt (suffix.h). Same
+     * incremental index as propose(): 1 <= nmin <= nmax <= kMaxN. */
+    void index(const TokenSeq& seq, int nmin, int nmax, int64_t upto);
+
     /* The latest end position e < seq.size() - 1 of an earlier occurrence of the sequence's last
      * `n` tokens, or -1. Visible for tests; propose() calls it after indexing. */
     int64_t find_suffix(const TokenSeq& seq, int n) const;

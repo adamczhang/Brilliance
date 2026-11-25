@@ -376,6 +376,23 @@ typedef struct RadBatch {
      * ckpt_cut is 0. */
     int32_t        ckpt_cut;
     const int32_t* ckpt_cu;
+    /* ABI 44. Host mirror of the optional prefill_tail[_anchors] derivation.
+     * [rows, decode_rows, cu[n_seq+1], prefill_cu[n_prefill+1], original_row[rows], position[rows],
+     * optional three rotary planes of rows, optional compact ckpt_cu[3]].
+     * A full or empty tail needs only rows. */
+    const int32_t* prefill_tail_h;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* The trunk layers a prefill chunk's rows run on this pass: [layer_lo, layer_hi), in the
+     * model's own numbering. 0/0 is the whole trunk, the only shape a step had before ABI 44.
+     * The scheduler slices one chunk into m sub-steps (S-02) only on a model whose plugin declares
+     * the persistent set that makes a slice resumable (RadBuildCtx::layer_slices) and reports it
+     * can stop between two layers (RadArchProbe::slice_layers_ok): the chunk's tokens and slots
+     * are the same on every sub-step, its rows sit at the same place in the batch, n_checkpoints
+     * is 0 on every sub-step but the last, and a slice resumes from the previous one's layer_hi.
+     * A plugin that ignores the range (the zero default) runs the whole trunk. */
+    int32_t        layer_lo;
+    int32_t        layer_hi;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -515,6 +532,14 @@ typedef struct RadGenBatch {
     /* COND: the request's RAD_GEN_COND_* options, 0 for none and on every other pass. Only
      * options the plugin declares (RadGeneratorDecl::cond_opts) are set. */
     int32_t        cond_opts;
+    /* ---- appended Krea 2 reference attention (release assigns the ABI version) */
+    /* DENOISE: one natural-log bias a sequence on target queries to reference keys.
+     * Finite biases are in [-16, 16]; zero leaves dense attention unchanged.
+     * The driver uses negative infinity internally to isolate outfill reference queries. */
+    const float*   ref_log_bias;
+    /* DENOISE: three timesteps a sequence, one per text/reference/target span.
+     * Registered outfill leaves the source reference at timestep zero. */
+    const float*   mode_sigma;
 } RadGenBatch;
 
 /* A request's conditioning options on a COND pass (RadGenBatch::cond_opts). */
@@ -690,7 +715,9 @@ typedef struct RadVideoGenBatch {
     /* ---- VSTEP */
     int32_t         step;          /* from 0; the first draws the lane's noise */
     /* f32 [16]: the video's timestep, sigma and next sigma, then the soundtrack's; from [6] the
-     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below). */
+     * res_multistep scalars of the video, then of the soundtrack (`sampler`, below).
+     * For UniPC, the timestep is Wan's unnormalised integer timestep as f32.
+     * Eight flow_unipc_step coefficients start at RAD_VIDEO_UNIPC_COEFF_OFFSET. */
     const float*    sched;
     const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
     /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first (VSTEP, VUPSCALE and
@@ -737,7 +764,8 @@ typedef struct RadVideoGenBatch {
      * (k-diffusion's res_multistep at eta 0), which keeps the previous step's estimate. Its scalars
      * are sched[6..10] for the video and sched[11..15] for the soundtrack: sigma, r = next sigma /
      * sigma, the weights hb1 and hb2 of this step's estimate and the previous one, and the order,
-     * 1 where there is no previous estimate on the same grid. */
+     * 1 where there is no previous estimate on the same grid. RAD_SAMPLER_UNIPC uses
+     * the coefficients at RAD_VIDEO_UNIPC_COEFF_OFFSET and a three-plane history. */
     int32_t         sampler;
     /* VENCODE: f32 [enc_frames, enc_height, enc_width, 3] RGB in 0..255, the frames padded to
      * whole clips by repeating the last (rad_arch_encode_geom's entry 23). AENCODE: f32
@@ -757,7 +785,8 @@ typedef struct RadVideoGenBatch {
      * height, latent width, latent frames, soundtrack latents} in presentation order and 3 a
      * keyframe {frame, latent frames, soundtrack latents}, then the prompt's vision pads: a count
      * and {first token, tokens} of each picture's run. A reference's kind is RAD_VREF_PICTURE,
-     * _AUDIO or _VIDEO; its slot is its encode pass's. */
+     * _AUDIO or _VIDEO; its slot is its encode pass's. A keyframe with soundtrack latents is the
+     * song guide (RAD_ENC_GUIDE), which has no picture: its latent frames are 0. */
     const int32_t*  ref_tab;
     /* VSTEP: i32, rad_arch_video_pack's `mod`: the boundaries of the modulation groups, then the
      * cell each reads; `seg_cu` then holds the segment boundaries. A request without references
@@ -765,7 +794,8 @@ typedef struct RadVideoGenBatch {
     const int32_t*  mod_cu;
 } RadVideoGenBatch;
 
-enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1 };
+enum { RAD_SAMPLER_EULER = 0, RAD_SAMPLER_RES_MULTISTEP = 1, RAD_SAMPLER_UNIPC = 2 };
+enum { RAD_VIDEO_UNIPC_COEFF_OFFSET = 6 };
 
 /* What a shape generator's pass carries beside the step batch's own fields (rad_builder.h,
  * RadShapeGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
@@ -806,13 +836,14 @@ typedef struct RadShapeGenBatch {
 } RadShapeGenBatch;
 
 /* RadVideoGenBatch::enc_kind: the media an encode pass carries, numbered from 1 within a kind. A
- * keyframe is 1 for the first frame and 2 for the last. */
+ * keyframe is 1 for the first frame and 2 for the last. Additive; RAD_ABI_VERSION does not move. */
 enum {
     RAD_ENC_IMAGE = 1,      /* a reference picture; Vencode */
     RAD_ENC_VIDEO = 2,      /* a reference video; Vencode */
     RAD_ENC_VAUDIO = 3,     /* the soundtrack of reference video `enc_slot`; Aencode */
     RAD_ENC_AUDIO = 4,      /* a standalone soundtrack; Aencode */
-    RAD_ENC_KEYFRAME = 5    /* a first or last frame; Vencode */
+    RAD_ENC_KEYFRAME = 5,   /* a first or last frame; Vencode */
+    RAD_ENC_GUIDE = 6       /* a song guide, the soundtrack of a keyframe without a picture; Aencode */
 };
 
 /* RadVideoGenBatch::ref_tab: a reference's kind. */
@@ -928,6 +959,12 @@ int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n)
  * the second lane's window where the architecture declares one, abi/rad_builder.h). */
 int rad_lane(RadCtx* c, int lane);
 int rad_lane_join(RadCtx* c, int from, int to);
+
+/* The domain this deployment's issue dispatches `op` to: RAD_DOMAIN_DEVICE or RAD_DOMAIN_HOST
+ * (abi/rad_abi.h). The placement planner moves an op to the host after declare, when its weight
+ * operands are all host-placed (core/runtime/ctx.h "the placement seam"), so the plugin can only
+ * ask at run time. A negative status for a handle that was never declared. Additive export. */
+int rad_op_domain(RadCtx* c, rad_op op);
 
 /* Same, with the ranged value taken from the batch. */
 #define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)

@@ -1074,7 +1074,7 @@ bool mix_params(const RadArgs* a, long long* n, long long* hc, long long* iters,
     *eps = (float)r4d_getf(a, "eps", 0);
     *heps = (float)r4d_getf(a, "hc_eps", 0);
     return *n > 0 && *hc >= 2 && *hc <= 8 && *iters >= 1 && *iters <= 256 &&
-           *hc * *n <= (1L << 30) && std::isfinite(*eps) && std::isfinite(*heps) && *eps > 0 &&
+           *hc * *n <= (1LL << 30) && std::isfinite(*eps) && std::isfinite(*heps) && *eps > 0 &&
            *heps >= 0;
 }
 

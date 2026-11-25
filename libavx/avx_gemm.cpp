@@ -1192,6 +1192,11 @@ static int embed_impl(const RadArgs* a) {
      * as a parameter. */
     const float scale = QUANT ? (sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f)
                               : p_f32(a, "mult", 1.0f);
+    /* With one scale entry a table row (`n_vocab` of them) the scale is per row, x[m] =
+     * decode(wte[id]) * scale[id - vocab_offset]; one entry keeps its old meaning, any other
+     * count is refused (ref_embed_lookup_q). */
+    const bool per_row = QUANT && sc->data && n_vocab > 1 && numel(sc) == n_vocab;
+    if (QUANT && sc->data && numel(sc) > 1 && !per_row) return RAD_E_SHAPE;
 
     /* Validated before the loop; an OpenMP body cannot return. */
     if (voff == 0 && a->world_size <= 1)
@@ -1217,20 +1222,21 @@ static int embed_impl(const RadArgs* a) {
             else          std::memset(dst, 0, rowb);
             continue;
         }
+        const float rscale = per_row && have_row ? ldt(sc, offlin(sc, id)) : scale;
         float* s = scratch_f32((size_t)n_embd);
         if (!have_row) {
             for (int64_t i = 0; i < n_embd; ++i) s[i] = 0.0f;
         } else if (wc == 1) {
             row_to_f32(wte->dtype, byte_at(wte->data, wte->dtype, id * ws), s, n_embd);
-            if (scale != 1.0f) {
-                const vf vs = vf_set1(scale);
+            if (rscale != 1.0f) {
+                const vf vs = vf_set1(rscale);
                 int64_t i = 0;
                 for (; i + VF_N <= n_embd; i += VF_N) vf_storeu(s + i, vf_mul(vf_loadu(s + i), vs));
-                for (; i < n_embd; ++i) s[i] *= scale;
+                for (; i < n_embd; ++i) s[i] *= rscale;
             }
         } else {
             for (int64_t i = 0; i < n_embd; ++i)
-                s[i] = ld_elem(wte->data, wte->dtype, id * ws + i * wc) * scale;
+                s[i] = ld_elem(wte->data, wte->dtype, id * ws + i * wc) * rscale;
         }
         out_row(x, xb, n_embd, s);
     }
@@ -1253,8 +1259,28 @@ AVX_KERNEL(embed_lookup)   { return embed_impl<false>(a); }
  *
  * Every row is a cache miss, so each row's lines are prefetched kAhead rows before its decode. */
 static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                             int64_t n, const uint16_t* lut) {
+                             int64_t n, const DecodeTab* tab) {
     constexpr int64_t kAhead = 8;
+    const uint16_t* lut = tab->lut;
+    if (tab->per_row) {
+        /* A scale a row: bf16(decode(code) * scale[id]), the product in f32 rounded once. */
+        static const std::vector<float> flut = [] {
+            std::vector<float> t(256);
+            for (int b = 0; b < 256; ++b) t[(size_t)b] = rad_fp8e4m3_to_f32((uint8_t)b);
+            return t;
+        }();
+        const RowScale& rs = *tab->per_row;
+        float* tmp = scratch_f32((size_t)n + 16);
+        for (int64_t r = 0; r < count; ++r) {
+            const int64_t m = (int64_t)(dst[r] - rs.out) / rs.x_ld;
+            const int64_t id = (int64_t)rs.ids[m] - rs.voff;
+            const float sc = rad_load_f32(rs.scale, rs.dtype, id * rs.stride);
+            const uint8_t* s = src[r];
+            for (int64_t i = 0; i < n; ++i) tmp[i] = flut[s[i]] * sc;
+            cvt_f32_to_bf16(tmp, dst[r], n);
+        }
+        return;
+    }
 #if AVX_LEVEL >= 3
     __m512i t[8];
     for (int k = 0; k < 8; ++k) t[k] = _mm512_loadu_si512((const void*)(lut + 32 * k));
@@ -1297,13 +1323,13 @@ static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, in
 
 /* A bf16 table's rows are the output: the decode is a copy. */
 static void decode_bf16_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                             int64_t n, const uint16_t*) {
+                             int64_t n, const DecodeTab*) {
     for (int64_t r = 0; r < count; ++r) std::memcpy(dst[r], src[r], (size_t)n * sizeof(uint16_t));
 }
 
 /* Fills `g` for avx_ngram.cpp's gather, or returns false: i32 ids, a dense E4M3 table with a
  * scale or a dense bf16 table without, bf16 output rows at one pitch. */
-static bool rows_form(const RadArgs* a, RowGather* g) {
+static bool rows_form(const RadArgs* a, RowGather* g, RowScale* rs) {
     /* The scale (operand 2) is optional. */
     if (!rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3)) return false;
     const RadTensor* tok = &a->t[0];
@@ -1319,6 +1345,10 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
     const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
     if (n_embd <= 0 || n_vocab <= 0) return false;
+    /* A scale a table row (Engram's): `n_vocab` entries, contiguous. Any other count above one is
+     * the generic path's to refuse. */
+    const bool per_row = scaled && n_vocab > 1 && numel(sc) == n_vocab;
+    if (scaled && numel(sc) > 1 && (!per_row || !rad_tensor_is_contiguous(sc))) return false;
     int64_t ld = -1;
     if (rad_tensor_is_contiguous(x))                                        ld = n_embd;
     else if (x->rank == 2 && x->shape[1] == n_embd && x->stride[1] == 1)   ld = x->stride[0];
@@ -1339,12 +1369,24 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
     g->n_ahead = ahead ? numel(ahd) : 0;
     g->rank = a->rank;
     g->world_size = a->world_size;
+    g->row_scale = nullptr;
+    if (per_row) {
+        rs->ids = g->ids;
+        rs->voff = g->voff;
+        rs->out = g->out;
+        rs->x_ld = ld;
+        rs->scale = sc->data;
+        rs->dtype = sc->dtype;
+        rs->stride = 1;
+        g->row_scale = rs;
+    }
     return true;
 }
 
 AVX_KERNEL(embed_lookup_q) {
     RowGather g;
-    if (!rows_form(a, &g)) return embed_impl<true>(a);
+    RowScale rs;
+    if (!rows_form(a, &g, &rs)) return embed_impl<true>(a);
     if (g.voff < 0 || g.M <= 0 || numel(&a->t[0]) < g.M || numel(&a->t[1]) < g.n_vocab * g.n_embd)
         return RAD_E_SHAPE;
     /* Checked before the gather so a refusal never leaves the output half written. Same bound

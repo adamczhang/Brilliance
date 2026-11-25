@@ -54,6 +54,9 @@
 
 /* ---- elementwise and norms ---------------------------------------------------------------- */
 /* rmsnorm_add has no `mult`: no fused residual-norm site uses a scaled branch. */
+static const RadParamSpec pL2Clip[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_F64("threshold"),
+                                       P_STR("dtype"), P_F64O("floor"), P_F64O("alpha") };
+static const RadOperandSpec oL2Clip[] = { OPD("x"), WGT_O("w"), OPD_O("positions"), OUT("y") };
 static const RadParamSpec pRmsnormAdd[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
                                           P_F64O("wadd") };
 static const RadParamSpec pRmsnorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype"),
@@ -122,6 +125,11 @@ static const RadParamSpec pCausalConv[]   = { P_INT("M"), P_INT("n"), P_INT("wid
 static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
                                               OPD_O("cache_idx"), OPD_O("has_init"),
                                               OPD_O("num_accepted"), OUT("y") };
+static const RadParamSpec pSconvRes[]    = { P_INT("M"), P_INT("n"), P_INT("width"), P_INT("heads"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oSconvRes[]  = { OPD("x"), WGT("w"), INOUT("conv_state"), OPD("cu"),
+                                              OPD_O("dyn"), OPD_O("cache_idx"), OPD_O("has_init"),
+                                              OPD_O("num_accepted"), OUT("y") };
 
 static const RadParamSpec pHcWrite[]   = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
@@ -145,12 +153,26 @@ static const RadParamSpec pLayernorm[]   = { P_INT("M"), P_INT("n"), P_F64("eps"
 static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT("y") };
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
+/* posemb_resample (avx_norm.cpp): the same table resampled to a grid, as a table of its own. */
+static const RadParamSpec pPosembResample[] = { P_INT("S_h"), P_INT("S_w"), P_INT("T_h"), P_INT("T_w"),
+                                                P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oPosembResample[] = { WGT("table"), OUT("y") };
 static const RadParamSpec pWindowOrder[] = { P_INT("M"), P_INT("window") };
 static const RadOperandSpec oWindowOrder[] = { OPD("crd"), OPD_O("cu"), OUT("idx"), OUT("inv"),
                                                OUT("pos"), OUT("cuw") };
 static const RadParamSpec pGridEmbedCpe[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
                                                 P_INTO("n_prefix") };
 static const RadOperandSpec oGridEmbedCpe[] = { INOUT("x"), WGT("table"), OPD("coord"), WGT_O("prefix") };
+/* SiTU over a fused gate_up (avx_elementwise.cpp). */
+static const RadParamSpec pSituMul[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("gate_cap"),
+                                         P_F64O("up_cap") };
+/* Block attention residuals (avx_attn_res.cpp; libref/ref_attn_res.cpp has the contract). */
+static const RadParamSpec pAttnResMix[] = { P_INT("M"), P_INT("n"), P_INT("n_state"),
+                                            P_INT("n_query"), P_STR("dtype"), P_F64("eps") };
+static const RadOperandSpec oAttnResMix[] = { OPD_O("states"), OPD("cur"), OPD_O("addend"),
+                                              WGT("query"), WGT_O("w"), OUT("y") };
+static const RadParamSpec pGridEmbedSf[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype"),
+                                             P_F64O("offset") };
 /* LiLiCorr's correlator (avx_lili.cpp; libref/ref_lili.cpp has the contracts). */
 static const RadParamSpec pLiliCand[] = { P_INT("M"), P_INT("k"), P_INT("world"), P_INT("steps"),
                                           P_INT("n"), P_STR("dtype"), P_F64O("eps"),
@@ -169,6 +191,12 @@ static const RadOperandSpec oLiliWalk[] = { OPD("edges"), OPD("aout"), OPD("cand
                                             OUT_O("scores") };
 
 static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
+static const RadParamSpec pSwigluClampedHadQuant[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
+                                                        P_INT("group"), P_STR("dtype") };
+static const RadParamSpec pMlaExpandGateQuant[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_INT("group"), P_STR("dtype") };
+static const RadOperandSpec oMlaExpandGateQuant[] = { OPD("x"), WGT("w"), OPD("g"), OUT("q"),
+                                                      OUT("scale"), OUT_O("out_bf16") };
 static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
 /* `kv_dtype`: the latent cache's dtype when it is not the query's (fp8_e4m3, at descale 1). */
 static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
@@ -180,6 +208,68 @@ static const RadParamSpec pMlaAttnPaged[] = { P_INT("M"), P_INT("heads"), P_INT(
     P_INT("rope_dim"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
 static const RadOperandSpec oMlaAttnPaged[] = { OPD("q"), OPD_O("q_rope"), OPD("kv"),
     OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), OPD_O("gate"), OUT("out") };
+/* ---- Hy4-flash (docs/OPS.md, "Hy4-flash") ---------------------------------------------------- */
+static const RadParamSpec pIhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
+    P_F64("eps"), P_F64("hc_eps"), P_F64O("post_mag"), P_STR("dtype") };
+static const RadOperandSpec oIhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT_O("post") };
+/* rmsnorm_ihc_junction (WP16.2): the same lists as libr4d's and libref's. */
+static const RadParamSpec pIhcJunction[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("rows"),
+    P_F64("eps"), P_F64O("ihc_eps"), P_F64O("hc_eps"), P_F64O("post_mag"), P_INTO("tail"),
+    P_STR("dtype"), P_INTO("group") };
+static const RadOperandSpec oIhcJunction[] = { INOUT("a"), OPD_O("b"), WGT("w_post"),
+    INOUT("post"), INOUT("h"), WGT_O("fn"), WGT_O("scale"), WGT_O("base"), WGT_O("w_next"),
+    OUT_O("xn"), OUT_O("y"), OUT_O("x"), OUT_O("xq"), OUT_O("xs") };
+static const RadParamSpec pIhcPost[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
+static const RadOperandSpec oIhcPost[] = { OPD("y"), OPD("post"), INOUT("h") };
+static const RadParamSpec pMlaProjectKv[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
+static const RadParamSpec pMlaAttnPagedSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("block_size"), P_INT("window"), P_F64("scale"), P_STR("dtype"),
+    P_INTO("stable") };
+static const RadOperandSpec oMlaAttnPagedSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"),
+    OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"), WGT("sinks"), OUT("out") };
+static const RadParamSpec pMlaAttnSelSink[] = { P_INT("M"), P_INT("heads"), P_INT("latent_dim"),
+    P_INT("rope_dim"), P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype"),
+    P_INTO("stable") };
+static const RadOperandSpec oMlaAttnSelSink[] = { OPD("q"), OPD("q_rope"), OPD("kv"), OPD("bt"),
+    OPD("length"), WGT("sinks"), OUT("out") };
+static const RadParamSpec pMlaKvSplit[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("rope_dim"), P_STR("dtype") };
+static const RadOperandSpec oMlaKvSplit[] = { OPD("kvb"), OPD("k_rope"), OUT("k"), OUT("v") };
+/* N is a capacity (libref's spelling): the kernel reads the operands' extents. */
+static const RadParamSpec pAttnKvSink[] = { P_INT("M"), P_CAP("N"), P_INT("heads"),
+    P_INT("head_dim"), P_INT("window"), P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oAttnKvSink[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_q"),
+    OPD("cu_k"), WGT("sinks"), OUT("out") };
+static const RadOperandSpec oGateMul[] = { OPD("a"), OPD("g"), OUT("y") };
+static const RadParamSpec pMlaExpandGate[] = { P_INT("M"), P_INT("heads"), P_INT("k_dim"),
+    P_INT("v_dim"), P_INT("latent_dim"), P_STR("dtype") };
+static const RadOperandSpec oMlaExpandGate[] = { OPD("x"), WGT("w"), OPD("g"), OUT("y") };
+static const RadParamSpec pIdxPoolGated[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
+    P_INT("rotary_dim"), P_F64("eps"), P_F64("theta"), P_STR("mode"), P_STRO("sections"),
+    P_INTO("block_size"), P_STR("dtype") };
+static const RadOperandSpec oIdxPoolGated[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
+    WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("out") };
+static const RadOperandSpec oIdxPoolGatedFp8[] = { OPD("k"), WGT("wv"), WGT("wg"), WGT("ape"),
+    WGT("gain"), OPD("pos"), OPD_O("page"), INOUT_O("cache"), OUT_O("q"), OUT_O("scale") };
+static const RadParamSpec pIdxScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"), P_INT("blocks"),
+    P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oIdxScore[] = { OPD("q"), OPD("gate"), OPD("k"), OPD("bt"), OPD("cu"),
+    OPD("nc"), OUT("score") };
+static const RadParamSpec pEngramIds[] = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
+    P_INT("pad"), P_INT("map_size"), P_INTO("image"), P_INTO("video") };
+static const RadOperandSpec oEngramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), OPD("pos"),
+    WGT("token_map"), WGT("mult"), WGT("vocab_sizes"), WGT("offsets"), OPD_O("num_accepted"),
+    OPD_O("cache_idx"), OUT("ids"), OUT("mask"), OUT_O("ahead_ids") };
+static const RadParamSpec pEngramNorm[] = { P_INT("M"), P_INT("heads"), P_INT("n"), P_F64("eps"),
+    P_STR("dtype") };
+static const RadOperandSpec oEngramNorm[] = { OPD("e"), WGT("gain"), OUT("y") };
+static const RadParamSpec pEngramGate[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_F64("eps"),
+    P_STR("dtype") };
+static const RadOperandSpec oEngramGate[] = { OPD("key"), OPD("val"), OPD("mask"), WGT("w_key"),
+    WGT("w_query"), WGT("w_val"), WGT("w_branch"), INOUT("h") };
+
 static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
     P_INT("blocks"), P_INT("seqs"), P_STR("dtype"), P_INTO("row_part") };
 static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
@@ -252,6 +342,9 @@ static const RadParamSpec pCast[] = { P_INT("M"), P_INT("n"), P_STR("from"), P_S
 /* ---- quantisation and rotation ------------------------------------------------------------ */
 static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group"),
                                             P_STR("dtype") };
+/* had_quant_act_i8g's and had_quant_act_fp8's (libref's spelling): `chained` is a device library's row choice, ignored here. */
+static const RadParamSpec pHadQuantI8g[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
+                                            P_INTO("chained") };
 /* gram_accum's: `upper` 1 accumulates only k2 >= k1, the half a reader of a symmetric H needs. */
 static const RadParamSpec pGram[]       = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
                                             P_INTO("upper") };
@@ -288,7 +381,12 @@ static const RadOperandSpec oRmsHadQuant[] = { OPD("x"), INOUT_O("residual"), WG
                                                OUT("q"), OUT("scale"), OUT_O("out_bf16") };
 
 static const RadParamSpec pGatedQuant[]   = { P_INT("M"), P_INT("n"), P_INT("group"),
-                                              P_STR("dtype"), P_STRO("act"), P_INTO("mode") };
+                                              P_STR("dtype"), P_STRO("act"), P_INTO("mode"),
+                                              P_F64O("gate_cap"), P_F64O("up_cap") };
+/* gated_quant_i8: the same parameters with `group` optional (default 128); libref's table matches. */
+static const RadParamSpec pGatedQuantI8[] = { P_INT("M"), P_INT("n"), P_INTO("group"), P_STR("dtype"),
+                                              P_STRO("act"), P_INTO("mode"), P_F64O("gate_cap"),
+                                              P_F64O("up_cap") };
 static const RadOperandSpec oGatedQuant[] = { OPD("a"), OPD_O("b"), OUT("q"), OUT("scale") };
 
 /* `a_scale` is optional: a "bf16" activation has none. */
@@ -302,6 +400,8 @@ static const RadParamSpec pDequantW4[] = { P_INT("N"), P_INT("K"), P_INT("group"
 static const RadOperandSpec oDequantW4[] = { WGT("wq"), WGT("ws"), OUT("y") };
 
 /* ---- gemm --------------------------------------------------------------------------------- */
+static const RadParamSpec pGemmF32[] = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
+                                         P_INTO("weight_bf16") };
 static const RadParamSpec pGemm[]       = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype") };
 static const RadOperandSpec oGemm[]     = { OPD("a"), WGT("b"), OUT("y") };
 static const RadParamSpec pGemmBias[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_STR("dtype"),
@@ -355,6 +455,18 @@ static const RadOperandSpec oAttnPagedTree[] = {
 static const RadOperandSpec oAttnPagedSink[] = {
     OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
     OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"), WGT("sinks"), OUT("out")
+};
+/* Inkling 2's attention: attn_paged's parameters and operands with the bias (r, rel_proj) and the
+ * per-row sinks before `out` (libref's ref_registry.cpp has the contract). */
+static const RadParamSpec pAttnPagedRel[] = {
+    P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"), P_INTD("block_size"), P_INT("causal"),
+    P_INT("window"), P_STR("q_dtype"), P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
+    P_INTO("n_head"), P_INTO("max_seqs"), P_INTO("prefill_fp8"), P_INT("d_rel"), P_INT("extent")
+};
+static const RadOperandSpec oAttnPagedRel[] = {
+    OPD("q"), OPD("kv_cache"), OPD("block_table"), OPD("seqused"),
+    OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("cu_seqlens"),
+    OPD("r"), WGT("rel_proj"), OPD("sink"), OUT("out")
 };
 static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 
@@ -459,7 +571,7 @@ static const RadParamSpec pQsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads")
 static const RadOperandSpec oQsaScore[] = { OPD("q"), OPD("bk"), OPD("bt"), OPD("cu"), OPD("nc"),
                                             OUT("score") };
 static const RadParamSpec pQsaSelect[] = { P_INT("M"), P_INT("blocks"), P_INT("topk"),
-                                           P_INT("ratio"), P_INT("seqs"), P_INTO("signed") };
+                                           P_INT("ratio"), P_INT("seqs"), P_INTO("signed"), P_INTO("own") };
 static const RadOperandSpec oQsaSelect[] = { OPD("score"), OPD("bt"), OPD("nc"), OPD("pos"),
                                              OPD("cu"), OUT("sel"), OUT("nsel"), OUT("seqused") };
 static const RadParamSpec pQsaTailStore[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("ring"),
@@ -471,6 +583,13 @@ static const RadParamSpec pQsaWork[] = { P_INT("M"), P_INT("n"), P_INT("ratio"),
 static const RadOperandSpec oQsaWork[] = { OPD("k"), OPD("pos"), OPD("cu"), OPD("state"),
                                            OPD("sidx"), OPD("bt"), OPD_O("rope"), OUT("stage"),
                                            OUT("page"), OUT("bpos"), OUT("nc") };
+
+/* dfly_sel: DFly2's draft table (libref/ref_dfly.cpp). `count` is optional. */
+static const RadParamSpec pDflySel[] = { P_INT("M"), P_INT("blocks_in"), P_INT("blocks"),
+                                         P_INT("ratio"), P_INT("seqs") };
+static const RadOperandSpec oDflySel[] = { OPD("sel"), OPD("nsel"), OPD("src"), OPD("bt"),
+                                           OPD("pos"), OPD("cu"), OUT("out"), OUT("len"),
+                                           OUT_O("count") };
 
 static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
                                               P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
@@ -706,7 +825,9 @@ static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
 static const RadParamSpec pIm2col[] = { P_INT("M"), P_INT("cin"), P_INT("k"), P_INT("stride"),
                                         P_STR("pad"), P_INT("up"), P_STR("dtype") };
-static const RadParamSpec pL2Norm[] = { P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype") };
+static const RadParamSpec pL2Norm[] = {
+    P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"), P_INTO("round_length"),
+};
 static const RadOperandSpec oL2Norm[] = { OPD("x"), WGT("gamma"), OUT("y") };
 static const RadParamSpec pSpaceDepth[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("ft"),
                                             P_STR("dtype") };
@@ -967,6 +1088,15 @@ static const RadParamSpec pDflashMarkov[]    = { P_INT("M"), P_INT("steps"), P_I
 static const RadOperandSpec oDflashMarkov[]  = { OPD("logits"), OPD("anchor"), WGT("pred"),
                                                  WGT("succ"), OUT("tile_scores"),
                                                  OUT("tile_tokens"), OUT("tokens") };
+static const RadParamSpec pMarkovRnn[]       = { P_INT("M"), P_INT("steps"), P_INT("rank"),
+                                                 P_INT("n_vocab"), P_INTO("anchor_stride"),
+                                                 P_F64O("cap"), P_INTO("vocab_rows"),
+                                                 P_STR("dtype") };
+static const RadOperandSpec oMarkovRnn[]     = { OPD("logits"), OPD("ctx"), OPD("ctx_seq"),
+                                                 OPD("anchor"), WGT("w1"), WGT("wsp"),
+                                                 WGT("bias"), WGT("fold"), WGT("fold_b"),
+                                                 OUT("scratch"), OUT("tile_scores"),
+                                                 OUT("tile_tokens"), OUT("tokens") };
 static const RadParamSpec pDflashTree[]      = { P_INT("M"), P_INT("steps"), P_INT("top_k"),
                                                  P_INT("rank"), P_INT("n_vocab"),
                                                  P_INTO("anchor_stride"), P_INT("nodes"),
@@ -1046,6 +1176,8 @@ static const RadOpSchema kSchemas[] = {
 { "rmsnorm", ARR(pRmsnorm), ARR(oRmsnorm),
   "y = x * rsqrt(mean(x^2) + eps) * (w + wadd); the sum of squares is a four-accumulator vector "
   "reduction, in a different order from libref's." },
+{ "l2_clip", ARR(pL2Clip), ARR(oL2Clip),
+  "per-group L2 clip with an optional scale and a position tau: libref's l2_clip." },
 { "rmsnorm_p", ARR(pLayernorm), ARR(oUnary),
   "y = x * rsqrt(mean(x^2) + eps): rmsnorm with no gain, summed as rmsnorm sums." },
 { "rmsnorm_add", ARR(pRmsnormAdd), ARR(oRmsnormAdd),
@@ -1088,6 +1220,12 @@ static const RadOpSchema kSchemas[] = {
   "window boundaries; window <= 0 is the identity." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
+{ "situ_mul", ARR(pSituMul), ARR(oGateUp),
+  "SiTU over a fused gate_up, gate first: gcap * tanh(g / gcap) * sigmoid(g) * ucap * tanh(u / "
+  "ucap); a cap of 0 is no softcap on that side." },
+{ "attn_res_mix", ARR(pAttnResMix), ARR(oAttnResMix),
+  "Block attention residuals: a softmax over depth of rms-normed states, cur + addend, per query; "
+  "optionally rms-normed and gained by w. states may be absent at n_state 0." },
 { "lili_cand", ARR(pLiliCand), ARR(oLiliCand),
   "LiLiCorr's candidates from the ranks' sample_logprobs rows, their rank features through "
   "layernorm, the up projection and silu, and the lattice rows' additive part." },
@@ -1102,6 +1240,17 @@ static const RadOpSchema kSchemas[] = {
   "x += the table resampled half-pixel bilinear (no antialias) onto a square of the grid's larger "
   "side and cropped to the grid: RADIO's cropped position embedding. A row with a negative row "
   "coordinate gets the learned prefix row its column names." },
+{ "grid_embed_hw", ARR(pGridEmbedCpe), ARR(oGridEmbedCpe),
+  "x += the table resampled half-pixel bilinear (no antialias) onto the grid's own height and "
+  "width, each axis its own extent: Inkling 2's position embedding. A row with a negative row "
+  "coordinate gets the learned prefix row its column names." },
+{ "posemb_resample", ARR(pPosembResample), ARR(oPosembResample),
+  "y [T_h * T_w, n] = the S_h x S_w table resampled bilinearly to a T_h x T_w grid, row "
+  "i_h * T_w + i_w, align_corners=False with edge taps clamped; as libref's." },
+{ "grid_embed_sf", ARR(pGridEmbedSf), ARR(oGridEmbed),
+  "x += the table resampled half-pixel bilinear (no antialias) at the stated scale factor "
+  "(size + offset) / side an axis, 1 / scale in f64 rounded to f32 as torch forms it: Hy4-flash's "
+  "position embedding." },
 { "add", ARR(pAdd), ARR(oBinary),
   "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows. With "
   "`div`, y = rd(rd(a + b) / div), bit for bit libref's." },
@@ -1146,14 +1295,97 @@ static const RadOpSchema kSchemas[] = {
   "Dense causal latent attention over a paged cache whose token row is the latent then the rotated "
   "key part: score = scale * (q . latent + q_rope . rope), value = the latent; sequences as in "
   "attn_paged. With `gate`, out = bf16(bf16(out) * bf16(sigmoid(gate[head])))." },
+{ "ihc_pre", ARR(pIhcPre), ARR(oIhcPre),
+  "Independent hyper-connection read (Hy4-flash; no mixing matrix, no Sinkhorn). f = f32(h); r = "
+  "rsqrt(sum f^2 / (hc*n) + eps); c[j] = (fn[j] . f) * r; pre[j] = sigmoid(c[j]*scale[0] + base[j]) "
+  "+ hc_eps; x = round(sum_j pre[j] f[j]). With `post` present (rows == 2*hc, scale has two "
+  "entries, post_mag required): post[j] = post_mag * sigmoid(c[hc+j]*scale[1] + base[hc+j]) + "
+  "hc_eps, f32. Without it (rows == hc, one scale entry) the head's collapse." },
+{ "ihc_post", ARR(pIhcPost), ARR(oIhcPost),
+  "h[j][i] = round(post[j] * f32(y[i]) + f32(h[j][i])), in place on the hc streams; the product is "
+  "rounded to f32 before the add. Nothing normalises the stream." },
+{ "rmsnorm_ihc_junction", ARR(pIhcJunction), ARR(oIhcJunction),
+  "The iHC junction between two blocks in one op: [y = a + b, rounded and stored into a] "
+  "y = rmsnorm(a or the sum; w_post, eps); ihc_post(y, post, h); with `tail` (default 1) "
+  "ihc_pre(h; fn, scale, base; rows, ihc_eps, hc_eps, post_mag) -> x and, at rows == 2*hc, "
+  "the next post (into `post`); xn = rmsnorm(x; w_next, eps). `y` and `x` are stored only "
+  "when passed. Byte-identical to the five ops in sequence." },
+{ "mla_project_kv", ARR(pMlaProjectKv), ARR(oGemm),
+  "Per-head absorption or expansion through the checkpoint's kv_b, rows head-major with each head's "
+  "k_dim key rows then its v_dim value rows. absorb: [M,heads,k_dim] -> [M,heads,latent]; expand: "
+  "[M,heads,latent] -> [M,heads,v_dim]. mla_project with unequal K and V widths." },
+{ "mla_attn_paged_sink", ARR(pMlaAttnPagedSink), ARR(oMlaAttnPagedSink),
+  "mla_attn_paged with a window and a sink. A row at position p sees keys [max(0, p-window+1), p] "
+  "(window 0: all), the window counting the row's own token. s_j = scale*(q.latent_j + "
+  "q_rope.rope_j); out = sum exp(s_j) latent_j / (sum exp(s_j) + exp(sink[h])): the sink joins the "
+  "softmax once and carries no value. No visible key gives zero. `stable` 1 (optional, default 0) "
+  "asks that a row's bytes not depend on the launch (M, its other rows); a row-independent "
+  "kernel ignores it." },
+{ "mla_attn_sel_sink", ARR(pMlaAttnSelSink), ARR(oMlaAttnSelSink),
+  "mla_attn's per-query page table and visible length with a rotary part and a sink: tokens "
+  "[0, length[r]) of table row bt[r]. The score, the sink and `stable` are "
+  "mla_attn_paged_sink's." },
+{ "mla_kv_split", ARR(pMlaKvSplit), ARR(oMlaKvSplit),
+  "kvb [N, heads*(k_dim+v_dim)] and k_rope [N, rope_dim] -> k [N, heads, k_dim+rope_dim] (the rope "
+  "part shared by every head) and v [N, heads, v_dim]. A copy." },
+{ "attn_kv_sink", ARR(pAttnKvSink), ARR(oAttnKvSink),
+  "Dense causal attention with a key prefix, a window and a sink. Sequence s has m_s query rows and "
+  "n_s >= m_s key rows (cu_q, cu_k); query i sits at key index p = n_s - m_s + i and sees j <= p "
+  "with p - j < window (window 0: all). out = sum exp(s_j) v_j / (sum exp(s_j) + exp(sink[h]))." },
+{ "mla_expand_gate", ARR(pMlaExpandGate), ARR(oMlaExpandGate),
+  "mla_project_kv's expand followed by gate_mul in one op: y = round(f32(round(sum_j x[m,h,j] * "
+  "w[h*(k_dim+v_dim) + k_dim + c][j])) * sigmoid(f32(g[m, h*v_dim + c]))), the pair's bytes." },
+{ "gate_mul", ARR(pMnD), ARR(oGateMul),
+  "y = round(f32(a) * sigmoid(f32(g))): one rounding. act_mul's sigmoid form rounds the sigmoid "
+  "first, which is a different bf16 result." },
+{ "idx_pool_gated", ARR(pIdxPoolGated), ARR(oIdxPoolGated),
+  "The compressed indexer's group key (Hy4-flash). Per group of `ratio` token keys, in f32: "
+  "val_s = wv x_s; gat_s = wg x_s + ape[s]; softmax over the slots per channel; y = sum_s val_s p_s; "
+  "z = round(gain * (y * rsqrt(mean y^2 + eps))); then the last `rotary_dim` channels rotated as "
+  "adjacent pairs at the group's first position (mode gptj, or imrope_gptj with `sections`, pos "
+  "[3, W]) and rounded again. Written to cache[page[w]] and/or out[w]." },
+{ "idx_pool_gated_fp8", ARR(pIdxPoolGated), ARR(oIdxPoolGatedFp8),
+  "idx_pool_gated's group key kept in f32 (no rounding after the norm or the rotation), then "
+  "quantised as vLLM's IndexPool does: ascending-stride Walsh-Hadamard transform times n^-0.5, "
+  "E4M3 codes at scale 2^ceil(log2(max(amax, 1e-4) / 448)), nearest even, nothing rounded to "
+  "bf16 in between. Written to the packed u8 cache page (dsa_pool's [pages, 1, 4, 34]: 128 codes, "
+  "f32 scale at byte 128; n 128) and/or q [W, n] E4M3 with scale [W, 1] f32." },
+{ "idx_pool_gated_i8", ARR(pIdxPoolGated), ARR(oIdxPoolGatedFp8),
+  "idx_pool_gated_fp8's key (f32, no bf16 rounding, the 128-wide Hadamard times n^-0.5) as symmetric "
+  "INT8 codes at an f32 scale max(amax, 1e-4) / 127, nearest even, clamped to +-127 (the "
+  "RADIANCE_HY4_INDEXER=int8 form). Written to the packed u8 cache page ([pages, 1, 4, 34]: 128 int8 "
+  "codes, f32 scale at byte 128; n 128) and/or q [W, n] i8 with scale [W, 1] f32." },
+{ "idx_score", ARR(pIdxScore), ARR(oIdxScore),
+  "Group scores of the compressed indexer: w_h = gate[m][h] * (heads*n)^-0.5, d_h = q[m][h] . key, "
+  "score = (sum_{h < heads/2} w_h relu(d_h)) + (sum_{h >= heads/2} w_h relu(d_h)). A block past "
+  "nc[seq], with a page < 0 or out of range, or past the table: -inf." },
+{ "engram_ids", ARR(pEngramIds), ARR(oEngramIds),
+  "Engram's hash ids: c_k = map[tok_k] (pad before the document start and for an id at or past "
+  "map_size), m_k = c_k * mult[k] in wrapping int64, mix_g = m_0 ^ .. ^ m_{g-1}, head i of order g: "
+  "floor_mod(mix_g, vocab_sizes[i]) + offsets[i]; mask = tok not in {pad, image, video}. `state` is "
+  "ngram_ids' window of committed ids. With `ahead_ids` present, `tok` holds the following "
+  "prompt of the last sequence past the step's rows (numel(ahead_ids) / heads tokens, positions "
+  "continuing its last), and their ids land in `ahead_ids` (a read-ahead hint); the window written "
+  "back is the step's own." },
+{ "engram_norm", ARR(pEngramNorm), ARR(oEngramNorm),
+  "One rms norm a head over the gathered rows: y[i] = round(gain[i] * x[i] * rsqrt(mean_head(x^2) + "
+  "eps)). eps is a parameter: 0.0078125 (HF in bf16) or 1.19e-7." },
+{ "engram_gate", ARR(pEngramGate), ARR(oEngramGate),
+  "Engram's gate and its add into the hc streams: main = w_val * val * rsqrt(mean(val^2) + eps); per "
+  "stream c, d = (sum kn*qn) n^-0.5 over kn = w_key*key*rsqrt(..), qn = w_query*h_c*rsqrt(..); g = "
+  "sigmoid(sign(d) sqrt(max(|d|, 1e-6))); h_c += round(g*main + w_branch[c]*main). Rows with mask 0 "
+  "are untouched." },
 { "mla_project", ARR(pMlaProject), ARR(oGemm),
   "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
 { "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
   "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
-{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
-  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "gemm_nt_f32", ARR(pGemmF32), ARR(oGemm),
+  "BF16 activations times F32 or stored BF16 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "dsa_query", ARR(pMnD), ARR(oQuantFp8),
   "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
+{ "dsa_query_i8", ARR(pMnD), ARR(oQuantFp8),
+  "dsa_query's INT8 form: normalized Hadamard in f32, symmetric int8 codes at an f32 scale "
+  "max(amax, 1e-4) / 127 per query head row, nearest even, clamped to +-127." },
 { "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
   "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
 { "swiglu_step", ARR(pSwigluClamped), ARR(oGateUp),
@@ -1179,6 +1411,9 @@ static const RadOpSchema kSchemas[] = {
   "ple_conv with a per-channel bias inside the silu (Mamba-2's conv1d)." },
 { "causal_conv1d", ARR(pCausalConv), ARR(oCausalConv),
   "depthwise causal conv with ple_conv's window, no activation and no residual (LFM2)." },
+{ "sconv_res", ARR(pSconvRes), ARR(oSconvRes),
+  "depthwise causal conv with its input as the residual and optional input-dependent taps, "
+  "scaled by 1/sqrt(m*k+1) (Inkling 2's short convolution)." },
 { "ngram_ids", ARR(pNgramIds), ARR(oNgramIds), "hashed n-gram row ids for PLE." },
 { "gather_rows", ARR(pMnD), ARR(oGather), "y[i,:] = x[idx[i],:]." },
 { "scatter_rows", ARR(pMnD), ARR(oScatterRows),
@@ -1194,7 +1429,10 @@ static const RadOpSchema kSchemas[] = {
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
 { "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
-{ "had_quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
+{ "had_quant_act_fp8", ARR(pHadQuantI8g), ARR(oQuantFp8),
+  "width-128 Hadamard, then quant_act_fp8's symmetric E4M3 per group. No normalisation: the "
+  "1/128 is the rotated expert weight's stored scale (docs/OPS.md)." },
+{ "had_quant_act_i8g", ARR(pHadQuantI8g), ARR(oQuantFp8),
   "width-`group` Hadamard, then quant_act_i8g's symmetric int8 per group. No normalisation: the "
   "1/group is the i8a8h weight's stored scale (docs/OPS.md)." },
 { "gram_accum", ARR(pGram), ARR(oGram),
@@ -1206,6 +1444,8 @@ static const RadOpSchema kSchemas[] = {
   "RMS norm, optional residual add, rotation and int8 in one pass." },
 { "gated_had_quant_i8", ARR(pGatedQuant), ARR(oGatedQuant),
   "gated product, rotation and int8 in one pass." },
+{ "gated_quant_i8", ARR(pGatedQuantI8), ARR(oGatedQuant),
+  "gated_had_quant_i8 without the rotation: per-group int8 with one f32 scale per group." },
 { "dequant", ARR(pDequant), ARR(oDequant), "group-scaled dequantisation." },
 { "dequant_w4", ARR(pDequantW4), ARR(oDequantW4),
   "Packed int4 weight to row-major bf16. Each 32-bit word holds 8 codes; the scale is "
@@ -1235,6 +1475,12 @@ static const RadOpSchema kSchemas[] = {
 { "lora_expand_mm", ARR(pLoraExpand), ARR(oLoraExpand),
   "lora_expand with t rounded to bf16, the sum over j in any order; a base row is neither read nor "
   "written." },
+{ "swiglu_clamped_had_quant_i8g", ARR(pSwigluClampedHadQuant), ARR(oGatedQuantFp8),
+  "swiglu_clamped followed by had_quant_act_i8g in one op: the pair itself, on this library's two "
+  "kernels. `out_bf16` holds the unrotated product the codes were taken over." },
+{ "mla_expand_gate_had_quant_i8g", ARR(pMlaExpandGateQuant), ARR(oMlaExpandGateQuant),
+  "mla_expand_gate followed by had_quant_act_i8g over its product in one op: the chain itself, on "
+  "this library's kernels. `out_bf16` holds the unrotated product." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },
@@ -1252,6 +1498,10 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged_sink", ARR(pAttnPaged), ARR(oAttnPagedSink),
   "attn_paged with `sinks` [n_head] f32, one logit a query head beside the keys in the softmax's "
   "maximum and denominator, with no value." },
+{ "attn_paged_rel", ARR(pAttnPagedRel), ARR(oAttnPagedRel),
+  "attn_paged with a relative-position bias and a sink logit per query row and head. The bias of "
+  "key j is r[i,h] . rel_proj[:, d] at d = pos_i - pos_j for 0 <= d < extent, else 0; it joins "
+  "the score unscaled. The sink joins the softmax's maximum and denominator with no value." },
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
@@ -1293,6 +1543,11 @@ static const RadOpSchema kSchemas[] = {
   "the topk highest-scoring complete blocks as page ids, libref's order exactly: the blocks above "
   "the threshold in block order, then its ties in block order, then the partial page, then -1 to "
   "topk + 1; a radix select, linear in the blocks." },
+{ "dfly_sel", ARR(pDflySel), ARR(oDflySel),
+  "DFly2's draft table: for each query row of a sequence whose first row sits at position a, the "
+  "source row src[s]'s recalled pages (sel[src][0, nsel-1), or bt[0, g0) when nsel is 0, g0 = "
+  "(a-1)/ratio), then bt[g0] .. bt[pos/ratio], -1 to `blocks`; len = ratio*nrec + pos - ratio*g0 + "
+  "1, count = the entries. A source of -1 or a table past `blocks` gives the row -1 and len 0." },
 { "qsa_tail_store", ARR(pQsaTailStore), ARR(oQsaTailStore),
   "state[sidx[s][0]][pos[t] % ring] = k[t] for the last `ring` tokens of each sequence; the other "
   "rows of the tail keep what they held." },
@@ -1598,6 +1853,10 @@ static const RadOpSchema kSchemas[] = {
   "succ[token][r], the greatest wins (lower id on a tie) and is the next predecessor." },
 { "dflash_markov_greedy_f32", ARR(pDflashMarkov), ARR(oDflashMarkov),
   "dflash_markov_greedy with f32 draft logits and bf16 codebooks." },
+{ "markov_rnn_greedy", ARR(pMarkovRnn), ARR(oMarkovRnn),
+  "Inkling 2's recurrent DSpark head walked greedily: a gated rank-r state from [state | "
+  "w1[prev]] and the step's context, a tanh latent, and the full-vocabulary argmax of "
+  "softcap(logits + fold_b + fold . latent), the next step's predecessor." },
 { "dflash_select", ARR(pDflashSelect), ARR(oDflashSelect),
   "a greedy walk over a candidate lattice: score[l, c] = unary[l, c] + sum_r pred[pid(l)][r] * "
   "hp[l][r] * succ[cand[l, c]][r], pid(0) the anchor and pid(l) the walk's own previous pick. "
@@ -1724,14 +1983,17 @@ static const RadOpSchema kSchemas[] = {
  * stored joined (abi/rad_planes.h); a view of one plane is stored as it is. The selections
  * accepted are libref's (libref/ref_moe.cpp: cb_check), so a weight libref refuses at declare is
  * refused here too, and both libraries store the same bytes under one tag. */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; bool fp4 = false; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
+    /* NVFP4's codes are one plain e2m1 plane (no join), so only its scale view is checked here. */
+    if (s && !std::strcmp(s, "nvfp4a8i8")) return CbForm{ 4, 16, RAD_F8E4M3, true, true };
     if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
     if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
+    if (s && !std::strcmp(s, "w6nl64a8h")) return CbForm{ 6, 64, RAD_F8E4M3, true };
     /* The same stored experts under their names against an int8 activation. */
     if (s && !std::strcmp(s, "w4nl64a8i8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
     if (s && !std::strcmp(s, "w4nl32a8i8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
@@ -1743,7 +2005,7 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
     if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes != 2 ||
-        std::strcmp(enc->transform, "fwht128") != 0)
+        (!f.fp4 && std::strcmp(enc->transform, "fwht128") != 0))
         return RAD_E_DTYPE;
     for (int i = 0; i < 2; ++i)
         if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
@@ -1751,7 +2013,7 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const RadEncPlane& b = enc->plane[sel[1]];
     if (codes)
         return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
+               a.dtype == (f.bits == 6 ? (uint32_t)RAD_U6 : f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
                a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
                b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
@@ -1819,6 +2081,8 @@ static const RadKernelInfo kKernels[] = {
 SIMPLE("avx_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT, L(rmsnorm)),
 SIMPLE("avx_rmsnorm_p", "rmsnorm_p", "norm", "weightless RMS norm (no gain)", DT_FLOAT,
        L(rmsnorm_p)),
+SIMPLE("avx_l2_clip", "l2_clip", "elem", "per-group L2 clip with a scale and a position tau",
+       DT_FLOAT, L(l2_clip)),
 SIMPLE("avx_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", DT_FLOAT,
        L(rmsnorm_add)),
 SIMPLE("avx_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
@@ -1859,6 +2123,20 @@ SIMPLE("avx_grid_embed_aa", "grid_embed_aa", "elem",
 SIMPLE("avx_grid_embed_cpe", "grid_embed_cpe", "elem",
        "half-pixel bilinear resample of a position grid onto a square, cropped, added in", DT_FLOAT,
        L(grid_embed_cpe)),
+SIMPLE("avx_grid_embed_hw", "grid_embed_hw", "elem",
+       "half-pixel bilinear resample of a position grid onto the grid's own height and width, "
+       "added in", DT_FLOAT, L(grid_embed_hw)),
+SIMPLE("avx_posemb_resample", "posemb_resample", "elem",
+       "bilinear resample of a position table to a T_h x T_w grid, as a table", DT_FLOAT,
+       L(posemb_resample)),
+SIMPLE("avx_situ_mul", "situ_mul", "elem", "SiTU gated product over a fused gate_up", DT_FLOAT,
+       L(situ_mul)),
+SIMPLE("avx_attn_res_mix", "attn_res_mix", "norm",
+       "block attention residuals: a depth softmax over rms-normed states", DT_FLOAT,
+       L(attn_res_mix)),
+SIMPLE("avx_grid_embed_sf", "grid_embed_sf", "elem",
+       "half-pixel bilinear resample of a position grid at a stated scale factor, added in",
+       DT_FLOAT, L(grid_embed_sf)),
 SIMPLE("avx_lili_cand", "lili_cand", "draft", "LiLiCorr candidates and their features", DT_FLOAT,
        L(lili_cand)),
 SIMPLE("avx_lili_attn", "lili_attn", "draft", "LiLiCorr lattice attention with slot biases",
@@ -1904,6 +2182,44 @@ SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        L(attn_local_rel)),
 SIMPLE("avx_mla_attn_paged", "mla_attn_paged", "attn", "dense paged latent attention with a rotary part",
        DT_FLOAT, L(mla_attn_paged)),
+SIMPLE("avx_ihc_pre", "ihc_pre", "norm", "independent hyper-connection read (no Sinkhorn)", DT_FLOAT,
+       L(ihc_pre)),
+SIMPLE("avx_ihc_post", "ihc_post", "norm", "independent hyper-connection write into the streams",
+       DT_FLOAT, L(ihc_post)),
+SIMPLE("avx_rmsnorm_ihc_junction", "rmsnorm_ihc_junction", "norm",
+       "the iHC junction: [add,] rmsnorm, ihc_post, [ihc_pre, rmsnorm], this library's ops in sequence",
+       DT_FLOAT, L(rmsnorm_ihc_junction)),
+SIMPLE("avx_mla_project_kv", "mla_project_kv", "attn", "absorbed MLA projections, K and V widths apart",
+       DT_FLOAT, L(mla_project_kv)),
+SIMPLE("avx_mla_attn_paged_sink", "mla_attn_paged_sink", "attn",
+       "paged latent attention with a window and a sink", DT_FLOAT, L(mla_attn_paged_sink)),
+SIMPLE("avx_mla_attn_sel_sink", "mla_attn_sel_sink", "attn",
+       "selected-page latent attention with a rotary part and a sink", DT_FLOAT,
+       L(mla_attn_sel_sink)),
+SIMPLE("avx_mla_kv_split", "mla_kv_split", "attn", "kv_b output split into k and v heads", DT_FLOAT,
+       L(mla_kv_split)),
+SIMPLE("avx_attn_kv_sink", "attn_kv_sink", "attn", "prefix attention with a window and a sink",
+       DT_FLOAT, L(attn_kv_sink)),
+SIMPLE("avx_gate_mul", "gate_mul", "elem", "a * sigmoid(g) with one rounding", DT_FLOAT,
+       L(gate_mul)),
+SIMPLE("avx_mla_expand_gate", "mla_expand_gate", "attn", "the expansion then gate_mul, the pair itself",
+       DT_FLOAT, L(mla_expand_gate)),
+SIMPLE("avx_idx_pool_gated", "idx_pool_gated", "attn",
+       "compressed indexer group key: gated pool, norm, rotary", DT_FLOAT, L(idx_pool_gated)),
+SIMPLE("avx_idx_pool_gated_fp8", "idx_pool_gated_fp8", "attn",
+       "compressed indexer group key in f32, Hadamard and E4M3 (the FP8 indexer)", DT_FLOAT,
+       L(idx_pool_gated_fp8)),
+SIMPLE("avx_idx_pool_gated_i8", "idx_pool_gated_i8", "attn",
+       "compressed indexer group key in f32, Hadamard and int8 (the INT8 indexer)", DT_FLOAT,
+       L(idx_pool_gated_i8)),
+SIMPLE("avx_idx_score", "idx_score", "attn", "compressed indexer group scores", DT_FLOAT,
+       L(idx_score)),
+SIMPLE("avx_engram_ids", "engram_ids", "vocab", "Engram hash ids and mask", DT_ANY,
+       L(engram_ids)),
+SIMPLE("avx_engram_norm", "engram_norm", "norm", "Engram per-head rms norm", DT_FLOAT,
+       L(engram_norm)),
+SIMPLE("avx_engram_gate", "engram_gate", "norm", "Engram gate and stream add", DT_FLOAT,
+       L(engram_gate)),
 SIMPLE("avx_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
        L(mla_attn)),
 SIMPLE("avx_dsa_score", "dsa_score", "attn", "weighted FP8 index scoring", DT_FLOAT,
@@ -1912,6 +2228,8 @@ SIMPLE("avx_dsa_pool", "dsa_pool", "attn", "learned compressed FP8 index keys", 
        L(dsa_pool)),
 SIMPLE("avx_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_FLOAT,
        L(dsa_query)),
+SIMPLE("avx_dsa_query_i8", "dsa_query_i8", "attn", "normalized int8 index queries", DT_FLOAT,
+       L(dsa_query_i8)),
 SIMPLE("avx_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
        L(gemm_nt_f32)),
 SIMPLE("avx_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
@@ -1945,6 +2263,9 @@ SIMPLE("avx_ple_conv_bias", "ple_conv_bias", "norm",
        L(ple_conv_bias)),
 SIMPLE("avx_causal_conv1d", "causal_conv1d", "conv", "depthwise causal conv, no activation",
        DT_FLOAT, L(causal_conv1d)),
+SIMPLE("avx_sconv_res", "sconv_res", "conv",
+       "depthwise causal conv with its residual and optional input-dependent taps", DT_FLOAT,
+       L(sconv_res)),
 SIMPLE("avx_cast", "cast", "elem", "dtype conversion", DT_ANY, L(cast)),
 SIMPLE("avx_softmax", "softmax", "elem", "row-wise softmax", DT_FLOAT, L(softmax)),
 SIMPLE("avx_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
@@ -1963,6 +2284,10 @@ SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
 SIMPLE("avx_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
        "float in, fp8_e4m3 out, f32 scale", L(quant_cols_fp8)),
+SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
+       "128-wide Hadamard, then the symmetric E4M3 quantiser, one scale per 128",
+       "float in, fp8_e4m3 out, f32 scale per group; n a multiple of 128",
+       L(had_quant_act_fp8)),
 SIMPLE("avx_had_quant_act_i8g", "had_quant_act_i8g", "quant",
        "width-`group` Hadamard, then the symmetric int8 quantiser, one scale per group",
        "float in, i8 out, f32 scale per group; n a multiple of group",
@@ -1978,6 +2303,9 @@ SIMPLE("avx_rmsnorm_had_quant_i8", "rmsnorm_had_quant_i8", "quant",
 SIMPLE("avx_gated_had_quant_i8", "gated_had_quant_i8", "quant",
        "gated product, rotation and int8 in one pass", "float in, i8 out, f32 scale",
        L(gated_had_quant_i8)),
+SIMPLE("avx_gated_quant_i8", "gated_quant_i8", "quant",
+       "gated product and grouped int8 in one pass", "float in, i8 out, f32 scale per group",
+       L(gated_quant_i8)),
 SIMPLE("avx_dequant", "dequant", "quant", "group-scaled dequantisation", DT_ANY, L(dequant)),
 SIMPLE("avx_dequant_w4", "dequant_w4", "quant", "packed int4 weight to row-major bf16", DT_ANY,
        L(dequant_w4)),
@@ -1987,6 +2315,14 @@ SIMPLE("avx_rmsnorm_quant_fp8", "rmsnorm_quant_fp8", "quant",
 SIMPLE("avx_gated_quant_fp8", "gated_quant_fp8", "quant",
        "act(gate) * up over a packed [M, 2n] plane, then the E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale, bf16 out_bf16", L(gated_quant_fp8)),
+
+SIMPLE("avx_swiglu_clamped_had_quant_i8g", "swiglu_clamped_had_quant_i8g", "quant",
+       "swiglu_clamped, then the rotated int8 quantiser, the pair itself",
+       "float in, i8 out, f32 scale, bf16 out_bf16", L(swiglu_clamped_had_quant_i8g)),
+
+SIMPLE("avx_mla_expand_gate_had_quant_i8g", "mla_expand_gate_had_quant_i8g", "attn",
+       "the expansion, gate_mul and the rotated int8 quantiser, the chain itself",
+       "float in, i8 out, f32 scale, bf16 out_bf16", L(mla_expand_gate_had_quant_i8g)),
 
 SIMPLE("avx_gemm_nt", "gemm_nt", "gemm", "C = A B^T, f32 accumulate, cache-blocked", DT_FLOAT,
        L(gemm_nt)),
@@ -2027,6 +2363,10 @@ ROW("avx_attn_paged_sink", "attn_paged_sink", "attn",
     "paged causal / sliding-window attention with a sink logit a head, any query length",
     "any q and out dtype; bf16 or fp8 kv cache with optional per-(seq,head) descales; f32 sinks",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_sink)),
+ROW("avx_attn_paged_rel", "attn_paged_rel", "attn",
+    "paged causal / sliding-window attention with a relative-position bias and a sink logit per row",
+    "any q and out dtype; bf16, f32 or int8 kv cache with optional per-(seq,head) descales",
+    cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged_rel)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
 SIMPLE("avx_attn_cross", "attn_cross", "attn",
@@ -2060,6 +2400,8 @@ SIMPLE("avx_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary
        DT_FLOAT, L(qk_norm_rope)),
 SIMPLE("avx_qsa_score", "qsa_score", "attn",
        "QSA block scores: per-head relu dots summed over the heads", DT_FLOAT, L(qsa_score)),
+SIMPLE("avx_dfly_sel", "dfly_sel", "attn", "DFly2's draft page table, two copies and a fill a row",
+       DT_ANY, L(dfly_sel)),
 SIMPLE("avx_qsa_select", "qsa_select", "attn",
        "QSA selection: the top-k blocks as a page-id table, partial page last",
        "f32 scores, i32 tables", L(qsa_select)),
@@ -2339,6 +2681,10 @@ SIMPLE("avx_dflash_markov_greedy_f32", "dflash_markov_greedy_f32", "draft",
        "Full-vocabulary greedy Markov walk with f32 draft logits",
        "f32 logits, bf16 codebooks, f32/i32 tile winners, i32 tokens out",
        L(dflash_markov_greedy_f32)),
+SIMPLE("avx_markov_rnn_greedy", "markov_rnn_greedy", "draft",
+       "Inkling 2's recurrent DSpark Markov walk",
+       "f32 logits and contexts, bf16 weights, f32/i32 tile winners, i32 tokens out",
+       L(markov_rnn_greedy)),
 SIMPLE("avx_dflash_tree", "dflash_tree", "draft",
        "DFlash2's candidate lattice grown best-first into a tree",
        "i32 candidates, tokens and parents, float unary and codebooks", L(dflash_tree)),

@@ -123,8 +123,14 @@ inline void dbg_resid(RadCtx* c, int layer, const char* site, int64_t n_embd,
  * the sum scales H by `world`; GPTQ is invariant to a positive scale (damping is a fraction of
  * the trace and the update uses ratios). */
 inline const char* calib_dir() {
-    static const char* d = std::getenv("RADIANCE_CALIB_DIR");
-    return d && *d ? d : nullptr;
+    /* Brilliance: a copy, not getenv's pointer. The UCRT's _putenv_s replaces a variable's string
+     * and frees the old one, so a cached pointer dangles once anything sets or clears the variable
+     * again (hyv4flash's map_cli_to_env does, and a test process declares several times). */
+    static const std::string d = [] {
+        const char* e = std::getenv("RADIANCE_CALIB_DIR");
+        return std::string(e ? e : "");
+    }();
+    return d.empty() ? nullptr : d.c_str();
 }
 
 /* Whether layer `layer` taps (RADIANCE_CALIB_LAYERS: comma-separated layers and "lo-hi" ranges;
@@ -561,6 +567,26 @@ inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const 
     return rad_decl_name_map(b, &m);
 }
 
+/* The product `left @ right` of two checkpoint tensors, computed at convert (RAD_MAP_MATMUL): a
+ * linear folded into the one after it. `right` may be a vector, giving a vector. */
+inline int map_matmul(RadBuilder* b, const char* declared, const char* left, const char* right) {
+    RadNameMap m = map_base(declared, RAD_MAP_MATMUL);
+    m.n_src  = 2;
+    m.src[0] = left;
+    m.src[1] = right;
+    return rad_decl_name_map(b, &m);
+}
+
+/* The softmax of a checkpoint tensor along its last dimension (RAD_MAP_SOFTMAX); `row` >= 0 keeps
+ * that row alone, a vector. */
+inline int map_softmax(RadBuilder* b, const char* declared, const char* src, int row = -1) {
+    RadNameMap m = map_base(declared, RAD_MAP_SOFTMAX);
+    m.n_src        = 1;
+    m.src[0]       = src;
+    m.src_index[0] = row;
+    return rad_decl_name_map(b, &m);
+}
+
 /* A checkpoint tensor copied through unchanged. */
 inline int map_copy(RadBuilder* b, const char* declared, const char* src) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);
@@ -823,12 +849,41 @@ struct Geom {
      * w_bf16 is. */
     bool    w_i8h = false;
     int64_t w_i8_group = 128;
+    /* Ask for the chained form of the 128-group rotated quantisers (had_quant_act_i8g's and
+     * had_quant_act_fp8's `chained` 1, libr4d's *_chained rows) where the blocks declare them. Off by
+     * default: chained between two plain GEMMs it measured slower (Flash-Next); an architecture
+     * whose GEMMs around them all chain sets it (Hy4-flash). The bytes are the same either way. */
+    bool    chain_q8 = false;
 
     int64_t q_dim()   const { return n_head * head_dim; }
     int64_t kv_dim()  const { return n_head_kv * head_dim; }
     int64_t qkv_dim() const { return q_dim() + 2 * kv_dim(); }
     int64_t gqa()     const { return n_head_kv ? n_head / n_head_kv : 0; }
 };
+
+/* A linear of the bf16 blocks (rad_block_mlp.h, rad_block_attn_gated.h, rad_block_gdn.h): its
+ * weight, declared at what the model holds, and the `gemm_nt` dtype that reads it. A `bf16x12`
+ * weight, libquant's lossless packing of a bf16 one in 12.25 bits a value (docs/TOOLS.md), is
+ * declared over every plane at its codes' dtype and read at "bf16x12" (docs/OPS.md), whose rows
+ * give bf16's bytes. Any other weight is declared bf16 and read at `g.dtype`, so a container with
+ * no bf16x12 weight declares the graph it did before. */
+struct LinearBF16 {
+    rad_weight  w     = 0;
+    const char* dtype = nullptr;   /* gemm_nt's */
+};
+
+inline LinearBF16 decl_linear_bf16(RadBuilder* b, const Geom& g, const char* name,
+                                   std::initializer_list<int64_t> shape, int shard,
+                                   RadWeightGroup group,
+                                   std::initializer_list<int64_t> row_parts = {}) {
+    RadEncoding e{};
+    const bool x12 = weight_enc(b, name, &e) && rad_enc_is(&e, "bf16x12") && e.n_planes > 0;
+    LinearBF16 l;
+    l.w     = decl_w(b, name, x12 ? e.plane[0].dtype : (uint32_t)RAD_BF16, shape,
+                     RAD_ACCESS_PER_TOKEN, shard, group, 0, row_parts);
+    l.dtype = x12 ? "bf16x12" : g.dtype;
+    return l;
+}
 
 /* The KV cache dtype: RadBuildCtx::kv_dtype (--kv-cache-dtype), or `dflt` when it is
  * RAD_DT_INVALID (not given). Every architecture in this tree passes RAD_BF16 as the default. */

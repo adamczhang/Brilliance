@@ -57,6 +57,11 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <cctype>
+#include <chrono>
+#include <sys/mman.h>   /* Brilliance: brl_prefetch_ranges (win/compat), the Windows gather's prefetch */
+#include "avx_ngram_pf.h"
 #endif
 
 namespace {
@@ -442,6 +447,18 @@ inline uint64_t owner_tag() {
     return me.v;
 }
 
+/* ring_errno: 0 when this process can make an io_uring ring, else the errno (defined below). */
+int ring_errno();
+
+/* True when this process reads the n-gram table with synchronous pread instead of a ring: the
+ * kernel, the sandbox, or a resource limit refused io_uring. pread() needs no ring: a positional
+ * read on a read-only file is safe from every thread. Every read is its own round trip, so the
+ * table reads slower; startup and serving work. avx_init_ngram says it once. */
+inline bool ring_sync_mode() {
+    static const bool sync = ring_errno() != 0;
+    return sync;
+}
+
 struct ReadRing {
     static constexpr unsigned kEntries = 4096;
     int            fd       = -1;
@@ -461,7 +478,7 @@ struct ReadRing {
         std::memset(&p, 0, sizeof p);
         p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
         const long r = syscall(__NR_io_uring_setup, kEntries, &p);
-        if (r < 0) { err = errno; return false; }
+        if (r < 0) { err = errno; entries = 1; return false; }  /* Sync-read mode keeps one span at a time. */
         fd      = (int)r;
         entries = p.sq_entries;
         sq_sz   = p.sq_off.array + (size_t)p.sq_entries * sizeof(unsigned);
@@ -506,6 +523,19 @@ struct ReadRing {
     int read_spans(const TableFile& tf, const SpanRead* r, unsigned count, long long n,
                    long long stride, uint8_t* bounce) {
         const long long A = tf.align;
+        if (ring_sync_mode()) {
+            for (unsigned i = 0; i < count; ++i) {
+                const long long a   = (long long)r[i].key & ~(A - 1);
+                const long long len = (((long long)r[i].key + n + A - 1) & ~(A - 1)) - a;
+                uint8_t* dst = bounce + (size_t)i * stride;
+                for (long long off = 0; off < len;) {
+                    const ssize_t got = ::pread(tf.fd, dst + off, (size_t)(len - off), (off_t)(a + off));
+                    if (got <= 0) return RAD_E_IO;
+                    off += got;
+                }
+            }
+            return RAD_OK;
+        }
         unsigned tail = __atomic_load_n(sq_tail, __ATOMIC_RELAXED);
         for (unsigned i = 0; i < count; ++i) {
             const long long a = (long long)r[i].key & ~(A - 1);
@@ -553,7 +583,10 @@ inline ReadRing* read_ring(int* why) {
         tried = true;
         std::unique_ptr<ReadRing> p(new ReadRing());
         if (p->init()) r = std::move(p);
-        else           err = p->err ? p->err : EIO;
+        else {
+            err = p->err ? p->err : EIO;
+            if (ring_sync_mode()) r = std::move(p);  /* The reader thread runs; its reads go through pread. */
+        }
     }
     if (!r && why) *why = err;
     return r.get();
@@ -598,7 +631,7 @@ std::atomic<uint64_t> g_rows_read{0};
  * read, every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
                      const SpanRead* reads, size_t total, long long n, long long ne,
-                     avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
+                     avx::RowDecode decode, const avx::DecodeTab* lut, uint16_t* out, long long x_ld) {
     const long long A      = tf.align;
     const long long stride = ((n + A - 1) / A + 1) * A;
     for (size_t b = 0; b < total;) {
@@ -661,7 +694,7 @@ struct UrgentReads {
 };
 
 int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                    avx::RowDecode decode, const uint16_t* lut) {
+                    avx::RowDecode decode, const avx::DecodeTab* lut) {
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
@@ -793,7 +826,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
  * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
  * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                long long first, avx::RowDecode decode, const uint16_t* lut) {
+                long long first, avx::RowDecode decode, const avx::DecodeTab* lut) {
     /* A decode step's rows are read on demand; a prefill chunk's tens of thousands, whose future is
      * known, go through the claims and the read-ahead queue. */
     if (q.M <= kOnDemandMaxRows) return gather_ondemand(tf, rc, rr, q, decode, lut);
@@ -938,6 +971,37 @@ int stream_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
     uint8_t* bounce = g.bounce_for(depth * (size_t)stride, (size_t)A);
     int status = bounce ? RAD_OK : RAD_E_NOMEM;
     freebuf.clear();
+    if (status == RAD_OK && ring_sync_mode()) {
+        for (size_t i = 0; i < total; ++i) {
+            for (int u; (u = g_urgent_reads.load(std::memory_order_acquire)) > 0;)
+                g_urgent_reads.wait(u, std::memory_order_acquire);
+            const SpanRead& r = reads[i];
+            const long long a   = (long long)r.key & ~(A - 1);
+            const long long len = (((long long)r.key + n + A - 1) & ~(A - 1)) - a;
+            bool ok = true;
+            for (long long off = 0; off < len;) {
+                const ssize_t got = ::pread(tf.fd, bounce + off, (size_t)(len - off), (off_t)(a + off));
+                if (got <= 0) { ok = false; break; }
+                off += got;
+            }
+            if (!ok) { status = RAD_E_IO; break; }
+            const uint8_t* row = bounce + (r.key & (uint64_t)(A - 1));
+            std::memcpy(rc.data + (size_t)r.slot * (size_t)n, row, (size_t)n);
+            rc.ref[r.slot].store(1, std::memory_order_relaxed);
+            rc.word[r.slot].store(RowCache::ready(r.key), std::memory_order_release);
+            landed[i] = 1;
+            g_rows_read.fetch_add(1, std::memory_order_relaxed);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        if (status != RAD_OK) {
+            for (size_t i = 0; i < total; ++i)
+                if (!landed[i]) rc.word[reads[i].slot].store(RowCache::EMPTY, std::memory_order_release);
+            rc.published.fetch_add(1, std::memory_order_release);
+            rc.published.notify_all();
+        }
+        return status;
+    }
     for (size_t d = 0; d < depth; ++d) freebuf.push_back((uint32_t)(depth - 1 - d));
     size_t next = 0, inflight = 0;
     unsigned pending = 0;                       /* queued in the SQ, not yet submitted */
@@ -1180,6 +1244,258 @@ struct TableFile { int fd = -1; };
 inline const TableFile* table_file(const uint8_t*, long long, int*) { static TableFile m; return &m; }
 #endif
 
+#if defined(_WIN32)
+
+/* ============================== Brilliance: the Windows gather's prefetch ==============================
+ *
+ * Windows reads the table as memory (above): a row is a load through the container's mapping, and a
+ * cold row a hard page fault, served one at a time on the gathering thread. So a call's rows are
+ * first handed to PrefetchVirtualMemory together (brl_prefetch_ranges), which reads their pages in
+ * parallel and returns once they are in memory; it does not map them, so the gather's touch is
+ * still a soft fault per page.
+ *
+ * A read-ahead thread does the same for the following chunks' ids (RowGather::ahead, the engine's
+ * next prefill chunks) in kPfPieceRows pieces, and then reads one byte of each page, which maps it
+ * into the process for every thread: a call whose rows it has already mapped asks for nothing. The
+ * byte is read with a volatile load, never written (the view is read-only).
+ *
+ * Not used: unbuffered reads. While any view of a file is mapped Windows serialises them (wmmunn's
+ * measurement, ~16k reads/s at any queue depth against 122-151k with no view), and the engine keeps
+ * the container mapped. There is no row cache and no pinned copy: the file cache holds the table's
+ * pages, and memory pressure can take them back. The bookkeeping is avx_ngram_pf.h (host-tested).
+ *
+ * BRILLIANCE_NGRAM_PREFETCH=off turns it all off: the gather as it was, a page fault per cold row.
+ * Adapted from wmmunn's patches for another Windows port of radiance (2026-11-15). */
+
+constexpr long long kPfAheadRows  = 1ll << 18;   /* ids handed to the read-ahead at most (~250K) */
+constexpr size_t    kPfPieceRows  = 2048;        /* ids per read-ahead prefetch */
+constexpr long long kPfUrgentRows = 4096;        /* a decode-sized call: the read-ahead waits for it */
+constexpr int       kPfShiftTries = 64;          /* as kShiftTries (read_ahead, Linux) */
+
+/* BRILLIANCE_NGRAM_PREFETCH=off (or 0, no, false): no prefetch at all. Read once. */
+bool prefetch_off() {
+    static const bool off = [] {
+        const char* e = std::getenv("BRILLIANCE_NGRAM_PREFETCH");
+        if (!e) return false;
+        std::string v(e);
+        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        return v == "off" || v == "0" || v == "no" || v == "false";
+    }();
+    return off;
+}
+
+/* What the prefetch did, every thread together: avx_ngram_prefetch_stats, and one line at exit. */
+struct PfStats {
+    std::atomic<uint64_t> calls{0};        /* calls' own prefetches */
+    std::atomic<uint64_t> pages{0};        /* pages they asked for (deduplicated; this rank's share) */
+    std::atomic<uint64_t> call_us{0};      /* time inside them, on the gathering threads */
+    std::atomic<uint64_t> covered{0};      /* calls whose rows the read-ahead had already mapped */
+    std::atomic<uint64_t> ahead_pages{0};  /* pages the read-ahead prefetched and mapped */
+    std::atomic<uint64_t> dropped{0};      /* read-ahead lists dropped (not continuing the last) */
+    std::atomic<uint64_t> failed{0};       /* prefetches Windows refused */
+};
+void pf_exit_line();
+PfStats& pf_stats() {
+    static PfStats* const s = [] {
+        PfStats* p = new PfStats();
+        std::atexit(pf_exit_line);
+        return p;
+    }();
+    return *s;     /* never destroyed: the exit line and the detached read-ahead read it */
+}
+void pf_exit_line() {
+    const PfStats& s = pf_stats();
+    const uint64_t calls = s.calls.load(), covered = s.covered.load(), ahead = s.ahead_pages.load();
+    if (!calls && !covered && !ahead) return;
+    std::fprintf(stderr, "libavx: n-gram prefetch: %llu calls, %llu pages, %.1f ms in the calls, %llu "
+                 "calls already mapped by the read-ahead; read-ahead %llu pages, %llu lists dropped; "
+                 "%llu prefetches failed\n", (unsigned long long)calls,
+                 (unsigned long long)s.pages.load(), (double)s.call_us.load() / 1e3,
+                 (unsigned long long)covered, (unsigned long long)ahead,
+                 (unsigned long long)s.dropped.load(), (unsigned long long)s.failed.load());
+}
+
+/* One prefetch. A refusal is said once and the gather goes on without it. */
+bool pf_issue(const std::vector<avx::pf::Range>& r) {
+    static_assert(sizeof(avx::pf::Range) == sizeof(brl_prefetch_range) &&
+                      offsetof(avx::pf::Range, bytes) == offsetof(brl_prefetch_range, bytes),
+                  "avx::pf::Range is passed as brl_prefetch_range");
+    char why[256] = "";
+    if (brl_prefetch_ranges(reinterpret_cast<const brl_prefetch_range*>(r.data()), r.size(), why,
+                            sizeof why) == 0)
+        return true;
+    pf_stats().failed.fetch_add(1, std::memory_order_relaxed);
+    static std::once_flag said;
+    std::call_once(said, [&why] {
+        std::fprintf(stderr, "libavx: %s; the n-gram gather goes on without a prefetch, a page fault "
+                     "per cold row\n", why);
+    });
+    return false;
+}
+
+/* A queued piece of one table's ahead list. */
+struct PfJob {
+    avx::pf::AheadStream* st = nullptr;
+    const uint8_t*        tab = nullptr;
+    long long             row_bytes = 0, voff = 0, n_vocab = 0;
+    avx::pf::Piece        pc;
+};
+
+struct Prefetcher {
+    std::mutex              mu;
+    std::condition_variable cv;     /* a job queued, or the urgent calls ended */
+    std::condition_variable idle;   /* the queue is empty and no piece runs */
+    std::deque<PfJob>       q;
+    std::vector<std::pair<const uint8_t*, std::unique_ptr<avx::pf::AheadStream>>> streams;
+    bool                    running = false;
+    int                     urgent = 0;   /* decode-sized calls prefetching now */
+
+    /* Called with `mu` held. */
+    avx::pf::AheadStream* stream(const uint8_t* tab) {
+        for (auto& st : streams)
+            if (st.first == tab) return st.second.get();
+        streams.emplace_back(tab, std::make_unique<avx::pf::AheadStream>());
+        return streams.back().second.get();
+    }
+
+    /* Drops the queued pieces of `st`. Called with `mu` held. */
+    void drop(const avx::pf::AheadStream* st) {
+        for (auto it = q.begin(); it != q.end();) it = it->st == st ? q.erase(it) : it + 1;
+    }
+
+    void run() {
+        std::vector<uintptr_t>      pages;
+        std::vector<avx::pf::Range> ranges;
+        for (;;) {
+            PfJob j;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                running = false;
+                if (q.empty()) idle.notify_all();
+                /* No piece starts while a decode-sized call prefetches, so its few reads do not
+                 * queue in the drive behind a piece's 2,048 (Linux: g_urgent_reads). */
+                cv.wait(lk, [&] { return !q.empty() && urgent == 0; });
+                j = std::move(q.front());
+                q.pop_front();
+                running = true;
+            }
+            avx::pf::row_pages(j.tab, j.row_bytes, j.voff, j.n_vocab, j.pc.ids.data(),
+                               (int64_t)j.pc.ids.size(), [](int64_t) { return true; }, pages);
+            /* A piece that is all padding has no pages, and is complete as it is. */
+            if (!pages.empty()) {
+                avx::pf::merge_pages(pages, ranges);
+                if (!pf_issue(ranges)) continue;     /* failed: `done` stays before its start */
+                uint8_t sink = 0;
+                for (uintptr_t pg : pages)
+                    sink ^= *reinterpret_cast<const volatile uint8_t*>(pg * avx::pf::kPage);
+                (void)sink;
+                pf_stats().ahead_pages.fetch_add(pages.size(), std::memory_order_relaxed);
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            j.st->complete(j.pc);
+        }
+    }
+};
+
+/* The read-ahead, started by the first call that hands it ids; null before. Detached and never
+ * destroyed: at exit it may be inside a prefetch, which the process's end abandons. */
+std::atomic<Prefetcher*> g_prefetcher{nullptr};
+
+Prefetcher* prefetcher() {
+    static Prefetcher* const r = [] {
+        Prefetcher* a = new Prefetcher();
+        std::thread([a] { a->run(); }).detach();
+        g_prefetcher.store(a, std::memory_order_release);
+        return a;
+    }();
+    return r;
+}
+
+/* Hands q.ahead's ids the last list did not hold (at most kPfAheadRows) to the read-ahead, in
+ * kPfPieceRows pieces in list order, so the nearest chunk comes first. */
+void pf_read_ahead(const avx::RowGather& q) {
+    const long long na = q.n_ahead < kPfAheadRows ? q.n_ahead : kPfAheadRows;
+    Prefetcher* r = prefetcher();
+    std::lock_guard<std::mutex> lk(r->mu);
+    avx::pf::AheadStream* st = r->stream(q.tab);
+    bool restarted = false;
+    std::vector<avx::pf::Piece> pcs =
+        st->hand_over(q.ahead, na, kPfPieceRows, kPfShiftTries, &restarted);
+    if (restarted) {
+        pf_stats().dropped.fetch_add(1, std::memory_order_relaxed);
+        r->drop(st);
+    }
+    if (pcs.empty()) return;
+    for (auto& pc : pcs) {
+        PfJob j;
+        j.st = st;
+        j.tab = q.tab;
+        j.row_bytes = q.row_bytes;
+        j.voff = q.voff;
+        j.n_vocab = q.n_vocab;
+        j.pc = std::move(pc);
+        r->q.push_back(std::move(j));
+    }
+    r->cv.notify_one();
+}
+
+/* Whether the read-ahead has already prefetched and mapped every row of this call. */
+bool pf_covered(const avx::RowGather& q) {
+    Prefetcher* r = g_prefetcher.load(std::memory_order_acquire);
+    if (!r) return false;
+    std::lock_guard<std::mutex> lk(r->mu);
+    for (const auto& st : r->streams)
+        if (st.first == q.tab) return st.second->covered(q.ids, q.M);
+    return false;
+}
+
+/* Prefetches `ranges` as a call's own: counted, timed, and urgent when the call is decode-sized. */
+void pf_call(const std::vector<avx::pf::Range>& ranges, size_t pages, bool urgent) {
+    Prefetcher* r = urgent ? g_prefetcher.load(std::memory_order_acquire) : nullptr;
+    if (r) {
+        std::lock_guard<std::mutex> lk(r->mu);
+        ++r->urgent;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    pf_issue(ranges);
+    const long long us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0).count();
+    if (r) {
+        {
+            std::lock_guard<std::mutex> lk(r->mu);
+            --r->urgent;
+        }
+        r->cv.notify_all();
+    }
+    PfStats& s = pf_stats();
+    s.calls.fetch_add(1, std::memory_order_relaxed);
+    s.pages.fetch_add(pages, std::memory_order_relaxed);
+    s.call_us.fetch_add((uint64_t)us, std::memory_order_relaxed);
+}
+
+/* A call's own rows, before the gather touches them. Every rank gathers every row, so rank r asks
+ * only for the rows m with m % world_size == r: each page is asked for once and the ranks' calls run
+ * together; a page the other rank is still reading is waited for by the touch, which Windows serves
+ * from the read in flight. Rows the read-ahead has already mapped are not asked for again. */
+void prefetch_call(const avx::RowGather& q) {
+    if (prefetch_off()) return;
+    if (pf_covered(q)) {
+        pf_stats().covered.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    static thread_local std::vector<uintptr_t>      pages;
+    static thread_local std::vector<avx::pf::Range> ranges;
+    const long long share = q.world_size > 1 ? q.world_size : 1;
+    const long long mine  = q.rank >= 0 ? q.rank % share : 0;
+    avx::pf::row_pages(q.tab, q.row_bytes, q.voff, q.n_vocab, q.ids, q.M,
+                       [&](int64_t m) { return m % share == mine; }, pages);
+    if (pages.empty()) return;
+    avx::pf::merge_pages(pages, ranges);
+    pf_call(ranges, pages.size(), q.M <= kPfUrgentRows);
+}
+
+#endif  /* _WIN32 */
+
 }  // namespace
 
 /* Rows read from table files by this process, once the reader thread has nothing queued or
@@ -1196,6 +1512,23 @@ extern "C" uint64_t avx_ngram_reads(void) {
 #endif
 }
 
+#if defined(_WIN32)
+/* Brilliance: the Windows prefetch's counters, once the read-ahead has nothing queued or running,
+ * into out[0, n): calls, pages, call_us, covered, ahead_pages, dropped, failed (PfStats). Returns
+ * how many there are (7). rad-avx-check reports them (avx_check_rows.cpp). */
+extern "C" int avx_ngram_prefetch_stats(uint64_t* out, int n) {
+    if (Prefetcher* r = g_prefetcher.load(std::memory_order_acquire)) {
+        std::unique_lock<std::mutex> lk(r->mu);
+        r->idle.wait(lk, [&] { return !r->running && r->q.empty(); });
+    }
+    const PfStats& s = pf_stats();
+    const uint64_t v[7] = { s.calls.load(), s.pages.load(), s.call_us.load(), s.covered.load(),
+                            s.ahead_pages.load(), s.dropped.load(), s.failed.load() };
+    for (int i = 0; out && i < n && i < 7; ++i) out[i] = v[i];
+    return 7;
+}
+#endif
+
 int avx::row_gather(const RowGather& q, RowDecode decode) {
     if (!decode || !q.ids || !q.tab || !q.out || q.M <= 0 || q.n_embd <= 0 || q.n_vocab <= 0 ||
         q.row_bytes < q.n_embd)
@@ -1207,9 +1540,11 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
 
     /* bf16 value of every E4M3 code at this call's scale, built with the ABI's converters (so it
      * matches libref); the decode is a table lookup. */
-    uint16_t lut[256];
+    avx::DecodeTab tab;
     for (int b = 0; b < 256; ++b)
-        lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+        tab.lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+    tab.per_row = q.row_scale;
+    const avx::DecodeTab* lut = &tab;
 
     /* File-backed tables go through the shared cache; others are read from memory. The caller
      * has already refused ids past the table, which matters once they become file offsets. */
@@ -1235,6 +1570,9 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         if (q.ahead && q.n_ahead > 0) read_ahead(*tfile, *rc, q);
         return RAD_OK;
     }
+#elif defined(_WIN32)
+    /* Brilliance: the rows below are loads through the mapping; their pages are prefetched first. */
+    prefetch_call(q);
 #endif
 
     Gather& g = gather_state();
@@ -1251,6 +1589,10 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         g.dst.push_back(dst);
     }
     if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, lut);
+#if defined(_WIN32)
+    /* Brilliance: the rows a later call will gather go to the read-ahead, after this call's own. */
+    if (q.ahead && q.n_ahead > 0 && !prefetch_off()) pf_read_ahead(q);
+#endif
     return RAD_OK;
 }
 
@@ -1262,7 +1604,9 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
  * shipped format). E4M3 carries its own exponent, a row's dynamic range is only ~2.3x, and the
  * error is flat across scales from 2^-13 to 2^-10, so a per-row scale would buy a few percent of
  * error for 1.25% more bytes. (INT8 in the same byte would do much better; that is a different
- * format.)
+ * format.) Engram's tables (Hy4-flash) are the one place a scale a row is the model's own format:
+ * `block` 1 x * and a `[rows, 1]` plane, bf16 or f32 (the f32 form keeps the reference's own
+ * scale, amax / 448 unrounded), accepted below and decoded through avx::RowScale.
  *
  * The table is stored as is, so it can be read in place from the container's mapping (a relayout
  * would copy 51 GB). This hook only validates; any other quantisation is refused. The one other
@@ -1289,14 +1633,17 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
         return RAD_E_UNSUPPORTED;
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
+    /* One scale for the table (`block` 0 x 0), or one a row (`block` 1 x *, Engram's tables). */
+    const bool per_row = sc && sc->block[0] == 1 && sc->block[1] == 0;
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
-        enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||
-        sc->block[1] != 0)
+        enc->plane[0].dtype != RAD_F8E4M3 || !sc ||
+        !(sc->dtype == RAD_BF16 || (per_row && sc->dtype == RAD_F32)) ||
+        (!per_row && (sc->block[0] != 0 || sc->block[1] != 0)))
         return RAD_E_DTYPE;
     if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
     const char* want = operand == EQ_WTE ? "codes" : "scale";
     if (std::strncmp(enc->plane[sel[0]].role, want, RAD_ENC_STR) != 0) return RAD_E_SHAPE;
-    const long long r = operand == EQ_WTE ? rows : 1, c = operand == EQ_WTE ? dim : 1;
+    const long long r = operand == EQ_WTE || per_row ? rows : 1, c = operand == EQ_WTE ? dim : 1;
     if (pl[0].rank != 2 || pl[0].shape[0] != r || pl[0].shape[1] != c) return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }
@@ -1316,8 +1663,23 @@ extern "C" int avx_init_ngram(const RadParam* p, int n_p, int rank, int world_si
     if (!dt || std::strcmp(dt, "bf16") != 0) return RAD_OK;
     if (const int e = ring_errno()) {
         static std::once_flag said;
-        std::call_once(said, [e] { std::fprintf(stderr, "%s\n", ring_refusal(e).c_str()); });
-        return RAD_E_UNSUPPORTED;
+        std::call_once(said, [e] { std::fprintf(stderr, "%s The table reads fall back to synchronous pread: the model starts and serves, the n-gram reads are slower.\n", ring_refusal(e).c_str()); });
+    }
+#elif defined(_WIN32)
+    /* Brilliance: Windows has no ring to refuse; a bf16 gather's instance says once how the table
+     * is read. */
+    const char* dt = rad_param_gets(p, n_p, "dtype", nullptr);
+    if (dt && std::strcmp(dt, "bf16") == 0) {
+        static std::once_flag said;
+        std::call_once(said, [] {
+            if (prefetch_off())
+                std::fprintf(stderr, "libavx: BRILLIANCE_NGRAM_PREFETCH=off: the n-gram table is "
+                             "read through the container's mapping, a page fault per cold row\n");
+            else
+                std::fprintf(stderr, "libavx: the n-gram table is read through the container's "
+                             "mapping, each gather's rows prefetched first (PrefetchVirtualMemory) "
+                             "and the next chunks' ahead of the gather by a read-ahead thread\n");
+        });
     }
 #else
     (void)p;

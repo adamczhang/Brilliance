@@ -1,0 +1,18 @@
+# hy4-flash-w6nl64-rtn.recipe -- hy4-flash-w4nl64-rtn.recipe's form at 6 bits: the routed experts as rotated
+# u6 codes into libquant's 64-entry `table=w6nl` codebook, one E4M3 scale a (row, 64 of K) under a fixed
+# f32 of 2^-13 (libr4d's w6nl64a8h, docs/MOE-W6.md), read against the rotated E4M3 activation;
+# the Engram tables as E4M3 rows; the rest as the checkpoint holds it.
+#
+#   rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-w6nl64-rtn.recipe -o hy4-flash-w6nl64.rad
+#
+# Every layer clamps its SwiGLU at swiglu_limit (gate <= 10, |up| <= 10): the clamp writes the bf16
+# product and had_quant_act_fp8 quantises it for the down projection (rad_fp8.h, GateQuantFP8), so
+# the clamped product, not the unclamped one, is what the codes approximate. Round to nearest with a
+# searched scale, uncalibrated: a size and plumbing baseline. hy4-flash-w4nl64-gptq.recipe shows the
+# calibrated form (table=w6nl in its expert line). At two and four ranks every rank holds a slice
+# of every expert (768 / 384 of the 1536 columns).
+#
+# PATTERN                     QUANTISER  OPTIONS
+blk.*.ffn_*_exps.*.weight     rtn        table=w6nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

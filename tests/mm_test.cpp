@@ -25,8 +25,10 @@
 #include "gemma4u_golden.h"
 #include "glimmer_golden.h"
 #include "glm5_golden.h"
+#include "hy4_mm_golden.h"
 #include "radio_golden.h"
 #include "imaging_golden.h"
+#include "inkling2_proc_golden.h"
 #include "lfm2_golden.h"
 #include "mm/resample.h"
 #include "mm_golden.h"
@@ -291,6 +293,193 @@ std::vector<int64_t> first_and_last(const VideoInfo& info, const void*) {
 }
 
 }  /* namespace */
+
+/* ================================================================== Hy4-flash (Family::HyV4Flash) */
+namespace {
+
+/* config.json's markers and a mini band the golden's picture lands in. */
+VisionConfig hy_cfg() {
+    VisionConfig c;
+    c.family = Family::HyV4Flash;
+    c.patch = 16;
+    c.temporal = 1;
+    c.merge = 2;
+    c.image_min_pixels = 32 * 32 * 4;
+    c.image_max_pixels = 96 * 96;
+    c.video_min_pixels = 32 * 32;
+    c.video_max_pixels = 33554432;
+    c.video_frame_max_pixels = 1048576;
+    c.min_frames = 2;
+    c.max_frames = 1024;
+    c.tok_image = 120120;
+    c.tok_video = 120124;
+    c.tok_start = 120118;
+    c.tok_end = 120119;
+    c.tok_video_start = 120122;
+    c.tok_video_end = 120123;
+    const float m[3] = { 0.48145466f, 0.4578275f, 0.40821073f };
+    const float d[3] = { 0.26862954f, 0.26130258f, 0.27577711f };
+    for (int i = 0; i < 3; ++i) { c.mean[i] = m[i]; c.stdv[i] = d[i]; }
+    c.max_patches = 4096;
+    return c;
+}
+
+float bf16f(uint16_t v) {
+    uint32_t u = (uint32_t)v << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+}  /* namespace */
+
+TEST(hy4_video_sizes_are_the_references) {
+    for (int i = 0; i < kHyVidN; ++i) {
+        const long long* v = kHyVid + 8 * i;
+        int64_t oh = 0, ow = 0;
+        std::string why;
+        CHECK_OK(hy_video_size(v[0], v[1], v[2], (int32_t)v[3], v[4], v[5], &oh, &ow, &why));
+        CHECK_EQ(oh, (int64_t)v[6]);
+        CHECK_EQ(ow, (int64_t)v[7]);
+    }
+    int64_t oh = 0, ow = 0;
+    std::string why;
+    CHECK_EQ(hy_video_size(10, 2100, 2, 32, 33554432, 1048576, &oh, &ow, &why), RAD_E_INVAL);
+}
+
+/* The picture's patches against HYV4VLImageProcessorPil's: the reference emits them in raster
+ * order, radiance in merge-block order (the merger's view), so radiance's row of patch (y, x) is
+ * looked up for every reference value. Each value is the reference's f32 rounded to bf16; the
+ * fused normalisation may land one bf16 step away on a value that sits on a rounding edge. */
+TEST(hy4_pictures_patchify_as_the_reference_does) {
+    Processor p;
+    REQUIRE_EQ(p.init(hy_cfg(), [](const std::string&) { return std::vector<int32_t>{ 1 }; }), (int)RAD_OK);
+    std::shared_ptr<Item> it;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, kHyImgH, kHyImgW), &it, &why), (int)RAD_OK);
+    CHECK_EQ(it->grid_t, kHyImgGrid[0]);
+    CHECK_EQ(it->grid_h, kHyImgGrid[1]);
+    CHECK_EQ(it->grid_w, kHyImgGrid[2]);
+    REQUIRE_EQ(it->patch_dim, (int64_t)kHyImgDim);
+    const int gh = it->grid_h, gw = it->grid_w, m = 2;
+    /* A merged row of (gw / 2) cells and its newline: the rows, the pads and the rotary width. */
+    CHECK_EQ(it->rows_h, gh / m);
+    CHECK_EQ(it->rows_w, gw / m + 1);
+    CHECK_EQ(it->seg_rows, (gh / m) * (gw / m + 1));
+    CHECK_EQ(it->n_rows(), (int64_t)it->seg_rows);
+    REQUIRE_EQ(it->expand.size(), (size_t)it->seg_rows + 2);
+    CHECK_EQ(it->expand.front(), 120118);
+    CHECK_EQ(it->expand.back(), 120119);
+    for (size_t i = 1; i + 1 < it->expand.size(); ++i) CHECK_EQ(it->expand[i], 120120);
+    const int n = (int)it->n_patch * kHyImgDim;
+    int far = 0, steps = 0, checked = 0;
+    for (int f = 0; f < n; f += kHyImgStride, ++checked) {
+        const int raster = f / kHyImgDim, e = f % kHyImgDim;
+        const int y = raster / gw, x = raster % gw;
+        const int ours = (((y / m) * (gw / m) + x / m) * m + y % m) * m + x % m;
+        const float got = bf16f(it->pixels[(size_t)ours * kHyImgDim + e]);
+        const float want = kHyImgVals[f / kHyImgStride];
+        const float tol = std::fabs(want) * (1.0f / 128.0f) + 1e-6f;
+        if (got != bf16f(rad_f32_to_bf16(want))) ++steps;
+        if (std::fabs(got - want) > tol) ++far;
+    }
+    CHECK_EQ(far, 0);
+    CHECK(steps * 100 <= checked);   /* a rounding edge now and then, never a pattern */
+    /* The coordinates the tower reads invert the merge-block order. */
+    std::vector<int32_t> planes((size_t)(4 * it->n_patch));
+    it->coords(0, it->n_patch, planes.data());
+    for (int y = 0; y < gh; ++y)
+        for (int x = 0; x < gw; ++x) {
+            const int ours = (((y / m) * (gw / m) + x / m) * m + y % m) * m + x % m;
+            CHECK_EQ(planes[(size_t)ours], y);
+            CHECK_EQ(planes[(size_t)(it->n_patch + ours)], x);
+        }
+}
+
+TEST(hy4_rotary_layout_is_get_rope_index_newlines_included) {
+    VisionConfig c = hy_cfg();
+    Processor p;
+    REQUIRE_EQ(p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; }), (int)RAD_OK);
+    /* A picture of 4 x 6 patches and a clip of two 4 x 4 frames, as the golden's prompt. */
+    Video v;
+    v.frames = { frame(1, 64, 64), frame(2, 64, 64) };
+    v.index = { 0, 1 };
+    v.info.fps = 2.0;
+    std::shared_ptr<Item> img, vid;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, kHyImgH, kHyImgW), &img, &why), (int)RAD_OK);
+    REQUIRE_EQ(p.video_from(v, &vid, &why), (int)RAD_OK);
+    CHECK_EQ(vid->grid_t, 2);
+    CHECK_EQ(vid->grid_h, 4);
+    CHECK_EQ(vid->grid_w, 4);
+    CHECK_EQ(vid->n_seg, 2);
+    REQUIRE_EQ(vid->expand.size(), (size_t)(2 * vid->seg_rows + 2));
+    CHECK_EQ(vid->expand.front(), 120122);
+    CHECK_EQ(vid->expand.back(), 120123);
+    CHECK_EQ(vid->seg_at[1] - vid->seg_at[0], vid->seg_rows);
+
+    PromptMedia pm;
+    Placed a; a.item = img; a.tok = kHyRopeImageAt;
+    Placed b; b.item = vid; b.tok = kHyRopeVideoAt;
+    pm.items = { a, b };
+    pm.layout();
+    REQUIRE_EQ(pm.rope.runs.size(), (size_t)3);
+    int off = 0;
+    for (int32_t i = 0; i < kHyRopeN; ++i) {
+        int32_t q[3];
+        pm.rope.at(i, q);
+        if (q[0] != kHyRopeT[i] || q[1] != kHyRopeH[i] || q[2] != kHyRopeW[i]) {
+            if (off < 4)
+                std::fprintf(stderr, "    token %d: (%d, %d, %d), reference (%d, %d, %d)\n", i,
+                             q[0], q[1], q[2], kHyRopeT[i], kHyRopeH[i], kHyRopeW[i]);
+            ++off;
+        }
+    }
+    CHECK_EQ(off, 0);
+    int32_t q[3];
+    pm.rope.at(kHyRopeN + 3, q);
+    CHECK_EQ(q[0], kHyRopeN + 3 + kHyRopeDelta);
+    CHECK_EQ(q[2], q[0]);
+}
+
+TEST(hy4_reads_its_processor_from_the_container) {
+    const char* keys[] = { "model_type", "vision_config.num_hidden_layers",
+                           "vision_config.patch_size", "vision_config.spatial_merge_size",
+                           "vision_config.temporal_patch_size", "image_token_id",
+                           "video_token_id", "image_start_token_id", "image_end_token_id",
+                           "video_start_token_id", "video_end_token_id",
+                           "preprocessor.min_pixels", "video_preprocessor.image_mean" };
+    const char* vals[] = { "hy_v4_flash", "27", "16", "2", "1", "120120", "120124", "120118",
+                           "120119", "120122", "120123", "65536", "" };
+    RadModelMeta mt{};
+    mt.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    mt.kv_key = keys;
+    mt.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    REQUIRE_EQ(c.from_meta(mt, &why), (int)RAD_OK);
+    CHECK(c.family == Family::HyV4Flash);
+    CHECK_EQ(c.patch_dim(), (int64_t)768);
+    CHECK_EQ(c.factor(), 32);
+    CHECK_EQ(c.image_min_pixels, (int64_t)65536);
+    CHECK_EQ(c.image_max_pixels, (int64_t)2048 * 2048);
+    CHECK_EQ(c.video_max_pixels, (int64_t)33554432);
+    CHECK_EQ(c.video_frame_max_pixels, (int64_t)1048576);
+    CHECK_EQ(c.min_frames, 2);
+    CHECK_EQ(c.max_frames, 1024);
+    CHECK_EQ(c.tok_video_end, 120123);
+    /* CLIP's mean for pictures, 0.5 for video: the two classes' defaults. */
+    CHECK_EQ(c.mean[0], 0.48145466f);
+    CHECK_EQ(c.stdv[2], 0.27577711f);
+    CHECK_EQ(c.vmean[1], 0.5f);
+    vals[12] = "0.4 0.4 0.4";
+    VisionConfig d;
+    REQUIRE_EQ(d.from_meta(mt, &why), (int)RAD_OK);
+    CHECK_EQ(d.vmean[2], 0.4f);
+    vals[4] = "2";
+    VisionConfig e;
+    CHECK_EQ(e.from_meta(mt, &why), RAD_E_UNSUPPORTED);
+}
 
 TEST(every_admitted_picture_format_decodes) {
     if (!decoder_available()) SKIP("no media decoder in this build");
@@ -1214,6 +1403,192 @@ TEST(muse_pictures_patchify_as_the_reference_does) {
     }
 }
 
+/* Inkling 2: no resize, the picture padded bottom and right to whole 40-pixel cells with the raw
+ * value -1, one zero class row ahead of the patches, (y, x, channel) patches in merge-block order,
+ * the reference's normalisation (inkling2_proc_golden.h: transformers' own Inkling2ImageProcessor,
+ * run by mkinkling2procgolden.py), and <|content_image|> then one placeholder a cell. */
+namespace {
+
+Processor ink2_processor() {
+    const char* keys[] = { "vision_config.model_type", "vision_config.native_patch_size",
+                           "vision_config.adapter_merge_size", "processor.image_token",
+                           "processor.image_processor.image_mean",
+                           "processor.image_processor.image_std" };
+    const char* vals[] = { "inkling2_vision", "20", "2", "<|unused_200054|>", "0.5 0.5 0.5",
+                           "0.5 0.5 0.5" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    Processor p;
+    if (c.from_meta(m, nullptr) < 0) return p;
+    c.max_patches = 16384;
+    p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; },
+           [](const std::string& t) {
+               return t == "<|unused_200054|>" ? 200054 : t == "<|content_image|>" ? 200005 : -1;
+           });
+    return p;
+}
+
+}  /* namespace */
+
+/* The reference's pixel_values, cast to bf16, bit for bit: the whole plane's FNV-1a and its first
+ * values, on pictures whose sides are and are not whole cells (a 1 x 1 one is all padding but a
+ * pixel). */
+TEST(inkling2_values_are_the_references_bit_for_bit) {
+    const Processor p = ink2_processor();
+    REQUIRE(p.config().family == Family::Inkling2);
+    for (const GoldInk2Image& g : kGoldInk2Image) {
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image_from(frame(g.f, (int)g.h, (int)g.w), &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->rows_h, g.rows);
+        CHECK_EQ(it->rows_w, g.cols);
+        REQUIRE_EQ(it->n_patch, (int64_t)1 + (int64_t)g.rows * g.cols * 4);
+        REQUIRE_EQ(it->pixels.size(), (size_t)it->n_patch * 1200);
+        for (int i = 0; i < 1200; ++i) CHECK_EQ(it->pixels[(size_t)i], (uint16_t)0);
+        for (int i = 0; i < 16; ++i) CHECK_EQ(it->pixels[(size_t)1200 + i], g.head[i]);
+        CHECK_EQ(fnv(it->pixels), g.fnv);
+    }
+}
+
+/* The reference's convert_to_rgb: alpha composited onto its checkerboard, in integers. */
+TEST(inkling2_alpha_is_the_references_checkerboard) {
+    FrameRGBA fa;
+    fa.w = kGoldInk2AlphaW;
+    fa.h = kGoldInk2AlphaH;
+    fa.rgba.resize((size_t)fa.w * fa.h * 4);
+    for (int y = 0; y < fa.h; ++y)
+        for (int x = 0; x < fa.w; ++x) {
+            uint8_t* q = &fa.rgba[((size_t)y * fa.w + x) * 4];
+            for (int ch = 0; ch < 3; ++ch) q[ch] = pix(0, (uint64_t)y, (uint64_t)x, (uint64_t)ch);
+            q[3] = pix(1, (uint64_t)y, (uint64_t)x, 0);
+        }
+    Frame f;
+    composite_checkerboard(fa, &f);
+    CHECK_EQ(f.w, fa.w);
+    CHECK_EQ(f.h, fa.h);
+    CHECK_EQ(fnv(f.rgb), kGoldInk2AlphaFnv);
+    /* An opaque picture is its RGB, a transparent one the board: 204 where the 8-pixel squares'
+     * row and column have the same parity, 153 elsewhere. */
+    for (size_t i = 3; i < fa.rgba.size(); i += 4) fa.rgba[i] = 255;
+    composite_checkerboard(fa, &f);
+    int64_t bad = 0;
+    for (size_t i = 0; i < (size_t)fa.w * fa.h; ++i)
+        for (int ch = 0; ch < 3; ++ch) bad += f.rgb[i * 3 + ch] != fa.rgba[i * 4 + ch];
+    CHECK_EQ(bad, (int64_t)0);
+    for (size_t i = 3; i < fa.rgba.size(); i += 4) fa.rgba[i] = 0;
+    composite_checkerboard(fa, &f);
+    bad = 0;
+    for (int y = 0; y < fa.h; ++y)
+        for (int x = 0; x < fa.w; ++x)
+            for (int ch = 0; ch < 3; ++ch)
+                bad += f.rgb[((size_t)y * fa.w + x) * 3 + ch] != ((y / 8 + x / 8) % 2 == 0 ? 204 : 153);
+    CHECK_EQ(bad, (int64_t)0);
+}
+
+/* A picture file through the whole processor: quad-alpha.png's alpha lands on the checkerboard,
+ * and an opaque file is its RGB (it takes the same decode). */
+TEST(inkling2_a_files_alpha_is_composited_before_the_patches) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const Processor p = ink2_processor();
+    REQUIRE(p.config().family == Family::Inkling2);
+    struct F { const char* name; uint64_t fnv; };
+    for (const F& fx : { F{ "quad-alpha.png", kGoldInk2FileAlphaFnv },
+                         F{ "quad.png", kGoldInk2FileOpaqueFnv } }) {
+        const std::vector<uint8_t> b = media_file(fx.name);
+        REQUIRE(!b.empty());
+        std::shared_ptr<Item> it;
+        std::string why;
+        CHECK_OK(p.image(b.data(), b.size(), 0, &it, &why));
+        REQUIRE(it != nullptr);
+        CHECK_EQ(it->rows_h, 1);
+        CHECK_EQ(it->rows_w, 1);
+        if (fnv(it->pixels) != fx.fnv) std::fprintf(stderr, "    %s: the plane differs\n", fx.name);
+        CHECK_EQ(fnv(it->pixels), fx.fnv);
+    }
+}
+
+TEST(inkling2_pictures_patchify_as_the_reference_does) {
+    const char* keys[] = { "vision_config.model_type", "vision_config.native_patch_size",
+                           "vision_config.adapter_merge_size", "processor.image_token",
+                           "processor.image_processor.image_mean",
+                           "processor.image_processor.image_std" };
+    const char* vals[] = { "inkling2_vision", "20", "2", "<|unused_200054|>", "0.5 0.5 0.5",
+                           "0.5 0.5 0.5" };
+    RadModelMeta m{};
+    m.n_kv = (int)(sizeof(keys) / sizeof(keys[0]));
+    m.kv_key = keys;
+    m.kv_val = vals;
+    VisionConfig c;
+    std::string why;
+    CHECK_OK(c.from_meta(m, &why));
+    CHECK(c.family == Family::Inkling2);
+    CHECK_EQ(c.patch_dim(), (int64_t)1200);
+    CHECK_EQ(c.factor(), 40);
+    CHECK_EQ(c.max_image_tokens, 4096);
+    c.max_patches = 16384;
+    Processor p;
+    REQUIRE(p.init(c, [](const std::string&) { return std::vector<int32_t>{ 1 }; },
+                   [](const std::string& t) {
+                       return t == "<|unused_200054|>" ? 200054 : t == "<|content_image|>" ? 200005 : -1;
+                   }) >= 0);
+    /* 50 x 90: 2 x 3 cells, 4 x 6 patches; every pixel (37, 128, 255). */
+    Frame f;
+    f.h = 50;
+    f.w = 90;
+    f.rgb.resize((size_t)f.h * f.w * 3);
+    for (size_t i = 0; i < f.rgb.size(); i += 3) { f.rgb[i] = 37; f.rgb[i + 1] = 128; f.rgb[i + 2] = 255; }
+    std::shared_ptr<Item> it;
+    CHECK_OK(p.image_from(f, &it, &why));
+    REQUIRE(it != nullptr);
+    CHECK_EQ(it->grid_h, 4);
+    CHECK_EQ(it->grid_w, 6);
+    CHECK_EQ(it->seg_prefix, 1);
+    CHECK_EQ(it->n_patch, (int64_t)25);
+    CHECK_EQ(it->n_rows(), (int64_t)6);
+    REQUIRE_EQ(it->pixels.size(), (size_t)25 * 1200);
+    const uint16_t* kIn = kGoldInk2FlatIn;
+    const uint16_t* kPad = kGoldInk2FlatPad;
+    for (int i = 0; i < 1200; ++i) CHECK_EQ(it->pixels[(size_t)i], 0);
+    int64_t bad = 0;
+    for (int k = 0; k < 24; ++k) {
+        const int blk = k / 4, py = (blk / 3) * 2 + (k / 2) % 2, px = (blk % 3) * 2 + k % 2;
+        for (int y = 0; y < 20; ++y)
+            for (int x = 0; x < 20; ++x)
+                for (int ch = 0; ch < 3; ++ch) {
+                    const bool in = py * 20 + y < 50 && px * 20 + x < 90;
+                    bad += it->pixels[(size_t)(1 + k) * 1200 + (y * 20 + x) * 3 + ch] !=
+                           (in ? kIn[ch] : kPad[ch]);
+                }
+    }
+    CHECK_EQ(bad, (int64_t)0);
+    REQUIRE_EQ(it->expand.size(), (size_t)7);
+    CHECK_EQ(it->expand[0], 200005);
+    for (int i = 1; i < 7; ++i) CHECK_EQ(it->expand[(size_t)i], 200054);
+    REQUIRE_EQ(it->seg_at.size(), (size_t)1);
+    CHECK_EQ(it->seg_at[0], 1);
+    /* The class row's coordinate is (-1, -1); patch 3 is (1, 1) of the 4 x 6 grid. */
+    std::vector<int32_t> crd(4 * 25);
+    it->coords(0, 25, crd.data());
+    CHECK_EQ(crd[0], -1);
+    CHECK_EQ(crd[25], -1);
+    CHECK_EQ(crd[4], 1);
+    CHECK_EQ(crd[25 + 4], 1);
+    CHECK_EQ(crd[50 + 4], 4);
+    CHECK_EQ(crd[75 + 4], 6);
+    /* Past the cap a picture shrinks, aspect kept, until its cells fit. */
+    int64_t h = 0, w = 0;
+    CHECK_OK(inkling2_size(4000, 3000, 40, 4096, &h, &w, &why));
+    CHECK(((h + 39) / 40) * ((w + 39) / 40) <= 4096);
+    CHECK(h > 2000 && w > 1500);
+    CHECK_OK(inkling2_size(50, 90, 40, 4096, &h, &w, &why));
+    CHECK_EQ(h, (int64_t)50);
+    CHECK_EQ(w, (int64_t)90);
+}
+
 TEST(muse_reads_its_processor_from_the_container) {
     const char* keys[] = { "vision_config.model_type", "vision_config.patch_size",
                            "vision_config.patch_temporal", "vision_config.merge_size",
@@ -1785,6 +2160,30 @@ TEST(mono_audio_at_the_rate_passes_through_and_truncates_exactly) {
     REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &cut, &why), RAD_OK);
     CHECK_EQ(cut.size(), (size_t)1000);
     CHECK(std::equal(cut.begin(), cut.end(), m.begin()));
+}
+
+/* With two channels asked, a stereo source keeps its own, channel-major and resampled, and a mono
+ * one is copied to both: the song guide's form. max_samples caps each channel. */
+TEST(stereo_audio_keeps_its_channels_when_asked) {
+    if (!decoder_available()) SKIP("no media decoder in this build");
+    const std::vector<int16_t> left = tone(44100, 1.0, 440.0, 0.5), silent(left.size(), 0);
+    const std::vector<uint8_t> b = wav(interleave(left, silent), 2, 44100);
+    std::vector<float> s;
+    std::string why;
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    const size_t m = s.size() / 2;
+    CHECK(m >= 15990 && m <= 16010);
+    REQUIRE(m >= 14000);
+    const std::vector<float> l(s.begin(), s.begin() + m), r(s.begin() + m, s.end());
+    CHECK_NEAR(amplitude(l, 2000, 14000), 0.5, 0.005);
+    CHECK_NEAR(amplitude(r, 2000, 14000), 0.0, 0.0005);
+    REQUIRE_EQ(decode_audio(b.data(), b.size(), 16000, 1000, &s, &why, 2), RAD_OK);
+    CHECK_EQ(s.size(), (size_t)2000);
+    const std::vector<uint8_t> mono = wav(left, 1, 44100);
+    REQUIRE_EQ(decode_audio(mono.data(), mono.size(), 16000, 1 << 20, &s, &why, 2), RAD_OK);
+    REQUIRE(s.size() % 2 == 0);
+    CHECK(std::equal(s.begin(), s.begin() + s.size() / 2, s.begin() + s.size() / 2));
 }
 
 /* Qwen3-ASR's front end is the reference's, and its chunks are staged apart. Qwen3ASRFeatureExtractor

@@ -41,6 +41,23 @@ models:
     max-num-seqs: 2
     max-model-len: 32768
     chat-template-kwargs: {"enable_thinking": false}
+  inkling2-mini-1card:              # profiles/inkling2-mini-1card.yaml (its model: inkling2-mini), 1 card
+    model: D:/models/hf/StillDeadcode/inkling-2-mini-iq8r/inkling-2-mini-iq8r.rad
+    tp: 1
+    max-num-seqs: 4
+    max-model-len: 32768
+    kv-cache-dtype: i8
+    num-speculative-tokens: 0
+    chat-template-kwargs: {"reasoning_effort": "none"}
+  inkling2-mini-dspark-1card:              # profiles/inkling2-mini-dspark-1card.yaml (its model: inkling2-mini-dspark), 1 card
+    model: D:/models/hf/gostar77/inkling2-mini-i8-dspark-radiance/inkling2-mini-i8-vl-dspark.rad
+    tp: 1
+    max-num-seqs: 4
+    max-model-len: 131072
+    kv-cache-dtype: i8
+    num-speculative-tokens: 7
+    draft-window: adaptive
+    chat-template-kwargs: {"reasoning_effort": "none"}
   ltx-2.5-1card:              # profiles/ltx-2.5-1card.yaml (its model: ltx-2.5), 1 card
     model: D:/models/hf/StillDeadcode/radiance-ltx-2.5-distilled-iq8r/ltx-2.5-distilled-iq8r.rad
     tp: 1
@@ -115,8 +132,30 @@ models:
     draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
-    ngram-warm: true
+    ngram-warm: false
     # weight-prefetch off: Windows TP2 A/B on flashnext-2card-fast (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical; same host-staged collective path.
+    weight-prefetch: off
+  flashnext-2card-512k:              # profiles/flashnext-2card-512k.yaml (its model: qwen3.8-next-flash), 2 cards
+    model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
+    tp: 2
+    placement: expert_tiered
+    host-pool-mib: 18432
+    rope-scaling: yarn:2
+    max-num-seqs: 2
+    max-model-len: 524288
+    kv-cache-dtype: i8
+    prefix-cache-mib: 8192
+    checkpoint-slots: 8
+    vision-tower-placement: ram
+    num-speculative-tokens: 5
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+    draft-depth-load: on
+    max-num-batched-tokens: 6144
+    prefill-span: 3
+    ngram-warm: false
     weight-prefetch: off
   flashnext-2card-fast:              # profiles/flashnext-2card-fast.yaml (its model: qwen3.8-next-flash), 2 cards
     model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
@@ -141,6 +180,44 @@ models:
     ngram-warm: true
     # weight-prefetch off: measured on this profile, Windows TP2 A/B (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical.
     weight-prefetch: off
+  hy4-2card:              # profiles/hy4-2card.yaml (its model: hy4-flash), 2 cards
+    model: D:/models/hf/keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad
+    tp: 2
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 17408
+    max-model-len: 8192
+    max-num-seqs: 1
+    max-num-batched-tokens: 2048
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 0
+    ngram-placement: disk
+    mm-max-patches: 0
+    deterministic: true
+  hy4-2card-dfly:              # profiles/hy4-2card-dfly.yaml (its model: hy4-flash), 2 cards
+    model: D:/models/hf/keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad
+    tp: 2
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 17408
+    max-model-len: 32768
+    max-num-seqs: 2
+    max-num-batched-tokens: 4096
+    checkpoint-interval: 4096
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 5
+    draft-window: fixed
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-load: on
+    draft-depth-load-from: 1
+    draft-suffix: on
+    ngram-placement: disk
+    mm-max-patches: 0
+    deterministic: true
   qwen27-iq8r-2card:              # profiles/qwen27-iq8r-2card.yaml (its model: qwen3.8-27b), 2 cards
     model: D:/models/hf/StillDeadcode/qwen3.8-27b-iqr-v4/qwen3.8-27b-iq8r-v4.rad
     tp: 2
@@ -194,6 +271,29 @@ models:
     draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
-    ngram-warm: true
+    ngram-warm: false
     # weight-prefetch off: not measured at TP4; same host-staged collective path as TP2, where an A/B (prefetch-ab, 2026-11-22) measured update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical. The G6 gate measures it.
     weight-prefetch: off
+  hy4-4card-dfly:              # profiles/hy4-4card-dfly.yaml (its model: hy4-flash), 4 cards
+    model: D:/models/hf/keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad
+    tp: 4
+    tp-wire: exact
+    p2p: off
+    placement: all_vram
+    max-model-len: 65536
+    max-num-seqs: 8
+    max-num-batched-tokens: 8192
+    checkpoint-interval: 4096
+    prefill-span: 2
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 5
+    draft-window: fixed
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-load: on
+    draft-depth-load-from: 1
+    draft-suffix: on
+    ngram-placement: disk
+    mm-max-patches: 0
+    deterministic: true

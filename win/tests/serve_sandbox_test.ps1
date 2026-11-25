@@ -115,10 +115,17 @@ try {
   Check ($r.Rc -eq 0 -and (Has $r.Out 'dropped flashnext-2card') -and (Has $r.Out 'dropped flashnext-4card') -and -not (Has $r.Out 'dropped minicpm5-2b-1card') -and
          (Has $r.Out 'model minicpm5-2b-1card: model from models.minicpm5-2b-1card.model, num-speculative-tokens 0 (environment (BRILLIANCE_MODEL_SPECULATION))')) "sandbox -Cpu: the one-card entries stay, drafting off:`n$($r.Out)"
 
-  # The shipped sandbox profile on the two-card pair: only the four-card entries go.
+  # The shipped sandbox profile on the two-card pair: only the entries wider than two go, read from
+  # the profile's own tp lines so a new four-card entry needs no edit here.
+  $wider = @(); $entry = $null
+  foreach ($line in [IO.File]::ReadAllLines((Join-Path $PSScriptRoot '..\profiles\sandbox.yaml'))) {
+    if ($line -match '^  ([\w.-]+):') { $entry = $Matches[1] }
+    elseif ($entry -and $line -match '^    tp: (\d+)' -and [int]$Matches[1] -gt 2) { $wider += $entry }
+  }
+  $want = (@($wider | Sort-Object) -join ',')
   $r = Serve @('sandbox', '-Bus', '3,9', '-WhatIf', '-Exe', $Exe)
   $dropped = @([regex]::Matches($r.Out, 'dropped (\S+):') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-  Check ($r.Rc -eq 0 -and ($dropped -join ',') -eq 'deepseek41-4card,flashnext-4card') "sandbox on buses 3 and 9: only the four-card entries dropped (got '$($dropped -join ',')'):`n$($r.Out)"
+  Check ($r.Rc -eq 0 -and $wider.Count -gt 0 -and ($dropped -join ',') -eq $want) "sandbox on buses 3 and 9: only the entries wider than two dropped (want '$want', got '$($dropped -join ',')'):`n$($r.Out)"
 } finally {
   Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

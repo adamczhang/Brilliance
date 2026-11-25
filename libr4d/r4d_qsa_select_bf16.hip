@@ -134,7 +134,7 @@ __device__ __forceinline__ void counts_before(const uint32_t* wsum, int lane, in
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,                            \
     const int32_t* __restrict__ cu, int32_t* __restrict__ sel, int32_t* __restrict__ nsel,      \
     int32_t* __restrict__ seqused, int nb, int topk, int ratio, int nseq, int s_ld,             \
-    int t_ld, int o_ld, int cap
+    int t_ld, int o_ld, int cap, int ownq, int tw
 template <bool Signed>
 __device__ __forceinline__ void qsa_select_body(QSA_SELECT_PARAMS) {
 
@@ -156,7 +156,7 @@ __device__ __forceinline__ void qsa_select_body(QSA_SELECT_PARAMS) {
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
-    const int own = (p + 1) / ratio;            /* blocks entirely in THIS query's past */
+    const int own = (p + 1 - ownq) / ratio;            /* blocks entirely in THIS query's past */
     int n = nc[seq] < nb ? nc[seq] : nb;        /* complete blocks; the rest is at most a partial */
     if (own < n) n = own;
 
@@ -279,7 +279,8 @@ __device__ __forceinline__ void qsa_select_body(QSA_SELECT_PARAMS) {
         /* Above topk blocks the table is full (ties fill it), unless topk or fewer are live:
          * then T is 0, every live key was emitted, and the slots past them hold nothing. */
         uint32_t out = (n <= topk || T == 0u) ? sh_out : (uint32_t)topk;
-        const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
+        const int32_t part = ownq ? (p / ratio < tw ? tb[p / ratio] : -1)
+                                     : (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
         if (part >= 0) ou[out++] = part;
         for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
         nsel[m] = (int32_t)out;
@@ -303,7 +304,7 @@ __global__ __launch_bounds__(kThreads)
 void qsa_select_kernel(QSA_SELECT_PARAMS) {
     if (CH::on) r4d_chain_wait();
     qsa_select_body<Signed>(score, bt, nc, pos, cu, sel, nsel, seqused, nb, topk, ratio, nseq, s_ld,
-                            t_ld, o_ld, cap);
+                            t_ld, o_ld, cap, ownq, tw);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_SELECT_PARAMS
@@ -418,7 +419,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld) {
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int o_ld, int ownq, int tw) {
 
     /* The first digit's 4096 bins; afterwards [0, kBins) is the later digits' histogram and the
      * rest holds the collected keys. */
@@ -447,7 +448,7 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
-    const int own = (p + 1) / ratio;
+    const int own = (p + 1 - ownq) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;
     if (own < n) n = own;
 
@@ -763,7 +764,8 @@ __global__ __launch_bounds__(kThreads) void qsa_select_wide_kernel(
     /* ---- the partial page, appended last, as above. */
     if (t == 0) {
         uint32_t out = (n <= topk || T == 0u) ? sh_out : (uint32_t)topk;
-        const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
+        const int32_t part = ownq ? (p / ratio < tw ? tb[p / ratio] : -1)
+                                     : (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
         if (part >= 0) ou[out++] = part;
         for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
         nsel[m] = (int32_t)out;
@@ -938,7 +940,7 @@ __device__ __forceinline__ RunTake run_take(const uint32_t* __restrict__ key, in
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,                            \
     const int32_t* __restrict__ cu,                                                             \
     uint32_t* __restrict__ ck, int32_t* __restrict__ ci, int32_t* __restrict__ cc,              \
-    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk
+    int nb, int topk, int ratio, int nseq, int s_ld, int t_ld, int chunk, int ownq
 template <bool Signed, int LT>
 __device__ __forceinline__ void qsa_local_body(QSA_LOCAL_PARAMS) {
 
@@ -957,7 +959,7 @@ __device__ __forceinline__ void qsa_local_body(QSA_LOCAL_PARAMS) {
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
-    const int own = (p + 1) / ratio;
+    const int own = (p + 1 - ownq) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;
     if (own < n) n = own;
 
@@ -1023,7 +1025,7 @@ template <bool Signed, int LT, class CH>
 __global__ __launch_bounds__(LT) void qsa_local_kernel(QSA_LOCAL_PARAMS) {
     if (CH::on) r4d_chain_wait();
     qsa_local_body<Signed, LT>(score, bt, nc, pos, cu, ck, ci, cc, nb, topk, ratio, nseq, s_ld,
-                               t_ld, chunk);
+                               t_ld, chunk, ownq);
     if (CH::on) r4d_chain_done();
 }
 #undef QSA_LOCAL_PARAMS
@@ -1036,7 +1038,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     const int32_t* __restrict__ nc, const int32_t* __restrict__ pos,
     const int32_t* __restrict__ cu,
     int32_t* __restrict__ sel, int32_t* __restrict__ nsel, int32_t* __restrict__ seqused,
-    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk) {
+    int nb, int topk, int ratio, int nseq, int t_ld, int o_ld, int nchunk, int ownq, int tw) {
     /* CH `r4dchain` is the chained form (r4d_chain.h): no block or thread returns before the end. */
     if (CH::on) r4d_chain_wait();
 
@@ -1056,7 +1058,7 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
     __syncthreads();
     const int seq = sh_seq;
     const int p   = pos ? pos[m] : 0;
-    const int own = (p + 1) / ratio;
+    const int own = (p + 1 - ownq) / ratio;
     int n = nc[seq] < nb ? nc[seq] : nb;
     if (own < n) n = own;
 
@@ -1140,7 +1142,8 @@ __global__ __launch_bounds__(kMergeThreads) void qsa_merge_kernel(
          * padding loop overwrite ties with -1. The exception is the same as there: topk or
          * fewer live blocks, all of them emitted. */
         uint32_t out = all ? n_hi : (uint32_t)topk;
-        const int32_t part = (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
+        const int32_t part = ownq ? (p / ratio < tw ? tb[p / ratio] : -1)
+                                     : (n < nb && (p + 1) % ratio != 0) ? tb[n] : -1;
         if (part >= 0) ou[out++] = part;
         for (uint32_t i = out; i < (uint32_t)(topk + 1); ++i) ou[i] = -1;
         nsel[m] = (int32_t)out;
@@ -1171,7 +1174,7 @@ static inline int64_t par_scratch_bytes(long long topk) {
 template <bool Signed>
 static int r4d_qsa_select_bf16_emit(long long score, long long bt, long long nc, long long pos, long long cu, long long sel,
                                    long long nsel, long long seqused, int M, int nb, int topk, int ratio,
-                                   int nseq, int s_ld, int t_ld, int o_ld,
+                                   int nseq, int s_ld, int t_ld, int o_ld, int ownq, int tw,
                                    void* scratch, long long scratch_bytes, RadStream stream,
                                    bool chain) {
     if (!score || !bt || !nc || !cu || !sel || !nsel || !seqused) return R4D_NO(RAD_E_INVAL);
@@ -1199,14 +1202,14 @@ static int r4d_qsa_select_bf16_emit(long long score, long long bt, long long nc,
                  (size_t)chunk * sizeof(uint32_t),                                              \
                  (const float*)score, (const int32_t*)bt, (const int32_t*)nc,                   \
                  (const int32_t*)pos, (const int32_t*)cu, ck, ci, cc, nb, topk,                 \
-                 ratio, nseq, s_ld, t_ld, chunk)
+                 ratio, nseq, s_ld, t_ld, chunk, ownq)
 #define R4D_QMRG(CH_)                                                                           \
         R4D_EMIT(stream, (qsa_merge_kernel<Signed, CH_>), dim3((unsigned)M),                    \
                  dim3(kMergeThreads), (size_t)nchunk * topk * sizeof(uint32_t),                 \
                  (const uint32_t*)ck, (const int32_t*)ci, (const int32_t*)cc,                   \
                  (const int32_t*)bt, (const int32_t*)nc, (const int32_t*)pos,                   \
                  (const int32_t*)cu, (int32_t*)sel, (int32_t*)nsel, (int32_t*)seqused,          \
-                 nb, topk, ratio, nseq, t_ld, o_ld, nchunk)
+                 nb, topk, ratio, nseq, t_ld, o_ld, nchunk, ownq, tw)
         const bool wide = (long long)M * nchunk <= kLocalWideGrid;
         const int  rc = wide ? (chain ? R4D_QLOC(kLocalWideThreads, r4dchain)
                                       : R4D_QLOC(kLocalWideThreads, R4dUnchained))
@@ -1225,7 +1228,7 @@ static int r4d_qsa_select_bf16_emit(long long score, long long bt, long long nc,
                         (const float*)score, (const int32_t*)bt, (const int32_t*)nc,
                         (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,
                         (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld,
-                        o_ld);
+                        o_ld, ownq, tw);
     }
 
     /* Never more than the table width. */
@@ -1236,7 +1239,7 @@ static int r4d_qsa_select_bf16_emit(long long score, long long bt, long long nc,
     R4D_EMIT(stream, (qsa_select_kernel<Signed, CH_>), dim3((unsigned)M), dim3(kThreads),       \
              (size_t)cap * sizeof(uint32_t), (const float*)score, (const int32_t*)bt,           \
              (const int32_t*)nc, (const int32_t*)pos, (const int32_t*)cu, (int32_t*)sel,        \
-             (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap)
+             (int32_t*)nsel, (int32_t*)seqused, nb, topk, ratio, nseq, s_ld, t_ld, o_ld, cap, ownq, tw)
     const int rc = chain ? R4D_QSEL(r4dchain) : R4D_QSEL(R4dUnchained);
 #undef R4D_QSEL
     return rc;
@@ -1270,6 +1273,11 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     const long long sgn   = r4d_geti_or(a, "signed", 0);
     if (topk <= 0 || ratio <= 0) return R4D_NO(RAD_E_INVAL);
     if (sgn != 0 && sgn != 1) return R4D_NO(RAD_E_INVAL);
+    /* `own` 1: the block holding the query is never a candidate and is appended last, complete or
+     * not (Hy4-flash's indexer). The candidate bound becomes pos / ratio, and the appended page
+     * bt[pos / ratio] is read when it lies inside the table's width `tw`. */
+    const long long own = r4d_geti_or(a, "own", 0);
+    if (own != 0 && own != 1) return R4D_NO(RAD_E_INVAL);
     /* nb = min of the two widths, as in r4d_qsa_score_bf16.hip. */
     const long long M = sc->shape[0];
     const long long nb = bt->shape[1] < sc->shape[1] ? bt->shape[1] : sc->shape[1];
@@ -1289,7 +1297,7 @@ extern "C" int r4d_rad_qsa_select(const RadArgs* a, RadStream stream) {
     return emit(r4d_addr(sc), r4d_addr(bt), r4d_addr(nc), r4d_addr(po),
                 r4d_addr(cu), r4d_addr(se), r4d_addr(ns), r4d_addr(su),
                 (int)M, (int)nb, (int)topk, (int)ratio, (int)nseq,
-                (int)sp, (int)tp, (int)op, a->scratch, a->scratch_bytes,
+                (int)sp, (int)tp, (int)op, (int)own, (int)bt->shape[1], a->scratch, a->scratch_bytes,
                 stream, r4d_geti_or(a, "chain", 0) != 0);
 }
 

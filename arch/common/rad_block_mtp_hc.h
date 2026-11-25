@@ -322,6 +322,8 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
         if (mlp.gfold) { gs.sh = mlp.w.sout; gs.sg = mlp.w.sgate; }
         gs.top_k  = mlp.c.top_k;
         gs.rows   = mlp.c.rows;
+        /* A gather that keeps the sum's codes cannot be folded (rad_block_hc.h). */
+        gs.sum_codes = mlp.gather_q8;
         RAD_ARCH_TRY(hc_mlp.declare_gather(b, gs));
         mlp.gather_out_rows  = hc_mlp.gather_rows;
         mlp.gather_out_rows6 = hc_mlp.gather_rows6;

@@ -34,18 +34,18 @@ int table_copy_check(const uint8_t* src, int64_t n, const uint8_t* buf, std::str
     return RAD_OK;
 }
 
-int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
-                    uint8_t* buf, std::string* why) {
-    if (!why || !src || !buf || n <= 0) return RAD_E_INVAL;
-    const int64_t huge = (int64_t)2 << 20;
-
-    /* One reader per hardware thread up to 16, each reading its own contiguous span in 64 MiB
-     * pieces: a drive serves 16 queued reads at full rate, and spans keep each reader
-     * sequential. */
-    const int nt = (int)std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+/* The table's readers: `readers` threads (no more than the table has 64 MiB pieces), each reading
+ * its own contiguous span in 64 MiB pieces and dropping the container's pages behind it. A drive
+ * serves the queued reads at full rate, and spans keep each reader sequential. */
+static void table_readers(const RadFile& file, int64_t foff, uint8_t* buf, int64_t n, int readers,
+                          std::atomic<int>& err) {
     const int64_t piece = (int64_t)64 << 20;
+    const int64_t huge = (int64_t)2 << 20;
+    const int64_t pieces = (n + piece - 1) / piece;
+    const int nt = (int)std::min<int64_t>(
+        std::max(1, (int)std::min<uint32_t>((uint32_t)readers, std::thread::hardware_concurrency())),
+        std::max<int64_t>(1, pieces));
     const int64_t span = ((n + nt - 1) / nt + huge - 1) & ~(huge - 1);
-    std::atomic<int> err{RAD_OK};
     std::vector<std::thread> rd;
     for (int i = 0; i < nt; ++i) {
         const int64_t lo = (int64_t)i * span, hi = std::min(n, lo + span);
@@ -60,17 +60,80 @@ int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t 
         });
     }
     for (std::thread& t : rd) t.join();
-
-    if (err.load() != RAD_OK) {
-        *why = fmt("reading the container failed (%s)", rad_strerror(err.load()));
-        return RAD_E_IO;
-    }
-    return table_copy_check(src, n, buf, why);
 }
 
-int table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
-                    TableCopy* out, std::string* why) {
-    if (!out || !why || !src || n <= 0) return RAD_E_INVAL;
+struct TableFill::State {
+    std::atomic<int>      err{RAD_OK};
+    std::atomic<uint64_t> began{0}, ended{0};
+};
+
+TableFill::~TableFill() {
+    if (th_.joinable()) th_.join();
+}
+
+TableFill& TableFill::operator=(TableFill&& o) noexcept {
+    if (this == &o) return *this;
+    if (th_.joinable()) th_.join();
+    st_ = std::move(o.st_);
+    src_ = o.src_;
+    dst_ = o.dst_;
+    n_ = o.n_;
+    th_ = std::move(o.th_);
+    o.src_ = nullptr;
+    o.dst_ = nullptr;
+    o.n_ = 0;
+    return *this;
+}
+
+int TableFill::start(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff, uint8_t* dst,
+                     int readers) {
+    if (!src || !dst || n <= 0 || readers < 1) return RAD_E_INVAL;
+    if (th_.joinable()) return RAD_E_STATE;
+    src_ = src;
+    dst_ = dst;
+    n_ = n;
+    st_ = std::make_shared<State>();
+    const std::shared_ptr<State> st = st_;
+    th_ = std::thread([&file, foff, buf = dst, n, readers, st] {
+        st->began.store(rad_mono_ns());
+        table_readers(file, foff, buf, n, readers, st->err);
+        st->ended.store(rad_mono_ns());
+    });
+    return RAD_OK;
+}
+
+int TableFill::wait(std::string* why) {
+    if (!why) return RAD_E_INVAL;
+    if (!st_ || !src_ || !dst_ || n_ <= 0) return RAD_E_STATE;
+    if (th_.joinable()) th_.join();
+    const int err = st_->err.load();
+    if (err != RAD_OK) {
+        *why = fmt("reading the container failed (%s)", rad_strerror(err));
+        return RAD_E_IO;
+    }
+    return table_copy_check(src_, n_, dst_, why);
+}
+
+double TableFill::seconds() const {
+    if (!st_) return 0;
+    const uint64_t began = st_->began.load(), ended = st_->ended.load();
+    return ended > began ? (double)(ended - began) / 1e9 : 0;
+}
+
+int table_copy_fill(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
+                    uint8_t* buf, std::string* why) {
+    if (!why || !src || !buf || n <= 0) return RAD_E_INVAL;
+    TableFill fill;
+    const int rc = fill.start(file, src, n, foff, buf, 16);
+    if (rc != RAD_OK) {
+        *why = "the table's readers could not be started";
+        return rc;
+    }
+    return fill.wait(why);
+}
+
+int table_copy_reserve(int64_t n, TableCopy* out, std::string* why) {
+    if (!out || !why || n <= 0) return RAD_E_INVAL;
     *out = TableCopy{};
     const size_t huge = (size_t)2 << 20;
     const size_t sz = ((size_t)n + huge - 1) & ~(huge - 1);
@@ -86,14 +149,23 @@ int table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t 
         ::munmap(m, sz);
         return RAD_E_NOMEM;
     }
-    const int rc = table_copy_fill(file, src, n, foff, static_cast<uint8_t*>(m), why);
-    if (rc != RAD_OK) {
-        ::munlock(m, sz);
-        ::munmap(m, sz);
-        return rc;
-    }
     out->base = m;
     out->bytes = sz;
+    return RAD_OK;
+}
+
+int table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
+                    TableCopy* out, std::string* why) {
+    if (!out || !why || !src || n <= 0) return RAD_E_INVAL;
+    TableCopy tc;
+    int rc = table_copy_reserve(n, &tc, why);
+    if (rc != RAD_OK) return rc;
+    rc = table_copy_fill(file, src, n, foff, static_cast<uint8_t*>(tc.base), why);
+    if (rc != RAD_OK) {
+        table_copy_free(&tc);
+        return rc;
+    }
+    *out = tc;
     return RAD_OK;
 }
 

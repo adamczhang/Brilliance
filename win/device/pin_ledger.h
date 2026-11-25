@@ -74,6 +74,20 @@ struct PinLimitChoice {
     bool    invalid = false;
 };
 
+/* The physical memory a pin leaves available, at least: a GiB for the system and the pin's own
+ * page tables. */
+constexpr int64_t kPinPhysReserve = (int64_t)1 << 30;
+
+/* The check after the limit, made at the moment of the pin: a pin stays resident, so one larger
+ * than the physical memory available now less `reserve` can only be made by paging other memory
+ * out. On 2026-11-22 a 47.68 GiB n-gram copy was pinned under the limit while about 12 GiB was
+ * available (two other servers had started in the same second), and the next GPU call
+ * (hipStreamCreateWithFlags) never returned. True when the pin must be refused. Unreadable memory
+ * (`avail` < 0) refuses nothing. */
+inline bool pin_past_physical(int64_t bytes, int64_t avail, int64_t reserve) {
+    return avail >= 0 && bytes > avail - reserve;
+}
+
 inline PinLimitChoice choose_pin_limit(int64_t budget, int devices, int64_t margin, const char* env) {
     PinLimitChoice c;
     if (budget > 0 && devices > 0) c.computed = std::max<int64_t>(budget / devices - margin, 0);

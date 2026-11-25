@@ -1116,7 +1116,25 @@ void apply_template_defaults(const json& b, const OaiLimits& lim, ChatRenderOpti
     opt->reasoning_format = lim.reasoning_format;
 }
 
-void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
+/* A template whose own word for "no reasoning" is a reasoning_effort level (Hy4-flash's
+ * `no_think`, which it takes next to `high` and has no enable_thinking at all): thinking off, in
+ * any spelling, renders as that level, and that level named as the effort turns thinking off.
+ * Found at startup (probe_reasoning_efforts), so a template without the word is untouched. */
+static void apply_no_think_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
+    const auto& set = lim.reasoning_efforts;
+    if (std::find(set.begin(), set.end(), "no_think") == set.end()) return;
+    auto it = opt->template_kwargs.find("reasoning_effort");
+    if (it != opt->template_kwargs.end()) {
+        bool over = false, deep = false;
+        const json v = parse_json_bounded(it->second, 0, &over, &deep);
+        if (!over && !deep && v.is_string() && v.get<std::string>() == "no_think")
+            opt->enable_thinking = false;
+    }
+    /* Thinking off wins over a level named beside it (a deployment default of `high`). */
+    if (!opt->enable_thinking) opt->template_kwargs["reasoning_effort"] = json("no_think").dump();
+}
+
+static void map_effort_word(const OaiLimits& lim, ChatRenderOptions* opt) {
     if (lim.reasoning_effort_map.empty()) return;
     auto it = opt->template_kwargs.find("reasoning_effort");
     if (it == opt->template_kwargs.end()) return;
@@ -1133,6 +1151,11 @@ void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
     } else {
         it->second = json(m->second).dump();
     }
+}
+
+void map_reasoning_effort(const OaiLimits& lim, ChatRenderOptions* opt) {
+    map_effort_word(lim, opt);
+    apply_no_think_effort(lim, opt);
 }
 
 ApiError template_refusal(const ChatRenderOptions& opt, const OaiLimits& lim, int rs,
@@ -1191,7 +1214,7 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
             }
         }
     }
-    map_reasoning_effort(lim, opt);
+    map_effort_word(lim, opt);
 
     /* OpenRouter groups the same switches in one `reasoning` object on Chat
      * (`effort`, `enabled`, `max_tokens`), and Anthropic's `thinking` object names its
@@ -1279,6 +1302,7 @@ static int parse_thinking(const json& b, const OaiLimits& lim, ChatRenderOptions
         if (effort == "none" || effort == "minimal") opt->enable_thinking = false;
         else opt->template_kwargs.emplace("reasoning_effort", json(effort).dump());
     }
+    apply_no_think_effort(lim, opt);
     return RAD_OK;
 }
 
@@ -1850,6 +1874,11 @@ static int parse_thinking_budget(const json& b, const OaiDeps& d, const OaiLimit
             span.close       = c[0];
             span.open        = (o.size() == 1 || open_first) ? o[0] : -1;
             span.starts_open = render.think_starts_open;
+            /* A one-token message header the reply opens with, ahead of the opener. */
+            if (span.open >= 0 && !render.think_frame.empty()) {
+                const std::vector<int32_t> f = d.tok->encode(render.think_frame, false, true);
+                if (f.size() == 1 && f[0] != span.open && f[0] != span.close) span.frame = f[0];
+            }
         }
     }
     sp->reasoning = span;
@@ -3018,6 +3047,7 @@ json timings_json(const TimingsOut& t) {
     if (t.draft_n > 0) {
         o["draft_n"]          = t.draft_n;
         o["draft_n_accepted"] = t.draft_n_accepted;
+        o["draft_steps"]      = t.draft_steps;
     }
     return o;
 }

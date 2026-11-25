@@ -15,6 +15,16 @@
  * thread count.
  */
 #include <algorithm>
+#if defined(_WIN32)
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <sys/mman.h>                  /* Brilliance: brl_prefetch_ranges (win/compat) */
+#include "../libavx/avx_ngram_pf.h"    /* Brilliance: the page math of the n-gram prefetch */
+#endif
 #include "ref_common.h"
 #include "ref_gemm.h"
 #include "ref_ops.h"
@@ -560,7 +570,7 @@ int ref_logits_gemm(const RadArgs* a, RadStream) {
  *
  * Every row read is multiplied by `factor`: embed_lookup's `mult`, embed_lookup_q's table scale. */
 static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor* wte,
-                        const RadTensor* x, float factor) {
+                        const RadTensor* x, float factor, const RadTensor* row_scale = nullptr) {
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
     const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
     const int64_t voff = p_int(a, "vocab_offset", 0);
@@ -583,8 +593,10 @@ static int embed_gather(const RadArgs* a, const RadTensor* tok, const RadTensor*
         const int64_t id = ld_int(tok->dtype, tok->data, offlin(tok, m)) - voff;
         const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
         const bool have_row = id >= 0 && id < n_vocab;
+        /* A scale a row (Engram's table): the row's own, in f32, before the one rounding. */
+        const float f = have_row && row_scale ? ldt(row_scale, offlin(row_scale, id)) : factor;
         for (int64_t i = 0; i < n_embd; ++i)
-            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) * factor : 0.0f);
+            stt(x, xb + i * xs, have_row ? ldt(wte, id * ws + i * wc) * f : 0.0f);
     }
     return RAD_OK;
 }
@@ -593,6 +605,57 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     return embed_gather(a, &a->t[0], &a->t[1], &a->t[2], p_f32(a, "mult", 1.0f));
 }
+
+#if defined(_WIN32)
+/* Brilliance: DeepSeek's Engram table (103 GiB) under ngram-placement: disk is read here, through
+ * the container's mapping, where each cold row is a hard page fault on the thread that loads it.
+ * The pages of every row's codes and scales are first read in together with one
+ * PrefetchVirtualMemory call (brl_prefetch_ranges), as libavx's n-gram gather does for Flash-Next
+ * (avx_ngram.cpp; the page math is libavx/avx_ngram_pf.h). Only for a codes plane of 1 GiB or more,
+ * and not with BRILLIANCE_NGRAM_PREFETCH=off. The values gathered do not change. */
+static bool plane_prefetch_off() {
+    static const bool off = [] {
+        const char* e = std::getenv("BRILLIANCE_NGRAM_PREFETCH");
+        if (!e) return false;
+        std::string v(e);
+        for (char& c : v) c = (char)std::tolower((unsigned char)c);
+        return v == "off" || v == "0" || v == "no" || v == "false";
+    }();
+    return off;
+}
+
+static void prefetch_plane_rows(const RadArgs* a, const RadTensor& cd, const RadTensor& sc,
+                                int64_t rb, int64_t sc_cols, int64_t V, int64_t voff, int64_t M) {
+    if (plane_prefetch_off() || V * rb < ((int64_t)1 << 30)) return;
+    const RadTensor& tok = a->t[0];
+    const int64_t sbytes = rad_dtype_bytes(sc.dtype, sc_cols);
+    const bool sc_rows = laststride(&sc) == 1 && sbytes > 0;
+    static thread_local std::vector<uintptr_t> pages;
+    static thread_local std::vector<avx::pf::Range> ranges;
+    pages.clear();
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t id = ld_int(tok.dtype, tok.data, offlin(&tok, m)) - voff;
+        if (id < 0 || id >= V) continue;
+        avx::pf::add_span_pages((const uint8_t*)cd.data + id * rb, (size_t)rb, pages);
+        if (sc_rows)
+            avx::pf::add_span_pages(
+                (const uint8_t*)sc.data + rad_dtype_bytes(sc.dtype, rowoff(&sc, id, sc_cols)),
+                (size_t)sbytes, pages);
+    }
+    avx::pf::unique_pages(pages);
+    if (pages.empty()) return;
+    avx::pf::merge_pages(pages, ranges);
+    char why[256] = "";
+    if (brl_prefetch_ranges(reinterpret_cast<const brl_prefetch_range*>(ranges.data()), ranges.size(),
+                            why, sizeof why) != 0) {
+        static std::once_flag said;
+        std::call_once(said, [&why] {
+            std::fprintf(stderr, "libref: %s; the Engram gather goes on without a prefetch, a page "
+                         "fault per cold row\n", why);
+        });
+    }
+}
+#endif
 
 /* A gather from a table stored as single-level affine planes, read in place: no relayout, so a
  * table too large to copy (an n-gram embedding of hundreds of GiB) is gathered from the
@@ -626,6 +689,9 @@ int ref_embed_lookup_planes(const RadArgs* a, RadStream) {
     if (voff == 0 && a->world_size <= 1)
         for (int64_t m = 0; m < M; ++m)
             if (ld_int(tok.dtype, tok.data, offlin(&tok, m)) >= V) return RAD_E_INVAL;
+#if defined(_WIN32)
+    prefetch_plane_rows(a, cd, sc, rb, E / G, V, voff, M);
+#endif
     REF_PAR_FOR(M * E)
     for (int64_t m = 0; m < M; ++m) {
         const int64_t id = ld_int(tok.dtype, tok.data, offlin(&tok, m)) - voff;
@@ -669,5 +735,11 @@ int ref_embed_lookup_q(const RadArgs* a, RadStream) {
     /* An absent scale is 1, so a plain bf16 n-gram embedding read in place from a container takes
      * the same op and host path, keeping a table too large for any device pool on the mapped tier. */
     const float scale = sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
-    return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale);
+    /* With one entry per table row (`n_vocab` of them) the scale is per row: x[m] =
+     * decode(wte[id]) * scale[id - vocab_offset], the product in f32 rounded once. One entry keeps
+     * today's meaning. */
+    const int64_t n_vocab = p_int(a, "n_vocab", 0);
+    const bool per_row = sc->data && n_vocab > 1 && numel(sc) == n_vocab;
+    if (sc->data && numel(sc) > 1 && !per_row) return RAD_E_SHAPE;
+    return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale, per_row ? sc : nullptr);
 }

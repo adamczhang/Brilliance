@@ -84,14 +84,13 @@ int64_t NgramIndex::find_suffix(const TokenSeq& s, int n) const {
     }
 }
 
-int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
-                        int* match, int match_cap) {
-    const int64_t len = seq.size();
-    if (depth <= 0 || len < 2) return 0;
+/* The preamble both callers share: the pattern lengths, a rebuild when they changed or the
+ * sequence went back behind the index, and the n-grams up to `upto`. Only n-grams with a token
+ * after them are indexed: the last one is the pattern sought. */
+void NgramIndex::index(const TokenSeq& seq, int nmin, int nmax, int64_t upto) {
     nmin = std::max(1, std::min(nmin, (int)kMaxN));
     nmax = std::max(nmin, std::min(nmax, (int)kMaxN));
-    /* Only n-grams with a token after them are indexed: the last one is the pattern sought. */
-    const int64_t upto = std::min(len - 1, kMaxLen);
+    upto = std::min(std::min(upto, seq.size() - 1), kMaxLen);
     if (nmin != nmin_ || nmax != nmax_ || filled_ > upto) {
         const uint64_t own = owner_;
         reset(own);
@@ -99,6 +98,13 @@ int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int3
         nmax_ = nmax;
     }
     index_to(seq, upto);
+}
+
+int NgramIndex::propose(const TokenSeq& seq, int nmin, int nmax, int depth, int32_t* out,
+                        int* match, int match_cap) {
+    const int64_t len = seq.size();
+    if (depth <= 0 || len < 2) return 0;
+    index(seq, nmin, nmax, len - 1);
     for (int n = (int)std::min<int64_t>(nmax, len - 1); n >= nmin; --n) {
         const int64_t e = find_suffix(seq, n);
         if (e < 0) continue;

@@ -1,0 +1,20 @@
+# hy4-flash-w4nl64-gptq.recipe -- hy4-flash-w4nl64-rtn.recipe's experts, fitted by GPTQ against the
+# Grams of a calibration run (the same codebook, scale layout and rotation as the rtn recipe; only
+# the rounding differs). `calib=$CALIB` names the directory a `--calib-corpus` run wrote and
+# tools/calib_st2gram.py converted: every expert's gate_up reads the layer's pooled Gram
+# (gram.r0.blk.L.ffn_gate_up_exps.bin) and its down projection its own
+# (gram.r0.blk.L.ffn_down_exps.E.bin, from 4 x K rows of that expert, else the pooled
+# gram.r0.blk.L.ffn_down_exps.bin); a weight with no file is rounded to nearest and the converter
+# says so. The end-to-end run, with the flags, is in docs/ARCHITECTURES.md (hyv4flash, "Calibrating").
+#
+#   CALIB=<grams dir> rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-w4nl64-gptq.recipe -o hy4-flash-w4nl64-gptq.rad
+#
+# Add one `gptq` line a trunk linear to fit the trunk too (hy4-flash-i8.recipe's lines with
+# `gptq codes=i8 group=128 scale=bf16 transform=fwht128 damp=0.01 calib=$CALIB`, or
+# hy4-flash-iqr-gptq.recipe's u5 trellis); the Grams for it are in the same directory under the
+# declared weight stem (`blk.L.attn_q_a`, `blk.L.attn_q_nope`, `blk.L.ffn_latent_in`, ...).
+#
+# PATTERN                     QUANTISER  OPTIONS
+blk.*.ffn_*_exps.*.weight     gptq       table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

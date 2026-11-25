@@ -119,8 +119,12 @@ public:
     char*   ring_full() const { return region_; }
     char*   ring_low() const { return low_; }
     /* Per step, before release: whether the next step continues a prompt in a pass this stager
-     * arms for, so this step's trunk pass stages that pass's first layers. */
-    void set_next_prefill(bool more) { next_prefill_ = more; }
+     * arms for, so this step's trunk pass stages that pass's first layers -- and from which layer
+     * it starts, which inside a chunk group (S-02) is the next sub-step's layer_lo, not 0. */
+    void set_next_prefill(bool more, int32_t first_layer = 0) {
+        next_prefill_ = more;
+        arm_first_ = more ? first_layer : 0;
+    }
 
     bool    enabled() const { return !layers_.empty(); }
     int64_t ring_bytes() const { return ring_; }
@@ -202,7 +206,12 @@ private:
     bool     next_prefill_ = false;
     bool     first_op_ = false;        /* the pass has issued nothing yet */
     int32_t  next_ = 0;                /* the next layer to stage this pass */
-    /* The next trunk pass's first layers, staged at this pass's end: layers [0, n_early_). */
+    /* The next trunk pass's first layer as the engine named it (set_next_prefill). */
+    int32_t  arm_first_ = 0;
+    /* The next trunk pass's first layers, staged at the last pass's end: the layers
+     * [early_first_, early_first_ + n_early_) -- [0, n_early_) for an unsliced pass -- which the
+     * pass that begins there adopts. */
+    int32_t  early_first_ = 0;
     int32_t  n_early_ = 0;
 
     enum { kStaged, kNone, kLater };

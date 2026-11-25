@@ -566,6 +566,28 @@ int64_t process_rss() {
     return (int64_t)pmc.WorkingSetSize;
 }
 
+int64_t process_commit() {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof pmc)) return -1;
+    return (int64_t)pmc.PrivateUsage;
+}
+
+/* Brilliance (issue #1): queried without a handle, Windows answers for the job this process runs
+ * in, the innermost when jobs nest. A limit is read only where its flag is set. */
+JobMemoryLimit job_memory_limit() {
+    JobMemoryLimit j;
+    BOOL in = FALSE;
+    if (!IsProcessInJob(GetCurrentProcess(), nullptr, &in) || !in) return j;
+    j.in_job = true;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    if (!QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &li, sizeof li, nullptr))
+        return j;
+    const DWORD f = li.BasicLimitInformation.LimitFlags;
+    if (f & JOB_OBJECT_LIMIT_JOB_MEMORY) j.job = (int64_t)li.JobMemoryLimit;
+    if (f & JOB_OBJECT_LIMIT_PROCESS_MEMORY) j.process = (int64_t)li.ProcessMemoryLimit;
+    return j;
+}
+
 // ------------------------------------------------------------------------------- paths
 std::string exe_path() {
     std::vector<wchar_t> buf(1024);
@@ -868,6 +890,62 @@ bool fd_names(int fd, const std::string& path) {
                       std::memcmp(ia, ib, sizeof ia) == 0;
     CloseHandle(p);
     return same;
+}
+
+namespace {
+// FILETIME-style 100 ns units since 1601-01-01 as seconds and nanoseconds since 1970-01-01.
+void stamp_time(int64_t t, int64_t* sec, int32_t* nsec) {
+    const int64_t since1970 = t - 116444736000000000ll;
+    int64_t s = since1970 / 10000000, r = since1970 % 10000000;
+    if (r < 0) { r += 10000000; --s; }
+    *sec = s;
+    *nsec = (int32_t)(r * 100);
+}
+
+bool stamp_of(HANDLE h, FileStamp* out) {
+    FILE_BASIC_INFO b{};
+    FILE_STANDARD_INFO st{};
+    uint64_t volume = 0;
+    unsigned char id[16];
+    if (!GetFileInformationByHandleEx(h, FileBasicInfo, &b, sizeof b) ||
+        !GetFileInformationByHandleEx(h, FileStandardInfo, &st, sizeof st) ||
+        !file_identity(h, &volume, id)) {
+        fail();
+        return false;
+    }
+    if (st.Directory || GetFileType(h) != FILE_TYPE_DISK) {
+        errno = st.Directory ? EISDIR : EINVAL;
+        return false;
+    }
+    uint64_t lo = 0, hi = 0;
+    std::memcpy(&lo, id, 8);
+    std::memcpy(&hi, id + 8, 8);
+    out->device = volume;
+    out->inode = lo ^ hi;
+    out->bytes = (uint64_t)st.EndOfFile.QuadPart;
+    stamp_time(b.LastWriteTime.QuadPart, &out->mtime_s, &out->mtime_ns);
+    stamp_time(b.ChangeTime.QuadPart, &out->ctime_s, &out->ctime_ns);
+    return true;
+}
+}   // namespace
+
+bool file_stamp_fd(int fd, FileStamp* out) {
+    const HANDLE h = brl::osfhandle(fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    return stamp_of(h, out);
+}
+
+bool file_stamp(const std::string& path, FileStamp* out) {
+    const HANDLE h = CreateFileW(widen(path).c_str(), FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        fail();
+        return false;
+    }
+    const bool ok = stamp_of(h, out);
+    CloseHandle(h);
+    return ok;
 }
 
 // ------------------------------------------------------------------------------- processes

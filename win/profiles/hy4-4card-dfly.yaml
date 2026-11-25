@@ -1,0 +1,71 @@
+# Brilliance profile: Hy4-flash IQR-V4 u3 (keptn's quantised Tencent Hy4-flash: trellis u3 gate_up
+# and w4nl64 down projections for the 512 routed experts, a u5 trellis trunk, E4M3 Engram tables, the
+# IQ8R DFly2 drafter) on four Radeon AI PRO R9700s, tensor parallel (TP4), every routed expert on
+# the cards, with the file's DFly2 block drafter. Preview: it loads, serves chat, tools and streaming,
+# passes greedy consistency checks (drafter on against off, TP4 against TP2) and stops cleanly on
+# Ctrl-Break; no soak, stop-under-load or concurrency qualification has run on it.
+#
+# What the settings do:
+#   placement: all_vram           every rank holds every routed expert's 384-column share (about
+#                                 15 GiB of experts a card). With this context and drafter the card
+#                                 holds about 28.6 GiB.
+#   max-model-len 65536 x 8       65,536 tokens of context, eight requests at once, a bf16 KV cache.
+#   max-num-batched-tokens 8192   prefill steps of up to 8,192 tokens; with checkpoint-interval 4096
+#   prefill-span 2                a lone prefill spans two checkpoint intervals a step.
+#   num-speculative-tokens 5 ...  DFly2, the container's block drafter: five draft positions, coupled
+#                                 to the verify (fixed-seed tokens are not preserved), traversal
+#                                 verify, an adaptive and load-aware depth, and SuffixDecoding beside
+#                                 it, as the reference Linux runs serve the model. Drafting doubles a
+#                                 single code stream's decode and costs some aggregate at 4-8 streams.
+#   tp-wire: exact, p2p: off      the collectives carry exact bf16 through pinned host memory (no
+#                                 peer-to-peer on Windows). The iHC junction runs unfused on Windows.
+#   ngram-placement: disk         the 60.24 GiB Engram tables stay in the container's file mapping;
+#                                 each step reads the rows it needs on the host, prefetched.
+#   mm-max-patches: 0             text only: the vision tower is not served.
+#   kernels: libr4d,libavx,spechub  the card kernels, the host library, and the drafter's coupling.
+#
+# Do not set RADIANCE_HY4_PIPE (the pipelined prefill): it gave wrong long-context answers.
+#
+#   .\serve.ps1 hy4-4card-dfly -Fetch     fetch the model if it is not whole, then serve it
+#   .\serve.ps1 hy4-4card-dfly
+#
+# The model file: keptn/hy4-flash-iqr-v4 on Hugging Face, hy4-flash-iqr-v4-u3.rad, 128.61 GiB
+# (138,093,449,672 bytes), SHA-256 c4a80918139f2bae4d097976fd2794ca3f1f56e9ea7eb60600188c45f4f5e7aa.
+# Tencent Hy License 1.0 (/terms/licenses/tencent-hy-1.0; a separate licence for large MaaS
+# businesses, TERMS-OF-USE.md).
+# brilliance-fetch: keptn/hy4-flash-iqr-v4 main hy4-flash-iqr-v4-u3.rad
+#
+# The cards: without -Bus every discrete card HIP shows is used, the integrated GPU left out.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 hy4-4card-dfly -Listen 0.0.0.0
+# -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+  kernels: libr4d,libavx,spechub
+scheduler:
+  load-timeout: 1200s
+models:
+  hy4-flash:
+    model: D:/models/hf/keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad
+    tp: 4
+    tp-wire: exact
+    p2p: off
+    placement: all_vram
+    max-model-len: 65536
+    max-num-seqs: 8
+    max-num-batched-tokens: 8192
+    checkpoint-interval: 4096
+    prefill-span: 2
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 5
+    draft-window: fixed
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-load: on
+    draft-depth-load-from: 1
+    draft-suffix: on
+    ngram-placement: disk
+    mm-max-patches: 0
+    deterministic: true

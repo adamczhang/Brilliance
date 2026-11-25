@@ -1,0 +1,41 @@
+# Brilliance profile: Inkling 2 Mini IQ8R (every routed expert, the attention and the head as rotated
+# int8, with its vision tower) on one Radeon AI PRO R9700. Supported (SUPPORT.md): its API checks
+# pass on one card; no soak or concurrency qualification yet, so long-run stability is unproven.
+# 32K tokens of context, four requests at once, an int8 KV cache. Loads in about 12 s and holds
+# 28.13 GiB of the card: 24.89 GiB of weights (23.16 GiB of experts), the vision tower, and a 2.52 GiB
+# cache for every sequence at full length; the 883 MiB token embedding is pinned in host memory.
+# Text, tool calls and pictures. Reasoning effort "none" by default: the model still writes a short
+# reasoning block before its answer, which a client's token limit counts. A request raises it with
+# "chat_template_kwargs": {"reasoning_effort": "high"} (none, minimal, low, medium, high, xhigh or
+# max, or a number from 0 to 0.99; the template's own default is 0.9).
+#
+#   .\serve.ps1 inkling2-mini-1card -Bus 6
+#   bin\radiance.exe --config profiles\inkling2-mini-1card.yaml
+#
+# The model file: StillDeadcode/inkling-2-mini-iq8r on Hugging Face, inkling-2-mini-iq8r.rad,
+# 26.14 GiB (28,070,305,792 bytes), SHA-256
+# eb05804beaa72d47f52a9a9ae65d880d8370e10826301853b0a60ecb0e6e42e9. Point `model:` at where it is.
+# Apache 2.0, as Thinking Machines' Inkling 2 Mini; its acceptable use policy applies.
+#
+# No speculation: the container carries an int8 DSpark drafter whose walk (markov_rnn_greedy_q8)
+# this build does not have, and the plugin refuses the drafter's int8 weights, so the line below
+# stays at 0. For DSpark on one card use inkling2-mini-dspark-1card.
+#
+# The card: name ONE card with serve.ps1's -Bus (its PCI bus) or -Device (its HIP index). With exactly
+# one card visible, HIP virtual memory is on and the KV cache is elastic; without -Bus every discrete
+# card is visible, the first is used, and the cache is sized whole.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 inkling2-mini-1card -Bus 6
+# -Listen 0.0.0.0 -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+models:
+  inkling2-mini:
+    model: D:/models/hf/StillDeadcode/inkling-2-mini-iq8r/inkling-2-mini-iq8r.rad
+    tp: 1
+    max-num-seqs: 4
+    max-model-len: 32768
+    kv-cache-dtype: i8
+    num-speculative-tokens: 0
+    chat-template-kwargs: {"reasoning_effort": "none"}

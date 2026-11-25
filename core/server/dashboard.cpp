@@ -130,6 +130,7 @@ HttpResponse Server::handle_sessions(const HttpRequest&) {
         e["id"]        = s.id;
         e["model"]     = s.model;
         if (!s.label.empty()) e["label"] = s.label;
+        if (!s.lora.empty()) e["lora"] = s.lora;
         e["tokens"]    = s.n_tokens;
         e["bytes"]     = s.bytes;
         e["idle_s"]    = s.idle_s;
@@ -439,14 +440,47 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["prefill_tps"]     = m.prefill_tps;
         o["decode_tps"]      = m.decode_tps;
         o["draft_accept"]    = m.draft_acceptance;
+        /* The deepest chain the latest step with a drafting row allowed; 0 before the first. */
+        o["draft_ceiling"]   = m.draft_ceiling;
         o["preemptions"]     = m.preemptions;
         o["total_requests"]  = m.total_requests;
+        /* Work attributed per runtime LoRA, by slot, named. A model serving several adapters
+         * shares every other counter; these are the ones that are not shared. */
+        {
+            const std::vector<std::string> lnames = deps_.sched->lora_names();
+            json lz = json::array();
+            for (size_t i = 0; i < lnames.size() && i < (size_t)SchedMetrics::MAX_LORA_SLOTS; ++i) {
+                json l;
+                l["name"]          = lnames[i];
+                l["requests"]      = m.loras[i].requests;
+                l["prompt_tokens"] = m.loras[i].prompt_tokens;
+                l["output_tokens"] = m.loras[i].output_tokens;
+                l["running"]       = m.loras[i].running;
+                lz.push_back(std::move(l));
+            }
+            o["loras"] = std::move(lz);
+        }
         o["steps"]           = m.steps;
         o["steps_prefill"]   = m.steps_prefill;
         o["steps_mixed"]     = m.steps_mixed;
         o["prefill_chunks_capped"] = m.prefill_chunks_capped;
         o["steps_decode"]    = m.steps_decode;
         o["steps_held"]      = m.steps_held;
+        o["steps_sliced"]    = m.steps_sliced;
+        o["substeps"]        = m.substeps;
+        o["steps_ahead"]     = m.steps_ahead;
+        /* Why a step was not issued ahead (S-07): one count per reason, and the first check that
+         * refused names it. steps_ahead plus these is every step_next the engine made once a step
+         * was in flight, so the gap between `steps` and `steps_ahead` is explained here. */
+        o["steps_ahead_refused"] = {
+            { "waiting",    m.ahead_refused_waiting },
+            { "held",       m.ahead_refused_held },
+            { "mid_prompt", m.ahead_refused_mid_prompt },
+            { "grammar",    m.ahead_refused_grammar },
+            { "suffix_hot", m.ahead_refused_suffix_hot },
+            { "ends_every", m.ahead_refused_ends_every },
+            { "kv",         m.ahead_refused_kv },
+        };
         o["mixed_step_target_steps"] = m.mixed_step_target_steps;
         o["mixed_step_target_misses"] = m.mixed_step_target_misses;
         o["mixed_step_target_prefill_cap"] = m.mixed_step_target_prefill_cap;
@@ -457,6 +491,12 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
         o["step_ns_decode_best"] = m.step_ns_decode_best;
         o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
+        /* The encoder's time and work, which the step figures above do not show: it runs between
+         * steps. Emitted on every model, zero on one without an encoder. */
+        o["encode_items"]    = m.encode_items;
+        o["encode_patches"]  = m.encode_patches;
+        o["encode_ns"]       = m.encode_ns;
+        o["encode_pending"]  = m.encode_pending;
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
          * noise, over a reach of 40000 a broken draft round. */
@@ -489,7 +529,13 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             j["kv_tokens"] = q.kv_tokens;
             j["kv_blocks"] = q.kv_blocks;
             j["draft"]     = q.n_draft;
+            /* The verify steps that carried drafts for it, the drafts they carried and the drafts they accepted,
+             * since it arrived; their growth between two reads is its drafts and accepted drafts a step. */
+            j["draft_steps"]    = q.draft_steps;
+            j["draft_tokens"]   = q.draft_tokens;
+            j["draft_accepted"] = q.draft_accepted;
             j["slot"]      = q.slot;
+            if (!q.lora.empty()) j["lora"] = q.lora;
             j["age_s"]     = q.age_s;
             if (q.ttft_s >= 0) j["ttft_s"] = q.ttft_s;
             if (q.prefill_s >= 0) j["prefill_s"] = q.prefill_s;
@@ -543,10 +589,20 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
             e["tiers"] = std::move(tiers);
             e["layer_units"]    = s.experts.layer_units;
             e["layer_resident"] = s.experts.layer_resident;
+            e["layer_routed"]   = s.experts.layer_routed;
+            e["layer_missed"]   = s.experts.layer_missed;
+            e["early_published"] = s.experts.early_published;
+            e["paced_units"]     = s.experts.paced_units;
+            e["paced_marks"]     = s.experts.paced_marks;
+            e["paced_late"]      = s.experts.paced_late;
             e["promotions"] = s.experts.promotions;
             e["demotions"]  = s.experts.demotions;
             e["distinct_promoted"] = s.experts.distinct_promoted;
             e["readmits"]    = s.experts.readmits;
+            e["readmit_16"]   = s.experts.readmit_16;
+            e["readmit_128"]  = s.experts.readmit_128;
+            e["readmit_1024"] = s.experts.readmit_1024;
+            e["heat_steps"]   = s.experts.heat_steps;
             e["routed"]      = s.experts.routed;
             e["routed_res"]  = s.experts.routed_resident;
             e["dispatches"]  = s.experts.dispatches;

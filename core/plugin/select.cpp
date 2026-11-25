@@ -467,7 +467,7 @@ std::string Registry::selection_table() const {
 int Registry::init_instance(Resolved& r, int rank, int world_size) {
     if (!r.row || !r.row->info) return RAD_E_INVAL;
     const RadKernelInfo* k = r.row->info;
-    if (!k->init) { r.instance = nullptr; return RAD_OK; }
+    if (!k->init || declare_only_) { r.instance = nullptr; return RAD_OK; }
 
     void* inst = nullptr;
     /* The parameters init reads: the frozen geometry, plus the engine's tensor-parallel group when

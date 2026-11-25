@@ -5,7 +5,9 @@
  * checked for the values a populated engine gives them, for every field the page reads of them
  * and for every figure the sampler derives from them. The KV figures behind both come from
  * SchedulerBridge's aggregation over the scheduler's groups, checked here on a hybrid model's
- * groups, where summing or picking the wrong group goes wrong silently.
+ * groups, where summing or picking the wrong group goes wrong silently. S-07's reasons for a
+ * step not issued ahead are checked twice: as the bridge carries them, and as /stats names them,
+ * because a reason wired to another reason's count is a wrong answer that reads as a right one.
  */
 #include "server_fakes.h"
 #include "rad_internal.h"   /* rad_mono_ns: a synthetic bringup start */
@@ -34,11 +36,15 @@ struct StatsScheduler : FakeScheduler {
         r.kv_blocks = 120;
         r.kv_tokens = 960;
         r.n_draft = 3;
+        r.draft_steps = 5;
+        r.draft_tokens = 17;
+        r.draft_accepted = 9;
         r.slot = 2;
         r.age_s = 4.5;
         r.ttft_s = 0.25;
         r.prefill_s = 0.20;
         r.decode_tps = 61.0;
+        r.lora = "style";   /* Brilliance (upstream defect): the page reads requests.lora */
         out->assign(1, r);
         return 1;
     }
@@ -57,6 +63,7 @@ struct StatsScheduler : FakeScheduler {
         s.snap_bytes = 4096;
         s.resume_tokens = 4096;
         s.moving = true;
+        s.lora = "style";   /* Brilliance (upstream defect): the page reads session.lora */
         out->assign(1, s);
         occ->host_bytes = 8 << 20;
         occ->host_cap_bytes = 64 << 20;
@@ -149,8 +156,13 @@ struct Dash {
         sched.m.hit_cut_resumed_below = 4;
         sched.m.prefix_restore_cuts = 1;
         sched.m.draft_depth_seen = 2;
+        sched.m.draft_ceiling = 6;
         sched.m.draft_pos_reached[0] = 10; sched.m.draft_pos_accepted[0] = 8;
         sched.m.draft_pos_reached[1] = 8;  sched.m.draft_pos_accepted[1] = 2;
+        sched.m.encode_items = 3;
+        sched.m.encode_patches = 12000;
+        sched.m.encode_ns = 1500000000;
+        sched.m.encode_pending = 1;
         srv.reset(new Server(d, o));
     }
     json get(const char* path) {
@@ -191,6 +203,11 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     const json& r = s["requests"][0];
     CHECK_EQ(r.value("state", ""), std::string("decode"));
     CHECK_EQ(r.value("kv_tokens", (int64_t)0), (int64_t)960);
+    CHECK_EQ(r.value("draft", (int64_t)-1), (int64_t)3);
+    CHECK_EQ(r.value("draft_steps", (int64_t)-1), (int64_t)5);
+    CHECK_EQ(r.value("draft_tokens", (int64_t)-1), (int64_t)17);
+    CHECK_EQ(r.value("draft_accepted", (int64_t)-1), (int64_t)9);
+    CHECK_EQ(s.value("draft_ceiling", (int64_t)-1), (int64_t)6);
     CHECK_NEAR(r.value("ttft_s", -1.0), 0.25, 1e-12);
     CHECK_NEAR(r.value("prefill_s", -1.0), 0.20, 1e-12);
     REQUIRE(s["cards"].size() == 1);
@@ -209,6 +226,10 @@ TEST(stats_carries_the_engine_the_requests_and_the_snapshot) {
     CHECK_EQ(s["hit_cuts"].value("no_snapshot", (int64_t)0), (int64_t)2);
     CHECK_EQ(s["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s.value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
+    CHECK_EQ(s.value("encode_items", (int64_t)0), (int64_t)3);
+    CHECK_EQ(s.value("encode_patches", (int64_t)0), (int64_t)12000);
+    CHECK_EQ(s.value("encode_ns", (int64_t)0), (int64_t)1500000000);
+    CHECK_EQ(s.value("encode_pending", (int64_t)0), (int64_t)1);
 
     CHECK_EQ(d.srv->router().call("GET", "/graph").status, 501);
     Dash g(true);
@@ -238,6 +259,43 @@ TEST(sessions_lists_each_conversation_and_what_the_tiers_did) {
     CHECK_EQ(s["linear"]["hit_cuts"].value("resumed_below", (int64_t)0), (int64_t)4);
     CHECK_EQ(s["moved"].value("restore_cuts", (int64_t)0), (int64_t)1);
     CHECK_EQ(s["linear"].value("hit_cut_tokens", (int64_t)0), (int64_t)9000);
+}
+
+/* /stats carries the ahead-refusal reasons one key per reason, under `steps_ahead_refused`, and
+ * `steps_ahead` beside them (S-07). S-07's point is that the gap between `steps` and
+ * `steps_ahead` is explained, so these seven reasons are the whole explanation: a key that goes
+ * missing, one invented beside them, or one on another reason's counter is a wrong answer that
+ * still reads as a right one. Each count is distinct, so a key moved to a neighbouring counter
+ * fails here. */
+TEST(stats_names_each_reason_a_step_was_not_issued_ahead) {
+    Dash d(false);
+    d.sched.m.steps = 39;   /* 11 issued ahead + 28 refused, one per reason */
+    d.sched.m.steps_ahead = 11;
+    d.sched.m.ahead_refused_waiting = 1;
+    d.sched.m.ahead_refused_held = 2;
+    d.sched.m.ahead_refused_mid_prompt = 3;
+    d.sched.m.ahead_refused_grammar = 4;
+    d.sched.m.ahead_refused_suffix_hot = 5;
+    d.sched.m.ahead_refused_ends_every = 6;
+    d.sched.m.ahead_refused_kv = 7;
+    const json s = d.get("/stats");
+    CHECK_EQ(s.value("steps_ahead", (int64_t)-1), (int64_t)11);
+    REQUIRE(s.contains("steps_ahead_refused"));
+    const json& a = s["steps_ahead_refused"];
+    REQUIRE(a.is_object());
+    CHECK_EQ(a.value("waiting", (int64_t)-1), (int64_t)1);
+    CHECK_EQ(a.value("held", (int64_t)-1), (int64_t)2);
+    CHECK_EQ(a.value("mid_prompt", (int64_t)-1), (int64_t)3);
+    CHECK_EQ(a.value("grammar", (int64_t)-1), (int64_t)4);
+    CHECK_EQ(a.value("suffix_hot", (int64_t)-1), (int64_t)5);
+    CHECK_EQ(a.value("ends_every", (int64_t)-1), (int64_t)6);
+    CHECK_EQ(a.value("kv", (int64_t)-1), (int64_t)7);
+    CHECK_EQ(a.size(), (size_t)7);
+    /* The seven reasons and the steps issued ahead are every step_next made while a step was in
+     * flight, which is the sentence the counters exist to let a reader check. */
+    int64_t refused = 0;
+    for (auto it = a.begin(); it != a.end(); ++it) refused += it.value().get<int64_t>();
+    CHECK_EQ(s.value("steps", (int64_t)-1), s.value("steps_ahead", (int64_t)-1) + refused);
 }
 
 /* DELETE /sessions forgets one stored conversation by its label or engine id and answers with
@@ -383,7 +441,7 @@ TEST(the_sampler_yields_every_charted_figure_from_the_stats_route) {
     for (const char* k : { "decode", "prefill", "running", "waiting", "preempted", "flight", "hit", "kvUsed", "kvCap",
                            "kvKept", "kvRead", "jobRun", "jobDone", "prefillRate", "reqRate", "stepAny", "step",
                            "accept", "tokStep", "lkAr", "lkUp", "lkDn", "lkSsd", "lkStream", "expHit", "expIn",
-                           "expOut" }) {
+                           "expOut", "encBusy", "encRate", "encPatch", "encWait" }) {
         CHECK(have.count(k) == 1);
         if (!have.count(k)) fprintf(stderr, "    the sampler yields no '%s' from /stats\n", k);
     }
@@ -418,6 +476,7 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     m.hit_cut_resumed_below = 6;
     m.prefix_restore_cuts = 7;
     m.draft_depth_seen = 70;
+    m.draft_ceiling = 5;
     for (int j = 0; j < 64; ++j) { m.draft_pos_reached[j] = 100 - j; m.draft_pos_accepted[j] = j; }
 
     const server::SchedMetrics o = bridge_metrics(m);
@@ -430,6 +489,7 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(o.kv_bytes_carved, (int64_t)(2000 + 400 + 1000 + 128));
     CHECK_EQ(o.kv_tokens_cached, o.kv_tokens_used);
     CHECK_EQ(o.draft_depth_seen, server::SchedMetrics::MAX_DRAFT_POS);
+    CHECK_EQ(o.draft_ceiling, 5);
     CHECK_EQ(o.draft_pos_reached[63], (int64_t)37);
     CHECK_EQ(o.hit_cut_resumed_below, (int64_t)6);
     CHECK_EQ(o.prefix_restore_cuts, (int64_t)7);
@@ -440,6 +500,32 @@ TEST(the_bridge_reads_the_binding_paged_group_and_sums_only_bytes) {
     CHECK_EQ(p.kv_tokens_total, (int64_t)(200 * 16));
     CHECK_EQ(p.kv_tokens_used, (int64_t)(190 * 16));
     CHECK_EQ(p.kv_tokens_max, (int64_t)(100 * 16));
+}
+
+/* SchedulerBridge copies S-07's seven reasons one for one: each keeps its own counter, so a
+ * reason is never reported under another reason's name. Every value differs, so a field left
+ * unbridged (0), or copied from the reason next to it, fails. */
+TEST(the_bridge_carries_each_reason_a_step_was_not_issued_ahead) {
+    rad::SchedMetrics m;
+    m.steps = 20;
+    m.steps_ahead = 11;
+    m.ahead_refused_waiting = 1;
+    m.ahead_refused_held = 2;
+    m.ahead_refused_mid_prompt = 3;
+    m.ahead_refused_grammar = 4;
+    m.ahead_refused_suffix_hot = 5;
+    m.ahead_refused_ends_every = 6;
+    m.ahead_refused_kv = 7;
+    const server::SchedMetrics o = bridge_metrics(m);
+    CHECK_EQ(o.steps, (int64_t)20);
+    CHECK_EQ(o.steps_ahead, (int64_t)11);
+    CHECK_EQ(o.ahead_refused_waiting, (int64_t)1);
+    CHECK_EQ(o.ahead_refused_held, (int64_t)2);
+    CHECK_EQ(o.ahead_refused_mid_prompt, (int64_t)3);
+    CHECK_EQ(o.ahead_refused_grammar, (int64_t)4);
+    CHECK_EQ(o.ahead_refused_suffix_hot, (int64_t)5);
+    CHECK_EQ(o.ahead_refused_ends_every, (int64_t)6);
+    CHECK_EQ(o.ahead_refused_kv, (int64_t)7);
 }
 
 RAD_TEST_MAIN()

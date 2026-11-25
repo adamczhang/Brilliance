@@ -148,7 +148,7 @@ private:
     /* Steps by shape, and decode rows that ran unspeculated. Counters, so two scrapes give the
      * rate over a window rather than an average dominated by startup. */
     Counter c_steps_prefill_, c_steps_mixed_, c_steps_decode_, c_rows_unspec_, c_steps_ahead_;
-    Counter c_prefill_capped_, c_steps_held_;
+    Counter c_prefill_capped_, c_steps_held_, c_steps_sliced_, c_substeps_;
     Counter c_mixed_step_target_steps_, c_mixed_step_target_misses_;
     Gauge   g_mixed_step_target_cap_;
     /* Seconds inside a step, all shapes and decode-only. Wall clock over a step count is not a
@@ -158,7 +158,7 @@ private:
     Counter c_prefill_tokens_, c_decode_tokens_, c_draft_tokens_, c_draft_accepted_;
     Counter c_draft_refills_, c_draft_refill_tokens_;
     Counter c_lookup_proposals_, c_lookup_held_, c_lookup_held_drafts_, c_lookup_held_hits_;
-    Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_suffix_held_ahead_;
+    Counter c_suffix_steps_, c_suffix_rows_, c_suffix_accepted_, c_ahead_refused_suffix_hot_;
     Counter c_attn_cached_, c_linear_cached_, c_checkpoints_;
     Counter c_prefix_queries_;
     Counter c_prefix_evict_, c_prefix_ckpt_evict_;

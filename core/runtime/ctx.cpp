@@ -59,7 +59,15 @@ int Ctx::init(const CtxDesc& d) {
     return RAD_OK;
 }
 
+int Ctx::quiesce() {
+    if (stream_) RAD_TRY(rad_stream_sync(stream_));
+    if (lane1_) RAD_TRY(rad_stream_sync(lane1_));
+    return RAD_OK;
+}
+
 void Ctx::shutdown() {
+    if (quiesce() < 0)
+        fatal("refusing to free a runtime context whose compute streams did not drain");
     oracle_close();
     xp_close();
     /* Teardown sync, before freeing memory the streams may still use: the routing staging is the
@@ -1033,7 +1041,7 @@ int Ctx::lane_join(int from, int to) {
  * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
  * never recorded (below). `ckpt_cut` and `ckpt_cu`: a pass carrying them is never recorded.
  */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 496,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 512,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -1042,7 +1050,7 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* Not recordable: encoder passes are shaped by their media, and passes carrying encoder rows
      * issue the scatter only when they have some (and the second attention over a run read both
      * ways, n_bidi, only on such a pass). */
-    if (b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
+    if (b->prefill_tail_h || b->enc || b->n_mm_rows > 0 || b->n_bidi > 0) return 0;
     /* A plugin with no pass-key callback cannot key a launch that splits its KV by the live
      * context, so a prefill or mixed pass of a program holding such a launcher is not recorded.
      * Its decode, verify and draft passes are: their launches get the keyed context bound in
@@ -1063,6 +1071,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     /* A step with a checkpoint inside it copies from addresses the engine armed for it
      * (Ctx::set_ckpt_snap), which no recording could replay. */
     if (b->ckpt_cut > 0) return 0;
+    /* A layer-sliced pass (S-02) carries a group's carried chunk state across steps (the plugin's
+     * persistent set), which no recorded launch replays: its layers are [layer_lo, layer_hi), not
+     * the whole trunk, and the state it resumes from is not in the batch. */
+    if (b->layer_lo != 0 || b->layer_hi != 0) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
         h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
@@ -1371,7 +1383,7 @@ int Ctx::play_pass(PassTape& t) {
         }
         case kTapeXpMark:
             lane_ = st.lane;
-            rc = xp_ ? xp_mark_run() : RAD_OK;
+            rc = xp_ || pace_hook_ ? xp_mark_run() : RAD_OK;
             lane_ = l0;
             break;
         case kTapeXpStep:

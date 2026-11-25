@@ -1,6 +1,7 @@
 """A split head can keep its unsplit source without duplicating a shard or changing the classes."""
 import errno
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,9 +19,16 @@ sys.path.insert(0, str(TOOLS))
 import vhead
 
 
+def scratch():
+    base = os.environ.get("RAD_TEST_TMPDIR") or None   # Brilliance: scratch inside the build tree
+    if base:
+        os.makedirs(base, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=base)
+
+
 class VHeadTest(unittest.TestCase):
     def test_head_in_own_shard(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with scratch() as tmp:
             src = Path(tmp) / "src"
             src.mkdir()
             shard, index = "head.safetensors", "model.safetensors.index.json"
@@ -45,16 +53,20 @@ class VHeadTest(unittest.TestCase):
                              (plain / "vhead.safetensors").read_bytes())
 
             alias = Path(tmp) / "alias"
-            alias.symlink_to(src, target_is_directory=True)
-            attempt = subprocess.run([sys.executable, TOOLS / "vhead.py", src, alias, classes],
-                                     capture_output=True)
-            self.assertNotEqual(attempt.returncode, 0)
-            self.assertIn(b"DST must be separate from SRC", attempt.stderr)
-            self.assertEqual((src / index).read_text(), original)
-            self.assertFalse((src / "vhead.safetensors").exists())
+            with self.subTest("DST is a symlink to SRC"):
+                try:
+                    alias.symlink_to(src, target_is_directory=True)
+                except OSError as exc:  # Brilliance: Windows without the symlink privilege
+                    self.skipTest(f"cannot create a directory symlink here: {exc}")
+                attempt = subprocess.run([sys.executable, TOOLS / "vhead.py", src, alias, classes],
+                                         capture_output=True)
+                self.assertNotEqual(attempt.returncode, 0)
+                self.assertIn(b"DST must be separate from SRC", attempt.stderr)
+                self.assertEqual((src / index).read_text(), original)
+                self.assertFalse((src / "vhead.safetensors").exists())
 
     def test_conflicting_destination_keeps_original_checkpoint(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with scratch() as tmp:
             root = Path(tmp)
             classes = root / "widths.cls"
             classes.write_bytes(b"radiance-vhead-1 n_vocab=8 widths=3,4,5,6\n\xe4\xe4")

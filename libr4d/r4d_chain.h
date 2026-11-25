@@ -83,7 +83,9 @@ __device__ __forceinline__ const R4dChainRec* r4d_chain_rec() {
 // runs on.
 __device__ __forceinline__ void r4d_chain_acquire(bool scalar = true) {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-    if (scalar) asm volatile("s_dcache_inv" ::: "memory");
+    /* The wait: the compiler does not know the asm is an SMEM op, so it inserts no s_wait_kmcnt for it,
+     * and the RDNA4 ISA text does not say a later s_load is served behind the invalidate. */
+    if (scalar) asm volatile("s_dcache_inv\n\ts_wait_kmcnt 0x0" ::: "memory");
 }
 
 #ifndef R4D_CHAIN_TINY

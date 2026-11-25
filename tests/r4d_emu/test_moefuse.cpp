@@ -12,9 +12,15 @@
  * without, and the inverse against the table the gather builds from `sorted`; then moe_gather's
  * kernel reading that inverse against its self-scan (T <= 512) or the prepass's table (above), at
  * GLM's f32 routing weights and bf16 ones, with the ungated shared arm, a sigmoid-gated one and
- * none, and slices that drop slots. moe_scatter's three-pass form (T > 1024) is not here: its
- * kernels take dynamic LDS through `extern __shared__`, which the emulator cannot give; the card
- * checks it (r4d_selftest --case moe_scatter_inv_i32). */
+ * none, and slices that drop slots. moe_scatter's three-pass form (T > 1024) is not exercised
+ * here; the card checks it (r4d_selftest --case moe_scatter_inv_i32).
+ *
+ * moe_gather_inv_i8g through its published entry point (libr4d/r4d_moe.hip), which is where the
+ * wave form is chosen and where its refusals live: the sixteen-slot quantising kernel at a decode
+ * height, the wide (256-column-wave) one at prefill with bf16 routing weights (and each pinned),
+ * the kernel that ran named, the sums against the plain sixteen-slot form's launch and the codes
+ * and scales the quantiser's arithmetic applied to the sums the op itself wrote -- the pair the
+ * fusion replaces -- then every refusal of its quantising block. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -34,6 +40,18 @@ namespace {
 
 constexpr int32_t kPoison = -77;
 constexpr uint16_t kGatePoison = 0x7e57;
+
+/* The published op's entry point and its form pin (libr4d/r4d_moe.hip), driven through their ABI
+ * by the launcher case below. */
+extern "C" void r4d_moe_gather_pin_form(int form);
+
+RadParam pint(const char* k, int64_t v) {
+    RadParam p{};
+    p.key = k;
+    p.kind = RAD_P_INT;
+    p.ival = v;
+    return p;
+}
 
 /* moe_scatter's contract: slot i = token * top_k + slot goes to its expert's run in ascending i;
  * an expert outside the slice drops the slot; protected experts are placed last in list order;
@@ -135,7 +153,8 @@ void router_scatter_cases(std::mt19937& rng, int& cases, int& fails) {
         { 100, 288, 8, 0, 0, 0, 0, nullptr, true },    { 128, 288, 8, 1, 0, 0, 0, nullptr, true },
         { 24, 288, 8, 1, 0, 144, 144, nullptr, true }, { 24, 288, 8, 1, 1, 96, 32, "3,7,90", true },
         { 48, 512, 8, 1, 0, 0, 0, nullptr, true },     { 32, 32, 32, 0, 1, 0, 0, nullptr, true },
-        { 5, 300, 10, 1, 2, 0, 0, "0,299", true },
+        { 8, 512, 16, 1, 0, 0, 0, nullptr, true },     { 9, 512, 16, 1, 1, 0, 0, nullptr, true },
+        { 16, 512, 16, 1, 2, 0, 0, nullptr, true },    { 5, 300, 10, 1, 2, 0, 0, "0,299", true },
     };
     std::uniform_int_distribution<int> ud(-1000, 1000);
     for (const RouterShape& sh : shapes) {
@@ -450,6 +469,482 @@ void gather_inverse_cases(std::mt19937& rng, int& cases, int& fails) {
     }
 }
 
+/* moe_gather's sixteen-slot form (gather_kernel16, r4d_moe_gather.h): top_k = 16 with eight
+ * columns a lane, one sixteen-byte load a slot, against the scalar form's sums -- the same table
+ * from the inverse and the same self-scan from `sorted`, at Hy4-flash's decode heights (one row,
+ * the c8 verify's 32, and past the self-scan bound), f32 routing weights and bf16, the ungated
+ * shared arm, a sigmoid-gated one and none, and a slice that drops slots. */
+struct SixteenShape {
+    int M, n, nl, base;
+    bool f32w; /* Hy4-flash's f32 routing weights, else bf16 */
+    int shared; /* 0 none, 1 the ungated arm, 2 a sigmoid gate */
+};
+void gather_sixteen_cases(std::mt19937& rng, int& cases, int& fails) {
+    const SixteenShape shapes[] = {
+        { 1, 2560, 288, 0, true, 0 },  { 1, 2560, 288, 0, true, 1 }, { 8, 2560, 288, 0, true, 2 },
+        { 32, 2560, 288, 0, true, 1 }, { 32, 3072, 288, 0, false, 0 }, { 40, 2560, 288, 0, true, 1 },
+        { 64, 2560, 288, 0, true, 2 }, { 33, 512, 144, 0, true, 1 },  { 48, 256, 96, 96, false, 0 },
+        { 2, 4096, 288, 0, true, 0 },
+    };
+    const int k = 16, ne = 288;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const SixteenShape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k, nl = sh.nl;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter plain = scatter_kernel(ids, nl, sh.base, nullptr, false);
+        Scatter inv = scatter_kernel(ids, nl, sh.base, nullptr, true);
+        ++cases;
+        if (plain.rc != RAD_OK || inv.rc != RAD_OK || inv.inv != inverse_of(plain.sorted)) {
+            std::printf("FAIL moe_gather's sixteen-slot form: the inverse at M=%d slice %d+%d\n", M,
+                        sh.base, nl);
+            ++fails;
+            continue;
+        }
+        /* The form reads a row as one sixteen-byte load: every pitch a multiple of eight and the
+         * rows sixteen-byte aligned, which the launcher checks before it takes the form. */
+        const int ye_ld = n + 8, ew_ld = k + 2, y_ld = n + 8, sh_ld = n + 8, sg_ld = 2;
+        std::vector<uint16_t> ye((size_t)T * ye_ld), shp((size_t)M * sh_ld), sg((size_t)M * sg_ld);
+        std::vector<float> ewf((size_t)M * ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)shp.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather's sixteen-slot form: unaligned buffers at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (auto& v : shp) v = f2b(nd(rng));
+        for (size_t i = 0; i < sg.size(); ++i) sg[i] = sh.shared == 1 ? f2b(1.f) : f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        const void* ew = sh.f32w ? (const void*)ewf.data() : (const void*)ewb.data();
+        const uint16_t* shv = sh.shared ? shp.data() : nullptr;
+        const uint16_t* sgv = sh.shared ? sg.data() : nullptr;
+        const int sig = sh.shared == 2;
+        const unsigned gy1 = (unsigned)((n + 255) / 256);
+        const int kcols = (int)r4d_moegather::kGatherCols;
+        const unsigned gy8 = (unsigned)((n + 256 * kcols - 1) / (256 * kcols));
+        auto gather = [&](const int32_t* tab, const int32_t* sorted, bool cols,
+                          std::vector<uint16_t>& y) {
+            y.assign((size_t)M * y_ld, kGatePoison);
+            const dim3 grid((unsigned)M, cols ? gy8 : gy1);
+#define R4D_EMU_GATHER(K)                                                                          \
+    R4D_EMIT(nullptr, (K), grid, dim3(256), 0, ye.data(), ew, tab, y.data(), (uint32_t)M,          \
+             (uint32_t)n, (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, sorted,   \
+             (uint32_t)T, shv, sgv, (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
+            if (cols) {
+                if (sh.f32w) R4D_EMU_GATHER((r4d_moegather::gather_kernel16<256, true>));
+                else R4D_EMU_GATHER((r4d_moegather::gather_kernel16<256, false>));
+            } else {
+                if (sh.f32w) R4D_EMU_GATHER((r4d_moegather::gather_kernel<256, true>));
+                else R4D_EMU_GATHER((r4d_moegather::gather_kernel<256, false>));
+            }
+#undef R4D_EMU_GATHER
+        };
+        const std::vector<int32_t> table = inverse_of(plain.sorted);
+        std::vector<uint16_t> y_ref, y_inv, y_self_ref, y_self;
+        gather(table.data(), nullptr, false, y_ref);
+        gather(inv.inv.data(), nullptr, true, y_inv);
+        ++cases;
+        if (y_inv != y_ref) {
+            size_t first = 0;
+            while (first < y_inv.size() && y_inv[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather's sixteen-slot form from the inverse at M=%d n=%d slice "
+                        "%d+%d %s weights, shared %d: first difference at %zu\n",
+                        M, n, sh.base, nl, sh.f32w ? "f32" : "bf16", sh.shared, first);
+            ++fails;
+        }
+        if (T <= (int)r4d_moegather::kGatherSelfT) {
+            gather(nullptr, plain.sorted.data(), false, y_self_ref);
+            gather(nullptr, plain.sorted.data(), true, y_self);
+            ++cases;
+            if (y_self != y_self_ref) {
+                size_t first = 0;
+                while (first < y_self.size() && y_self[first] == y_self_ref[first]) ++first;
+                std::printf("FAIL moe_gather's sixteen-slot form's self-scan at M=%d n=%d %s "
+                            "weights, shared %d: first difference at %zu\n",
+                            M, n, sh.f32w ? "f32" : "bf16", sh.shared, first);
+                ++fails;
+            }
+        }
+    }
+}
+
+/* moe_gather_inv_i8g's quantising sixteen-slot form (gather_kernel16_q8, libr4d/r4d_moe_gather.h):
+ * the same sums and the same `y` store as the plain sixteen-slot form, and the rotated int8 codes and
+ * their scales of the row it sums -- the quantiser the layer used to launch after it. The codes are
+ * checked against that quantiser's arithmetic written out here on the host (had_quant_act_i8g's:
+ * the 128-wide unnormalised rotation, the amax of the scale group, its scale, round to nearest into
+ * -127..127), at both scale groups: 128 for the int8 trunk and 256 for an IQ8R one, whose two
+ * rotation blocks share a scale. Codes and scales run at padded pitches with the poison after the
+ * last row, so an overrun shows, and the slices drop slots as on the card. */
+void host_quant_i8g(const std::vector<uint16_t>& y, int M, int n, int y_ld, int g8,
+                    std::vector<uint8_t>& q, std::vector<float>& s) {
+    const int nkb = n / g8;
+    q.assign((size_t)M * n, 0);
+    s.assign((size_t)M * nkb, 0.0f);
+    std::vector<float> v((size_t)n);
+    for (int r = 0; r < M; ++r) {
+        for (int i = 0; i < n; ++i) v[(size_t)i] = b2f(y[(size_t)r * y_ld + i]);
+        for (int g = 0; g < n / 128; ++g) {          /* the rotation, a 128-wide block at a time */
+            float* w = v.data() + g * 128;
+            for (int h = 1; h < 128; h <<= 1)
+                for (int i = 0; i < 128; ++i)
+                    if ((i & h) == 0) {
+                        const float a = w[i], b = w[i + h];
+                        w[i] = a + b;
+                        w[i + h] = a - b;
+                    }
+        }
+        for (int g = 0; g < nkb; ++g) {
+            float am = 0.0f;
+            for (int i = g * g8; i < (g + 1) * g8; ++i) am = std::fmax(am, std::fabs(v[(size_t)i]));
+            const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+            const float inv = 1.0f / sc;
+            s[(size_t)r * nkb + g] = sc;
+            for (int i = g * g8; i < (g + 1) * g8; ++i)
+                q[(size_t)r * n + i] = (uint8_t)(int8_t)std::rint(
+                    std::fmin(std::fmax(v[(size_t)i] * inv, -127.0f), 127.0f));
+        }
+    }
+}
+
+void gather_quant_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct Q8Shape {
+        int M, n, nl, base, g8;
+        bool f32w;
+    };
+    const Q8Shape shapes[] = {
+        { 1, 2560, 288, 0, 128, true }, { 8, 1536, 288, 0, 128, true },
+        { 32, 512, 288, 0, 256, true }, { 33, 768, 144, 0, 128, false },
+        { 48, 256, 96, 96, 256, true }, { 40, 1024, 288, 0, 256, false },
+    };
+    const int k = 16, ne = 288;
+    const float s_poison = -1234.5f;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (const Q8Shape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k, nl = sh.nl, g8 = sh.g8, nkb = n / g8;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter inv = scatter_kernel(ids, nl, sh.base, nullptr, true);
+        ++cases;
+        if (inv.rc != RAD_OK) {
+            std::printf("FAIL moe_gather_inv_i8g: the inverse at M=%d slice %d+%d\n", M, sh.base, nl);
+            ++fails;
+            continue;
+        }
+        const int ye_ld = n + 8, ew_ld = k + 2, y_ld = n + 8, q_ld = n + 8, s_ld = nkb + 2;
+        std::vector<uint16_t> ye((size_t)T * ye_ld);
+        std::vector<float> ewf((size_t)M * ew_ld);
+        std::vector<uint16_t> ewb((size_t)M * ew_ld);
+        if (((uintptr_t)ye.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather_inv_i8g: unaligned buffers at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        const void* ew = sh.f32w ? (const void*)ewf.data() : (const void*)ewb.data();
+        const dim3 grid((unsigned)M,
+                        (unsigned)((n + 256 * (int)r4d_moegather::kGatherCols - 1) /
+                                   (256 * (int)r4d_moegather::kGatherCols)));
+        std::vector<uint16_t> y_ref((size_t)M * y_ld, kGatePoison);
+        std::vector<uint8_t> q_ref, q((size_t)M * q_ld + 16, 0x5a);
+        std::vector<float> s_ref, s((size_t)M * s_ld + 4, s_poison);
+        /* The plain form first: the sums the quantiser is fed in the layer. */
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, true>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, nullptr, nullptr, 0, 0, 0);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, false>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr,
+                     (uint32_t)T, nullptr, nullptr, 0, 0, 0);
+        std::vector<uint16_t> y((size_t)M * y_ld, kGatePoison);
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16_q8<256, true>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y.data(), (uint32_t)M, (uint32_t)n, (uint32_t)k,
+                     (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr, (uint32_t)T, nullptr,
+                     nullptr, 0, 0, 0, q.data(), s.data(), (uint32_t)q_ld, (uint32_t)s_ld,
+                     (uint32_t)g8);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16_q8<256, false>), grid, dim3(256), 0,
+                     ye.data(), ew, inv.inv.data(), y.data(), (uint32_t)M, (uint32_t)n, (uint32_t)k,
+                     (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld, nullptr, (uint32_t)T, nullptr,
+                     nullptr, 0, 0, 0, q.data(), s.data(), (uint32_t)q_ld, (uint32_t)s_ld,
+                     (uint32_t)g8);
+        ++cases;
+        if (y != y_ref) {
+            size_t first = 0;
+            while (first < y.size() && y[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather_inv_i8g's sums at M=%d n=%d slice %d+%d %s weights: first "
+                        "difference at %zu\n", M, n, sh.base, nl, sh.f32w ? "f32" : "bf16", first);
+            ++fails;
+            continue;
+        }
+        host_quant_i8g(y_ref, M, n, y_ld, g8, q_ref, s_ref);
+        bool bad = false;
+        for (int r = 0; r < M && !bad; ++r) {
+            const uint8_t* qr = q.data() + (size_t)r * q_ld;
+            for (int i = 0; i < n && !bad; ++i)
+                if (qr[i] != q_ref[(size_t)r * n + i]) {
+                    std::printf("FAIL moe_gather_inv_i8g's codes at M=%d n=%d g8=%d %s weights, row "
+                                "%d column %d: %d, the quantiser's %d\n", M, n, g8,
+                                sh.f32w ? "f32" : "bf16", r, i, (int)qr[i],
+                                (int)q_ref[(size_t)r * n + i]);
+                    bad = true;
+                }
+            for (int g = 0; g < nkb && !bad; ++g)
+                if (std::memcmp(&s[(size_t)r * s_ld + g], &s_ref[(size_t)r * nkb + g],
+                                sizeof(float)) != 0) {
+                    std::printf("FAIL moe_gather_inv_i8g's scales at M=%d n=%d g8=%d %s weights, "
+                                "row %d group %d: %.9g, the quantiser's %.9g\n", M, n, g8,
+                                sh.f32w ? "f32" : "bf16", r, g, (double)s[(size_t)r * s_ld + g],
+                                (double)s_ref[(size_t)r * nkb + g]);
+                    bad = true;
+                }
+        }
+        ++cases;
+        if (bad) ++fails;
+        /* Past the live columns of every row, past the last group and past the last row nothing was
+         * written: the padding and the guards still hold the poison. */
+        bool over = false;
+        for (int r = 0; r < M; ++r) {
+            for (int i = n; i < q_ld; ++i)
+                if (q[(size_t)r * q_ld + i] != 0x5a) over = true;
+            for (int g = nkb; g < s_ld; ++g)
+                if (std::memcmp(&s[(size_t)r * s_ld + g], &s_poison, sizeof(float)) != 0) over = true;
+        }
+        for (int i = 0; i < 16; ++i)
+            if (q[(size_t)M * q_ld + i] != 0x5a) over = true;
+        for (int i = 0; i < 4; ++i)
+            if (std::memcmp(&s[(size_t)M * s_ld + i], &s_poison, sizeof(float)) != 0) over = true;
+        ++cases;
+        if (over) {
+            std::printf("FAIL moe_gather_inv_i8g wrote past its codes or scales at M=%d n=%d g8=%d\n",
+                        M, n, g8);
+            ++fails;
+        }
+    }
+}
+
+/* The quantising gather through the published op rather than a kernel emitted by hand: which of
+ * its two wave forms the launcher arms for a shape, whether that kernel is the one that ran, and
+ * every refusal of its quantising block. The codes are held to the pair the fusion replaces -- the
+ * plain sixteen-slot gather's sums, and the layer's quantiser applied to them -- so a caller with
+ * bf16 routing weights (the prefill form) is as covered as the decode one. */
+void gather_quant_launcher_cases(std::mt19937& rng, int& cases, int& fails) {
+    struct LShape {
+        int M, n, g8, pin;
+        bool f32w, wide;
+    };
+    const LShape shapes[] = {
+        { 8, 2560, 128, 0, false, false },    /* a decode height: the sixteen-slot form */
+        { 8, 2560, 256, 0, true, false },     /* ... with f32 routing weights */
+        { 48, 2560, 128, 0, false, true },    /* prefill, bf16 weights: the wide form */
+        { 48, 512, 256, 0, false, true },
+        { 48, 2560, 128, 3, false, false },   /* the sixteen-slot form, pinned at prefill */
+        { 48, 512, 128, 2, false, true },     /* the wide form, pinned */
+    };
+    const int k = 16, ne = 288;
+    const float s_poison = -1234.5f;
+    std::normal_distribution<float> nd(0.f, 1.f);
+    auto mat = [](void* d, uint32_t dt, int64_t r, int64_t c, int64_t ld) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 2;
+        t.shape[0] = r;
+        t.shape[1] = c;
+        t.stride[0] = ld;
+        t.stride[1] = 1;
+        return t;
+    };
+    auto vec1 = [](void* d, uint32_t dt, int64_t len) {
+        RadTensor t{};
+        t.data = d;
+        t.dtype = dt;
+        t.rank = 1;
+        t.shape[0] = len;
+        t.stride[0] = 1;
+        return t;
+    };
+    for (const LShape& sh : shapes) {
+        const int M = sh.M, n = sh.n, T = M * k, g8 = sh.g8, nkb = n / g8;
+        std::vector<int32_t> ids((size_t)T);
+        for (int r = 0; r < M; ++r) {
+            std::vector<int32_t> pool(ne);
+            for (int e = 0; e < ne; ++e) pool[(size_t)e] = e;
+            std::shuffle(pool.begin(), pool.end(), rng);
+            for (int j = 0; j < k; ++j) ids[(size_t)(r * k + j)] = pool[(size_t)j];
+        }
+        Scatter inv = scatter_kernel(ids, ne, 0, nullptr, true);
+        std::vector<uint16_t> ye((size_t)T * n);
+        std::vector<float> ewf((size_t)M * k);
+        std::vector<uint16_t> ewb((size_t)M * k);
+        if (((uintptr_t)ye.data() | (uintptr_t)ewf.data()) % 16 != 0) {
+            std::printf("FAIL moe_gather_inv_i8g through its launcher: unaligned buffers at M=%d\n",
+                        M);
+            ++fails;
+            continue;
+        }
+        for (auto& v : ye) v = f2b(nd(rng));
+        for (size_t i = 0; i < ewf.size(); ++i) {
+            ewf[i] = std::fabs(nd(rng)) * 0.3f;
+            ewb[i] = f2b(ewf[i]);
+        }
+        std::vector<uint16_t> y((size_t)M * n, kGatePoison), y_ref((size_t)M * n, kGatePoison);
+        std::vector<uint8_t> q((size_t)M * n, 0x5a), q_ref;
+        std::vector<float> s((size_t)M * nkb, s_poison), s_ref;
+        RadTensor t[6] = { mat(ye.data(), RAD_BF16, T, n, n),
+                           mat(sh.f32w ? (void*)ewf.data() : (void*)ewb.data(),
+                               sh.f32w ? RAD_F32 : RAD_BF16, M, k, k),
+                           vec1(inv.inv.data(), RAD_I32, T), mat(q.data(), RAD_I8, M, n, n),
+                           mat(s.data(), RAD_F32, M, nkb, nkb), mat(y.data(), RAD_BF16, M, n, n) };
+        RadParam p[3] = { pint("n", n), pint("top_k", k), pint("group", g8) };
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 6;
+        a.p = p;
+        a.n_p = 3;
+        a.world_size = 1;
+        ++cases;
+        if (inv.rc != RAD_OK) {
+            std::printf("FAIL moe_gather_inv_i8g through its launcher: the inverse at M=%d\n", M);
+            ++fails;
+            continue;
+        }
+        r4d_moe_gather_pin_form(sh.pin);
+        const int rc = r4d_rad_moe_gather_inv_i8g(&a, nullptr);
+        r4d_moe_gather_pin_form(0);
+        const char* want_kernel = sh.wide ? "gather_wide_kernel" : "gather_kernel16_q8";
+        if (rc != RAD_OK || !std::strstr(emu_last_kernel, want_kernel)) {
+            std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d g8=%d pin %d %s "
+                        "weights: rc %d, %s, wanted the %s form\n", M, n, g8, sh.pin,
+                        sh.f32w ? "f32" : "bf16", rc, emu_last_kernel, want_kernel);
+            ++fails;
+            continue;
+        }
+        /* The sums the plain sixteen-slot form writes for the same table (the form the layer used
+         * to launch before the fusion), then the quantiser of those sums on the host: the pair the
+         * fusion replaces. */
+        const dim3 grid((unsigned)M,
+                        (unsigned)((n + 256 * (int)r4d_moegather::kGatherCols - 1) /
+                                   (256 * (int)r4d_moegather::kGatherCols)));
+        if (sh.f32w)
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, true>), grid, dim3(256), 0,
+                     ye.data(), ewf.data(), inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)n, (uint32_t)k, (uint32_t)n, nullptr, (uint32_t)T,
+                     nullptr, nullptr, 0, 0, 0);
+        else
+            R4D_EMIT(nullptr, (r4d_moegather::gather_kernel16<256, false>), grid, dim3(256), 0,
+                     ye.data(), ewb.data(), inv.inv.data(), y_ref.data(), (uint32_t)M, (uint32_t)n,
+                     (uint32_t)k, (uint32_t)n, (uint32_t)k, (uint32_t)n, nullptr, (uint32_t)T,
+                     nullptr, nullptr, 0, 0, 0);
+        ++cases;
+        if (y != y_ref) {
+            size_t first = 0;
+            while (first < y.size() && y[first] == y_ref[first]) ++first;
+            std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d %s weights: the "
+                        "sums differ from the sixteen-slot form's, first at %zu\n", M, n,
+                        sh.f32w ? "f32" : "bf16", first);
+            ++fails;
+            continue;
+        }
+        host_quant_i8g(y, M, n, n, g8, q_ref, s_ref);
+        bool bad = false;
+        for (int r = 0; r < M && !bad; ++r)
+            for (int i = 0; i < n && !bad; ++i)
+                if (q[(size_t)r * n + i] != q_ref[(size_t)r * n + i]) {
+                    std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d g8=%d %s "
+                                "weights, row %d column %d: code %d, the quantiser's %d\n", M, n,
+                                g8, sh.f32w ? "f32" : "bf16", r, i,
+                                (int)q[(size_t)r * n + i], (int)q_ref[(size_t)r * n + i]);
+                    bad = true;
+                }
+        for (int r = 0; r < M && !bad; ++r)
+            for (int g = 0; g < nkb && !bad; ++g)
+                if (std::memcmp(&s[(size_t)r * nkb + g], &s_ref[(size_t)r * nkb + g], sizeof(float))) {
+                    std::printf("FAIL moe_gather_inv_i8g through its launcher at M=%d n=%d g8=%d %s "
+                                "weights, row %d group %d: scale %.9g, the quantiser's %.9g\n", M,
+                                n, g8, sh.f32w ? "f32" : "bf16", r, g,
+                                (double)s[(size_t)r * nkb + g],
+                                (double)s_ref[(size_t)r * nkb + g]);
+                    bad = true;
+                }
+        ++cases;
+        if (bad) ++fails;
+    }
+
+    /* The quantising block's refusals (moe_gather_body): the codes are the reason the op exists, so
+     * a shape or a form that cannot take them is refused rather than served by the plain form, and
+     * the scalar form (pin 1) writes none. */
+    struct Refuse {
+        const char* what;
+        int M, n, g8, top_k, pin, want;
+        bool noq, sdt_i8, f32w;
+    };
+    const Refuse refusals[] = {
+        { "n not a whole number of 256-column waves", 2, 384, 128, 16, 0, RAD_E_UNSUPPORTED, false, false, false },
+        { "a scale group of 64", 2, 512, 64, 16, 0, RAD_E_UNSUPPORTED, false, false, false },
+        { "top_k 8 (the op's band is 16)", 2, 512, 128, 8, 0, RAD_E_UNSUPPORTED, false, false, false },
+        { "the scalar form, pinned", 48, 512, 128, 16, 1, RAD_E_UNSUPPORTED, false, false, false },
+        { "the wide form with f32 routing weights", 48, 512, 128, 16, 2, RAD_E_UNSUPPORTED, false, false, true },
+        { "no codes operand", 2, 512, 128, 16, 0, RAD_E_INVAL, true, false, false },
+        { "int8 scales", 2, 512, 128, 16, 0, RAD_E_DTYPE, false, true, false },
+    };
+    for (const Refuse& rf : refusals) {
+        const int M = rf.M, n = rf.n, T = M * rf.top_k, g8 = rf.g8, nkb = n / g8;
+        std::vector<int32_t> ids((size_t)T, 0);
+        Scatter inv = scatter_kernel(ids, ne, 0, nullptr, true);
+        std::vector<uint16_t> ye((size_t)T * n), y((size_t)M * n, kGatePoison);
+        std::vector<float> ewf((size_t)M * rf.top_k, 0.25f);
+        std::vector<uint16_t> ewb((size_t)M * rf.top_k, f2b(0.25f));
+        std::vector<uint8_t> q((size_t)M * n, 0x5a);
+        std::vector<float> s((size_t)M * nkb, s_poison);
+        RadTensor t[6] = { mat(ye.data(), RAD_BF16, T, n, n),
+                           mat(rf.f32w ? (void*)ewf.data() : (void*)ewb.data(),
+                               rf.f32w ? RAD_F32 : RAD_BF16, M, rf.top_k, rf.top_k),
+                           vec1(inv.inv.data(), RAD_I32, T),
+                           mat(rf.noq ? nullptr : q.data(), RAD_I8, M, n, n),
+                           mat(s.data(), rf.sdt_i8 ? RAD_I8 : RAD_F32, M, nkb, nkb),
+                           mat(y.data(), RAD_BF16, M, n, n) };
+        RadParam p[3] = { pint("n", n), pint("top_k", rf.top_k), pint("group", g8) };
+        RadArgs a{};
+        a.t = t;
+        a.n_t = 6;
+        a.p = p;
+        a.n_p = 3;
+        a.world_size = 1;
+        ++cases;
+        r4d_moe_gather_pin_form(rf.pin);
+        const int rc = r4d_rad_moe_gather_inv_i8g(&a, nullptr);
+        r4d_moe_gather_pin_form(0);
+        if (rc != rf.want) {
+            std::printf("FAIL moe_gather_inv_i8g should refuse %s with rc %d, got %d\n", rf.what,
+                        rf.want, rc);
+            ++fails;
+        }
+    }
+}
+
 }   // namespace
 
 int main() {
@@ -457,6 +952,9 @@ int main() {
     int fails = 0, cases = 0;
     router_scatter_cases(rng, cases, fails);
     gather_inverse_cases(rng, cases, fails);
+    gather_sixteen_cases(rng, cases, fails);
+    gather_quant_cases(rng, cases, fails);
+    gather_quant_launcher_cases(rng, cases, fails);
     std::printf("%d case(s), %d failure(s)\n", cases, fails);
     return fails ? 1 : 0;
 }

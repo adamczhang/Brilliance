@@ -85,6 +85,16 @@ add_test(NAME build_identity_test
 set_tests_properties(build_identity_test PROPERTIES LABELS unit TIMEOUT 60
   ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
 
+# win\tools\msvc-toolset.ps1, which win\setup.ps1 uses to choose the MSVC toolset, against fake
+# VC\Tools\MSVC layouts: the tested 14.51 wins, a newer 14.x stands in only without it (with
+# setup's warning), an older one never does; versions compare as versions. No Visual Studio.
+add_test(NAME msvc_toolset_test
+         COMMAND powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass
+                 -File "${CMAKE_CURRENT_SOURCE_DIR}/msvc_toolset_test.ps1"
+                 -Lib "${CMAKE_SOURCE_DIR}/win/tools/msvc-toolset.ps1")
+set_tests_properties(msvc_toolset_test PROPERTIES LABELS unit TIMEOUT 60
+  ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
 # profiles\sandbox.yaml is generated from the other profiles (win\tools\sandbox_profile.py): it
 # fails while a profile changed and the sandbox was not regenerated.
 find_program(RAD_PYTHON3 NAMES python3)
@@ -107,6 +117,17 @@ if(RAD_PYTHON3)
            COMMAND ${RAD_PYTHON3} -I -B ${CMAKE_SOURCE_DIR}/win/tools/stop_log_check_test.py)
   set_tests_properties(stop_log_check_test PROPERTIES LABELS unit TIMEOUT 60
                        ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
+  # win\tools\ab_bench.py's greedy probe and compare against a fake OpenAI server whose answer to a
+  # long prompt changes when it is served from the prefix cache: the probe empties the cache and
+  # runs twice, and compare pairs pass with pass (verify_cold, like with like). Loopback only.
+  # The A/B bench harness is not in the public source, so the test is registered only beside it.
+  if(EXISTS ${CMAKE_SOURCE_DIR}/win/tools/ab_bench.py)
+    add_test(NAME ab_bench_test
+             COMMAND ${RAD_PYTHON3} -I -B ${CMAKE_SOURCE_DIR}/win/tools/ab_bench_test.py)
+    set_tests_properties(ab_bench_test PROPERTIES LABELS unit TIMEOUT 60
+                         ENVIRONMENT "RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+  endif()
 
   # win\tools\gate_runner.py, the release gate runner, on fixture candidates (a small ZIP with a
   # MANIFEST, logs, check plug-ins, criteria files): the pass, fail, skip and carryover verdicts, the
@@ -147,6 +168,20 @@ target_compile_features(pin_limit_test PRIVATE cxx_std_20)
 set_target_properties(pin_limit_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
 add_test(NAME pin_limit_test COMMAND pin_limit_test)
 set_tests_properties(pin_limit_test PROPERTIES
+  LABELS unit
+  SKIP_RETURN_CODE 77
+  TIMEOUT 60
+  ENVIRONMENT "HIP_VISIBLE_DEVICES=-1;RAD_TEST_STRICT=1;RAD_TEST_TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+
+# A Windows job object's memory limit (win/os/job_limit.h, GitHub issue #1): the verdict and the
+# messages on handed-in figures, then os::job_memory_limit() on a real job this test process joins
+# (limits of 1 TiB). No card, no HIP.
+add_executable(job_limit_test job_limit_test.cpp)
+target_include_directories(job_limit_test PRIVATE "${CMAKE_SOURCE_DIR}/tests" "${CMAKE_SOURCE_DIR}/win")
+target_compile_features(job_limit_test PRIVATE cxx_std_20)
+set_target_properties(job_limit_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME job_limit_test COMMAND job_limit_test)
+set_tests_properties(job_limit_test PROPERTIES
   LABELS unit
   SKIP_RETURN_CODE 77
   TIMEOUT 60

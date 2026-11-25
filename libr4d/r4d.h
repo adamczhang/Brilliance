@@ -380,7 +380,7 @@ void r4d_ar_gather_2rank(long long peer_scratch, long long my_scratch, long long
                          long long seq_ctrs, long long slot_stride16, long long inp, long long out, long long n_elem,
                          long long dtype, long long rank, long long row_elems, long long stream, long long nblocks,
                          long long nthreads, long long drain, long long acq, long long dpitch,
-                         long long spitch, long long stage = 0);
+                         long long spitch, long long stage = 0, long long chain = 0);
 
 // ---- all-reduce: one-shot, push, 4 or 8 ranks over P2P -------------------------------------
 // The same algorithm at width (r4d_ar_oneshot_Nrank_exact.hip). Peer arguments are in ascending
@@ -721,8 +721,9 @@ void r4d_moe_gemm_pin_fk(int pin);
 // the launch is not the aligned form). Bit-identical.
 void r4d_moe_gemm_pin_down_tile(int pin);
 // Test hook: pins the gather's form. 0 is the launcher's rule, 1 a column a thread
-// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), refused on a
-// shape it cannot take. Bit-identical.
+// (gather_kernel), 2 a wave a token and sixteen bytes a lane (gather_wide_kernel), 3 sixteen slots
+// with eight columns a lane (gather_kernel16, top_k = 16), each refused on a shape it cannot take.
+// Bit-identical.
 void r4d_moe_gather_pin_form(int form);
 // Test hook: pins the sorted operand's decode kernel. 0 is the launcher's rule
 // (moe_down_dec_kernel on the sorted operand, one part, at most 512 experts, column tiles set by
@@ -908,12 +909,31 @@ int  r4d_ar_rmsnorm_had_quant_i8g(long long peer_scratch, long long my_scratch, 
                                   int nblocks, int nthreads, int drain, int acq, int wire,
                                   long long loc_pack, long long loc_scale_off, long long stage = 0,
                                   int group = 128, int chain = 0);
+// And with no quantiser (ar_rmsnorm): the reduction, the residual add and the norm into `y`
+// (required), bf16 only, the exact wire only, no post-norm. `chain`: the chained form at the decode
+// width (1024 threads), as r4d_ar_rmsnorm_had_quant_i8g's.
+int  r4d_ar_rmsnorm_bf16(long long peer_scratch, long long my_scratch, long long peer_flags, long long my_flags,
+                         long long seq_ctrs, long long slot_stride16,
+                         long long x, long long res, long long w, long long y, int M, int n, float eps, float wadd,
+                         int w_f32, int r_ld, int y_ld, long long stream,
+                         int nblocks, int nthreads, int drain, int acq, long long stage = 0,
+                         int chain = 0);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
 // the reduced `x` (`wp`), the residual add, the [1] scalar (`sc`), the norm (`w`) and the w4a8
 // GEMM's per-row int8 quantiser. Exact wire only; `x` is the message and takes no pitch. `grp`
 // takes quant_act_i8g's quantiser instead (ar_rmsnorm_quant_i8g): `s` [M][n / 128], n % 128 == 0.
 // `chain` launches the chained form (r4d_chain.h) where the launch is 1024 threads wide.
+/* ar_rmsnorm_ihc_junction's launches (r4d_ar_ihc_junction.hip): `j` points at the checked operands
+ * (r4d_ihc.h's R4dIhcJunction, from r4d_ihc_junction_args). 0 or a negative code. */
+int  r4d_ar_ihc_junction_2rank(long long peer_scratch, long long my_scratch, long long peer_flags, long long my_flags,
+                               long long seq_ctrs, long long slot_stride16, long long jparts, const void* j, long long stream,
+                               int nblocks, int drain, int acq, long long stage, int chain, int coded);
+int  r4d_ar_ihc_junction_4rank(long long peer_scratch0, long long peer_scratch1, long long peer_scratch2,
+                               long long peer_flags0, long long peer_flags1, long long peer_flags2,
+                               long long my_scratch, long long my_flags, long long seq_ctrs, long long slot_stride16,
+                               const void* j, int rank, long long stream, int nblocks, int drain,
+                               int acq, int pub, int chain);
 int  r4d_ar_rmsnorm_quant_i8(long long peer_scratch, long long my_scratch, long long peer_flags, long long my_flags,
                              long long seq_ctrs, long long slot_stride16, long long x, long long res, long long w, long long wp,
                              long long sc, int sc_f32, long long y, long long q, long long s, int M, int n, float eps,
@@ -1058,6 +1078,7 @@ int r4d_binary_bf16(long long a, long long b, long long y, int M, int n, int op,
 int r4d_sigmoid_bf16(long long x, long long y, int M, int n, int x_ld, int y_ld, long long stream);
 int r4d_fill_bf16(long long y, int M, int n, int y_ld, float value, long long stream);
 int r4d_fill_f32(long long y, int M, int n, int y_ld, float value, long long stream);
+int r4d_fill_i32(long long y, int M, int n, int y_ld, float value, long long stream);
 // y[.., i] = silu(gu[.., i]) * gu[.., n + i]. The gate is the first half, the order rad-convert
 // fuses gate_proj and up_proj in.
 int r4d_silu_mul_bf16(long long gu, long long y, int M, int n, int gu_ld, int y_ld, long long stream);
@@ -1083,7 +1104,7 @@ int r4d_rope_mc_bf16(long long qkv, long long pos, int M, int head_dim, int n_ro
 // that compares neighbouring probabilities. K must be a multiple of 8.
 int r4d_logits_gemm_bf16(long long a, long long w, long long c, int M, int K, int N, int a_ld, int c_ld,
                          long long stream);
-// The same bytes from a wave per four vocabulary columns; K must be 4096.
+// The same bytes from a wave per four vocabulary columns; K must be 4096 or 5120.
 int r4d_logits_gemm_bf16_cols(long long a, long long w, long long c, int M, int K, int N, int a_ld, int c_ld,
                               long long stream);
 // Scatter into kv_cache[n_blocks, kv_heads, block_size, 2*head_dim]: K at [.., d], V at

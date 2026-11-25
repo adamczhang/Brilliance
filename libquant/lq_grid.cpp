@@ -740,6 +740,13 @@ int grid_parse(const RadParam* o, int n_o, Grid* g, std::string* why) {
         if (why) *why = fmt("rule=%s is not absmax, mx, fixed or search", rule);
         return RAD_E_INVAL;
     }
+    g->divide = rad_param_geti(o, n_o, "divide", 0) != 0;
+    if (g->divide && (g->rule != Grid::ABSMAX || !g->is_float || g->scale_dt != RAD_F32 ||
+                      g->lv2 || g->fwht || !g->table.empty())) {
+        if (why) *why = "divide=1 takes a float code under rule=absmax at one f32 scale level, "
+                        "untransformed";
+        return RAD_E_INVAL;
+    }
     if ((g->rule == Grid::MX) != (g->scale_dt == RAD_E8M0)) {
         if (why) *why = "rule=mx and scale=e8m0 go together: a shared exponent is a power of two";
         return RAD_E_INVAL;
@@ -992,7 +999,7 @@ int grid_code(const Grid& g, const BlockScale& b, float v) {
         if (!g.table.empty()) return nearest_entry(g, v * b.inv);
         if (g.wide) return code_at(g, (double)v * b.inv_d, 1.0, g.asym ? b.zero : 0);
     }
-    const float x = v * b.inv;
+    const float x = g.divide ? v / b.s : v * b.inv;
     if (g.is_float) {
         if (g.codes == RAD_F8E4M3) return f32_to_e4m3(x);
         if (g.codes == RAD_FP4E2M1) return f32_to_e2m1(x);

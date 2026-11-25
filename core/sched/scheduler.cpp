@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <string>
 
@@ -19,6 +20,12 @@ namespace rad {
  * own steady_clock points. */
 static int64_t mono_us() {
     return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+/* Nanoseconds on the same clock, for the encoder's time (encodes_done). */
+static int64_t mono_ns() {
+    return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
@@ -183,7 +190,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         m_.mixed_step_target_prefill_cap = mixed_target_.cap();
         RAD_INFO("scheduler: --mixed-step-target-ms %lld: completed mixed steps teach an adaptive "
                  "aggregate prefill-row cap; while another sequence decodes the cap starts at "
-                 "%lld rows and aims for a full mixed-step duration near %lld ms (a soft target)",
+                 "%lld rows, aims for a full mixed-step duration near %lld ms (a soft target), "
+                 "and never sizes a chunk under the prefill stager's smallest step",
                  (long long)cfg.mixed_step_target_ms, (long long)mixed_target_.cap(),
                  (long long)cfg.mixed_step_target_ms);
     }
@@ -195,6 +203,29 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     mixed_target_prefill_planned_ = 0;
     mixed_target_prefill_continues_ = false;
     draft_refill_ = 0;
+    /* S-02: the chunk a step carries may be planned as m layer-sliced sub-steps only when the
+     * plugin reports it can run the trunk over a layer range and resume from a slice
+     * (RadArchProbe::slice_layers_ok, which Engine::declare put in cfg) and the trunk has more than
+     * one layer to split. --chunk-slices off (the default) never slices. */
+    n_layers_  = prog.meta.n_layers;
+    slice_ok_  = cfg.slice_layers_ok;
+    group_ = ChunkGroup{};
+    if (cfg.chunk_slices != 0 && n_layers_ > 1) {
+        if (!slice_ok_)
+            RAD_INFO("scheduler: --chunk-slices: this model's plugin reports no resumable layer "
+                     "range (RadArchProbe::slice_layers_ok), so a chunk is never sliced");
+        else if (cfg.chunk_slices < 0)
+            RAD_INFO("scheduler: --chunk-slices auto: m from --chunk-slice-target-ms %lld and "
+                     "--chunk-slice-cost-pct %lld once a chunk step and a decode step are "
+                     "measured", (long long)cfg.chunk_slice_target_ms,
+                     (long long)cfg.chunk_slice_cost_pct);
+        else
+            RAD_INFO("scheduler: --chunk-slices %lld: a prefill chunk sharing a step with decode "
+                     "rows is planned as %lld layer-sliced sub-steps",
+                     (long long)cfg.chunk_slices,
+                     (long long)std::min<int64_t>(std::min<int64_t>(cfg.chunk_slices, 8),
+                                                  n_layers_));
+    }
     if (cfg.n_spec > 0 && prog.drafter.kind == RAD_DRAFT_BLOCK && prog.drafter.window > 0 &&
         hit_holes_draft_) {
         draft_refill_ = prog.drafter.window;
@@ -230,6 +261,12 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
      * sends; kDebugMiss of the drafts are corrupted. The text must stay the plain run's whatever is
      * accepted. */
     debug_oracle_.clear();
+    debug_oracle_mode_ = 0;
+    if (const char* m = std::getenv("RADIANCE_DEBUG_ORACLE_MODE"); m && *m) {
+        static const char* const kModes[] = { "miss", "right", "wrong", "random", "close", "close2", "after" };
+        for (int i = 0; i < 7; ++i)
+            if (!std::strcmp(m, kModes[i])) debug_oracle_mode_ = i;
+    }
     if (const char* f = cfg.debug_draft_oracle.c_str(); *f && cfg.n_spec > 0) {
         if (FILE* fp = std::fopen(f, "r")) {
             std::string text;
@@ -326,6 +363,8 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     completed_.reserve((size_t)cfg.max_seqs);
     committed_.reserve((size_t)cfg.max_seqs);
     by_id_.reserve((size_t)cfg.max_seqs * 2);
+    /* At most one deferred wake per stream in a step, and a step has at most max_seqs of them. */
+    wake_sinks_.reserve((size_t)cfg.max_seqs);
     hit_blocks_.resize(prog.kv_groups.size());
     for (auto& v : hit_blocks_) v.reserve(64);
     return RAD_OK;
@@ -469,6 +508,10 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.arrived_us = mono_us();
     s.first_tok_us = 0;
     s.preempted_us = 0;
+    /* A new request's own drafted steps, never the last tenant's. */
+    s.spec_steps = 0;
+    s.spec_tokens = 0;
+    s.spec_accepted = 0;
     /* A recycled slot keeps its struct, and the prefill figure is computed from admitted_us
      * whenever it is non-zero: left standing, it would date this request's first token to the
      * admission of whichever request held the slot before. The re-admission guard below needs
@@ -490,6 +533,8 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.ckpt_src = -1;
     s.hit_attn = 0;
     s.hit_owed = false;
+    /* The slot's chain belonged to whatever request held it: drop it rather than trust it. */
+    s.chain.reset();
     /* Slots are reused: a request that inherited `restore_waited` would never wait for a deferred
      * release and its restore would be cut. */
     s.restore_waited = false;
@@ -643,6 +688,11 @@ int64_t Scheduler::evict_prefix_until(const std::function<bool()>& enough) {
 
 int Scheduler::preempt_until(const std::function<bool()>& enough) {
     std::lock_guard<std::mutex> lk(mu_);
+    /* A group's rows are frozen to its last sub-step: the chunk's remaining sub-steps write the
+     * layers above them into the same blocks, and a decoder's row is the base the plugin carries
+     * across them. Preempting one mid-group would hand its blocks to the next sequence while the
+     * group still writes them. The wait is one chunk of sub-steps, so the group finishes first. */
+    if (group_.active) return 0;
     int n = 0;
     while (!running_.empty() && !enough()) {
         preempt_back();
@@ -733,7 +783,7 @@ bool Scheduler::publish_prefix(SchedReq& s) {
             pub_blocks_[i] = kv_->block_table(s.req->id, cg[i]);
         }
         if (ok) {
-            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed);
+            const int rc = pc_->insert(*s.req, pub_blocks_, s.req->n_computed, &s.chain);
             if (rc < 0)
                 RAD_DEBUG("prefix cache: request %llu not published: %s",
                           (unsigned long long)s.req->id, rad_strerror(rc));
@@ -747,6 +797,17 @@ bool Scheduler::publish_prefix(SchedReq& s) {
 void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool defer_free,
                               bool publish, int status, const char* why) {
     ++step_finished_;
+    /* What a slot did, kept apart from the model's totals: the adapter a finished row ran under
+     * took the model's compute, and a view that attributes work by adapter reads these. */
+    if (st == ReqState::Finished) {
+        const int32_t sl = s.req->lora_slot;
+        if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) {
+            SchedMetrics::LoraCount& L = m_.loras[sl];
+            ++L.requests;
+            L.prompt_tokens += (int64_t)s.req->prompt.size();
+            L.output_tokens += (int64_t)s.req->output.size();
+        }
+    }
     /* Publish before freeing: this is the only moment the whole prefix is both computed and still
      * owned. insert() takes its own KV references, so the blocks survive the free below. Cancelled
      * and failed requests are published too; their prompts were computed, and a client that hangs
@@ -1052,7 +1113,11 @@ int Scheduler::requests_locked(ReqStat* out, int max) const {
             if (held * bt > o.kv_tokens) o.kv_tokens = held * bt;
         }
         o.n_draft         = s.n_draft;
+        o.draft_steps     = (int64_t)s.spec_steps;
+        o.draft_tokens    = (int64_t)s.spec_tokens;
+        o.draft_accepted  = (int64_t)s.spec_accepted;
         o.slot            = s.slot;
+        o.lora_slot       = r.lora_slot;
         o.age_s           = (double)(now - s.arrived_us) / 1e6;
         o.ttft_s          = s.first_tok_us ? (double)(s.first_tok_us - s.arrived_us) / 1e6 : -1.0;
         o.prefill_s       = (s.first_tok_us && s.admitted_us)
@@ -1094,12 +1159,42 @@ int Scheduler::draft_ngram(SchedReq& s, int depth, int* match) const {
          * where a hash of (n, position) falls under the miss rate. */
         const int64_t n = seq.nb;
         int d = 0;
+        /* RADIANCE_DEBUG_ORACLE_MODE (a rollback test, WP13.0): where the first wrong draft sits.
+         * Every draft from there on is wrong too, so the rows from it are rejected. Unset or
+         * `miss`: each draft wrong at kDebugMiss, by hash. `right`: none. `wrong`: the first.
+         * `random`: a hash picks the index (depth: all right). `close` / `close2`: the first /
+         * second draft whose row (position size + d) is the last of an indexer group of 4, i.e.
+         * the row that closes it is rejected. `after`: the first draft whose row follows a
+         * closing row (the closing row is accepted). Position size - 1 is row 0. */
+        int first_wrong = -1;
+        const int mode = debug_oracle_mode_;
+        if (mode != 0) {
+            first_wrong = depth;
+            auto mix = [&](uint64_t x) {
+                x = (x + 1) * 0x9E3779B97F4A7C15ull;
+                x ^= x >> 31; x *= 0xbf58476d1ce4e5b9ull; x ^= x >> 29;
+                return x;
+            };
+            if (mode == 2) first_wrong = 0;
+            else if (mode == 3) first_wrong = (int)(mix((uint64_t)n) % (uint64_t)(depth + 1));
+            else if (mode >= 4) {
+                int seen = 0;
+                const int want = mode == 5 ? 1 : 0;
+                for (int e = 0; e < depth; ++e) {
+                    const int64_t pe = seq.size() + e;
+                    if (mode == 6 ? (pe % 4 == 0) : (pe % 4 == 3)) {
+                        if (seen++ == want || mode == 6) { first_wrong = e; break; }
+                    }
+                }
+            }
+        }
         for (; d < depth && n + d < (int64_t)debug_oracle_.size(); ++d) {
             uint64_t h = (uint64_t)(n * RAD_SCHED_MAX_SPEC + d + 1) * 0x9E3779B97F4A7C15ull;
             h ^= h >> 31;
             h *= 0xbf58476d1ce4e5b9ull;
             h ^= h >> 29;
-            const bool miss = (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
+            const bool miss = first_wrong >= 0 ? d >= first_wrong
+                                               : (double)(h >> 11) * 0x1.0p-53 < kDebugMiss;
             const int32_t t = debug_oracle_[(size_t)(n + d)];
             s.draft[d] = miss ? (int32_t)((t + 1) % (int32_t)prog_->meta.n_vocab) : t;
         }
@@ -1126,6 +1221,18 @@ int Scheduler::suffix_propose(SchedReq& s, int32_t* out, int* match) {
                             cfg_.draft_suffix_min_score, out);
     if (match && o.n > 0) *match = o.match;
     return o.n;
+}
+
+/* --draft-suffix: the same index brought up to `r`'s committed history without proposing. A chunk
+ * of a prompt is indexed as it commits, while the card runs the next one, so the first decode does
+ * not index the prompt (O(prompt) at 64K) inside the step that issues it (S-06). */
+void Scheduler::suffix_index(SchedReq& s, const Request& r) {
+    TokenSeq seq;
+    seq.a = r.prompt.data();
+    seq.na = (int64_t)r.prompt.size();
+    seq.b = r.output.data();
+    seq.nb = (int64_t)r.output.size();
+    s.suffix_ix.index(seq, r.id, cfg_.draft_suffix_min_match, r.n_computed);
 }
 
 /* ------------------------------------------------------------------ chunking */
@@ -1402,7 +1509,9 @@ void Scheduler::set_stage_rows(int64_t rows) {
             RAD_WARN("scheduler: --busy-prefill-chunk %lld is under the %lld-token step the prefill "
                      "stager overlaps at: a held-back chunk alone reads every routed layer's "
                      "pooled experts synchronously, which slows a long prefill far more than the "
-                     "smaller step saves", (long long)n, (long long)stage_rows_);
+                     "smaller step saves (leave it at auto, which keeps the floor, or set "
+                     "at least %lld)", (long long)n, (long long)stage_rows_,
+                     (long long)stage_rows_);
         return;
     }
     RAD_INFO("scheduler: --busy-prefill-chunk auto: a prefill chunk sharing a step leaves decode "
@@ -1464,12 +1573,19 @@ int64_t Scheduler::busy_cap(int64_t n_computed, int64_t n_target, int64_t budget
         cap = std::min(cap, budget - mixed_target_decode_reserve);
     if (mixed_target_active_ && mixed_target_.cap() > 0) {
         mixed_target_shares = std::max<int64_t>(0, mixed_target_shares);
+        /* The learned cap may not push a chunk under the prefill stager's smallest step: below it
+         * every routed layer reads its pooled experts synchronously, which costs a long prefill
+         * far more than the shorter step buys (set_stage_rows warns about the same for an explicit
+         * cap). A target shorter than one floor-sized step is then missed rather than broken, and
+         * the misses stay visible in the counters. */
+        const int64_t floor_share = std::max(Q, stage_rows_ / Q * Q);
         /* Share the aggregate allowance evenly among this prefill and those expected later in
          * the step. Stable queue order must not let the first request consume the cap while the
-         * others receive only a minimum quantum on every step. If the learned cap cannot hold
-         * one quantum apiece, the effective allowance grows just enough to make progress; this
-         * may miss an impossible target, but it cannot silently starve a queued prompt. */
-        const int64_t floor = mixed_target_prefill_planned_ + (mixed_target_shares + 1) * Q;
+         * others receive only the floor on every step. If the learned cap cannot hold the floor
+         * apiece, the effective allowance grows just enough to make progress; this may miss an
+         * impossible target, but it cannot silently starve a queued prompt. */
+        const int64_t floor = mixed_target_prefill_planned_ +
+                              (mixed_target_shares + 1) * floor_share;
         const int64_t allowance = std::max(mixed_target_.cap(), floor);
         const int64_t left = std::max<int64_t>(0, allowance - mixed_target_prefill_planned_);
         const int64_t participants = mixed_target_shares + 1;
@@ -1505,6 +1621,190 @@ int64_t Scheduler::interleave_steps() const {
     if (ema_chunk_s_ <= 0.0 || ema_decode_s_ <= 0.0) return 1;
     const double n = cfg_.prefill_interleave_share * ema_chunk_s_ / ema_decode_s_;
     return n >= (double)kInterleaveAutoMax ? kInterleaveAutoMax : (int64_t)n;
+}
+
+/* ------------------------------------------------------------------ the layer-sliced chunk */
+
+/* S-02's m law (§2.2 of notes/backlog/design/S-02.md). `--chunk-slices N` fixes m = N; `auto` derives it
+ * from the learned step costs: m = clamp(ceil(C / target), 1, min(8, 1 + floor(cost_pct * C / D))) -- enough
+ * slices to bring a sub-step to the target, no more of them than the decode wait they add may buy (the
+ * cap is what keeps a chunk from growing by more than `cost_pct` percent). The chunk itself must be at
+ * least 128 rows (rule 2 of §2.3) and the trunk at least two layers, or a slice has nothing to run.
+ * 1 means "do not slice". */
+int32_t Scheduler::chunk_slice_count(int64_t tokens) const {
+    if (!slice_ok_ || cfg_.chunk_slices == 0 || n_layers_ < 2) return 1;
+    if (tokens < 128) return 1;
+    int32_t m = 0;
+    if (cfg_.chunk_slices > 0) {
+        m = (int32_t)cfg_.chunk_slices;
+    } else {
+        const double C = ema_chunk_s_, D = ema_decode_s_;
+        if (C <= 0.0 || D <= 0.0) return 1;   /* nothing measured yet: leave the chunk whole */
+        const double target = (double)cfg_.chunk_slice_target_ms / 1000.0;
+        if (target <= 0.0) return 1;
+        int32_t top = 1 + (int32_t)std::floor((double)cfg_.chunk_slice_cost_pct / 100.0 * C / D);
+        if (top > 8) top = 8;
+        m = (int32_t)std::ceil(C / target);
+        if (m > top) m = top;
+    }
+    if (m > 8) m = 8;
+    if (m > n_layers_) m = n_layers_;   /* at least one layer a slice */
+    return m < 2 ? 1 : m;
+}
+
+int32_t Scheduler::next_prefill_first_layer(bool next_plan) const {
+    const StepPlan& p = next_plan ? plan_next_ : plan_;
+    if (p.slice_m > 0 && !p.slice_last) return p.layer_hi;
+    return 0;
+}
+
+/* The next sub-step's rows: the frozen decode rows, one token each, then the carried chunk. The
+ * chunk's row base is therefore the same on every sub-step, which is what lets a plugin keep its
+ * transient row state and resume at layer_lo. */
+void Scheduler::fill_group_step(StepPlan& p, bool ahead) {
+    p.slice_m = group_.n_slices;
+    p.slice_j = group_.next;
+    p.layer_lo = group_.lo;
+    p.slice_last = group_.next + 1 >= group_.n_slices;
+    p.layer_hi = p.slice_last ? n_layers_
+                              : (int32_t)(((int64_t)(group_.next + 1) * n_layers_) / group_.n_slices);
+    p.n_spec = 0;
+    p.spec_is_tree = tree_;
+    p.phase = RAD_PHASE_MIXED;
+
+    int32_t row = 0;
+    for (int32_t slot : group_.dec) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        Request& r = *s.req;
+        StepEntry e;
+        e.req = &r;
+        e.seq = r.id;
+        e.slot = slot;
+        e.card = s.card;
+        e.n_tokens = 1;
+        /* Planned the way a decode step plans its row: after the previous sub-step committed,
+         * n_computed is the last committed token and it is on the host, so the row is host-staged
+         * at that position. Issued ahead of that commit the token is not on the host yet, so the
+         * card owns the row (dev) exactly as a plain ahead decode row's, and ctx_len is only the
+         * position ceiling: ADV_TRUNK restages the token and its position from the StepSlot. */
+        e.ctx_len = (int32_t)(r.n_computed + (ahead ? 1 : 0));
+        e.n_spec = 0;
+        e.n_accepted = r.n_accepted + 1;
+        e.conv_cursor = s.conv_cursor;
+        e.draft = s.draft;
+        e.n_draft = 0;
+        e.is_prefill = false;
+        e.produces_token = true;
+        e.dev = ahead;
+        e.dev_tok = row;
+        e.dev_out = row;
+        e.dev_aux = 0;
+        if (ahead) s.entry_next = (int32_t)p.e.size(); else s.entry = (int32_t)p.e.size();
+        p.e.push_back(e);
+        p.n_tok += 1;
+        ++row;
+    }
+    p.n_seq_decode = (int64_t)group_.dec.size();
+    p.n_tok_decode = (int64_t)group_.dec.size();
+
+    StepEntry ce = group_.entry;
+    ce.n_tokens = group_.n_tokens;
+    ce.n_spec = 0;
+    ce.n_draft = 0;
+    ce.draft = nullptr;
+    ce.draft_parent = nullptr;
+    ce.hidden_row = -1;
+    ce.hidden_n = 0;
+    ce.ckpt_restore = -1;
+    /* The checkpoint is the state after the chunk's last token read through every layer. Before
+     * the last sub-step the layers above layer_hi have not written this chunk's keys and values,
+     * so a snapshot now would be partial and must neither be taken nor published (S-02 D4). The
+     * carried entry keeps its slot and token until then. */
+    if (!p.slice_last) {
+        ce.ckpt_slot = -1;
+        ce.ckpt_tok = -1;
+    }
+    ce.dev = false;
+    ce.dev_tok = 0;
+    ce.dev_aux = 0;
+    ce.produces_token = p.slice_last && group_.produces_token;
+    ce.dev_out = ce.produces_token ? row : -1;
+    SchedReq& cs = *reqs_[(size_t)group_.slot];
+    if (ahead) cs.entry_next = (int32_t)p.e.size(); else cs.entry = (int32_t)p.e.size();
+    cs.sched_tokens = group_.n_tokens;
+    cs.n_draft = 0;
+    p.e.push_back(ce);
+    p.n_tok += group_.n_tokens;
+
+    group_.lo = p.layer_hi;
+    ++group_.next;
+    ++m_.substeps;
+}
+
+bool Scheduler::plan_group_slice() {
+    if (!group_.active) return false;
+    fill_group_step(plan_, false);
+    return true;
+}
+
+bool Scheduler::plan_group_ahead() {
+    if (!group_.active || group_.next >= group_.n_slices) return false;
+    fill_group_step(plan_next_, true);
+    return true;
+}
+
+/* Decide whether the mixed step just planned opens a group (§2.3 of the design). Every refusal
+ * here leaves the step exactly as it was: one whole chunk with its decode rows. */
+bool Scheduler::start_group() {
+    if (!slice_ok_ || cfg_.chunk_slices == 0 || n_layers_ < 2) return false;
+    if (plan_.phase != RAD_PHASE_MIXED || plan_.n_tok_decode <= 0) return false;
+    if (plan_.n_spec != 0) return false;   /* drafting inside a group would move the base */
+    int32_t pf = -1;
+    for (int32_t i = 0; i < (int32_t)plan_.e.size(); ++i) {
+        const StepEntry& e = plan_.e[(size_t)i];
+        if (e.is_prefill) {
+            if (pf >= 0) return false;      /* one chunk a step, or the base is not one row */
+            pf = i;
+            continue;
+        }
+        if (e.n_spec != 0 || e.n_tokens != 1) return false;
+    }
+    if (pf < 0) return false;
+    const StepEntry ce = plan_.e[(size_t)pf];
+    /* A checkpoint inside the chunk, or a restore from a prefix hit, is one whole pass. */
+    if (ce.ckpt_restore >= 0) return false;
+    if (ce.ckpt_tok >= 0 && ce.ckpt_slot >= 0 && ce.ckpt_tok + 1 < ce.n_tokens) return false;
+    const int32_t m = chunk_slice_count(ce.n_tokens);
+    if (m < 2) return false;
+    /* Reserve the frozen decode rows' KV for the whole group now: no sub-step may fail an
+     * ensure, and a shortfall is one more reason to leave the chunk whole. */
+    for (int32_t i = 0; i < pf; ++i) {
+        const StepEntry& e = plan_.e[(size_t)i];
+        if (kv_->ensure_from(e.seq, e.ctx_len + m, e.ctx_len) < 0) return false;
+    }
+    group_.active = true;
+    group_.slot = ce.slot;
+    group_.n_tokens = ce.n_tokens;
+    group_.n_slices = m;
+    group_.next = 1;                 /* sub-step 0 is the step just planned */
+    group_.lo = (int32_t)((int64_t)n_layers_ / m);
+    group_.produces_token = ce.produces_token;
+    group_.entry = ce;
+    group_.dec.clear();
+    for (int32_t i = 0; i < pf; ++i) group_.dec.push_back(plan_.e[(size_t)i].slot);
+
+    plan_.slice_m = m;
+    plan_.slice_j = 0;
+    plan_.layer_lo = 0;
+    plan_.layer_hi = group_.lo;
+    plan_.slice_last = false;
+    ++m_.steps_sliced;
+    ++m_.substeps;
+    /* The chunk plans its token once, on the last sub-step; unmasked it would emit m of them. */
+    StepEntry& e = plan_.e[(size_t)pf];
+    e.produces_token = false;
+    e.dev_out = -1;
+    return true;
 }
 
 /* ------------------------------------------------------------------ preemption */
@@ -1631,7 +1931,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve,
             cap.tokens = std::max<int64_t>(0, (int64_t)r.prompt.size() - draft_refill_);
             cap.max_give_back = 2 * draft_refill_;
         }
-        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr);
+        const CacheHit h = pc_->lookup(r, &hit_blocks_, draft_refill_ > 0 ? &cap : nullptr,
+                                       &s.chain);
         if (h.given_back > 0) {
             m_.draft_refill_tokens += h.given_back;
             ++m_.draft_refills;
@@ -1949,7 +2250,7 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
          * loop this gate exists to stop. The exact-mode grid floor is folded in as a bound too
          * -- crediting less than admission adopts only delays a re-admission by one round,
          * crediting more reopens the loop. */
-        const CacheHit h = pc_->lookup(r, nullptr, nullptr);
+        const CacheHit h = pc_->lookup(r, nullptr, nullptr, &s.chain);
         int64_t hit = h.n_attn_tokens;
         if (geo_.checkpoints() && h.n_linear_tokens < hit) hit = h.n_linear_tokens;
         if (geo_.exact && hit > 0) hit = geo_.grid_floor(hit);
@@ -2046,6 +2347,29 @@ const RadBatch* Scheduler::step() {
     step_decode_tok_ = 0;
     mixed_target_prefill_planned_ = 0;
     mixed_target_prefill_continues_ = false;
+
+    /* S-02: an open chunk group's next sub-step is planned from its frozen set, ahead of every
+     * gate below: the group's rows and their base may not move, so nothing is admitted, preempted
+     * or held in this step. The build failure path is the ordinary one, with the group dropped. */
+    if (group_.active) {
+        plan_group_slice();
+        span_now_ = false;
+        mixed_target_active_ = false;
+        held_prefill_ = 0;
+        step_start_ = std::chrono::steady_clock::now();
+        const RadBatch* gb = builder_.build(plan_, *kv_, step_);
+        if (!gb) {
+            for (StepEntry& e : plan_.e)
+                if (e.slot >= 0 && (size_t)e.slot < reqs_.size()) reqs_[(size_t)e.slot]->entry = -1;
+            plan_.reset();
+            group_ = ChunkGroup{};
+            step_open_ = false;
+            return nullptr;
+        }
+        ++step_;
+        step_open_ = true;
+        return gb;
+    }
 
     /* A preempted prefill waits for the whole-recompute gate so it cannot loop. That wait is
      * bounded here, for every overdue preempted request, not only the queue head: a head that
@@ -2752,6 +3076,10 @@ const RadBatch* Scheduler::step() {
             k += e.n_tokens;
         }
     }
+    /* S-02: a mixed step carrying one whole chunk beside decode rows may open a chunk group.
+     * Every refusal leaves the plan as it is, so a step is only ever sliced when the design's
+     * conditions all hold. */
+    start_group();
     /* Every snapshot this step restores from must still be in the store. The prefix cache keeps a
      * handed-out snapshot's slot until the next step begins (PrefixCache::begin_step), so this
      * should always hold; it is checked because restoring from a released slot reads another
@@ -2796,16 +3124,31 @@ const RadBatch* Scheduler::step() {
 }
 
 /* ------------------------------------------------------------------ media */
-bool Scheduler::prefill_continues() const {
+bool Scheduler::prefill_continues(bool next_plan) const {
     std::lock_guard<std::mutex> lk(mu_);
     /* Only the step being released has a plan to read. Between a commit and the next step (an
      * encoder pass is prepared there) `plan_` is the committed step's, whose requests in_step() no
-     * longer holds: a cancel and reap may have released one. */
-    if (stage_rows_ <= 0 || !step_open_) return false;
+     * longer holds: a cancel and reap may have released one. A step issued ahead is released
+     * against `plan_next_`, the plan it runs. */
+    if (stage_rows_ <= 0) return false;
+    if (next_plan ? !next_open_ : !step_open_) return false;
+    const StepPlan& p = next_plan ? plan_next_ : plan_;
     /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
-     * would be dropped by that step. */
-    if (interleave_left_ > 0) return false;
-    for (const StepEntry& e : plan_.e) {
+     * would be dropped by that step. A plan the scheduler has released (step(), or promote_next()
+     * for one issued ahead) has armed the hold in interleave_left_ already; a step issued ahead is
+     * released against plan_next_ before that, so its hold is the one its own shape will arm. */
+    int64_t hold = interleave_left_;
+    if (next_plan && cfg_.prefill_interleave != 0) {
+        int64_t n_dec = 0;
+        bool continues = false;
+        for (const StepEntry& e : p.e) {
+            if (e.is_prefill) { if (!e.produces_token) continues = true; }
+            else ++n_dec;
+        }
+        hold = n_dec && continues ? interleave_steps() : 0;
+    }
+    if (hold > 0) return false;
+    for (const StepEntry& e : p.e) {
         if (!e.is_prefill || e.slot < 0 || (size_t)e.slot >= reqs_.size() || !reqs_[(size_t)e.slot])
             continue;
         const int64_t left = reqs_[(size_t)e.slot]->seq_len() - ((int64_t)e.ctx_len + e.n_tokens);
@@ -2833,10 +3176,37 @@ bool Scheduler::encodes_pending() const {
     return !enc_want_.empty();
 }
 
+/* A pass of the encoder can run for seconds with no step, so no step publishes while it runs.
+ * Its start and end are published here instead, and the observers' copy carries the start
+ * (SchedMetrics::encode_started_ns): a reader adds the time since, and the encoder reads busy
+ * while it encodes rather than all at once when it is done. Both publications wait out a reader
+ * instead of skipping, and the end's counter update is made under pub_mu_, so no reader sees the
+ * pass ended and its time not yet added, or the time since its start larger than the pass. */
 void Scheduler::take_encodes(std::vector<std::shared_ptr<mm::Item>>* out) {
-    std::lock_guard<std::mutex> lk(mu_);
-    out->clear();
-    out->swap(enc_want_);
+    std::lock_guard<std::mutex> pk(pub_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        out->clear();
+        out->swap(enc_want_);
+        if (out->empty()) return;
+        enc_active_ = (int64_t)out->size();
+        enc_started_ns_ = mono_ns();
+    }
+    publish_held();
+}
+
+void Scheduler::encodes_done(int64_t items, int64_t patches) {
+    std::lock_guard<std::mutex> pk(pub_mu_);
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!enc_started_ns_) return;
+        m_.encode_items += items;
+        m_.encode_patches += patches;
+        m_.encode_ns += mono_ns() - enc_started_ns_;
+        enc_started_ns_ = 0;
+        enc_active_ = 0;
+    }
+    publish_held();
 }
 
 /* ------------------------------------------------------------------ the step's head depth */
@@ -2917,37 +3287,146 @@ bool Scheduler::ends_every_request() const {
     return !plan_.e.empty();
 }
 
+/* S-07: name the reason the next step is left to the one after the commit, so /stats can say
+ * where the gap between the engine's steps and engine_steps_ahead_total goes. The first check that
+ * refuses counts; the reasons are in SchedMetrics::ahead_refused_*. */
+const RadBatch* Scheduler::refuse_ahead(AheadRefused why) {
+    switch (why) {
+        case AheadRefused::Waiting:   ++m_.ahead_refused_waiting;    break;
+        case AheadRefused::Held:      ++m_.ahead_refused_held;       break;
+        case AheadRefused::MidPrompt: ++m_.ahead_refused_mid_prompt; break;
+        case AheadRefused::Grammar:   ++m_.ahead_refused_grammar;    break;
+        case AheadRefused::SuffixHot: ++m_.ahead_refused_suffix_hot; break;
+        case AheadRefused::EndsEvery: ++m_.ahead_refused_ends_every; break;
+        case AheadRefused::Kv:        ++m_.ahead_refused_kv;         break;
+    }
+    return nullptr;
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
-    /* An admission is a decision about the pool and the queue that the full step makes. */
-    if (!waiting_.empty()) return nullptr;
-    /* Once the hold is spent, the held chunk goes into the next full step rather than waiting
-     * behind decode steps issued ahead. */
-    if (held_prefill_ > 0 && interleave_left_ == 0) return nullptr;
+    /* S-02: a group's next sub-step is planned from its frozen set, with no admission against it;
+     * the step after the last sub-step is planned normally by step() after the commit. */
+    if (group_.active) {
+        if (group_.next >= group_.n_slices) return refuse_ahead(AheadRefused::MidPrompt);
+        const int32_t lo = group_.lo;
+        plan_next_.reset();
+        plan_next_.spec_is_tree = tree_;
+        plan_group_ahead();
+        const RadBatch* gb = builder_.build(plan_next_, *kv_, step_);
+        if (!gb) {
+            for (const StepEntry& e : plan_next_.e)
+                if (e.slot >= 0 && (size_t)e.slot < reqs_.size())
+                    reqs_[(size_t)e.slot]->entry_next = -1;
+            plan_next_.reset();
+            --group_.next;
+            group_.lo = lo;
+            return refuse_ahead(AheadRefused::Kv);
+        }
+        for (size_t i = 0; i < plan_next_.e.size(); ++i)
+            reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
+        next_open_ = true;
+        return gb;
+    }
     /* Before the loop below, which reserves the next step's KV. */
-    if (ends_every_request()) return nullptr;
+    if (ends_every_request()) return refuse_ahead(AheadRefused::EndsEvery);
+
+    const bool hold_prefill = cfg_.prefill_interleave != 0 && interleave_left_ > 0;
+    /* The experiments that split a chunk against a learned target read that target where the
+     * chunk is planned; a step is left to them as before. */
+    const bool prefill_ahead = !hold_prefill && !mixed_target_active_;
+    /* The head of the queue, when the full step would admit it: fresh, its media encoded, a free
+     * slot and card, and room in the context. A request still to be encoded is left to the
+     * engine (a step issued ahead in front of it would keep the encoders idle), and one step()
+     * would fail is failed there, not here. */
+    bool admit_head = false;
+    if (!waiting_.empty()) {
+        if (!prefill_ahead) return refuse_ahead(AheadRefused::Held);
+        /* step() admits as many waiters as the budget and the slots take, so one behind the head
+         * would make the step after the commit differ from this plan: it is left to that step. */
+        if (waiting_.size() > 1) return refuse_ahead(AheadRefused::Waiting);
+        SchedReq& w = *reqs_[(size_t)waiting_[0]];
+        if (!w.req || w.req->state != ReqState::Waiting) return refuse_ahead(AheadRefused::Waiting);
+        if (ctx_limit_ > 0 &&
+            (w.seq_len() > ctx_limit_ || (!w.req->embed && w.seq_len() == ctx_limit_)))
+            return refuse_ahead(AheadRefused::Kv);
+        if ((int64_t)running_.size() >= cfg_.max_seqs || free_cards_.empty())
+            return refuse_ahead(AheadRefused::Waiting);
+        if (!w.req->media || media_ready(w)) admit_head = true;
+        else return refuse_ahead(AheadRefused::Waiting);
+    }
 
     plan_next_.reset();
     plan_next_.spec_is_tree = tree_;
+
+    /* The row (at most one) that continues a prompt. A prefill chunk advances n_computed by
+     * exactly its rows, so the host knows where the next chunk starts before the commit; a
+     * second continuing chunk, or a hold, is left to the step built after the commit. */
+    const StepEntry* continuing = nullptr;
+    int32_t n_continuing = 0;
     for (const StepEntry& e : plan_.e) {
-        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) return nullptr;
-        SchedReq& s = *reqs_[(size_t)e.slot];
-        if (!s.req || s.req->state != ReqState::Running || !s.running) return nullptr;
+        if (!e.is_prefill || e.produces_token) continue;
+        if (++n_continuing > 1) return refuse_ahead(AheadRefused::MidPrompt);
+        continuing = &e;
+    }
+    /* The step after the commit sees each request advanced by the row it carries here: a chunk that
+     * reaches the prompt's end leaves a decode row there, and counts as one for the shares below
+     * and for whether another prompt still wants a chunk (step() plans that step from that view). */
+    auto pf_after = [&](const SchedReq& sr) -> bool {
+        const Request& rr = *sr.req;
+        int64_t nc = rr.n_computed;
+        if (sr.entry >= 0 && (size_t)sr.entry < plan_.e.size() &&
+            plan_.e[(size_t)sr.entry].slot == sr.slot && plan_.e[(size_t)sr.entry].is_prefill)
+            nc += plan_.e[(size_t)sr.entry].n_tokens;
+        return nc < (int64_t)rr.prompt.size() || nc + 1 < sr.seq_len();
+    };
+    int32_t pf_slot = continuing ? continuing->slot : -1;
+    const int64_t pf_adv = continuing ? (int64_t)continuing->n_tokens : 0;
+    /* A chunk the hold left over goes into the step after the one that spends its last held step:
+     * step() takes it there, with the budget and the queue it finds then, so it is as planable
+     * ahead as a chunk this step's plan already carries. */
+    if (pf_slot < 0 && held_prefill_ > 0 && interleave_left_ == 0) {
+        for (int32_t slot : running_) {
+            if (!pf_after(*reqs_[(size_t)slot])) continue;
+            if (pf_slot >= 0) return refuse_ahead(AheadRefused::MidPrompt);
+            pf_slot = slot;
+        }
+        if (pf_slot < 0) return refuse_ahead(AheadRefused::Held);   /* the hold outlived its prompt */
+    }
+    if (pf_slot >= 0) {
+        if (!prefill_ahead) return refuse_ahead(AheadRefused::Held);
+        /* One chunk and one admission: a second prompt that still wants a chunk shares that step's
+         * budget with the first, so the whole step is left to step(). */
+        for (int32_t slot : running_)
+            if (slot != pf_slot && pf_after(*reqs_[(size_t)slot]))
+                return refuse_ahead(AheadRefused::MidPrompt);
+    }
+
+    /* The rows of this step that produce a token, in the sequences' order -- which is the order
+     * step() sorts the decode half into, and is not the plan's order: a last chunk sits in the
+     * prefill half there and its sequence may still precede a decoder's. */
+    for (int32_t slot : running_) {
+        SchedReq& s = *reqs_[(size_t)slot];
+        if (s.entry < 0 || (size_t)s.entry >= plan_.e.size()) continue;
+        const StepEntry& e = plan_.e[(size_t)s.entry];
+        if (!e.produces_token || e.slot != slot) continue;   /* a continuing chunk, planned below */
+        if (!s.req || s.req->state != ReqState::Running || !s.running)
+            return refuse_ahead(AheadRefused::Waiting);
         Request& r = *s.req;
-        /* A mid-prompt chunk continues as a prefill from where the host knows it is. A grammar
-         * that cannot rewind decides at commit whether the next step may speculate; one that can,
-         * or no grammar, keeps its answer. */
-        if (!e.produces_token || !r.speculation_fixed) return nullptr;
+        /* A grammar that cannot rewind decides at commit whether the next step may speculate; one
+         * that can, or no grammar, keeps its answer. */
+        if (!r.speculation_fixed) return refuse_ahead(AheadRefused::Grammar);
         /* --draft-suffix: a sequence whose history ended in a recurring pattern at the last commit
          * is likely to continue it; its next step is built after the commit, where the lookup can
          * read the committed end (a step issued ahead is made on the card from the head's drafts). */
-        if (cfg_.draft_suffix && s.suffix_hot) { ++m_.suffix_held_ahead; return nullptr; }
+        if (cfg_.draft_suffix && s.suffix_hot) return refuse_ahead(AheadRefused::SuffixHot);
         /* A SCORED row (Request::token_scores, a /v1/systemone question) that the step in flight
          * brings to max_tokens gets no step issued ahead: it would run a whole forward pass for a
          * request that finishes at the commit, and max_tokens=1 pays a decode step after its
          * prefill. Scored rows only -- every other decode keeps the step of overlap it had. */
         if (r.token_scores && r.max_tokens > 0 &&
-            (int64_t)r.output.size() + 1 >= r.max_tokens) return nullptr;
+            (int64_t)r.output.size() + 1 >= r.max_tokens)
+            return refuse_ahead(AheadRefused::EndsEvery);
 
         /* The furthest context the row can reach: every position this step verifies committed,
          * counted from the last commit rather than this step's own bound (which would add a
@@ -2956,8 +3435,10 @@ const RadBatch* Scheduler::step_next_locked() {
         const int64_t ctx_up = r.n_computed + e.n_tokens;
         const int32_t d      = s.draft_next;
         const int64_t want   = 1 + d;
-        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_) return nullptr;
-        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0) return nullptr;
+        if (ctx_limit_ > 0 && ctx_up + want > ctx_limit_)
+            return refuse_ahead(AheadRefused::Kv);
+        if (kv_->ensure_from(r.id, ctx_up + want, r.n_computed) < 0)
+            return refuse_ahead(AheadRefused::Kv);
 
         StepEntry n;
         n.req            = &r;
@@ -2980,22 +3461,195 @@ const RadBatch* Scheduler::step_next_locked() {
         plan_next_.n_tok += want;
         if (d > plan_next_.n_spec) plan_next_.n_spec = d;
     }
-    plan_next_.phase        = RAD_PHASE_DECODE;
-    plan_next_.n_seq_decode = (int64_t)plan_next_.e.size();
-    plan_next_.n_tok_decode = plan_next_.n_tok;
+    /* A step with no decode row beside its prefill row is not a mixed step. */
+    if (plan_next_.e.empty()) { plan_next_.reset(); return refuse_ahead(AheadRefused::MidPrompt); }
+    const size_t n_dec = plan_next_.e.size();
+
+    const int64_t budget0 = cfg_.prefill_span > 1 ? geo_.shared_tok : cfg_.max_tok;
+    const int64_t Q = std::max<int64_t>(geo_.quantum, 1);
+    const bool share_step = cfg_.busy_prefill_chunk != 0;
+    const int64_t share_tok = std::max<int64_t>(Q, budget0 / 8 / Q * Q);
+    const int64_t dec_row_tok =
+        1 + std::max<int64_t>(std::max<int64_t>((int64_t)draft_.next_depth(),
+                                                (int64_t)draft_.step_window()),
+                              cfg_.draft_suffix ? (int64_t)cfg_.draft_suffix_max : 0);
+    const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
+                                (int64_t)running_.size() < cfg_.max_seqs;
+    auto planned_tok = [&](int32_t slot) -> int64_t {
+        for (const StepEntry& pe : plan_next_.e)
+            if (pe.slot == slot) return (int64_t)pe.n_tokens;
+        return 0;
+    };
+
+    /* ------------------------------------------------------------- the next chunk */
+    /* The step that follows this one spends its budget on the same running set in the same
+     * priority order. Walk that order to the chunk: what comes before it has its row in
+     * plan_next_ already (it sampled a token, or was a last chunk) and takes its budget; what
+     * comes after it is what busy_cap holds the chunk back for. */
+    if (pf_slot >= 0) {
+        int64_t budget_at_pf = budget0, behind_dec = 0, behind_pf = 0;
+        if (share_step) {
+            for (int32_t slot : running_) {
+                if (pf_after(*reqs_[(size_t)slot])) ++behind_pf;
+                else behind_dec += dec_row_tok;
+            }
+        }
+        for (int32_t slot : running_) {
+            if (slot == pf_slot) break;   /* step() takes the row's own share before planning it */
+            budget_at_pf -= planned_tok(slot);
+            if (share_step) {
+                if (pf_after(*reqs_[(size_t)slot])) --behind_pf;
+                else behind_dec -= dec_row_tok;
+            }
+        }
+
+        SchedReq& ps = *reqs_[(size_t)pf_slot];
+        const Request& pr = *ps.req;
+        const int64_t start  = pr.n_computed + pf_adv;
+        const int64_t target = ps.seq_len();
+        const int64_t shares = share_step ? behind_pf + (admit_possible ? 1 : 0) : 0;
+        const int64_t reserve = share_step ? behind_dec + share_tok * shares : 0;
+        const int64_t cap = busy_cap(start, target, budget_at_pf, reserve,
+                                     !plan_next_.e.empty(), shares == 0, 0, behind_dec);
+        const int64_t end = chunk_end(pr, target);
+        int64_t ckpt = -1;
+        int64_t want = plan_chunk(start, end, cap, &ckpt, pr.checkpoint_at, &pr);
+        if (want <= 0 && cap < budget_at_pf && prog_ && prog_->encoder.bidirectional)
+            want = plan_chunk(start, end, budget_at_pf, &ckpt, pr.checkpoint_at, &pr);
+        /* The step that follows this one would run the chunk alone if the chunk spent the budget
+         * the decode rows behind it need: that is not the mixed step this issues ahead. */
+        if (want <= 0 || plan_next_.n_tok + want > budget0) {
+            plan_next_.reset();
+            return refuse_ahead(AheadRefused::MidPrompt);
+        }
+        /* A chunk the shares held back is planned after the commit, where the budget they did not
+         * use goes back to it (step()'s reclaim): issuing it ahead would pin the shorter chunk. */
+        if (want < plan_chunk(start, end, budget_at_pf, nullptr, pr.checkpoint_at, &pr)) {
+            plan_next_.reset();
+            return refuse_ahead(AheadRefused::Held);
+        }
+        /* No preemption from here: a request in flight holds its blocks until this step commits,
+         * so a shortfall is the step after the commit's to fix. */
+        if (kv_->ensure_from(pr.id, start + want, pr.n_computed) < 0) {
+            plan_next_.reset();
+            return refuse_ahead(AheadRefused::Kv);
+        }
+        /* A snapshot the store dropped since the hit was taken: step() gives the hit back and
+         * prefills again, which only the step after the commit can do. */
+        if (ps.ckpt_src >= 0 && !kv_->checkpoint_held(ps.ckpt_src)) {
+            plan_next_.reset();
+            return refuse_ahead(AheadRefused::Kv);
+        }
+        StepEntry n;
+        n.req            = &pr;
+        n.seq            = pr.id;
+        n.slot           = pf_slot;
+        n.card           = ps.card;
+        n.n_tokens       = (int32_t)want;
+        n.ctx_len        = (int32_t)start;
+        n.n_spec         = 0;
+        n.n_accepted     = 1;          /* one-based; a prefill rolls nothing back */
+        n.conv_cursor    = ps.conv_cursor;
+        n.draft          = ps.draft;
+        n.n_draft        = 0;
+        n.is_prefill     = true;
+        n.produces_token = (start + want >= target);
+        n.ckpt_restore   = ps.ckpt_src;   /* consumed once by this step's chunk */
+        ps.ckpt_src      = -1;
+        ps.n_draft       = 0;
+        ps.sched_tokens  = (int32_t)want;
+        if (ps.req) { ps.req->n_draft = 0; ps.req->draft = nullptr; ps.req->draft_parent = nullptr; }
+        if (ckpt > 0) reserve_ckpt(n, pr, ckpt, (int32_t)(ckpt - start - 1));
+        /* step() plans the decode rows before the prompt chunks, so this row follows the decode
+         * rows planned above (an admission, which the full step also places last, follows it). */
+        plan_next_.e.push_back(n);
+        plan_next_.n_tok += want;
+    }
+
+    /* ----------------------------------------------------------------- an admission */
+    /* The step after this one admits with what the running rows leave it: the same budget and
+     * the same queue the full step would find. */
+    int32_t admit_slot = -1;
+    if (admit_head) {
+        const int32_t slot = waiting_[0];
+        SchedReq& s = *reqs_[(size_t)slot];
+        const int64_t room = budget0 - plan_next_.n_tok;
+        const int64_t areserve =
+            share_step && !s.req->embed && waiting_.size() > 1 &&
+            (int64_t)plan_next_.e.size() + 1 < cfg_.max_seqs && free_cards_.size() > 1
+                ? share_tok : 0;
+        admit_full_ = 0;
+        admit_next_step_ = false;
+        admission_failure_ = AdmissionFailure::None;
+        admission_reclaim_pending_ = false;
+        const int as = room > 0 ? admit_one(s, room, areserve, 0) : RAD_E_FULL;
+        /* A wait is a refusal too (the prefill room gate, a recompute with no room): step() leaves
+         * the waiter in the queue for the next attempt, so this step is not issued ahead with it,
+         * and nothing of the attempt is undone -- a hit it took is kept, as step() keeps it. */
+        if (as != RAD_OK) { plan_next_.reset(); return refuse_ahead(AheadRefused::Waiting); }
+
+        Request& r = *s.req;
+        StepEntry n;
+        n.req            = &r;
+        n.seq            = r.id;
+        n.slot           = slot;
+        n.card           = s.card;
+        n.n_tokens       = s.sched_tokens;
+        n.ctx_len        = (int32_t)r.n_computed;
+        n.n_spec         = 0;
+        n.n_accepted     = 1;
+        n.conv_cursor    = s.conv_cursor;
+        n.draft          = s.draft;
+        n.n_draft        = 0;
+        n.is_prefill     = true;
+        n.produces_token = (r.n_computed + s.sched_tokens >= s.seq_len());
+        n.ckpt_restore   = s.ckpt_src;
+        s.ckpt_src       = -1;
+        r.n_draft        = 0;
+        r.draft          = nullptr;
+        r.draft_parent   = nullptr;
+        if (s.pending_ckpt > 0)
+            reserve_ckpt(n, r, s.pending_ckpt, (int32_t)(s.pending_ckpt - r.n_computed - 1));
+        s.entry = (int32_t)plan_next_.e.size();
+        plan_next_.e.push_back(n);
+        plan_next_.n_tok += s.sched_tokens;
+        queue_insert(running_, slot);
+        queue_erase(waiting_, slot);
+        admit_slot = slot;
+    }
+
+    plan_next_.phase        = plan_next_.e.size() > n_dec ? RAD_PHASE_MIXED : RAD_PHASE_DECODE;
+    plan_next_.n_seq_decode = (int64_t)n_dec;
+    plan_next_.n_tok_decode = 0;
+    for (size_t i = 0; i < n_dec; ++i) plan_next_.n_tok_decode += plan_next_.e[i].n_tokens;
     {
         int64_t k = 0;
         int32_t row = 0;
         for (StepEntry& e : plan_next_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
-            e.dev_out = row;
+            e.dev_out = e.produces_token ? row : -1;
             e.dev_aux = e.n_spec;
-            row += 1 + e.n_spec;
+            if (e.produces_token) row += 1 + e.n_spec;
             k += e.n_tokens;
         }
     }
     const RadBatch* b = builder_.build(plan_next_, *kv_, step_);
-    if (!b) { plan_next_.reset(); return nullptr; }
+    if (!b) {
+        /* A failed staging hands the admission back to the queue, as step() does. */
+        for (StepEntry& e : plan_next_.e) {
+            SchedReq& s = *reqs_[(size_t)e.slot];
+            s.entry_next = -1;
+            if (e.slot != admit_slot) continue;
+            if (e.ckpt_restore >= 0) undo_hit(s);
+            s.running = false;
+            s.req->state = ReqState::Waiting;
+            queue_erase(running_, s.slot);
+            queue_insert(waiting_, s.slot);
+            admit_slot = -1;
+        }
+        plan_next_.reset();
+        return nullptr;
+    }
     for (size_t i = 0; i < plan_next_.e.size(); ++i)
         reqs_[(size_t)plan_next_.e[i].slot]->entry_next = (int32_t)i;
     next_open_ = true;
@@ -3024,15 +3678,34 @@ void Scheduler::promote_next() {
             s.req->draft_parent = tree_ && plan_.e[i].n_spec ? s.draft_par : nullptr;
         }
     }
-    ++m_.steps_decode;
-    /* A step issued ahead during a hold is one of its decode-only steps. */
-    if (interleave_left_ > 0) {
-        --interleave_left_;
-        if (held_prefill_ > 0) ++m_.steps_held;
+    /* The step was planned by step_next_locked, so its shape and its effect on the next hold are
+     * counted here the way step() counts them when it plans the step itself. */
+    switch (plan_.phase) {
+        case RAD_PHASE_PREFILL: ++m_.steps_prefill; break;
+        case RAD_PHASE_MIXED:   ++m_.steps_mixed;   break;
+        default:                ++m_.steps_decode;  break;
+    }
+    if (cfg_.prefill_interleave != 0) {
+        if (plan_.phase == RAD_PHASE_DECODE) {
+            /* A step issued ahead during a hold is one of its decode-only steps. */
+            if (interleave_left_ > 0) {
+                --interleave_left_;
+                if (held_prefill_ > 0) ++m_.steps_held;
+            }
+        } else {
+            held_prefill_ = 0;   /* the chunk this step carries is not one the hold left over */
+            bool continues = false;
+            int64_t n_dec = 0;
+            for (const StepEntry& e : plan_.e) {
+                if (e.is_prefill) { if (!e.produces_token) continues = true; }
+                else ++n_dec;
+            }
+            interleave_left_ = n_dec && continues ? interleave_steps() : 0;
+        }
     }
     ++m_.steps_ahead;
     for (const StepEntry& e : plan_.e)
-        if (e.n_spec == 0) ++m_.decode_rows_unspeculated;
+        if (!e.is_prefill && e.n_spec == 0) ++m_.decode_rows_unspeculated;
     step_start_ = std::chrono::steady_clock::now();
     ++step_;
     step_open_ = true;
@@ -3040,11 +3713,34 @@ void Scheduler::promote_next() {
 }
 
 /* ------------------------------------------------------------------ commit */
+/* commit's token pushes: the sink takes the wake it owes the stream, and commit issues it from
+ * flush_wakes, which WakeFlush runs once it has released mu_ (item S-08). */
+bool Scheduler::push_deferred(void* sink, int32_t token, const TokenLogprobs* lp, int64_t now) {
+    bool owed = false;
+    const bool ok = server::sink_push_deferred(sink, token, lp, now, &owed);
+    if (owed) wake_sinks_.push_back(sink);
+    return ok;
+}
+
+void Scheduler::push_progress(void* sink, int32_t processed, int32_t total, int32_t cached) {
+    bool owed = false;
+    server::sink_prompt_progress_deferred(sink, processed, total, cached, &owed);
+    if (owed) wake_sinks_.push_back(sink);
+}
+
+void Scheduler::flush_wakes() {
+    for (void* sink : wake_sinks_) server::sink_wake(sink);
+    wake_sinks_.clear();
+}
+
 /* This may run while the card still runs the drafter's passes behind the step (Engine::StepOut::
  * early). It therefore issues no device work and allocates nothing: what it releases (KV blocks,
  * StepSlot cards, prefix-cache publications) may still be read by those passes, and is reused only
  * by work the engine issues after waiting for step_end_. */
 int Scheduler::commit(StepResult& res) {
+    /* The wakes its pushes owe go out once mu_ is gone: a stream woken while the step lock is
+     * still held would only bounce off that lock on its own core (item S-08). */
+    WakeFlush wakes(*this);
     std::lock_guard<std::mutex> lk(mu_);
     if (!step_open_) return RAD_E_STATE;
     /* The step's tokens are pushed at one time (Sink::push). */
@@ -3063,6 +3759,10 @@ int Scheduler::commit(StepResult& res) {
     committed_.clear();
 
     const int32_t W = conv_window();
+    /* S-02: a sub-step of a chunk group commits only its decode rows; the chunk's own commit
+     * waits for the last sub-step (`slice_more`), and the group ends with it. */
+    const bool slice_step = plan_.slice_m > 0;
+    const bool slice_more = slice_step && !plan_.slice_last;
 
     /* A mixed step leaves decode rows the same replay factors as a decode step (recurrent path
      * over [0, n_seq_decode), chunked over the rest), so their scratch is not invalidated; the
@@ -3079,7 +3779,8 @@ int Scheduler::commit(StepResult& res) {
             s.entry = -1;
             /* Unless the drafter's snapshot still names it, or the next step carries it: the
              * sweep below, or that step's commit, releases it once nothing does. */
-            if (s.pending_free && !block_holds(r.id) && !(next_open_ && s.entry_next >= 0)) {
+            if (s.pending_free && !block_holds(r.id) && !(next_open_ && s.entry_next >= 0) &&
+                !(slice_more && group_.holds(s.slot))) {
                 free_kv(s);
                 s.pending_free = false;
                 --n_deferred_;
@@ -3097,44 +3798,53 @@ int Scheduler::commit(StepResult& res) {
          * the request with the reason; that token and everything after it is not sent. */
         bool lp_failed = false;
 
-        /* The snapshot the engine just took is now readable. Marked here, not at reservation
-         * (which happens at planning), so a lookup in between cannot adopt a slot still holding
-         * the previous tenant's state. A later restore is enqueued on the same stream behind this
-         * save, so issuing the copy is enough. */
-        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
-            pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
-
         if (e.is_prefill) {
-            r.n_computed += e.n_tokens;
-            /* The chunk is committed: a window group returns its blocks below the window now,
-             * not at this sequence's next ensure(), which may be steps away. */
-            kv_->trim_window(r.id, r.n_computed);
-            step_prefill_tok_ += e.n_tokens;
-            server::sink_prompt_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(),
-                                         r.n_cached);
-            /* Once, when the prompt is fully placed: the usage block's admission accounting.
-             * `n_cached` is what the prefix cache supplied. */
-            if (r.n_computed >= (int64_t)r.prompt.size()) {
-                server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
-                /* From here a decode step reads the ring, and the engine checks the resolve's
-                 * overflow. */
-                last_prefill_ids_.push_back(r.id);
-            }
-            if (e.produces_token && res.token && r.embed) {
-                /* The answer is the pooled vector the engine already put in the sink; there is
-                 * no token to emit, and `eos` ends the request below. */
-                if (!s.first_tok_us) s.first_tok_us = mono_us();
-            } else if (e.produces_token && res.token) {
-                if (!s.first_tok_us) s.first_tok_us = mono_us();
-                r.output.push_back(res.token[i]);
-                const TokenLogprobs* lp =
-                    res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
-                        ? &res.lp[res.first_row[i]] : nullptr;
-                if (lp && lp->token < 0) lp_failed = true;
-                else overflowed = !server::sink_push(r.sink, res.token[i], lp, pushed_ns);
-                /* The conv window absorbed this chunk; the cursor advances one committed
-                 * position, as in decode. */
-                s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
+            /* S-02: the chunk's rows and everything that follows from them (KV trim, sink
+             * progress, the prompt's stats, the prefix publish, the suffix index, the token)
+             * commit once, on the group's last sub-step. Before it the sub-step has only run this
+             * chunk's rows through its layers. */
+            if (!slice_more) {
+                /* The snapshot the engine just took is now readable. Marked here, not at
+                 * reservation (which happens at planning), so a lookup in between cannot adopt a
+                 * slot still holding the previous tenant's state. A later restore is enqueued on
+                 * the same stream behind this save, so issuing the copy is enough. A sliced chunk
+                 * stages its checkpoint on the last sub-step only, so nothing is published
+                 * before the chunk's state is whole. */
+                if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && pc_)
+                    pc_->commit_checkpoint(r, (int64_t)e.ctx_len + e.ckpt_tok + 1);
+                r.n_computed += e.n_tokens;
+                /* The chunk is committed: a window group returns its blocks below the window now,
+                 * not at this sequence's next ensure(), which may be steps away. */
+                kv_->trim_window(r.id, r.n_computed);
+                step_prefill_tok_ += e.n_tokens;
+                push_progress(r.sink, r.n_computed, (int32_t)r.prompt.size(), r.n_cached);
+                /* Once, when the prompt is fully placed: the usage block's admission accounting.
+                 * `n_cached` is what the prefix cache supplied. */
+                if (r.n_computed >= (int64_t)r.prompt.size()) {
+                    server::sink_prompt_stats(r.sink, (int32_t)r.prompt.size(), r.n_cached);
+                    /* From here a decode step reads the ring, and the engine checks the resolve's
+                     * overflow. */
+                    last_prefill_ids_.push_back(r.id);
+                }
+                if (e.produces_token && res.token && r.embed) {
+                    /* The answer is the pooled vector the engine already put in the sink; there is
+                     * no token to emit, and `eos` ends the request below. */
+                    if (!s.first_tok_us) s.first_tok_us = mono_us();
+                } else if (e.produces_token && res.token) {
+                    if (!s.first_tok_us) s.first_tok_us = mono_us();
+                    r.output.push_back(res.token[i]);
+                    const TokenLogprobs* lp =
+                        res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
+                            ? &res.lp[res.first_row[i]] : nullptr;
+                    if (lp && lp->token < 0) lp_failed = true;
+                    else overflowed = !push_deferred(r.sink, res.token[i], lp, pushed_ns);
+                    /* The conv window absorbed this chunk; the cursor advances one committed
+                     * position, as in decode. */
+                    s.conv_cursor = (int32_t)((s.conv_cursor + 1) % (W ? W : 1));
+                }
+                /* --draft-suffix: index this chunk now, behind the token it just pushed, so the first
+                 * decode does not index the whole prompt at once (suffix.h, S-06). */
+                if (cfg_.draft_suffix && r.may_speculate) suffix_index(s, r);
             }
         } else {
             int32_t a = res.n_accepted ? res.n_accepted[i] : 0;
@@ -3190,7 +3900,7 @@ int Scheduler::commit(StepResult& res) {
                     res.lp && res.first_row[i] >= 0 && r.sp.n_probs >= 0
                         ? &res.lp[res.first_row[i] + j] : nullptr;
                 if (lp_failed || (lp && lp->token < 0)) { lp_failed = true; return; }
-                if (!server::sink_push(r.sink, t, lp, pushed_ns)) overflowed = true;
+                if (!push_deferred(r.sink, t, lp, pushed_ns)) overflowed = true;
             };
             /* On a tree step the accepted drafts are the path's nodes, in path order. */
             const int32_t* path = res.path ? res.path + (size_t)i * RAD_SCHED_MAX_SPEC : nullptr;
@@ -3212,6 +3922,10 @@ int Scheduler::commit(StepResult& res) {
             step_decode_tok_ += 1 + a;
 
             if (e.n_spec > 0) {
+                /* This request's own, for the live request table (requests_locked). */
+                ++s.spec_steps;
+                s.spec_tokens += (uint64_t)e.n_spec;
+                s.spec_accepted += (uint64_t)a;
                 draft_.observe(e.n_spec, a);
                 /* And this sequence's own estimate under the adaptive window, only when the head
                  * drafted: a prompt-lookup proposal is accepted on different text by a different
@@ -3257,7 +3971,8 @@ int Scheduler::commit(StepResult& res) {
 
         /* A request the next step carries finishes now but keeps its blocks, which that step
          * writes; its commit finds the request not running and returns them. */
-        const bool carried = next_open_ && s.entry_next >= 0;
+        const bool carried = (next_open_ && s.entry_next >= 0) ||
+                             (slice_more && group_.holds(s.slot));
 
         /* Finish. emit() already stops at max_tokens, so the resize below is a backstop: a >=
          * test that can only be == is easy to break quietly later. */
@@ -3300,6 +4015,8 @@ int Scheduler::commit(StepResult& res) {
     m_.prefill_tokens += step_prefill_tok_;
     m_.decode_tokens += step_decode_tok_;
     ++m_.steps;
+    /* The group is over with its last sub-step: nothing is held for it after this commit. */
+    if (slice_step && plan_.slice_last) group_ = ChunkGroup{};
 
     /* Every entry is retired, so anything deferred on this step, or on a drafter snapshot that
      * block_end() / serial_end() has since cleared, can be released: every pass naming them was
@@ -3365,8 +4082,10 @@ void Scheduler::step_finished() {
     /* The window ages by all elapsed time, idle included; only the busy part is added as time the
      * tokens took. */
     const double aged = std::chrono::duration<double>(step_end - last_step_at_).count();
-    /* --prefill-interleave auto's two step costs (interleave_steps). */
-    if (wall > 0 && cfg_.prefill_interleave < 0)
+    /* The learned step costs: --prefill-interleave auto's (interleave_steps) and --chunk-slices
+     * auto's m law (chunk_slice_count). A chunk group's sub-step is neither a chunk step nor a
+     * decode step -- it lasts C/m + D -- so it teaches nothing here (S-02). */
+    if (wall > 0 && plan_.slice_m == 0 && (cfg_.prefill_interleave < 0 || cfg_.chunk_slices < 0))
         step_cost_locked(plan_.phase != RAD_PHASE_DECODE, wall);
     if (wall > 0) {
         constexpr double kWindowS = 1.0;
@@ -3573,6 +4292,9 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
             ++n_draft_rows;
         }
     }
+    /* The deepest chain a step with a drafting row allows, after the cuts above and the engine's own
+     * (--draft-depth-max), for /stats `draft_ceiling`. */
+    if (n_draft_rows > 0) m_.draft_ceiling = *rounds;
     return n_draft_rows;
 }
 
@@ -3959,30 +4681,60 @@ int32_t Scheduler::conv_window() const {
 }
 
 /* ------------------------------------------------------------------ metrics */
+/* The running encoder pass's time so far, added at read (take_encodes). */
+static SchedMetrics with_encode_in_flight(SchedMetrics m) {
+    if (m.encode_started_ns) m.encode_ns += mono_ns() - m.encode_started_ns;
+    return m;
+}
+
 SchedMetrics Scheduler::metrics() const {
     std::lock_guard<std::mutex> lk(mu_);
-    return metrics_locked();
+    return with_encode_in_flight(metrics_locked());
 }
 
 void Scheduler::publish(bool idle) {
     const int64_t now = mono_us();
     if (idle && now - pub_at_us_ < 20000) return;
+    /* The request table is the expensive half of the copy: a walk of reqs_ with a block-table
+     * lookup per group per request, a prefix-cache probe and a sort, under mu_. A busy step used
+     * to rebuild it every step, a few us at 8-16 requests (audit D-17), for observers that poll
+     * at dashboard rates: it is rebuilt at most every 20 ms now, while the metrics copy beside it,
+     * which is a handful of counters, still goes with every step. So /metrics' counters and the
+     * delta a phase's measurement takes never lose a step to a skipped publication. */
+    const bool table = now - pub_tbl_us_ >= 20000;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        scratch_m_ = metrics_locked();
+        if (table) {
+            scratch_reqs_.resize(reqs_.size());
+            scratch_reqs_.resize(
+                (size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
+        }
+    }
+    if (!pub_mu_.try_lock()) return;
+    pub_m_ = scratch_m_;
+    if (table) pub_reqs_.swap(scratch_reqs_);
+    pub_mu_.unlock();
+    pub_at_us_ = now;
+    if (table) pub_tbl_us_ = now;
+}
+
+/* publish() with pub_mu_ already held by the caller, so it cannot be skipped (take_encodes). */
+void Scheduler::publish_held() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         scratch_m_ = metrics_locked();
         scratch_reqs_.resize(reqs_.size());
         scratch_reqs_.resize((size_t)requests_locked(scratch_reqs_.data(), (int)scratch_reqs_.size()));
     }
-    if (!pub_mu_.try_lock()) return;
     pub_m_ = scratch_m_;
     pub_reqs_.swap(scratch_reqs_);
-    pub_mu_.unlock();
-    pub_at_us_ = now;
+    pub_at_us_ = mono_us();
 }
 
 SchedMetrics Scheduler::observed_metrics() const {
     std::lock_guard<std::mutex> lk(pub_mu_);
-    return pub_m_;
+    return with_encode_in_flight(pub_m_);
 }
 
 int Scheduler::observed_requests(ReqStat* out, int max) const {
@@ -3996,8 +4748,16 @@ SchedMetrics Scheduler::metrics_locked() const {
     SchedMetrics m = m_;
     m.step = step_;
     m.running = (int64_t)running_.size();
+    for (int32_t slot : running_)
+        if (slot >= 0 && slot < (int32_t)reqs_.size() && reqs_[(size_t)slot] && reqs_[(size_t)slot]->req) {
+            const int32_t sl = reqs_[(size_t)slot]->req->lora_slot;
+            if (sl >= 0 && sl < SchedMetrics::MAX_LORA_SLOTS) ++m.loras[sl].running;
+        }
     m.queue_depth = (int64_t)waiting_.size();
     m.preempted_waiting = 0;
+    /* Items asked for and not yet encoded, the ones being encoded now among them. */
+    m.encode_pending = (int64_t)enc_want_.size() + enc_active_;
+    m.encode_started_ns = enc_started_ns_;
     for (int32_t slot : waiting_)
         if (reqs_[(size_t)slot]->req->state == ReqState::Preempted) ++m.preempted_waiting;
 

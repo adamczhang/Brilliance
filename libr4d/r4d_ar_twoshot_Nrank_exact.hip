@@ -54,6 +54,9 @@ struct R4DArShardOff {
   int off[WS + 1];
   int sh_max;
 };
+static_assert(sizeof(R4DArShardOff<4>) == 6 * 4 && sizeof(R4DArShardOff<8>) == 10 * 4 &&
+                  sizeof(R4DArShardOff<3>) == 5 * 4,
+              "R4DArShardOff is a kernel argument by value and carries no padding");
 
 // PIECED false fixes pieces at 1, so the unpipelined launch keeps the straight-line kernel.
 // CHAIN: the chained form's wait (before the sequence take, so a block of the next launch on the

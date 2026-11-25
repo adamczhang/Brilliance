@@ -371,6 +371,8 @@ struct UsageOut {
  *   draft_n, draft_n_accepted
  *                 speculative tokens proposed for this request and accepted; present when any
  *                 were proposed, as in llama.cpp
+ *   draft_steps   the verify steps that carried those drafts (draft_n / draft_steps is the mean
+ *                 depth); present with draft_n
  *   ttft_ms       from having the whole request body to the first token: parse, chat template,
  *                 tokenisation, admission wait and prefill. Body transfer time is excluded, so
  *                 a remote client sees the server's own share
@@ -387,7 +389,7 @@ struct TimingsOut {
     int64_t predicted_n = 0;
     int64_t decode_n = 0;        /* of predicted_n, the tokens after each choice's first */
     double  predicted_ms = 0.0;
-    int64_t draft_n = 0, draft_n_accepted = 0;
+    int64_t draft_n = 0, draft_n_accepted = 0, draft_steps = 0;
     double  ttft_ms = -1.0, total_ms = -1.0;   /* < 0: the body's arrival is not known */
 };
 

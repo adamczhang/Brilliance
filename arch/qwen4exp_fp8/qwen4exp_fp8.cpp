@@ -1383,6 +1383,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             if (lay.mlp.gfold) { gs.sh = lay.mlp.w.sout; gs.sg = lay.mlp.w.sgate; }
             gs.top_k  = lay.mlp.c.top_k;
             gs.rows   = lay.mlp.c.rows;
+            /* A gather that keeps the sum's codes cannot be folded (rad_block_hc.h). */
+            gs.sum_codes = lay.mlp.gather_q8;
             RAD_ARCH_TRY(lay.hc_ffn.declare_gather(b, gs));
             lay.mlp.gather_out_rows  = lay.hc_ffn.gather_rows;
             lay.mlp.gather_out_rows6 = lay.hc_ffn.gather_rows6;

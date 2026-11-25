@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include "r4d_args.h"
+#include "r4d_chain.h"
 #include "r4d_common.h"
 
 // Internal linkage, as each unit's own definitions had: the same code generation in every kernel
@@ -178,11 +179,13 @@ __device__ __forceinline__ void scatter_small_place(
 /* moe_scatter's small form: the slot list from `ids`, then the sort. A template only so a unit that
  * includes this header and does not launch it compiles no kernel. */
 constexpr uint32_t kScatWaves = 8;          /* 256 threads */
-template <bool INV>
+template <bool INV, class CH = R4dUnchained>
 __global__ __launch_bounds__(kScatWaves * kSortWave) void scatter_small_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ sorted, int32_t* __restrict__ off,
     int32_t* __restrict__ cnt, uint32_t T, uint32_t n_expert, int32_t base, Protect prot,
     int32_t* __restrict__ inv) {
+    /* CH `r4dchain`: the chained form (r4d_chain.h); the one workgroup has no early return. */
+    if (CH::on) r4d_chain_wait();
     __shared__ ScatterLds<kScatWaves> sl;
     const uint32_t tid = threadIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) sl.cnt[e] = 0;
@@ -192,6 +195,7 @@ __global__ __launch_bounds__(kScatWaves * kSortWave) void scatter_small_kernel(
     }
     lds_barrier();
     scatter_small_place<kScatWaves, INV>(sorted, off, cnt, T, n_expert, sl, inv);
+    if (CH::on) r4d_chain_done();
 }
 
 }  // namespace

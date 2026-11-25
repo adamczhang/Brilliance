@@ -28,6 +28,7 @@
 #include <memory>
 #include <string>
 #include <deque>
+#include <functional>
 #include <vector>
 #include <unordered_map>
 
@@ -238,6 +239,8 @@ public:
 
     int  init(const CtxDesc& d);
     void shutdown();
+    /* Both compute lanes must finish before their operands may be reassigned. */
+    int quiesce();
 
     /* ---------------------------------------------------------- the hot path */
     int issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n);
@@ -358,6 +361,11 @@ public:
     int  xp_predict(const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows, int64_t n_embd);
     int  xp_mark();
     int  xp_step(int layer);
+    /* The mover's pacing at the same mark (Mover::pace_mark, expert streaming X1 b): set at
+     * bringup, before any pass is recorded, so recorded passes carry the mark as a host step.
+     * Called with the compute stream at each routed layer's mark, also where the prefetch is off. */
+    void set_pace_hook(std::function<int(RadStream)> f) { pace_hook_ = std::move(f); }
+    bool xp_on() const { return xp_ != nullptr; }
     /* Drain, do not sample. `next_histogram` returns the oldest bank holding a landed histogram
      * for a step in (`after_step`, `before_step`), or -1. A caller loops on it with the step it
      * last credited, so it sees every histogram in order. The readers below take that bank; they
@@ -753,6 +761,7 @@ private:
 
     /* The expert prefetch's state (xp_state.h), null while it is off. */
     std::unique_ptr<XpState> xp_;
+    std::function<int(RadStream)> pace_hook_;
     void xp_free(XpState& x);
     void xp_serve(XpState& x);
     void xp_judge(XpState& x);
@@ -772,8 +781,9 @@ private:
      * (order of 15% prefill throughput). Any use must respect these constraints:
      *
      * 1. Every collective rides the same lane. The all-reduce double-buffers its scratch on a
-     *    per-block `seq & 1`, so collectives that race differently on two ranks pick different
-     *    slots for the same message and deadlock or corrupt.
+     *    launch-count parity (r4d_ar_seq.h: every launch of an instance bumps one parity counter
+     *    per block, and a block takes the slot from it), so collectives that race differently on
+     *    two ranks pick different slots for the same message and deadlock or corrupt.
      *
      * 2. A device-wide arrival counter must be per stream. `split_ctr` in r4d_gemm_fp8a8.hip (the
      *    self-resetting split-K finisher counter) is sound only because its launches are ordered

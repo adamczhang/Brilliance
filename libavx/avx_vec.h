@@ -653,10 +653,10 @@ static inline vf vf_sigmoid(vf x) {
 static inline vf vf_silu(vf x) { return vf_mul(x, vf_sigmoid(x)); }
 
 #if AVX_LEVEL >= 2
-/* Cheap silu, only for consumers whose output is bf16: a Taylor-4 exp (truncation ~6e-5) and a
- * raw reciprocal seed (2^-14 avx512, 2^-12 avx2, no Newton step). Worst lane ~3e-4, well inside the
- * bf16 tolerance of 6e-3 but not f32's 1e-5, so callers key on their output dtype. silu_mul uses
- * it; in the frontend-bound conv kernels it makes no measurable difference. */
+/* Cheap silu, only for consumers whose output is bf16: a Taylor-5 exp (truncation ~2.5e-6) and a
+ * reciprocal seed with one Newton step (no divide). Inside the bf16 tolerance of 6e-3 but not
+ * f32's 1e-5, so callers key on their output dtype. silu_mul uses it; in the frontend-bound conv
+ * kernels it makes no measurable difference. */
 static inline vf vf_exp_t4(vf x) {
     const vf hi = vf_set1(88.3762626647949f), lo = vf_set1(-87.3365447504f);
     x = vf_min(vf_max(x, lo), hi);
@@ -669,9 +669,10 @@ static inline vf vf_exp_t4(vf x) {
 #endif
     vf r = vf_fma(n, c1, x);
     r = vf_fma(n, c2, r);
-    /* Taylor-4: 1 + r(1 + r(1/2 + r(1/6 + r/24))). Same range reduction and exponent build as
-     * vf_exp. */
-    vf p = vf_fma(r, vf_set1(1.0f / 24.0f), vf_set1(1.0f / 6.0f));
+    /* Taylor-5: 1 + r(1 + r(1/2 + r(1/6 + r(1/24 + r/120)))). Same range reduction and exponent
+     * build as vf_exp. */
+    vf p = vf_fma(r, vf_set1(1.0f / 120.0f), vf_set1(1.0f / 24.0f));
+    p = vf_fma(p, r, vf_set1(1.0f / 6.0f));
     p = vf_fma(p, r, vf_set1(0.5f));
     p = vf_fma(p, r, vf_set1(1.0f));
     p = vf_fma(p, r, vf_set1(1.0f));
@@ -694,7 +695,10 @@ static inline vf vf_silu_fast(vf x) {
     vf d = vf_add(vf_set1(1.0f), e);
     vf r = _mm256_rcp_ps(d);
 #endif
-    /* No Newton step: d is in [1, emax], so the seed is in range and nothing overflows. */
+    /* One Newton step, r (2 - d r): the raw seed (2^-12 on avx2) alone moved ~14 % of the bf16
+     * products one ulp off the exact silu, which then grew through a deep model (Hy4-flash parity,
+     * notes/wp4.md). d is in [1, emax], so the seed is in range and nothing overflows. */
+    r = vf_mul(r, vf_fma(vf_sub(vf_zero(), d), r, vf_set1(2.0f)));
     return vf_mul(x, r);
 }
 #endif

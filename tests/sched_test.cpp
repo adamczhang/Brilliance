@@ -15,8 +15,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 using namespace rad;
@@ -1548,13 +1550,23 @@ TEST(observers_read_what_the_engine_thread_published) {
         CHECK_EQ(seen[(size_t)i].prompt_tokens, live[(size_t)i].prompt_tokens);
     }
 
-    /* An idle publication inside 20 ms of the last one is skipped; a step's never is. */
+    /* An idle publication inside 20 ms of the last one is skipped, as it always was. A step's
+     * publication carries its metrics and leaves the request table alone: the table is a walk of
+     * the whole queue for observers that poll at dashboard rates, so it is rebuilt at most every
+     * 20 ms, while the counters a scraper takes a delta of go with every step. */
     f.submit(160, 8);
     f.sch.publish(/*idle=*/true);
     CHECK_EQ(f.sch.observed_metrics().queue_depth, 1);
     f.sch.publish(/*idle=*/false);
     CHECK_EQ(f.sch.observed_metrics().queue_depth, 2);
+    CHECK_EQ(f.sch.observed_requests(seen.data(), 8), 3);   /* still the last table */
+    /* Wait out the table's interval: the next publication that finds it elapsed rebuilds it. */
+    for (int i = 0; i < 400 && f.sch.observed_requests(seen.data(), 8) != 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        f.sch.publish(/*idle=*/false);
+    }
     CHECK_EQ(f.sch.observed_requests(seen.data(), 8), 4);
+    CHECK_EQ(f.sch.observed_metrics().queue_depth, 2);
 }
 
 /* The sequences of one API request are added under one lock hold, each accepted or refused on its
@@ -1964,6 +1976,51 @@ TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
     CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
+/* The encoder's counters move while a pass runs, not only when it ends: take_encodes publishes the
+ * pass's start, both copies add the time since it, the item being encoded still counts as
+ * pending, and the end publishes a total no smaller than what a reader saw during the pass. */
+TEST(an_encoder_pass_reads_busy_while_it_runs) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    std::shared_ptr<mm::Item> ia;
+    f.submit_unencoded(160, 8, &ia);
+    f.sch.step();                                 /* asks for the item */
+    CHECK_EQ(f.sch.metrics().encode_pending, 1);
+    CHECK(f.sch.encodes_pending());
+
+    std::vector<std::shared_ptr<mm::Item>> items;
+    f.sch.take_encodes(&items);
+    REQUIRE_EQ(items.size(), 1u);
+    CHECK(!f.sch.encodes_pending());
+    const SchedMetrics o1 = f.sch.observed_metrics();    /* published without a step */
+    CHECK(o1.encode_started_ns > 0);
+    CHECK_EQ(o1.encode_pending, 1);
+    CHECK_EQ(o1.encode_items, 0);
+    usleep(5000);
+    const SchedMetrics o2 = f.sch.observed_metrics();
+    CHECK(o2.encode_ns >= 5000000);               /* the 5 ms so far, with no publication since */
+    CHECK(f.sch.metrics().encode_ns >= o2.encode_ns);
+
+    ia->encoded = true;
+    f.sch.encodes_done(1, 400);
+    const SchedMetrics o3 = f.sch.observed_metrics();
+    CHECK_EQ(o3.encode_started_ns, 0);
+    CHECK_EQ(o3.encode_pending, 0);
+    CHECK_EQ(o3.encode_items, 1);
+    CHECK_EQ(o3.encode_patches, 400);
+    CHECK(o3.encode_ns >= o2.encode_ns);
+    usleep(2000);
+    CHECK_EQ(f.sch.observed_metrics().encode_ns, o3.encode_ns);   /* flat once it has ended */
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+
+    /* An end without a start (take_encodes found nothing) adds nothing. */
+    f.sch.take_encodes(&items);
+    CHECK(items.empty());
+    f.sch.encodes_done(0, 0);
+    CHECK_EQ(f.sch.metrics().encode_ns, o3.encode_ns);
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */
@@ -2046,6 +2103,11 @@ TEST(preemption_takes_the_lowest_priority_victim_and_requeues_it_to_the_front) {
 
     CHECK_EQ(f.sch.metrics().preemptions, 1);
     CHECK_EQ(f.sch.metrics().preempted_waiting, 1);
+    /* The publish was handed A's kept chain (SchedReq::chain), the one its admission hashed: a
+     * recompute's prompt costs the same blocks twice otherwise. */
+    REQUIRE(f.pc.published.size() == 1);
+    CHECK_EQ(f.pc.published[0].seq, a);
+    CHECK_EQ(f.pc.published[0].chain_blocks, 10);   /* 160 tokens in 16-token blocks */
 }
 
 /* ================================================================== the step batch */
@@ -2678,6 +2740,145 @@ TEST(no_adapters_no_slot_array) {
     const int64_t on_bytes  = BatchBuilder::device_bytes(f.prog, on, f.kv.geom);
     CHECK(off_bytes > 0);
     CHECK_EQ(on_bytes - off_bytes, (f.cfg.max_tok * 4 + 255) / 256 * 256);
+}
+
+TEST(prefill_tail_maps_mixed_outputs_and_anchors_to_original_rows) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_MIXED;
+    plan.n_seq_decode = 1;
+    plan.n_tok_decode = 2;
+    int32_t cu[] = {0, 2, 6, 9};
+    int32_t pos[] = {40, 41, 0, 1, 2, 3, 12, 13, 14};
+    int32_t ids[] = {0, 1, 8, 8};
+    int32_t rope[27];
+    for (int i = 0; i < 27; ++i) rope[i] = 100 + i;
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 4;
+    in.n_tok = 9;
+    in.n_seq = 3;
+    in.rope_pos = rope;
+    for (bool anchors : {false, true}) {
+        const auto* fn = derive_row(derive_index(anchors ? "prefill_tail_anchors" : "prefill_tail"));
+        REQUIRE(fn);
+        int32_t out[48] = {};
+        int64_t used = 0;
+        CHECK_OK(fn->fn(in, out, 48, &used));
+        const std::vector<int> expected = anchors ? std::vector<int>{0, 1, 5, 8}
+                                                  : std::vector<int>{0, 1, 8};
+        const int m = (int)expected.size();
+        CHECK_EQ(used, 9 + 5 * m);
+        CHECK_EQ(out[0], m);
+        CHECK_EQ(out[1], 2);
+        CHECK_EQ(out[4], anchors ? 3 : 2);
+        CHECK_EQ(out[5], m);
+        CHECK_EQ(out[6], 0);
+        CHECK_EQ(out[8], m - 2);
+        for (int i = 0; i < m; ++i) {
+            CHECK_EQ(out[9 + i], expected[i]);
+            CHECK_EQ(out[9 + m + i], pos[expected[i]]);
+            for (int j = 0; j < 3; ++j)
+                CHECK_EQ(out[9 + (2 + j) * m + i], rope[j * 9 + expected[i]]);
+        }
+    }
+    in.n_out = 0;
+    int32_t empty = -1;
+    int64_t used = 0;
+    CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, &empty, 1, &used));
+    CHECK_EQ(used, 1);
+    CHECK_EQ(empty, 0);
+}
+
+/* #74 review, point 2: both variants keep every decode row, sampled or not, so the compact
+ * rows [0, DT) are the batch's decode rows in place. Decode sequence 1 (row 2) is not sampled. */
+TEST(prefill_tail_keeps_every_decode_row_in_both_variants) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_MIXED;
+    plan.n_seq_decode = 2;
+    plan.n_tok_decode = 3;
+    int32_t cu[] = {0, 2, 3, 8};
+    int32_t pos[] = {40, 41, 50, 0, 1, 2, 3, 4};
+    int32_t ids[] = {0, 1, 7};
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 3;
+    in.n_tok = 8;
+    in.n_seq = 3;
+    for (bool anchors : {false, true}) {
+        int32_t out[32] = {};
+        int64_t used = 0;
+        CHECK_OK(derive_row(derive_index(anchors ? "prefill_tail_anchors" : "prefill_tail"))
+                     ->fn(in, out, 32, &used));
+        CHECK_EQ(out[0], 4);
+        CHECK_EQ(out[1], 3);
+        const int32_t* kept = out + 4 + 3 + 1;   /* [m, DT, cu[4], pf_cu[2]] */
+        for (int i = 0; i < 3; ++i) CHECK_EQ(kept[i], i);
+        CHECK_EQ(kept[3], 7);
+    }
+}
+
+/* #74 review, point 1: the largest tail -- no decode sequence, rotary planes, a checkpoint cut --
+ * is 7 + 2 * n_seq + 5 * rows ints, the bound hyv4flash declares (TailLayout); without rotary
+ * planes it is 7 + 2 * n_seq + 2 * rows. One int less is refused. */
+TEST(prefill_tail_largest_tail_is_the_declared_bound) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_PREFILL;
+    int32_t cu[] = {0, 3, 6, 9, 12};
+    std::vector<int32_t> pos(12), rope(36);
+    for (int i = 0; i < 12; ++i) pos[(size_t)i] = i;
+    for (int i = 0; i < 36; ++i) rope[(size_t)i] = 100 + i;
+    int32_t ids[] = {1, 2, 4, 5, 7, 8, 10, 11};
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos.data();
+    in.out_ids = ids;
+    in.n_out = 8;
+    in.n_tok = 12;
+    in.n_seq = 4;
+    in.ckpt_cut = 2;
+    for (bool rotary : {true, false}) {
+        in.rope_pos = rotary ? rope.data() : nullptr;
+        const int64_t bound = 7 + 2 * 4 + (rotary ? 5 : 2) * 8;
+        std::vector<int32_t> out((size_t)bound, 0);
+        int64_t used = 0;
+        CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, out.data(), bound, &used));
+        CHECK_EQ(out[0], 8);
+        CHECK_EQ(used, bound);
+        CHECK_EQ(derive_row(derive_index("prefill_tail"))->fn(in, out.data(), bound - 1, &used),
+                 RAD_E_FULL);
+    }
+}
+
+TEST(prefill_tail_translates_an_interior_checkpoint_into_the_suffix) {
+    StepPlan plan;
+    plan.phase = RAD_PHASE_PREFILL;
+    int32_t cu[] = {0, 8};
+    int32_t pos[] = {20, 21, 22, 23, 24, 25, 26, 27};
+    int32_t ids[] = {7, 4, 5, 6, 7};  /* sampling plus a scored suffix */
+    DeriveInput in;
+    in.plan = &plan;
+    in.cu_seqlens = cu;
+    in.positions = pos;
+    in.out_ids = ids;
+    in.n_out = 5;
+    in.n_tok = 8;
+    in.n_seq = 1;
+    in.ckpt_cut = 6;
+    int32_t out[24] = {};
+    int64_t n = 0;
+    CHECK_OK(derive_row(derive_index("prefill_tail"))->fn(in, out, 24, &n));
+    CHECK_EQ(out[0], 4);
+    CHECK_EQ(n, 17);
+    CHECK_EQ(out[n - 3], 0);
+    CHECK_EQ(out[n - 2], 2);
+    CHECK_EQ(out[n - 1], 4);
 }
 
 TEST(state_chunk_bounds_split_a_long_prefill_at_absolute_multiples) {
@@ -3915,6 +4116,75 @@ TEST(a_mixed_step_target_preserves_speculative_verification_in_a_mixed_step) {
     CHECK_EQ(rd->n_accepted, 2);
 }
 
+/* The learned cap may not push a mixed chunk under the prefill stager's smallest step: below it
+ * every routed layer reads its pooled experts synchronously, which costs a long prefill far more
+ * than the shorter step buys (set_stage_rows warns about the same for an explicit cap). The seed
+ * (a quarter of the batch budget) and a cap the target learns are both below the floor here, and
+ * the step still runs a whole floor-sized chunk; the target misses stay visible in the counters. */
+TEST(a_mixed_step_target_clamps_its_cap_at_the_stager_floor) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 0;          /* the target controller stands on its own */
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(1025);            /* a held-back chunk keeps 1024 rows */
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 512);   /* the seed, under the floor */
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 1024);        /* the stager floor, not the seed's 512 */
+    }
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);  /* 12 ms against a 2 ms target: the cap falls to 128 */
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 128);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 1);
+
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 1024);        /* still the floor: the learned cap cannot go under it */
+    }
+    f.commit_plain(13);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_misses, 2);   /* the clamped target keeps missing */
+}
+
+/* With no stager armed there is no floor to hold: the one-quantum minimum is the whole clamp. */
+TEST(a_mixed_step_target_keeps_one_quantum_with_no_stager_armed) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096);
+    f.cfg.checkpoint_interval = 2048;
+    f.cfg.busy_prefill_chunk = 0;
+    f.cfg.mixed_step_target_ms = 2;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(0);
+
+    f.submit(100, 512, /*priority=*/0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(3500, 64, /*priority=*/1);
+    CHECK(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    f.commit_plain(12);
+    f.sch.note_mixed_step_cost(12000000);
+    CHECK_EQ(f.sch.metrics().mixed_step_target_prefill_cap, 64);
+
+    CHECK(f.sch.step() != nullptr);
+    for (const StepEntry& e : f.sch.plan().e) {
+        if (e.seq != p || !e.is_prefill) continue;
+        CHECK_EQ(e.n_tokens, 64);
+    }
+}
+
 TEST(a_mixed_step_target_composes_with_auto_interleave_and_burst_prefills) {
     Fixture f;
     share_fixture(f, /*busy off: the target controller stands on its own=*/0);
@@ -4133,7 +4403,7 @@ TEST(interleave_does_not_hold_after_a_prompts_last_chunk) {
 }
 
 /* A decode-only step of the hold may be issued ahead; it counts toward N and as a held step, and
- * once the hold is spent the next step is a full one that carries the chunk. */
+ * once the hold is spent the step that carries the chunk is issued ahead as well. */
 TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     Fixture f;
     f.build();
@@ -4154,13 +4424,101 @@ TEST(interleave_counts_steps_issued_ahead_and_then_serves_the_chunk) {
     f.commit_plain(12);
     f.sch.promote_next();
     CHECK_EQ(f.sch.metrics().steps_held, 2);
-    CHECK(f.sch.step_next() == nullptr);                /* the hold is spent */
+    CHECK(f.sch.step_next() != nullptr);                /* the hold is spent: the chunk's step, ahead */
     f.commit_plain(12);
+    f.sch.promote_next();
 
-    CHECK(f.sch.step() != nullptr);
     bool chunk = false;
     for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
     CHECK(chunk);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+}
+
+/* The stager's arming for the step after one issued ahead (S-03). Engine::arena_step releases the
+ * step issued ahead against its own plan, so it asks prefill_continues(next_plan), and the answer
+ * must be the one the same plan gets when the scheduler's own release reads it: nothing staged for
+ * a step the hold follows, the next chunk's experts staged for a step that carries one. Returns
+ * the answer for the step issued ahead; the caller says which it is. */
+static bool ahead_arming(int64_t interleave) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = interleave;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);                     /* the first chunk, released normally */
+    /* Commit the hold's decode-only steps until the step that carries a chunk is issued ahead. */
+    bool issued = f.sch.step_next() != nullptr;
+    for (int k = 0; !issued && k < 8; ++k) {
+        f.commit_plain(12);
+        CHECK(f.sch.step() != nullptr);
+        issued = f.sch.step_next() != nullptr;
+    }
+    CHECK(issued);                                      /* the chunk's step is the one issued ahead */
+    CHECK_EQ(f.sch.metrics().ahead_refused_held, interleave > 0 ? (int64_t)1 : (int64_t)0);
+    const bool ahead = f.sch.prefill_continues(/*next_plan=*/true);
+    f.commit_plain(12);
+    f.sch.promote_next();
+    bool chunk = false;
+    for (const StepEntry& e : f.sch.plan().e) if (e.seq == p && e.is_prefill) chunk = true;
+    CHECK(chunk);                                       /* the step issued ahead is the next chunk */
+    CHECK_EQ(f.sch.prefill_continues(), ahead);         /* released normally: the same answer */
+    return ahead;
+}
+
+/* No hold follows that chunk's step, so the step after it carries the next chunk: the stager is
+ * armed. */
+TEST(prefill_continues_ahead_arms_for_the_chunk_of_the_next_step) {
+    CHECK(ahead_arming(/*interleave=*/0));
+}
+
+/* The chunk's step arms the hold, whose decode-only step drops a chunk's experts: nothing is
+ * staged, as nothing is when the same step is released by step(). */
+TEST(prefill_continues_ahead_is_not_armed_for_a_step_the_hold_follows) {
+    CHECK(!ahead_arming(/*interleave=*/1));
+}
+
+/* The plan the stager asks about is the one the step issued ahead runs, not the open step's: the
+ * open step's last chunk finishes its prompt (nothing left to stage), while the admission the step
+ * issued ahead takes carries rows and must arm it. */
+TEST(prefill_continues_ahead_reads_the_step_issued_ahead_not_the_open_one) {
+    Fixture f;
+    f.build();
+    f.cfg.prefill_interleave = 0;
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t d = f.submit(100, 512);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    f.sch.find(d)->speculation_fixed = true;
+    const uint64_t p = f.submit(600, 4);                /* 256 + 256 + 88 */
+    f.sch.find(p)->speculation_fixed = true;
+    CHECK(f.sch.step() != nullptr);                     /* p's first chunk */
+    bool asked = false, open_leaves = true, ahead_leaves = false;
+    for (int k = 0; k < 8 && !asked; ++k) {
+        bool last = false;
+        for (const StepEntry& e : f.sch.plan().e)
+            if (e.seq == p && e.is_prefill && e.produces_token) last = true;
+        if (last) f.submit(2000, 4);                    /* arrives as p's last chunk runs */
+        const bool issued = f.sch.step_next() != nullptr;
+        if (last) {                                     /* p's rows all go in this step */
+            CHECK(issued);                              /* its chunk, issued ahead */
+            open_leaves  = f.sch.prefill_continues();
+            ahead_leaves = f.sch.prefill_continues(/*next_plan=*/true);
+            asked = true;
+            break;
+        }
+        f.commit_plain(12);
+        if (issued) f.sch.promote_next();
+        else CHECK(f.sch.step() != nullptr);
+    }
+    CHECK(asked);                                       /* p's last chunk went by */
+    CHECK(!open_leaves);                                /* nothing left of the open step's prompt */
+    CHECK(ahead_leaves);                                /* the step issued ahead carries a chunk */
 }
 
 /* The arithmetic at a real deployment's shape: a 2048-token step and interval, the stager arming
@@ -4192,6 +4550,38 @@ TEST(busy_cap_keeps_the_stager_floor_and_never_leaves_a_runt) {
     CHECK_EQ(f.sch.plan_chunk(0, 100000, f.sch.busy_cap(0, 100000, 2048, 8, false, true), nullptr), 1984);
     /* the same reserve with a share in it splits the interval */
     CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8 + 256, false, false), 1024);
+}
+
+/* S-01: an interval a quantum under the step (1984 under a 2048-token batch) is one step per
+ * interval, not two. The newcomer's chunk sharing its step with decode rows still lands on the
+ * interval boundary, and the last quantum of the batch stays free for the decode rows behind it.
+ * At an interval equal to the batch the same chunk stops a quantum short of the boundary (1984)
+ * and every interval runs a second, 64-row step that carries the checkpoint -- short in wall time
+ * (40-65 ms) but it arms its own run of decode-only interleave steps, which is the arrival TTFT
+ * the note measures (-27 % / -14 % in its own runs; three runs a side on the iks-A lane give
+ * 2.63 -> 2.20 s and 2.75 -> 2.41 s). */
+TEST(an_interval_a_quantum_under_the_batch_leaves_no_remainder_step) {
+    for (const int64_t interval : { (int64_t)2048, (int64_t)1984 }) {
+        Fixture f;
+        f.build(/*blocks=*/8192, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/8192);
+        f.cfg.checkpoint_interval = interval;
+        CHECK_OK(f.start());
+        f.sch.set_stage_rows(1025);
+        /* decode rows alone behind it (2 rows x (1 + 3 drafts)): no split, the chunk is what is
+         * left of the cap at the quantum, 1984, whichever the interval */
+        CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 8, false, /*rows_only=*/true), 2040);
+        CHECK_EQ(f.sch.plan_chunk(0, 100000, 2040, nullptr), 1984);
+        /* the step after it: the remainder up to the interval (64 rows at 2048), or a whole
+         * interval when the interval is the chunk (1984) */
+        const int64_t cap = f.sch.busy_cap(1984, 100000, 2048, 8, false, true);
+        CHECK_EQ(cap, 2040);
+        CHECK_EQ(f.sch.plan_chunk(1984, 100000, cap, nullptr), interval == 2048 ? 64 : 1984);
+        /* four decoders (4 rows x (1 + 3 drafts)) take 32 rows of the batch, still inside the
+         * quantum of headroom, so the chunk is the interval and the next step is not a runt */
+        const int64_t cap4 = f.sch.busy_cap(1984, 100000, 2048, 32, false, true);
+        CHECK_EQ(f.sch.busy_cap(0, 100000, 2048, 32, false, true), 2016);
+        CHECK_EQ(f.sch.plan_chunk(1984, 100000, cap4, nullptr), interval == 2048 ? 64 : 1984);
+    }
 }
 
 /* The share left for a request that then does not start (its media is not encoded yet) goes back
@@ -4686,9 +5076,11 @@ TEST(the_adaptive_window_is_per_sequence_and_the_rounds_follow_the_deepest) {
     /* The head runs for the deepest. */
     int rounds = 4;
     Scheduler::SerialRow rows[4];
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 0);          /* before the first drafting step */
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
     CHECK_EQ(rounds, 4);
     REQUIRE(f.sch.serial_batch(0, 1) != nullptr);
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 4);
     for (int rd = 2; rd <= rounds; ++rd) REQUIRE(f.sch.serial_batch(rd, 1) != nullptr);
 
     /* The step issued ahead: `a` verifies one of the four rounds, `b` all four. */
@@ -5299,6 +5691,7 @@ TEST(the_adaptive_window_times_its_steps_and_the_next_cycle_reads_them) {
     Scheduler::SerialRow rows[4];
     CHECK_EQ(f.sch.serial_begin(&rounds, rows, 4), 2);
     CHECK_EQ(rounds, 1);
+    CHECK_EQ(f.sch.metrics().draft_ceiling, 1);          /* after the cut to the head's depth */
     f.sch.serial_end(0);
     CHECK_NEAR(f.sch.metrics().draft_depth_adaptive, 1.0, 1e-6);
 }
@@ -6058,6 +6451,82 @@ TEST(a_preempted_request_comes_back_with_no_draft_window) {
     CHECK_EQ(f.sch.find(a)->n_draft, 0);
 }
 
+/* A REQUEST'S OWN DRAFT COUNTERS, for the live request table (ReqStat::draft_steps, draft_tokens,
+ * draft_accepted). Counted at commit for a row that carried drafts, kept across a preemption, and
+ * cleared for a new request, including one that takes a recycled slot. */
+TEST(a_request_counts_its_own_verify_steps_drafts_and_accepts) {
+    Fixture f;
+    f.build();
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+
+    auto stat = [&](uint64_t id) {
+        std::vector<Scheduler::ReqStat> st(8);
+        const int n = f.sch.requests(st.data(), 8);
+        for (int i = 0; i < n; ++i)
+            if (st[(size_t)i].id == id) return st[(size_t)i];
+        CHECK(false);
+        return Scheduler::ReqStat();
+    };
+
+    uint64_t a = f.submit(40, 64);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();                               /* the prefill: no drafts */
+    CHECK_EQ(stat(a).draft_steps, (int64_t)0);
+    CHECK_EQ(stat(a).draft_tokens, (int64_t)0);
+    CHECK_EQ(stat(a).draft_accepted, (int64_t)0);
+
+    int64_t steps = 0, drafted = 0, accepted = 0;
+    const int32_t acc_for[3] = { 3, 1, 4 };
+    for (int k = 0; k < 3; ++k) {
+        int32_t draft[4] = { 21, 22, 23, 24 };
+        CHECK_OK(f.sch.set_draft(a, draft, 4));
+        REQUIRE(f.sch.step() != nullptr);
+        const int32_t n_spec = f.sch.plan().e[0].n_spec;
+        CHECK_EQ(n_spec, 4);
+        CHECK_OK(f.commit(7, 0, [&](const StepEntry&) { return acc_for[k]; }));
+        ++steps;
+        drafted += n_spec;
+        accepted += acc_for[k];
+        CHECK_EQ(stat(a).draft_steps, steps);
+        CHECK_EQ(stat(a).draft_tokens, drafted);
+        CHECK_EQ(stat(a).draft_accepted, accepted);
+    }
+    CHECK_EQ(steps, (int64_t)3);
+    CHECK_EQ(drafted, (int64_t)12);
+    CHECK_EQ(accepted, (int64_t)8);
+
+    /* A plain decode step (no draft standing) adds nothing. */
+    REQUIRE(f.sch.step() != nullptr);
+    if (f.sch.plan().e[0].n_spec == 0) {
+        f.commit_plain();
+        CHECK_EQ(stat(a).draft_steps, steps);
+    } else {
+        f.commit_plain();
+        steps = stat(a).draft_steps;
+    }
+
+    /* Preemption keeps them: the text and the history of what was drafted for it are the same. */
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 1);
+    CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Preempted);
+    CHECK_EQ(stat(a).draft_steps, steps);
+    CHECK(stat(a).draft_tokens >= drafted);
+    CHECK_EQ(stat(a).draft_accepted >= accepted, true);
+    const int64_t kept_tokens = stat(a).draft_tokens;
+    REQUIRE(f.sch.step() != nullptr);               /* re-admitted by recompute */
+    f.commit_plain();
+    CHECK_EQ(stat(a).draft_steps, steps);
+    CHECK_EQ(stat(a).draft_tokens, kept_tokens);
+
+    /* A new request starts at zero, also in a slot a finished one held. */
+    CHECK_OK(f.sch.cancel(a));
+    CHECK_OK(f.sch.reap(a));
+    uint64_t b = f.submit(40, 64);
+    CHECK_EQ(stat(b).draft_steps, (int64_t)0);
+    CHECK_EQ(stat(b).draft_tokens, (int64_t)0);
+    CHECK_EQ(stat(b).draft_accepted, (int64_t)0);
+}
+
 /* Each terminal id is handed over once: take_completed swaps the list out under the lock. A
  * reference into scheduler storage that nothing cleared would have every finished request walked
  * again on every step, without the lock, while an HTTP thread's cancel appends to it. */
@@ -6357,6 +6826,13 @@ TEST(a_failed_admission_gives_back_its_checkpoint_hit) {
 
     REQUIRE(f.sch.step() != nullptr);
     CHECK_EQ(f.pc.lookups, 3);
+    /* The second attempt was handed the chain the first one took (SchedReq::chain): a request
+     * that waits for room does not hash its prompt again on every round. r's lookup came first,
+     * with nothing kept yet. */
+    REQUIRE(f.pc.chain_blocks.size() == 3);
+    CHECK_EQ(f.pc.chain_blocks[0], 0);              /* r, its first and only lookup */
+    CHECK_EQ(f.pc.chain_blocks[1], 0);              /* a's first attempt */
+    CHECK_EQ(f.pc.chain_blocks[2], 37);             /* a's retry: 600 tokens in 16-token blocks */
     CHECK_EQ(f.sch.find(a)->n_computed, 256);
     CHECK_EQ(f.sch.plan().e[0].ckpt_restore, 5);
     SchedMetrics m = f.sch.metrics();
@@ -6575,12 +7051,52 @@ TEST(a_step_is_issued_ahead_only_once_the_requests_speculation_is_fixed) {
     f.commit_plain();
     CHECK(f.sch.step() != nullptr);                 /* the first decode */
     CHECK(f.sch.step_next() == nullptr);            /* the sampler has not started it */
+    CHECK_EQ(f.sch.metrics().ahead_refused_grammar, (int64_t)1);
 
     Request* r = f.sch.find(id);
     REQUIRE(r != nullptr);
     r->sp.grammar = "root ::= \"a\"";
     r->speculation_fixed = true;                    /* a grammar whose backend rewinds */
     CHECK(f.sch.step_next() != nullptr);
+}
+
+/* The room gate refuses to admit a fresh prompt beside a running sequence, and a step issued
+ * ahead takes that refusal the way step() does: the waiter stays queued, hit and all, for the step
+ * after the commit to decide. Taking the wait (kAdmitWait) as an admission moved the waiter into
+ * running_ with no card of its own (s.card stays -1) and a stale sched_tokens, staged a row the
+ * builder refuses, and then handed the hit back -- so the wait cost the prefix hit step() keeps
+ * across a bounce. */
+TEST(the_room_gate_refuses_an_admission_issued_ahead) {
+    Fixture f;
+    f.build(/*blocks=*/32, /*states=*/64, /*max_tok=*/512);
+    f.cfg.prefill_room_gate = true;
+    CHECK_OK(f.start());
+
+    const uint64_t d = f.submit(100, 64);
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's prompt */
+    f.commit_plain();
+    Request* dr = f.sch.find(d);
+    REQUIRE(dr != nullptr);
+    dr->speculation_fixed = true;
+
+    /* An earlier request filled the cache: a prefix 304 tokens deep, resumed at the 256
+     * checkpoint, which leaves 6 blocks of the pool free beside the running decoder. */
+    f.pc.seed(304);
+    f.pc.lin = 256;
+    f.pc.src = 3;
+    CHECK(f.sch.step() != nullptr);                 /* the decoder's step, in flight */
+
+    /* 32 blocks of prompt: far past the six the pool has free beside the runner. */
+    const uint64_t w = f.submit(500, 8);
+    CHECK(f.sch.step_next() == nullptr);            /* the gate's wait is no admission, ahead too */
+    CHECK_EQ(f.sch.metrics().ahead_refused_waiting, (int64_t)1);
+    Request* wr = f.sch.find(w);
+    REQUIRE(wr != nullptr);
+    CHECK_EQ((int)wr->state, (int)ReqState::Waiting);
+    /* The hit is kept for the next attempt, where step()'s wait leaves it. */
+    CHECK_EQ(wr->n_computed, (int64_t)256);
+    CHECK_EQ((int)f.kv.block_table(w, 0).size(), 16);
+    CHECK_EQ((int64_t)f.sch.metrics().queue_depth, (int64_t)1);
 }
 
 /* No step is issued ahead behind one that ends every request it carries: its rows would
@@ -6612,6 +7128,7 @@ TEST(no_step_is_issued_ahead_behind_one_that_ends_its_requests) {
         f.sch.expect_draft(id, 4);
         const int64_t free_before = f.kv.free_blocks(0);
         const bool issued = f.sch.step_next() != nullptr;
+        CHECK_EQ(f.sch.metrics().ahead_refused_ends_every, issued ? (int64_t)0 : (int64_t)1);
         if (!issued) CHECK_EQ(f.kv.free_blocks(0), free_before);
         return issued;
     };
@@ -6939,6 +7456,41 @@ TEST(shutdown_fails_each_sink_with_the_status_that_stopped_the_engine) {
     }
 }
 
+/* A step's tokens reach a sleeping stream without the step lock held: commit's pushes take the
+ * wake and commit issues it once mu_ is gone, so the woken HTTP thread does not land on the lock
+ * the step holds (item S-08). The consumer sleeps for five seconds, so only the step's own wake
+ * can return it. */
+TEST(a_step_wakes_its_streams_once_it_has_released_the_step_lock) {
+    server::Sink sink;
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+
+    /* The prompt's step emits its first token too; it is read out so that the stream is empty
+     * when the consumer goes to sleep below, which is what makes the next push owe a wake. */
+    CHECK(f.submit_to(&sink, /*n_prompt=*/8, /*max_tokens=*/8) != 0);
+    CHECK(f.sch.step() != nullptr);
+    f.commit_plain();
+    server::SinkToken drop[8];
+    CHECK_EQ(sink.read(drop, 8), 1);
+
+    std::atomic<bool> woke{false};
+    std::thread consumer([&] { woke.store(sink.wait(5000), std::memory_order_release); });
+    for (int i = 0; i < 500 && !sink.consumer_asleep(); ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    CHECK(sink.consumer_asleep());
+
+    CHECK(f.sch.step() != nullptr);         /* a decode step: it emits one token */
+    const auto t0 = std::chrono::steady_clock::now();
+    f.commit_plain();
+    consumer.join();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(woke.load(std::memory_order_acquire));
+    CHECK(ms < 1000.0);                     /* the step's wake, not the consumer's 5 s timeout */
+    CHECK_EQ(sink.n_produced(), 2);
+}
+
 /* A request's own draft counts and admission time reach its sink, so a response can report them
  * (aggregate counters cannot be split between overlapping requests). The counts are the same
  * proposed/accepted numbers /metrics sums. */
@@ -7041,21 +7593,55 @@ BatchRows read_rows(const RadBatch* b, const StepPlan& p, const FakeKV& kv) {
     return r;
 }
 
+/* The scheduler's count of the steps it did not issue ahead, by reason (S-07). */
+int64_t refused_total(const SchedMetrics& m) {
+    return m.ahead_refused_waiting + m.ahead_refused_held + m.ahead_refused_mid_prompt +
+           m.ahead_refused_grammar + m.ahead_refused_suffix_hot + m.ahead_refused_ends_every +
+           m.ahead_refused_kv;
+}
+
 struct AheadRun {
     std::vector<BatchRows> steps;
     std::vector<std::vector<int32_t>> out;
     std::vector<int64_t> held;      /* paged blocks each sequence holds at the end */
+    std::vector<int32_t> phases;    /* plan phase of each step, in order */
     int ahead = 0;                  /* steps that ran issued ahead */
+    int mixed_ahead = 0;            /* of those, the mixed ones (a chunk beside decode rows) */
+    int64_t steps_ahead_counter = 0;/* the scheduler's own count of them */
+    int64_t offers = 0;             /* step_next() calls made once a step was in flight */
+    int64_t refusals = 0;           /* of those, the ones that issued nothing */
+    SchedMetrics metrics;           /* the scheduler's counters at the end */
     int card_host_disagree = 0;
 };
 
-void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids) {
+/* The requests a run is made of: the ones submitted before its first step, and requests that
+ * arrive while it runs. An arrival at step t is queued once step t is planned and before its
+ * commit, which is where a request arriving on the card's flight lands. */
+struct AheadScript {
+    std::vector<int> prompts{ 40, 56, 72 };
+    std::vector<std::pair<int, int>> arrivals;   /* {step, prompt length} */
+    std::function<void(Fixture&)> tweak;         /* config the run differs by */
+};
+
+void ahead_setup(Fixture& f, int n_spec, std::vector<uint64_t>& ids,
+                 const AheadScript& sc = AheadScript{}) {
     f.build();
     f.cfg.n_spec = n_spec;
+    if (sc.tweak) sc.tweak(f);
     CHECK_OK(f.start());
-    for (int n : { 40, 56, 72 }) {
+    for (int n : sc.prompts) {
         auto r = f.request(n, 0);
         r->speculation_fixed = true;     /* no grammar: the commit cannot change speculation */
+        ids.push_back(f.add(std::move(r)));
+    }
+}
+
+/* Queue the script's requests that arrive at this step, once its plan exists. */
+void ahead_arrivals(Fixture& f, const AheadScript& sc, std::vector<uint64_t>& ids, int t) {
+    for (const auto& a : sc.arrivals) {
+        if (a.first != t) continue;
+        auto r = f.request(a.second, 0);
+        r->speculation_fixed = true;
         ids.push_back(f.add(std::move(r)));
     }
 }
@@ -7089,23 +7675,28 @@ void ahead_finish(Fixture& f, const std::vector<uint64_t>& ids, AheadRun& run) {
         run.out.push_back(f.sch.find(id)->output);
         run.held.push_back((int64_t)f.kv.block_table(id, 0).size());
     }
+    run.metrics = f.sch.metrics();
+    run.steps_ahead_counter = run.metrics.steps_ahead;
 }
 
 /* Every step built by step() after the commit. */
-AheadRun ahead_reference(int n_spec, int steps) {
+AheadRun ahead_reference(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         CHECK_OK(ahead_commit(f, t));
         ahead_publish(f, ids, n_spec, t + 1);
         b = f.sch.step();
         if (!b) break;
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7115,16 +7706,18 @@ AheadRun ahead_reference(int n_spec, int steps) {
  * acceptance into the StepSlots, the draft head's proposals into them, expect_draft and
  * step_next, the trunk advance on the new build, then the commit, the drafter's set_draft and
  * promote_next. */
-AheadRun ahead_pipelined(int n_spec, int steps) {
+AheadRun ahead_pipelined(int n_spec, int steps, const AheadScript& sc = AheadScript{}) {
     Fixture f;
     std::vector<uint64_t> ids;
-    ahead_setup(f, n_spec, ids);
+    ahead_setup(f, n_spec, ids, sc);
     AheadRun run;
     std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
     const RadBatch* b = f.sch.step();
     if (!b) return run;
     run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+    run.phases.push_back((int32_t)f.sch.plan().phase);
     for (int t = 0; t < steps; ++t) {
+        ahead_arrivals(f, sc, ids, t);
         /* The sampler's rows for step t: the drafts it agrees with, then its own token. */
         const StepPlan& p = f.sch.plan();
         std::vector<int32_t> y((size_t)b->n_out + 1, -1);
@@ -7141,7 +7734,9 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
         for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
         for (const StepEntry& e : p.e) {
             const StepSlot& S = slots[(size_t)e.card];
-            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+            /* A chunk that does not reach the prompt's end samples nothing to check. */
+            if (e.dev_out >= 0 &&
+                (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t)))
                 ++run.card_host_disagree;
             /* The draft head's proposals for step t + 1 (ADV_ROUND / ADV_TAKE on a card). */
             for (int j = 0; j < n_spec; ++j)
@@ -7149,6 +7744,8 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
             if (n_spec > 0) f.sch.expect_draft(e.seq, n_spec);
         }
         const RadBatch* nb = f.sch.step_next();
+        ++run.offers;
+        if (!nb) ++run.refusals;
         if (nb) {
             AdvanceArgs tr = f.sch.advance_args(0);
             tr.mode = ADV_TRUNK;
@@ -7161,11 +7758,13 @@ AheadRun ahead_pipelined(int n_spec, int steps) {
             f.sch.promote_next();
             b = nb;
             ++run.ahead;
+            if (nb->phase == RAD_PHASE_MIXED) ++run.mixed_ahead;
         } else {
             b = f.sch.step();
             if (!b) break;
         }
         run.steps.push_back(read_rows(b, f.sch.plan(), f.kv));
+        run.phases.push_back((int32_t)f.sch.plan().phase);
     }
     ahead_finish(f, ids, run);
     return run;
@@ -7204,6 +7803,180 @@ TEST(a_step_issued_ahead_equals_the_step_built_after_the_commit) {
             CHECK(b.held[i] <= a.held[i] + 1);
         }
     }
+}
+
+/* A prefill chunk carried ahead: a long prompt whose chunks are split by the checkpoint interval
+ * runs beside a decoding sequence, so the step after each commit is mixed (a decode row plus the
+ * prompt's next chunk). That chunk starts where the in-flight one ends -- the host knows, since a
+ * prefill advances n_computed by exactly its rows -- and takes the budget the rows behind it
+ * leave. Issued ahead it must be the same chunk, in the same batch, with the same phase. */
+TEST(a_mid_prompt_chunk_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    int mixed = 0;
+    for (int32_t ph : b.phases) if (ph == RAD_PHASE_MIXED) ++mixed;
+    CHECK(mixed >= 2);                       /* the chunk's steps ran beside decode rows */
+}
+
+/* A newcomer carried ahead: a request arriving while the step before it flies is admitted into the
+ * step issued ahead (media ready, the context fits), so its first chunk is planned, staged and
+ * launched without waiting for the commit. The run then carries that prompt's next chunks beside
+ * the decoding sequences, as above. */
+TEST(an_admission_is_issued_ahead) {
+    const int T = 16;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.ahead, T);                    /* every step after the first ran ahead */
+    CHECK_EQ(b.steps_ahead_counter, (int64_t)b.ahead);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    for (size_t t = 0; t < a.steps.size(); ++t) {
+        const bool same = a.steps[t] == b.steps[t];
+        CHECK(same);
+        if (!same) std::fprintf(stderr, "    step %zu differs\n", t);
+        CHECK_EQ(a.steps[t].bad_slots, 0);
+        CHECK_EQ(b.steps[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+    /* The arrival is in step 3 in both runs: admitted ahead, it is the step after the step it
+     * arrived in, not the one after that. */
+    REQUIRE_EQ(a.steps.size(), (size_t)T + 1);
+    CHECK_EQ(a.steps[3].seq.size(), (size_t)4);
+    CHECK_EQ(a.steps[2].seq.size(), (size_t)3);
+}
+
+/* A chunk the step's shares hold back is left to the step after the commit: the budget the rows it
+ * made room for did not use goes back to the chunk there (step()'s reclaim), so the chunk issued
+ * ahead would be a shorter one than the full step plans. */
+TEST(a_chunk_held_back_by_the_shares_is_left_to_the_step_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.busy_prefill_chunk = 128;   /* under the 256-token checkpoint chunk */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);                   /* the capped chunk's step was not issued ahead */
+    CHECK(b.metrics.ahead_refused_held > 0);   /* and says the shares held it back */
+    CHECK_EQ(b.metrics.steps_ahead + refused_total(b.metrics), b.offers);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* Two requests arriving in the same step: step() would admit as many as fit, so the step issued
+ * ahead (which admits the head only) is left to the step after the commit. */
+TEST(a_queue_of_two_arrivals_is_admitted_after_the_commit) {
+    const int T = 12;
+    AheadScript sc;
+    sc.arrivals.push_back({ 2, 300 });
+    sc.arrivals.push_back({ 2, 340 });
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    CHECK(b.ahead < T);
+    CHECK(b.metrics.ahead_refused_waiting > 0);  /* the second arrival waits for step() */
+    CHECK_EQ(b.metrics.steps_ahead + refused_total(b.metrics), b.offers);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* A chunk the hold left over: the step that takes it after the hold's last held step carries a
+ * prefill row, so it is a mixed step and can be issued ahead like any other. */
+TEST(a_chunk_the_hold_left_over_is_issued_ahead) {
+    const int T = 20;
+    AheadScript sc;
+    sc.prompts = { 40, 900 };
+    sc.tweak = [](Fixture& f) {
+        f.cfg.prefill_interleave = 2;   /* two decode-only steps behind each chunk step */
+    };
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.mixed_ahead > 0);       /* the chunk after the hold ran issued ahead */
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* The rows keep step()'s order: the decode rows first, then the prompt chunk, so a chunk whose
+ * sequence was admitted before a decoder's still follows that decoder's row. */
+TEST(a_chunk_issued_ahead_keeps_the_order_of_the_sequences) {
+    const int T = 12;
+    AheadScript sc;
+    sc.prompts = { 900, 40 };   /* the prompt that continues has the lower slot */
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK(b.ahead > 0);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+    CHECK(a.phases == b.phases);
+}
+
+/* A step left to step() for its shape: a prompt continuing on its own carries no decode row, so
+ * it is not a mixed step and is counted as mid-prompt. The scheduler's counts and steps_ahead are
+ * every step_next the engine made, and the run is the reference run's. */
+TEST(a_prompt_that_continues_alone_is_counted_as_mid_prompt) {
+    const int T = 4;
+    AheadScript sc;
+    sc.prompts = { 2000 };   /* longer than one checkpoint chunk */
+    const AheadRun a = ahead_reference(0, T, sc);
+    const AheadRun b = ahead_pipelined(0, T, sc);
+    CHECK_EQ(b.offers, (int64_t)T);
+    CHECK_EQ(b.refusals, (int64_t)T);
+    CHECK_EQ(b.metrics.steps_ahead, (int64_t)0);
+    CHECK_EQ(b.metrics.ahead_refused_mid_prompt, (int64_t)T);
+    CHECK_EQ(refused_total(b.metrics), (int64_t)T);
+    REQUIRE_EQ(a.steps.size(), b.steps.size());
+    for (size_t t = 0; t < a.steps.size(); ++t) CHECK(a.steps[t] == b.steps[t]);
+    CHECK(a.out == b.out);
+}
+
+/* A next step the request's own context cannot hold is counted as KV: the head drafted deeper
+ * than the context has room for, so the step after the commit is the one that plans within it. */
+TEST(a_context_that_does_not_fit_the_next_step_is_counted_as_kv) {
+    Fixture f;
+    f.build(/*blocks=*/64, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/160);
+    f.cfg.n_spec = 8;
+    CHECK_OK(f.start());
+    const uint64_t a = f.submit(150, 0);
+    REQUIRE(f.sch.step() != nullptr);          /* the prompt */
+    f.commit_plain();
+    f.sch.find(a)->speculation_fixed = true;
+    int32_t draft[4] = { 11, 12, 13, 14 };
+    CHECK_OK(f.sch.set_draft(a, draft, 4));    /* this step: 1 + 4 tokens, to 155 */
+    REQUIRE(f.sch.step() != nullptr);
+    f.sch.expect_draft(a, 8);                  /* the head's next chain wants 9 more tokens */
+    CHECK(f.sch.step_next() == nullptr);       /* 155 + 9 past the 160 context */
+    CHECK_EQ(f.sch.metrics().ahead_refused_kv, (int64_t)1);
+    CHECK_EQ(refused_total(f.sch.metrics()), (int64_t)1);
 }
 
 /* ================================================================== a block drafter on the card */
@@ -7808,6 +8581,7 @@ TEST(no_step_is_issued_ahead_for_a_scored_request_the_step_in_flight_finishes) {
     f.commit_plain();
     REQUIRE(f.sch.step() != nullptr);
     CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.metrics().ahead_refused_ends_every, (int64_t)1);   /* the row it finishes */
     f.commit_plain();                              /* the second token: finished */
     CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Finished);
     CHECK_EQ(f.kv.free_blocks(0), before);
@@ -9104,9 +9878,11 @@ uint64_t ngram_cycle_request(Fixture& f) {
 }  // namespace
 
 namespace {
-/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on). */
-void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true) {
-    f.build(4096, 64);
+/* A serial MTP head that drafts 3 rounds under a verify window of 8 rows (--draft-suffix on), in
+ * a context of `max_ctx` tokens. */
+void suffix_setup(Fixture& f, int head = 3, int mx = 8, int min_match = 4, bool on = true,
+                  int64_t max_ctx = 4096) {
+    f.build(4096, 64, 512, max_ctx);
     f.cfg.n_spec = std::max(head, mx);
     f.cfg.n_spec_head = on ? head : 0;
     f.cfg.draft_suffix = on;
@@ -9152,6 +9928,60 @@ TEST(the_suffix_index_proposes_the_latest_recurrence_and_cuts_by_path_score) {
     CHECK(ow.n >= 3);
     CHECK_EQ(out[0], 8); CHECK_EQ(out[1], 9); CHECK_EQ(out[2], 40);
     CHECK_NEAR(ow.score, 1.0, 1e-4);   /* a pattern seen once, followed once: D = 1 */
+}
+
+TEST(the_suffix_index_advanced_by_chunk_proposes_what_one_build_proposes) {
+    using namespace rad;
+    /* A history full of recurrences: a 512-token passage over a 24-token alphabet, repeated 12
+     * times with one token of each repetition changed. Indexed in 64-token chunks as a prompt
+     * prefilling commits them, it must count and find what one pass over the whole history counts
+     * and finds, and the later proposal must add nothing: the work moves out of the first decode,
+     * not out of the index. */
+    std::vector<int32_t> v(6144);
+    uint32_t rng = 12345;
+    for (size_t i = 0; i < 512; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        v[i] = (int32_t)((rng >> 16) % 24u);
+    }
+    for (size_t b = 1; b < 12; ++b) {
+        for (size_t i = 0; i < 512; ++i) v[b * 512 + i] = v[i];
+        v[b * 512 + (b * 37) % 512] = (int32_t)(100 + b);
+    }
+    TokenSeq s;
+    s.a = v.data(); s.na = (int64_t)v.size();
+    int32_t want[16], got[16];
+    SuffixIndex cold;
+    const SuffixIndex::Out ow = cold.propose(s, 9, 4, 8, 0.3f, want);
+    REQUIRE(ow.n > 0);
+    CHECK_EQ(cold.indexed(), (int64_t)v.size());
+
+    SuffixIndex warm;
+    TokenSeq c;
+    c.a = v.data(); c.na = 0;
+    for (int64_t n = 64; n <= (int64_t)v.size(); n += 64) {
+        c.na = n;
+        warm.index(c, 9, 4, n);
+    }
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+    const SuffixIndex::Out og = warm.propose(c, 9, 4, 8, 0.3f, got);
+    CHECK_EQ(og.n, ow.n);
+    CHECK_EQ(og.match, ow.match);
+    CHECK_NEAR(og.score, ow.score, 1e-6);
+    for (int j = 0; j < og.n; ++j) CHECK_EQ(got[j], want[j]);
+    /* the first decode's proposal indexes nothing: the history was indexed as it committed */
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+    warm.propose(c, 9, 4, 8, 0.3f, got);
+    CHECK_EQ(warm.indexed(), (int64_t)v.size());
+
+    /* A history that shrank under the index (a request restarted) is rebuilt, not counted twice */
+    c.na = 3000;
+    const SuffixIndex::Out os = warm.propose(c, 9, 4, 8, 0.3f, got);
+    SuffixIndex fresh;
+    const SuffixIndex::Out of = fresh.propose(c, 9, 4, 8, 0.3f, want);
+    CHECK_EQ(os.n, of.n);
+    CHECK_EQ(os.match, of.match);
+    CHECK_NEAR(os.score, of.score, 1e-6);
+    for (int j = 0; j < os.n; ++j) CHECK_EQ(got[j], want[j]);
 }
 
 TEST(a_recurring_history_selects_a_suffix_step_in_place_of_the_heads_draft) {
@@ -9222,8 +10052,72 @@ TEST(without_a_recurrence_or_with_the_flag_off_the_heads_draft_is_verified_as_be
         CHECK(!f.sch.find(a)->draft_suffix);
         commit_one(f, 3, 900);
         CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)0);
-        CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+        CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)0);
     }
+}
+
+/* The prompt is indexed as its chunks commit, so nothing in the first decode's step pays for the
+ * whole prompt: the last prefill chunk's commit used to run the one index build over all of it, and
+ * this one indexes its own chunk (S-06). The chain it proposes there is still the chain a cold
+ * index over the same history proposes. */
+TEST(a_long_prompt_is_indexed_as_its_chunks_commit_and_not_at_the_first_decode) {
+    Fixture f;
+    suffix_setup(f, 3, 8, 4, /*on=*/true, /*max_ctx=*/65536);
+    CHECK_OK(f.start());
+    const int64_t N = 64000;
+    auto r = std::make_unique<Request>();
+    r->id = f.next_id++;
+    r->max_tokens = 256;
+    r->prompt.resize((size_t)N);
+    for (int64_t i = 0; i < N; ++i) r->prompt[(size_t)i] = 100 + (int32_t)(i % 64);
+    const uint64_t a = r->id;
+    CHECK(f.add(std::move(r)) == a);
+
+    int64_t chunks = 0;
+    double last_ms = 0.0;
+    for (;;) {
+        REQUIRE(f.sch.step() != nullptr);
+        const StepPlan& p = f.sch.plan();
+        REQUIRE_EQ(p.e.size(), (size_t)1);
+        const bool last = p.e[0].produces_token;
+        const auto c0 = std::chrono::steady_clock::now();
+        f.commit_plain(100);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - c0).count();
+        ++chunks;
+        if (last) { last_ms = ms; break; }
+    }
+    CHECK(chunks > 200);   /* chunks of the checkpoint interval (256) over 64000 tokens */
+
+    /* What the first decode used to do: one index build over the whole prompt, here in the test. */
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    TokenSeq ts;
+    ts.a = rq->prompt.data(); ts.na = (int64_t)rq->prompt.size();
+    ts.b = rq->output.data(); ts.nb = (int64_t)rq->output.size();
+    int32_t cold_out[16];
+    SuffixIndex cold;
+    const auto k0 = std::chrono::steady_clock::now();
+    const SuffixIndex::Out oc = cold.propose(ts, a, f.cfg.draft_suffix_min_match,
+                                             std::min(f.cfg.draft_suffix_max, (int)RAD_SCHED_MAX_SPEC),
+                                             f.cfg.draft_suffix_min_score, cold_out);
+    const double cold_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - k0).count();
+    std::fprintf(stderr, "suffix index over %lld tokens: one build %.2f ms; the last prefill "
+                 "chunk's commit (chunk index + proposal) %.3f ms\n",
+                 (long long)N, cold_ms, last_ms);
+    /* The commit indexes its own chunk (256 tokens at this geometry) and proposes: eight times
+     * under the one build over all 64000 tokens that the first decode used to do. */
+    CHECK(last_ms * 8.0 < cold_ms);
+
+    /* And the chain at the first decode is the one the cold index proposes */
+    REQUIRE(f.sch.step() != nullptr);
+    rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    REQUIRE(oc.n > 0);
+    CHECK(rq->draft_suffix);
+    CHECK_EQ(rq->n_draft, oc.n);
+    for (int j = 0; j < oc.n; ++j) CHECK_EQ(rq->draft[j], cold_out[j]);
 }
 
 /* The head runs only its own 3 rounds after a suffix step, but its history pass covers every
@@ -9293,10 +10187,10 @@ TEST(a_sequence_in_a_recurring_pattern_is_not_issued_ahead) {
         const RadBatch* nb = f.sch.step_next();
         if (hot) {
             CHECK(nb == nullptr);
-            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)1);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)1);
         } else {
             CHECK(nb != nullptr);
-            CHECK_EQ(f.sch.metrics().suffix_held_ahead, (int64_t)0);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)0);
         }
     }
 }
@@ -9401,4 +10295,698 @@ TEST(adaptive_depth_rows_are_issued_ahead_in_a_suffix_deployment_unless_a_sequen
             CHECK_EQ(q[1], 4);   /* 1 + the 3 of the other */
         }
     }
+}
+
+/* ================================================================== --draft-suffix over a block drafter */
+
+namespace {
+/* DFlash2's shape: a block drafter of 7 proposals (block 8) whose block is the verify window, with
+ * --draft-suffix on (window 7: the suffix chain cut to the block). */
+void block_suffix_setup(Fixture& f, int min_match = 4) {
+    f.build(4096, 64);
+    f.cfg.n_spec = 7;
+    f.cfg.n_spec_head = 7;
+    f.cfg.draft_suffix = true;
+    f.cfg.draft_suffix_min_match = min_match;
+    f.cfg.draft_suffix_max = 7;
+    f.cfg.draft_suffix_min_score = 0.3f;
+    f.prog.drafter.kind  = RAD_DRAFT_BLOCK;
+    f.prog.drafter.depth = 7;
+    f.prog.drafter.block = 8;
+}
+const int32_t kBlockDraft[7] = { 21, 22, 23, 24, 25, 26, 27 };
+}  // namespace
+
+/* A recurring history gives the step to the suffix chain in place of the block's proposal; the
+ * drafter's context pass behind it mirrors every row the step verified (1 + 7, rejected ones
+ * included: its cache is positional), its query pass starts at the committed end, and the next
+ * step, with the cycle broken, verifies the block's prefix again. */
+TEST(a_block_drafters_proposal_gives_way_to_a_suffix_step_and_its_passes_cover_the_step) {
+    Fixture f;
+    block_suffix_setup(f);
+    CHECK_OK(f.start());
+    const uint64_t a = ngram_cycle_request(f);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(100);
+    CHECK_OK(f.sch.set_draft(a, kBlockDraft, 7));
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->n_spec, 7);
+    CHECK_EQ(b->n_tok, 8);
+    const StepEntry& e = f.sch.plan().e[0];
+    CHECK(e.suffix);
+    CHECK(e.draft_parent == nullptr);
+    const Request* rq = f.sch.find(a);
+    REQUIRE(rq != nullptr);
+    CHECK(rq->draft_suffix);
+    const int32_t want[7] = { 101, 102, 103, 104, 105, 106, 107 };
+    for (int j = 0; j < 7; ++j) CHECK_EQ(rq->draft[j], want[j]);
+    const int32_t ctx0 = e.ctx_len;
+    commit_one(f, 3, 900);
+    CHECK_EQ(f.sch.metrics().suffix_steps, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().suffix_accepted, (int64_t)3);
+
+    Scheduler::BlockRow rows[4];
+    CHECK_EQ(f.sch.block_begin(8, 7, 0, 99, rows, 4), 1);
+    CHECK(rows[0].seq == a);
+    const RadBatch* cb = f.sch.block_context(2);
+    REQUIRE(cb != nullptr);
+    CHECK_EQ(cb->n_tok, 8);                     /* every row of the suffix step */
+    CHECK_EQ(cb->ctx_lens[0], ctx0);
+    const RadBatch* qb = f.sch.block_query(2);
+    REQUIRE(qb != nullptr);
+    CHECK_EQ(qb->n_tok, 8);                     /* the anchor and seven masks */
+    CHECK_EQ(qb->token_ids[0], 900);            /* anchored at the committed end */
+    CHECK_EQ(qb->token_ids[1], 99);
+    f.sch.block_end();
+    /* 900 broke the cycle: the block's own proposal, as the adaptive prefix cut it (4 of 7) */
+    CHECK_OK(f.sch.set_draft(a, kBlockDraft, 4));
+    const RadBatch* b2 = f.sch.step();
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(b2->n_spec, 4);
+    CHECK(!f.sch.plan().e[0].suffix);
+    CHECK(!f.sch.find(a)->draft_suffix);
+    for (int j = 0; j < 4; ++j) CHECK_EQ(f.sch.find(a)->draft[j], kBlockDraft[j]);
+}
+
+/* Issued ahead: the block's rows with each row's own prefix (expect_draft of the adaptive rule),
+ * unless a sequence's history is in a pattern, which holds the step back for the suffix selector
+ * after the commit. */
+TEST(a_block_drafters_rows_are_issued_ahead_with_their_own_prefix_unless_a_sequence_is_in_a_pattern) {
+    for (int hot = 0; hot < 2; ++hot) {
+        Fixture f;
+        block_suffix_setup(f);
+        CHECK_OK(f.start());
+        const uint64_t a = hot ? ngram_cycle_request(f) : f.submit(160, 2000);
+        const uint64_t b = f.submit(160, 2000);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(hot ? 100 : 7);
+        CHECK_OK(f.sch.set_draft(a, kBlockDraft, 7));
+        CHECK_OK(f.sch.set_draft(b, kBlockDraft, 2));
+        REQUIRE(f.sch.step() != nullptr);
+        f.sch.find(a)->speculation_fixed = true;
+        f.sch.find(b)->speculation_fixed = true;
+        f.sch.expect_draft(a, 5);
+        f.sch.expect_draft(b, 1);
+        const RadBatch* nb = f.sch.step_next();
+        if (hot) {
+            CHECK(nb == nullptr);
+            CHECK_EQ(f.sch.metrics().ahead_refused_suffix_hot, (int64_t)1);
+        } else {
+            REQUIRE(nb != nullptr);
+            std::vector<int> q;
+            for (int64_t i = 0; i < nb->n_seq; ++i) q.push_back((int)nb->q_lens[i]);
+            std::sort(q.begin(), q.end());
+            REQUIRE_EQ(q.size(), (size_t)2);
+            CHECK_EQ(q[0], 2);
+            CHECK_EQ(q[1], 6);
+        }
+    }
+}
+
+
+/* ================================================================== a chunk planned in layer slices (S-02) */
+
+/* A trunk of `L` layers whose plugin reports it can run the trunk over a layer range
+ * (RadArchProbe::slice_layers_ok, which the engine reads into cfg.slice_layers_ok), a decoder, and a
+ * chunk of up to 512 rows: the mixed step a chunk group starts on. No state checkpoints, so a
+ * prompt's chunk is a whole 512 rows and its last one emits the token (a tail snapshot would cut
+ * the last quantum off it). */
+static void slice_fixture(Fixture& f, int64_t slices, int32_t L = 8) {
+    f.build(16384, 64, 512, 16384, /*windowed=*/false, /*linear=*/false);
+    f.prog.meta.n_layers = L;
+    f.cfg.checkpoint_interval = 0;
+    f.cfg.chunk_slices = slices;
+    f.cfg.slice_layers_ok = true;
+}
+
+/* A decoder (its prompt already committed, so it decodes) beside a `prompt`-row chunk, stepped
+ * once. The chunk is a multiple of the quantum: the step's budget is cfg.max_tok rows and the
+ * decode row takes one, so a 496-row prompt is what a chunk completes. The learned step costs are seeded between the two steps, standing in for step_finished. */
+static const RadBatch* slice_start(Fixture& f, uint64_t* dec, uint64_t* chunk, int prompt = 496,
+                                   double chunk_s = 0.0, double decode_s = 0.0) {
+    *dec = f.submit(100, 512);
+    if (!f.sch.step()) return nullptr;
+    f.commit_plain(11);
+    if (chunk_s > 0.0) f.sch.note_step_cost(true, chunk_s);
+    if (decode_s > 0.0) f.sch.note_step_cost(false, decode_s);
+    *chunk = f.submit(prompt, 64);
+    return f.sch.step();
+}
+
+/* Drive the chunk group the open step belongs to to its last slice: plan the next sub-step ahead,
+ * commit this one, promote. Checks every sub-step's layer range and the plan it becomes. */
+static void run_group(Fixture& f, int32_t m, int32_t L) {
+    for (int32_t j = 0; j < m; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j + 1 < m) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * L) / m));
+            CHECK_EQ(nb->layer_hi, (int32_t)(((int64_t)(j + 2) * L) / m));
+            CHECK_EQ(nb->n_seq, 2);          /* the frozen decode row, the chunk row */
+            CHECK_EQ(f.sch.next_prefill_first_layer(/*next_plan=*/true),
+                     j + 2 == m ? 0 : nb->layer_hi);
+        } else {
+            /* nothing left to slice: no step is planned ahead of the group's last sub-step */
+            CHECK(nb == nullptr);
+        }
+        f.commit_plain(20 + j);
+        if (j + 1 < m) {
+            f.sch.promote_next();
+            CHECK_EQ(f.sch.plan().slice_j, j + 1);
+            CHECK_EQ(f.sch.plan().slice_last, j + 1 == m - 1);
+            CHECK_EQ(f.sch.plan().layer_lo, nb->layer_lo);
+            CHECK_EQ(f.sch.plan().layer_hi, nb->layer_hi);
+        }
+    }
+}
+
+TEST(a_chunk_beside_a_decoder_is_planned_as_layer_slices) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.phase, RAD_PHASE_MIXED);
+    CHECK_EQ(pl.slice_m, 4);
+    CHECK_EQ(pl.slice_j, 0);
+    CHECK_EQ(pl.layer_lo, 0);
+    CHECK_EQ(pl.layer_hi, 2);          /* 8 layers over 4 slices */
+    CHECK(!pl.slice_last);
+    /* the frozen decode row first, the chunk last, and the chunk plans no token yet */
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    CHECK(!pl.e[0].is_prefill);
+    CHECK(pl.e[0].produces_token);
+    CHECK(pl.e[1].is_prefill);
+    CHECK(!pl.e[1].produces_token);
+    const int32_t rows = pl.e[1].n_tokens;
+    CHECK(rows >= 128);
+    CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)1);
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)1);
+    /* the batch carries the range, and no checkpoint is staged before the last slice */
+    CHECK_EQ(b->layer_lo, 0);
+    CHECK_EQ(b->layer_hi, 2);
+    CHECK_EQ(b->n_checkpoints, 0);
+    /* the pass after this one starts where this one ended */
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 2);
+
+    /* the chunk's own commit waits for the last slice */
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * 8) / 4));
+            CHECK_EQ(nb->layer_hi, (int32_t)(((int64_t)(j + 2) * 8) / 4));
+            CHECK_EQ(nb->n_seq, 2);
+        } else {
+            CHECK(nb == nullptr);
+        }
+        f.commit_plain(12 + j);
+        CHECK_EQ(f.sch.find(p)->n_computed, j == 3 ? (int64_t)rows : (int64_t)0);
+        /* the token comes on the last slice, not before it */
+        CHECK_EQ(f.sch.find(p)->output.size(), j == 3 ? (size_t)1 : (size_t)0);
+        if (j < 3) f.sch.promote_next();
+    }
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)4);
+    /* the group is over: the chunk emitted one token, the decoder one a sub-step, and the chunk's
+     * rows were counted as prefill tokens once */
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
+    CHECK_EQ(f.sch.metrics().prefill_tokens, (int64_t)(100 + rows));
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 0);
+    /* and the step after the group is planned normally */
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+}
+
+/* The m law (§2.2): --chunk-slices N fixes m; auto derives it from the learned costs, the target
+ * and the cost share. The layer boundaries are L_j = (j * L) / m. */
+TEST(the_slice_count_follows_the_m_law) {
+    struct Case {
+        const char* name;
+        int64_t slices;          /* cfg.chunk_slices: N, auto (-1), off (0) */
+        int32_t layers;          /* the trunk */
+        int32_t slice_ok;        /* the plugin's report (cfg.slice_layers_ok) */
+        double  chunk_s, decode_s;
+        int64_t target_ms, cost_pct;
+        int     prompt;
+        int32_t want;            /* m, or 0 for "not sliced" */
+    };
+    const Case cases[] = {
+        { "fixed 4",               4, 8, 1, 0.0,   0.0,    150, 10, 496, 4 },
+        { "fixed 8 capped by L",   8, 3, 1, 0.0,   0.0,    150, 10, 496, 3 },
+        { "auto: C 565 ms",       -1, 8, 1, 0.565, 0.0135, 150, 10, 496, 4 },
+        { "auto: C 1.2 s",        -1, 8, 1, 1.2,   0.0135, 150, 10, 496, 8 },
+        { "auto: D 50 ms",        -1, 8, 1, 0.565, 0.05,   150, 10, 496, 2 },
+        { "auto: cost_pct 0",     -1, 8, 1, 0.565, 0.0135, 150,  0, 496, 0 },
+        { "auto: target 600 ms",  -1, 8, 1, 0.565, 0.0135, 600, 10, 496, 0 },
+        { "auto: unmeasured",     -1, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "one layer",             4, 1, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "no slice set",          4, 8, 0, 0.0,   0.0,    150, 10, 496, 0 },
+        { "off",                   0, 8, 1, 0.0,   0.0,    150, 10, 496, 0 },
+        { "64-row chunk",          4, 8, 1, 0.0,   0.0,    150, 10,  64, 0 },
+    };
+    for (const Case& c : cases) {
+        Fixture f;
+        slice_fixture(f, c.slices, c.layers);
+        f.cfg.chunk_slice_target_ms = c.target_ms;
+        f.cfg.chunk_slice_cost_pct = c.cost_pct;
+        f.cfg.slice_layers_ok = c.slice_ok != 0;
+        CHECK_OK(f.start());
+        uint64_t d = 0, p = 0;
+        const RadBatch* b = slice_start(f, &d, &p, c.prompt, c.chunk_s, c.decode_s);
+        if (b == nullptr || f.sch.plan().slice_m != c.want) fprintf(stderr, "  case: %s\n", c.name);
+        REQUIRE(b != nullptr);
+        CHECK_EQ(f.sch.plan().slice_m, c.want);
+        CHECK_EQ(f.sch.metrics().steps_sliced, c.want >= 2 ? (int64_t)1 : (int64_t)0);
+        if (c.want >= 2) {
+            /* the whole trunk, in m ranges of at least one layer each */
+            run_group(f, c.want, c.layers);
+            CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)f.sch.find(p)->prompt.size());
+            CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+        }
+    }
+}
+
+/* --chunk-slices asks, but the scheduler plans by the plugin's report (RadArchProbe::slice_layers_ok,
+ * which Engine::declare reads into cfg.slice_layers_ok): a model whose trunk cannot be stopped
+ * between two layers keeps m = 1, runs the chunk whole, and the scheduler says why at init. */
+TEST(a_model_that_reports_no_layer_range_is_never_sliced) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.slice_layers_ok = false;              /* the plugin's RadArchProbe::slice_layers_ok = 0 */
+    const std::string logged = info_of([&] { CHECK_OK(f.start()); });
+    CHECK(has(logged, "no resumable layer range"));
+
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+    /* nothing is planned ahead of it: the one step runs the whole chunk */
+    CHECK(f.sch.step_next() == nullptr);
+    CHECK_EQ(f.sch.next_prefill_first_layer(), 0);
+    int32_t rows = 0;
+    for (const auto& e : f.sch.plan().e)
+        if (e.is_prefill) rows += (int32_t)e.n_tokens;
+    REQUIRE(rows > 0);
+    f.commit_plain(12);
+    CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)rows);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.metrics().substeps, (int64_t)0);
+}
+
+/* A prefill-only step is never sliced (there is no decoder to hand it to), and nor is one carrying
+ * two chunks: one group is the unit. */
+TEST(only_a_mixed_step_with_one_chunk_is_sliced) {
+    {
+        Fixture f;
+        slice_fixture(f, 4);
+        CHECK_OK(f.start());
+        const uint64_t p = f.submit(512, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_PREFILL);
+        CHECK_EQ(f.sch.plan().slice_m, 0);
+        CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+        CHECK_EQ(f.sch.find(p)->n_computed, (int64_t)0);
+    }
+    {
+        Fixture f;
+        slice_fixture(f, 4);
+        CHECK_OK(f.start());
+        const uint64_t d = f.submit(100, 512);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain(11);
+        const uint64_t a = f.submit(512, 64);
+        const uint64_t b = f.submit(512, 64);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ(f.sch.plan().phase, RAD_PHASE_MIXED);
+        CHECK_EQ(f.sch.plan().slice_m, 0);      /* two chunks: no group */
+        CHECK_EQ(f.sch.metrics().steps_sliced, (int64_t)0);
+        CHECK_EQ(f.sch.find(a)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(b)->n_computed, (int64_t)0);
+        CHECK_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    }
+}
+
+/* A decoder that finishes inside the group keeps its slot, its blocks and its place in the batch:
+ * the chunk's row base may not move under it, and it is reaped once the last slice has committed. */
+TEST(a_decoder_that_finishes_inside_a_group_keeps_its_place_until_the_last_slice) {
+    Fixture f;
+    slice_fixture(f, 4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 2);      /* its second token ends it */
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            /* the same two rows in the same order: the chunk's base does not move */
+            REQUIRE_EQ(nb->n_seq, 2);
+            CHECK_EQ((int)nb->q_lens[0], 1);
+            CHECK_EQ(nb->layer_lo, (int32_t)(((int64_t)(j + 1) * 8) / 4));
+        }
+        f.commit_plain(12 + j);               /* the first slice's token ends d */
+        if (j == 0) {
+            /* the server drains the finished sink and reaps, which the group defers: the slot,
+             * its blocks and its place in the batch are still the next sub-step's */
+            CHECK_EQ(f.sch.reap(d), RAD_OK);
+        }
+        /* it keeps its place until the group's last sub-step, whose commit lands the reap */
+        CHECK_EQ(f.sch.find(d) != nullptr, j < 3);
+        if (j < 3) f.sch.promote_next();
+    }
+    CHECK(f.sch.find(d) == nullptr);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+}
+
+/* ------------------------------------------------------------------ what the group freezes */
+/* A group's decode rows are planned the way a decode step plans its row. After the previous
+ * sub-step committed, the decoder's token is the last committed one, on the host, at n_computed;
+ * while a sub-step is issued ahead of that commit it is not on the host yet, so the card owns the
+ * row (as a plain ahead decode row's) and ctx_len is only the position ceiling. One position too
+ * far reads token 0 - a token the sequence never held - and a position it never reached. */
+TEST(a_group_s_decoders_are_planned_at_the_token_they_committed) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    uint64_t d = 0, p = 0;
+    const RadBatch* b = slice_start(f, &d, &p);
+    REQUIRE(b != nullptr);
+
+    /* the mixed step's own plan: the committed token at its own position */
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 100);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(b->token_ids[0], 11);
+    CHECK_EQ(b->positions[0], 100);
+
+    /* the next sub-step, issued ahead of this one's commit: token and position are the card's
+     * (the plugin's advance restages both from the StepSlot), and dev_tok names its row */
+    const RadBatch* nb = f.sch.step_next();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.next_plan().slice_j, 1);
+    CHECK(f.sch.next_plan().e[0].dev);
+    CHECK_EQ(f.sch.next_plan().e[0].ctx_len, 101);
+    CHECK_EQ(f.sch.next_plan().e[0].dev_tok, 0);
+    f.commit_plain(20);
+    f.sch.promote_next();
+    f.commit_plain(21);
+
+    /* the sub-step after that, planned after the commit instead of ahead: the token it just
+     * committed, at the position it committed at, not one past either */
+    const RadBatch* b2 = f.sch.step();
+    REQUIRE(b2 != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK(!f.sch.plan().e[0].dev);
+    CHECK_EQ(f.sch.plan().e[0].ctx_len, 102);
+    CHECK_EQ(f.sch.plan().e[0].dev_tok, 0);
+    CHECK_EQ(b2->token_ids[0], 21);
+    CHECK_EQ(b2->positions[0], 102);
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)3);
+    (void)p;
+}
+
+/* The checkpoint at the end of a chunk is the chunk read through every layer. Before the last
+ * sub-step the layers above layer_hi have not written this chunk's keys and values, so the
+ * snapshot is neither taken nor published then: a lookup in between must not adopt a partial
+ * slot. */
+TEST(a_group_s_checkpoint_is_taken_and_committed_on_its_last_slice) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/1024, /*max_ctx=*/4096);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 512;         /* the 512-row prompt ends on it */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(512, 64);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+
+    const StepPlan& pl = f.sch.plan();
+    CHECK_EQ(pl.slice_m, 4);
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    CHECK_EQ(pl.e[1].n_tokens, 512);         /* ends on the 256 interval: the chunk's last row */
+    CHECK_EQ(pl.e[1].ckpt_tok, 511);
+    CHECK(pl.e[1].ckpt_slot >= 0);
+    CHECK_EQ(f.pc.reserved, 1);              /* the slot is the group's from planning */
+    CHECK_EQ(f.pc.committed.size(), (size_t)0);
+    CHECK_EQ(b->n_checkpoints, 0);
+
+    for (int32_t j = 0; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j + 1 < 4) {
+            REQUIRE(nb != nullptr);
+            /* only the group's last sub-step stages the snapshot */
+            CHECK_EQ(nb->n_checkpoints, j + 1 == 3 ? 1 : 0);
+            CHECK_EQ(f.sch.next_plan().e[1].ckpt_slot >= 0, j + 1 == 3);
+        } else {
+            CHECK(nb == nullptr);            /* the last sub-step: nothing left to slice */
+        }
+        f.commit_plain(20 + j);
+        /* nothing is published before the last sub-step's commit */
+        CHECK_EQ(f.pc.committed.size(), (size_t)(j + 1 == 4 ? 1 : 0));
+        if (j + 1 < 4) f.sch.promote_next();
+    }
+    REQUIRE_EQ(f.pc.committed.size(), (size_t)1);
+    CHECK_EQ(f.pc.committed[0], 512);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
+    CHECK_EQ(f.sch.find(d)->output.size(), (size_t)5);
+}
+
+/* A chunk that restores from a prefix hit is one whole pass: the restore is consumed by the
+ * chunk's first (and only) pass, so a slice would start every sub-step from the same snapshot
+ * and write the same positions again. */
+TEST(a_chunk_that_restores_from_a_prefix_hit_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/16384, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/16384,
+            /*windowed=*/false, /*linear=*/true);
+    f.prog.meta.n_layers = 8;
+    f.cfg.checkpoint_interval = 256;         /* a recurrent hit resumes at a snapshot */
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    f.pc.seed(304);                          /* the attention blocks match 304 tokens deep ... */
+    f.pc.lin = 256;                          /* ... the last snapshot is at 256 */
+    f.pc.src = 3;
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_restore >= 0);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* A checkpoint inside the chunk would be a position whose state the remaining sub-steps have not
+ * written yet (a window's tail snapshot): the chunk runs whole, so its state is whole at it. */
+TEST(a_checkpoint_inside_a_chunk_is_never_sliced) {
+    Fixture f;
+    f.build(/*blocks=*/4096, /*states=*/64, /*max_tok=*/2048, /*max_ctx=*/4096,
+            /*windowed=*/true, /*linear=*/false);
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 2048;        /* no interval snapshot inside a 1000-row chunk */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(1000, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    const StepPlan& pl = f.sch.plan();
+    REQUIRE_EQ((int)pl.e.size(), 2);
+    REQUIRE(pl.e[1].ckpt_slot >= 0);
+    REQUIRE(pl.e[1].ckpt_tok + 1 < pl.e[1].n_tokens);
+    CHECK_EQ(pl.slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* The group freezes its decoders' rows, so a draft in flight would have its verify window's
+ * positions recomputed by every sub-step: a draft beside a chunk leaves the chunk whole. */
+TEST(a_draft_beside_a_chunk_leaves_the_chunk_whole) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    f.cfg.n_spec = 4;
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 512);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    int32_t draft[4] = { 21, 22, 23, 24 };
+    CHECK_OK(f.sch.set_draft(d, draft, 4));
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().n_spec, 4);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)p;
+}
+
+/* The embedding rows are scattered into the token rows once, on the group's first sub-step; the
+ * plugin carries them to the rest. The chunk's rows are the same on every sub-step. */
+TEST(a_group_scatters_its_media_on_the_first_slice_only) {
+    Fixture f;
+    media_fixture(f, /*max_tok=*/512, /*bidi=*/0);
+    f.prog.meta.n_layers = 8;
+    f.cfg.chunk_slices = 4;
+    f.cfg.slice_layers_ok = true;
+    f.cfg.checkpoint_interval = 0;           /* the chunk is the whole prompt, not cut short */
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+
+    const uint64_t p = f.add(with_run(f, 400, 200, 100, mm::Kind::Image));
+    CHECK(p != 0);
+    const RadBatch* b = f.sch.step();
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+    CHECK_EQ(b->n_tok, 401);                 /* the chunk's 400 rows and the decoder's */
+    CHECK_EQ(b->n_mm_rows, 100);
+    const int64_t n_tok = b->n_tok;
+
+    for (int32_t j = 1; j < 4; ++j) {
+        const RadBatch* nb = f.sch.step_next();
+        if (j < 3) {
+            REQUIRE(nb != nullptr);
+            CHECK_EQ(nb->n_tok, n_tok);
+            CHECK_EQ(nb->n_mm_rows, 0);
+        }
+        f.commit_plain(20 + j);
+        if (j < 3) f.sch.promote_next();
+    }
+    (void)d;
+    (void)p;
+}
+
+/* Nothing is admitted inside a group: a newcomer waits for the last sub-step, and the chunk's
+ * rows and blocks stay what they were. */
+TEST(admission_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const uint64_t q = f.submit(64, 8);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(f.sch.plan().slice_j, 1);
+    REQUIRE_EQ(nb->n_seq, 2);                /* the group's rows, not the newcomer's */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().slice_j, 2);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3, the last */
+    CHECK_EQ(f.sch.plan().slice_j, 3);
+    CHECK(f.sch.plan().slice_last);
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Waiting);
+
+    f.commit_plain(23);                      /* the last sub-step ends the group */
+    REQUIRE(f.sch.step() != nullptr);        /* and only now is the newcomer planned */
+    CHECK_EQ((int)f.sch.find(q)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.plan().slice_m, 0);
+    (void)d;
+    (void)p;
+}
+
+/* A preemption inside a group would hand the blocks its remaining sub-steps write to the next
+ * sequence: the fleet's room check waits for the group, then goes through again. */
+TEST(preemption_waits_for_a_group_s_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 0);
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Running);
+    CHECK_EQ(f.sch.metrics().preemptions, (int64_t)0);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(20);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    CHECK_EQ(nb->n_seq, 2);                  /* the group's next sub-step, still */
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    f.commit_plain(23);                      /* the group is over */
+
+    CHECK_EQ(f.sch.preempt_until([] { return false; }), 2);   /* both runners, as outside */
+    (void)p;
+}
+
+/* A cancel inside a group is recorded and acted on at its end: the row keeps its place (the
+ * chunk's rows below it read the same state) and its blocks until the last sub-step commits. */
+TEST(a_cancel_mid_group_keeps_the_decoder_s_row_until_the_last_slice) {
+    Fixture f;
+    slice_fixture(f, /*slices=*/4);
+    CHECK_OK(f.start());
+    const uint64_t d = f.submit(100, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    f.commit_plain(11);
+    const uint64_t p = f.submit(496, 64);
+    REQUIRE(f.sch.step() != nullptr);
+    CHECK_EQ(f.sch.plan().slice_m, 4);
+
+    const int64_t free0 = f.kv.free_blocks(0);
+    CHECK_OK(f.sch.cancel(d));
+    CHECK_EQ((int)f.sch.find(d)->state, (int)ReqState::Cancelled);
+    CHECK_EQ(f.kv.free_blocks(0), free0);    /* still the group's: the next sub-step writes it */
+    /* the server drains the closed request and reaps it, which the group defers */
+    CHECK_EQ(f.sch.reap(d), RAD_OK);
+
+    f.commit_plain(20);                      /* the cancelled row commits nothing */
+    REQUIRE_EQ(f.sch.find(d)->output.size(), (size_t)1);
+    const RadBatch* nb = f.sch.step();
+    REQUIRE(nb != nullptr);
+    REQUIRE_EQ(nb->n_seq, 2);                /* it keeps its place */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(21);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 2 */
+    CHECK_EQ(f.sch.plan().e[0].seq, d);
+    CHECK(f.sch.find(d) != nullptr);         /* held: its row is still planned */
+    f.commit_plain(22);
+    REQUIRE(f.sch.step() != nullptr);        /* sub-step 3 */
+    CHECK_EQ(f.kv.free_blocks(0), free0);
+
+    f.commit_plain(23);                      /* the last sub-step lets it go */
+    CHECK(f.sch.find(d) == nullptr);
+    CHECK(f.kv.free_blocks(0) > free0);
+    CHECK_EQ(f.sch.find(p)->output.size(), (size_t)1);
 }

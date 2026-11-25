@@ -14,6 +14,7 @@
 //
 // `dtype` only converts n_elem to bytes.
 #include "r4d.h"
+#include "r4d_chain.h"
 #include "r4d_ar_seq.h"
 #include <cstdint>
 #include <stdexcept>
@@ -62,7 +63,7 @@ __device__ __forceinline__ int r4d_g_src(int k, int row16, int n16, int sp16) {
 // resend re-pushes from `in4` (the gather has no in-place form, so nothing writes it here). Only for a
 // host twin (`stage` != 0); the launcher picks it.
 template <bool INJ = false, bool RS = false>
-__global__ void r4d_ar_gather_2rank_kernel(
+__device__ __forceinline__ void r4d_ar_gather_2rank_body(
     const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
     unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
     int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
@@ -192,11 +193,34 @@ __global__ void r4d_ar_gather_2rank_kernel(
   }
 }
 
+// The plain kernel and its chained form (r4d_chain.h) wrap the body; no block returns early, and
+// the handshake's flags are the kernel's own, so the wait only orders the operands behind it.
+template <bool INJ, bool RS>
+__global__ void r4d_ar_gather_2rank_kernel(
+    const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    unsigned int nbw, long long stage) {
+  r4d_ar_gather_2rank_body<INJ, RS>(in4, peer_base, my_base, out4, peer_flags, my_flags, seq_ctrs, n16,
+                           slot_stride16, rank, row16, dp16, sp16, drain, acq, nbw, stage);
+}
+template <bool INJ, bool RS>
+__global__ void r4dchain_ar_gather_2rank(
+    const int4* __restrict__ in4, int4* peer_base, const int4* my_base, int4* __restrict__ out4,
+    unsigned int* peer_flags, unsigned int* my_flags, unsigned int* seq_ctrs,
+    int n16, int slot_stride16, int rank, int row16, int dp16, int sp16, int drain, int acq,
+    unsigned int nbw, long long stage) {
+  r4d_chain_wait();
+  r4d_ar_gather_2rank_body<INJ, RS>(in4, peer_base, my_base, out4, peer_flags, my_flags, seq_ctrs, n16,
+                           slot_stride16, rank, row16, dp16, sp16, drain, acq, nbw, stage);
+  r4d_chain_done();
+}
+
 void r4d_ar_gather_2rank(long long peer_scratch, long long my_scratch, long long peer_flags, long long my_flags,
                          long long seq_ctrs, long long slot_stride16, long long inp, long long out, long long n_elem,
                          long long dtype, long long rank, long long row_elems, long long stream_i, long long nblocks,
                          long long nthreads, long long drain, long long acq, long long dpitch, long long spitch,
-                         long long stage) {
+                         long long stage, long long chain) {
   hipStream_t st = (hipStream_t)stream_i;
   const int esize = (dtype == 2) ? 4 : 2;
   const long long nbytes = (long long)n_elem * esize;
@@ -241,8 +265,11 @@ void r4d_ar_gather_2rank(long long peer_scratch, long long my_scratch, long long
   // host twin, as in r4d_ar_hc_write.
   const bool rs = (drain & R4D_AR_RESEND_BIT) != 0 && stage != 0;
   drain &= 0xffffffffLL & ~(long long)R4D_AR_RESEND_BIT;
+  // `chain` picks the chained form (r4d_chain.h) of whichever instantiation runs; only the AQL
+  // backend ever asks for it (Windows' native HIP launches never carry a chain record).
 #define R4D_ARG2(INJ_, RS_, dr_)                                                              \
-  r4d_ar_gather_2rank_kernel<INJ_, RS_><<<nb, nt, 0, st>>>(                                      \
+  (chain ? r4dchain_ar_gather_2rank<INJ_, RS_> : r4d_ar_gather_2rank_kernel<INJ_, RS_>)        \
+      <<<nb, nt, 0, st>>>(                                                                     \
       (const int4*)inp, (int4*)peer_scratch, (const int4*)my_scratch, (int4*)out,              \
       (unsigned*)peer_flags, (unsigned*)my_flags, (unsigned*)seq_ctrs, n16,                    \
       (int)slot_stride16, (int)rank, row16, dp16, sp16, (dr_), (int)acq, nbw, stage)

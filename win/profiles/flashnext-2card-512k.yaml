@@ -1,0 +1,78 @@
+# Brilliance profile: Qwen3.8-Flash-Next IQR-V4 on two Radeon AI PRO R9700s (32 GB), tensor parallel
+# (TP2), with a 512K context (524,288 tokens) through static YaRN. Experts tiered between the cards
+# and host memory as in flashnext-2card. Runs (SUPPORT.md, "Context, slots and the KV cache"): on the
+# test machine it loaded in 17.8 s, held 524,384 tokens of cache, found three hidden codes in order at
+# 250K, 500K and 520K tokens, and prefilled 500K tokens at 5,147 tok/s (97 s).
+# flashnext-2card stays the profile for everyday use: YaRN is static, so it also changes the output
+# slightly at short contexts, and this profile runs two requests at once instead of eight.
+#
+# What differs from flashnext-2card, and why:
+#   rope-scaling: yarn:2          static YaRN, factor 2 over the 262,144 trained positions: the
+#                                 rotary reaches 524,288 (docs/YARN.md). Startup logs the `rope:`
+#                                 line. The MTP drafter gets the same factor.
+#   max-model-len: 524288         one request may reach 512K tokens, prompt and reply together.
+#   max-num-seqs: 2               with two cards visible HIP virtual memory is off, so the KV cache is
+#                                 sized whole at load: one full-length conversation (524,384 tokens,
+#                                 3.9 GiB a card) shared by the running requests. A second slot lets
+#                                 a short side request (a client's title or tags) run beside a long
+#                                 conversation while the cache has room; each slot also keeps a
+#                                 recurrent state (111 MiB a card).
+#   host-pool-mib: 18432          9 GiB a rank of pinned host memory for experts: the 512K cache and
+#                                 its larger activation arena take about 1.8 GiB more of each card than
+#                                 the 256K profile, and that many experts move to the pool (7.74 GiB
+#                                 a rank). About 1.25 GiB a rank stays spare, room for a card that
+#                                 also runs a desktop.
+#   prefix-cache-mib: 8192        the host tier that keeps a finished conversation's KV, sized so one
+#                                 512K conversation fits (7.4 GiB at int8): a return restores it
+#                                 instead of prefilling 500K tokens again.
+# Everything else is flashnext-2card's: int8 KV, the MTP drafting stack, 6,144-token prefill steps,
+# eight linear-state snapshots, the encoders in host memory, the exact wire.
+#
+# Host memory: 30.00 GiB pinned (the pools 18, the prefix tier 8, the encoders, embedding and
+# snapshots 3.8), against 24.10 GiB for flashnext-2card, within the 46.83 GiB Windows lets a process
+# pin with two cards visible on a 128 GB machine. The 47.68 GiB n-gram table is read from the file
+# through the page cache, as there. With about 96 GB of RAM the pin limit is near 35 GiB: set
+# prefix-cache-mib: 4096 there.
+#
+#   .\serve.ps1 flashnext-2card-512k -Bus 3,9
+#   .\serve.ps1 flashnext-2card-512k -Bus 3,9 -WhatIf     what it would set and run
+#
+# The model file: StillDeadcode/qwen3.8-next-flash-iqr-v4 on Hugging Face (revision 679c9432),
+# qwen3.8-next-flash-iqr-v4.rad, 113.32 GiB. The uncensored container
+# (StillDeadcode/qwen3.8-next-flash-uncensored-iqr-v4) has the same size, recipe and layout, so the
+# same memory settings apply: point `model:` at it. Its long-context retrieval was not measured.
+#
+# The cards: name TWO with -Bus (PCI buses) or -Device (HIP indices), as for flashnext-2card. A card
+# that also drives a display, or runs other GPU applications, can lose VRAM while the server loads:
+# raise memory.gpu-headroom-mib (for example to 1536) rather than setting gpu-memory-mib. Loopback only
+# and no key; -Listen and -ApiKey as for flashnext-2card.
+server:
+  host: 127.0.0.1
+  port: 8000
+memory:
+  gpu-headroom-mib: 160
+scheduler:
+  load-timeout: 600s
+models:
+  qwen3.8-next-flash:
+    model: D:/models/hf/StillDeadcode/qwen3.8-next-flash-iqr-v4/qwen3.8-next-flash-iqr-v4.rad
+    tp: 2
+    placement: expert_tiered
+    host-pool-mib: 18432
+    rope-scaling: yarn:2
+    max-num-seqs: 2
+    max-model-len: 524288
+    kv-cache-dtype: i8
+    prefix-cache-mib: 8192
+    checkpoint-slots: 8
+    vision-tower-placement: ram
+    num-speculative-tokens: 5
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-stop: 0.85
+    draft-depth-load: on
+    max-num-batched-tokens: 6144
+    prefill-span: 3
+    ngram-warm: false
+    weight-prefetch: off

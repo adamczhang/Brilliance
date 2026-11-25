@@ -67,11 +67,20 @@ struct ExpertPlane {
     /* Per layer, so a starved layer shows as a number, not only as a dark band. */
     std::vector<int32_t> layer_units;
     std::vector<int32_t> layer_resident;
+    /* Per layer, cumulative: routed experts and of them read in place across the link (rank 0's
+     * heat engine, weighted like `routed`). */
+    std::vector<int64_t> layer_routed;
+    std::vector<int64_t> layer_missed;
+    /* Rank 0's mover: promotions published before the pass that followed their copy (Mover::
+     * publish_landed), promotion copies sent between the routed layers of a pass (pacing), the
+     * marks that sent them, and copies the pass's end sent unpaced. */
+    int64_t early_published = 0, paced_units = 0, paced_marks = 0, paced_late = 0;
 
     /* Mover activity, cumulative since start; readers take rates by subtracting two polls. */
     int64_t promotions = 0, demotions = 0;
     /* Separate progress from thrash at the same move count; see HeatStats. */
     int64_t distinct_promoted = 0, readmits = 0;
+    int64_t readmit_16 = 0, readmit_128 = 0, readmit_1024 = 0, heat_steps = 0;
     /* Why a dispatch moved nothing. `refused` is the guard declining (the healthy steady state);
      * the starved counts mean the mover had nowhere to put the bytes. */
     int64_t dispatches = 0, refused = 0, no_candidate = 0;

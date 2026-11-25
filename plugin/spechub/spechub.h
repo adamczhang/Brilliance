@@ -34,6 +34,7 @@ struct RadMtpCoupleProposeCall {
     int64_t        vocab;
     int64_t        ld_idx, ld_val, ld_draw, st_round, st_row;
     int            round;
+    float          q_temp = 1.0f; /* Q = softmax(score / q_temp); 1 = the shortlist's own law */
 };
 
 /* The verify's operands: the sampler's own candidate plane, its parameter rows, the bound state
@@ -117,8 +118,14 @@ static inline RAD_SPECHUB_HD void rad_mtp_couple_propose_row(const RadMtpCoupleP
     for (int i = 0; i < 8; ++i) s.ids[i] = -1;
     if (s.draw.mode == 1) {
         s.status = -1;
+        const float* val = c.val + row * c.ld_val;
+        float kv[8];
+        if (c.q_temp != 1.0f) {
+            for (int i = 0; i < 8; ++i) kv[i] = val[i] / c.q_temp;
+            val = kv;
+        }
         if (s.draw.card == c.card[row] &&
-            rad_mtp_couple_build_q(idx, c.val + row * c.ld_val, c.vocab, &s)) {
+            rad_mtp_couple_build_q(idx, val, c.vocab, &s)) {
             const double u = rad_spechub_uniform(s.draw.seed, s.draw.base,
                                                  RAD_MTP_COUPLE_KEY_DRAFT + (uint64_t)c.round);
             s.x = s.ids[rad_mtp_couple_pick(s, u)];

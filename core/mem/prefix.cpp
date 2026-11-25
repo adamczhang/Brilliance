@@ -344,7 +344,24 @@ std::vector<BlockHash> PrefixCache::chain_all(const std::vector<int32_t>& tokens
                                   mm.data(), (int32_t)mm.size(), b * block_size_);
         hs.push_back(parent);
     }
+    stats_.chain_blocks += n_blocks;
     return hs;
+}
+
+void PrefixCache::chain_upto(const std::vector<int32_t>& tokens,
+                             const std::vector<MMContentKey>& mm, int64_t n_blocks,
+                             PrefixChain* chain) const {
+    std::vector<BlockHash>& hs = chain->hs;
+    if ((int64_t)hs.size() >= n_blocks) return;
+    hs.reserve((size_t)n_blocks);
+    BlockHash parent = hs.empty() ? BlockHash{} : hs.back();
+    const int64_t from = (int64_t)hs.size();
+    for (int64_t b = from; b < n_blocks; ++b) {
+        parent = chain_block_hash(parent, tokens.data() + b * block_size_, (int32_t)block_size_,
+                                  mm.data(), (int32_t)mm.size(), b * block_size_);
+        hs.push_back(parent);
+    }
+    stats_.chain_blocks += n_blocks - from;
 }
 
 /* A snapshot is on the chain when its key equals the chain hash at its position. Probe the
@@ -382,14 +399,19 @@ void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
                              const std::vector<MMContentKey>& mm,
                              std::vector<std::vector<int32_t>>* blocks_out,
-                             const HitCap* cap, uint64_t session) const {
+                             const HitCap* cap, uint64_t session, PrefixChain* chain) const {
     CacheHit hit;
     if (blocks_out) { blocks_out->assign(groups_.size(), {}); }
     if (!enabled_ || tokens.empty()) return hit;
     ++stats_.lookups;
 
     const int64_t n_full = (int64_t)tokens.size() / block_size_;
-    std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
+    /* A kept chain may run past what this lookup needs (a publish of the same request hashed the
+     * reply's blocks too); every use below is bounded by n_full. */
+    std::vector<BlockHash> own;
+    if (chain) chain_upto(tokens, mm, n_full, chain);
+    else own = chain_all(tokens, mm, n_full);
+    const std::vector<BlockHash>& hs = chain ? chain->hs : own;
 
     int64_t matched = 0;
     bool departed = false;              /* the prompt goes on where nothing is cached */
@@ -495,7 +517,8 @@ int PrefixCache::insert(uint64_t session,
                         const std::vector<int32_t>& tokens,
                         const std::vector<MMContentKey>& mm,
                         const std::vector<std::vector<int32_t>>& blocks,
-                        int64_t n_tokens, const std::string& label) {
+                        int64_t n_tokens, const std::string& label, int32_t lora_slot,
+                        PrefixChain* chain) {
     if (!enabled_) return RAD_OK;
     if (blocks.size() != groups_.size()) return RAD_E_INVAL;
     if (n_tokens > (int64_t)tokens.size()) return RAD_E_INVAL;
@@ -505,7 +528,20 @@ int PrefixCache::insert(uint64_t session,
     for (size_t g = 0; g < blocks.size(); ++g)
         if ((int64_t)blocks[g].size() < n_full * per_[g]) return RAD_E_INVAL;
 
-    std::vector<BlockHash> hs = chain_all(tokens, mm, n_full);
+    /* The prompt's blocks are the ones a lookup of this request already hashed, and a reply's are
+     * new: only those past the kept chain's reach are computed. The session index is told the
+     * published chain exactly, so a kept chain that runs past it (the reply was published, then
+     * the request's output was cut back) is narrowed for it. */
+    std::vector<BlockHash> own;
+    if (chain) chain_upto(tokens, mm, n_full, chain);
+    else own = chain_all(tokens, mm, n_full);
+    const std::vector<BlockHash>& hs = chain ? chain->hs : own;
+    std::vector<BlockHash> published;
+    const std::vector<BlockHash>* whole = &hs;
+    if ((int64_t)hs.size() != n_full) {
+        published.assign(hs.begin(), hs.begin() + n_full);
+        whole = &published;
+    }
     const uint64_t now = rad_mono_ns();
     /* The chain's entries, retained as the loop finds or makes them: map nodes are stable
      * across inserts, so the touch and tier passes below need no second and third find per
@@ -571,7 +607,7 @@ int PrefixCache::insert(uint64_t session,
             tiers_->note_used(hs[(size_t)b], entries[(size_t)b]->blocks, now, b);
     }
     /* The session index names no blocks, so it is kept with or without a host copy. */
-    if (tiers_) tiers_->note_session(session, hs, n_tokens, now, label);
+    if (tiers_) tiers_->note_session(session, *whole, n_tokens, now, label, lora_slot);
 
     take_over(session, hs, n_full * block_size_);
     return RAD_OK;

@@ -8,6 +8,7 @@
 #include "rad_internal.h"
 #include "engine_hostmem.h"
 #include "place/host_admit.h"
+#include "place/ngram_auto.h"
 #include "kld.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
@@ -67,6 +68,25 @@
 #include <chrono>
 
 namespace rad {
+
+/* Brilliance: page-aligned host blocks. The UCRT has no std::aligned_alloc; its aligned blocks
+ * come from _aligned_malloc and must go back through _aligned_free, never free(). Elsewhere these
+ * are std::aligned_alloc and std::free. */
+static inline void* host_aligned_alloc(size_t align, size_t bytes) {
+#if defined(_WIN32)
+    return _aligned_malloc(bytes, align);
+#else
+    return std::aligned_alloc(align, bytes);
+#endif
+}
+static inline void host_aligned_free(void* p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
 #ifndef RAD_LOADER_INTERNALS_TEST
 
 
@@ -277,11 +297,43 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
     for (const Shortfall& f : pools.shortfalls()) (f.pool == "host_pool" ? host : card) = true;
     if (card) {
         RadDeviceProps p{};
+#if defined(_WIN32)
+        /* Brilliance (issue #1): on Windows a card pool is also refused when the card has room,
+         * by commit (WDDM charges VRAM to it) or by a job object's memory limit on commit. Which
+         * one is told from the card's free memory against what the refused pools wanted. There is
+         * no rocm-smi here; the startup lines name who held the card when the budget read it. */
+        int64_t wanted = 0;
+        for (const Shortfall& f : pools.shortfalls())
+            if (f.pool != "host_pool") wanted += f.wanted;
+        if (rad_dev_props(device, &p) == RAD_OK) {
+            const JobMemoryLimit job = os::job_memory_limit();
+            const os::MemInfo mi = os::mem_info();
+            if (p.vram_free >= wanted && wanted > 0) {
+                const std::string note = job_limit_note(job);
+                RAD_ERR("card %d has %s of %s free now, room for the %s refused, so the card is not "
+                        "what refused it. %s",
+                        device, humanb(p.vram_free).c_str(), humanb(p.vram_bytes).c_str(),
+                        humanb(wanted).c_str(),
+                        !note.empty() ? note.c_str()
+                        : fmt("WDDM charges VRAM to commit: %s of commit is available (RAM + page "
+                              "file, %s in all); a larger page file raises it",
+                              humanb(mi.commit_avail).c_str(), humanb(mi.commit_limit).c_str()).c_str());
+            } else {
+                RAD_ERR("card %d has %s of %s free now. Its budget was measured before any rank "
+                        "allocated, so memory gone since then went to another process or to an "
+                        "allocation the budget does not count; the startup line `card %d ... "
+                        "other processes` named who held it then. A card that also drives a "
+                        "display needs a larger memory.gpu-headroom-mib",
+                        device, humanb(p.vram_free).c_str(), humanb(p.vram_bytes).c_str(), device);
+            }
+        }
+#else
         if (rad_dev_props(device, &p) == RAD_OK)
             RAD_ERR("card %d has %s of %s free now. Its budget was measured before any rank "
                     "allocated, so memory gone since then is another process's; rocm-smi "
                     "--showpids names it", device, humanb(p.vram_free).c_str(),
                     humanb(p.vram_bytes).c_str());
+#endif
     }
     if (host) {
         int64_t pinned = 0, mapped = 0;
@@ -354,7 +406,7 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
         return false;
     }
     if (const int64_t avail = meminfo_bytes("MemAvailable");
-        avail >= 0 && avail - still - margin < need) {
+        host_mem_short(avail, still, margin, need)) {
         *why = fmt("%s of memory is available, %s more is still to be allocated %s, and this "
                    "wants %s with %s to spare (--host-headroom-mib)",
                    humanb(avail).c_str(), humanb(still).c_str(),
@@ -377,7 +429,7 @@ bool lockable_room(int64_t need, int64_t still, int64_t margin, bool mlocks,
             int64_t pinned = 0, mapped = 0;
             rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
             rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-            if (pinned + mapped + still + need > cap) {
+            if (pin_cap_short(cap, pinned + mapped, still, need)) {
                 *why = fmt("Windows lets this process pin %s for its cards (the shared-memory budget "
                            "over the devices it sees, less a GiB kept for the load's staging "
                            "windows); it holds %s, %s more is still to be pinned%s, and this "
@@ -431,16 +483,38 @@ static int64_t lockable_bytes(int64_t still, int64_t margin, std::string* limit)
  * container, and pins it either way. Only a table of kTableShareMin or more is shared: the gather's
  * scale is an n-gram weight too, since it moves with the table between gather sites, and as a file
  * its two bytes would cost the 2 MiB header and a 2 MiB page. One copy per container address,
- * shared by every rank; freed in ~Engine. */
+ * shared by every rank; freed in ~Engine.
+ *
+ * The read is not waited for here: the four Engram tables are 59 GiB, and one after the other they
+ * took 42 s of a 66 s startup. Each fill is started as its table is met, so it reads beside the
+ * tables before it and beside the container pass, and join_table_fills waits for them all once that
+ * pass is done (B-01). The memory is reserved here, so the pointer is known, and a copy another
+ * engine filled is only checked: there is nothing to read. */
 int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                        std::string* why) {
     for (const auto& c : table_copy_of_)
         if (c.first == src) { *out = c.second; return RAD_OK; }
+    /* Brilliance: auto chose the copy at plan time; other processes may have taken memory since
+     * (11-22: two servers started in the same second, and this one pinned its table with about
+     * 12 GiB available). Measured again now, after the pools: below the floor auto's caller reads
+     * the table from the container instead (place/ngram_auto.h). */
+    if (cfg_.ngram_placement == TablePlacement::Auto) {
+        const int64_t avail = meminfo_bytes("MemAvailable");
+        const int64_t margin = ngram_auto_margin(host_margin_bytes());
+        if (host_mem_short(avail, 0, margin, n)) {
+            *why = fmt("%s of memory is available now, and the copy wants %s with %s to spare; "
+                       "other processes took memory after the plan chose it",
+                       humanb(avail).c_str(), humanb(n).c_str(), humanb(margin).c_str());
+            return RAD_E_NOMEM;
+        }
+    }
     const auto t0 = std::chrono::steady_clock::now();
     auto since = [&] {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
     void* base = nullptr;
+    PendingTable p;
+    p.bytes = n;
     if (card && !cfg_.ngram_share_dir.empty() && n >= kTableShareMin) {
         const std::string id = table_share_id(file_->path(), foff, n);
         if (id.empty()) {
@@ -458,50 +532,111 @@ int Engine::copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, v
             table_share_close(&s);
             return RAD_E_NOMEM;
         }
-        if (s.filler) {
-            rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
-            if (rc == RAD_OK) rc = table_share_mark_ready(&s, n, id, why);
-        } else {
+        if (!s.filler) {
             rc = table_copy_check(src, n, static_cast<const uint8_t*>(base), why);
-            if (rc != RAD_OK)
-                *why = fmt("the shared file %s does not match the container (%s)", s.path.c_str(),
-                           why->c_str());
-        }
-        if (rc != RAD_OK) {
+            if (rc == RAD_OK) {
+                card_copies_.push_back(base);
+                table_shares_.push_back(s);
+                RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared "
+                         "file %s, reused (probes match) in %.1f s%s", humanb(n).c_str(),
+                         s.path.c_str(), since(), at_now().c_str());
+                table_copy_of_.push_back({ src, base });
+                *out = base;
+                return RAD_OK;
+            }
+            *why = fmt("the shared file %s does not match the container (%s)", s.path.c_str(),
+                       why->c_str());
             rad_dev_free(base, RAD_MEM_HOST_MAPPED);
             table_share_close(&s);
             return rc;
         }
-        card_copies_.push_back(base);
-        table_shares_.push_back(s);
-        RAD_INFO("placement: n-gram table in pinned memory the cards read, %s in shared file %s, "
-                 "%s in %.1f s", humanb(n).c_str(), s.path.c_str(),
-                 s.filler ? "filled" : "reused (probes match)", since());
+        p.shared = true;
+        p.share = s;
+        p.id = id;
+        p.line = fmt("n-gram table in pinned memory the cards read, %s in shared file %s",
+                     humanb(n).c_str(), s.path.c_str());
     } else if (card) {
         base = rad_dev_alloc(n, RAD_MEM_HOST_MAPPED);
         if (!base) {
             *why = fmt("pinning %s: %s", humanb(n).c_str(), rad_dev_last_error());
             return RAD_E_NOMEM;
         }
-        const int rc = table_copy_fill(*file_, src, n, foff, static_cast<uint8_t*>(base), why);
-        if (rc != RAD_OK) {
-            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
-            return rc;
-        }
-        card_copies_.push_back(base);
-        RAD_INFO("placement: n-gram table copied into pinned memory the cards read, %s in %.1f s",
-                 humanb(n).c_str(), since());
+        p.line = fmt("n-gram table copied into pinned memory the cards read, %s",
+                     humanb(n).c_str());
     } else {
         TableCopy tc;
-        const int rc = table_copy_make(*file_, src, n, foff, &tc, why);
+        const int rc = table_copy_reserve(n, &tc, why);
         if (rc != RAD_OK) return rc;
-        table_copies_.push_back(tc);
         base = tc.base;
-        RAD_INFO("placement: n-gram table copied into locked memory, %s in %.1f s",
-                 humanb(n).c_str(), since());
+        p.copy = tc;
+        p.locked = true;
+        p.line = fmt("n-gram table copied into locked memory, %s", humanb(n).c_str());
     }
+    const int started = p.fill.start(*file_, src, n, foff, static_cast<uint8_t*>(base));
+    if (started != RAD_OK) {
+        /* No reader runs, so the memory is still this call's to release, as a failed copy's is. */
+        *why = fmt("starting the read of %s: %s", humanb(n).c_str(), rad_strerror(started));
+        if (p.shared) {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+            table_share_close(&p.share);
+        } else if (p.locked) {
+            table_copy_free(&p.copy);
+        } else {
+            rad_dev_free(base, RAD_MEM_HOST_MAPPED);
+        }
+        return started;
+    }
+    p.base = base;
+    pending_tables_.push_back(std::move(p));
     table_copy_of_.push_back({ src, base });
     *out = base;
+    return RAD_OK;
+}
+
+/* B-01: waits for the fills copy_table started, once the container pass has read beside them. Each
+ * table keeps its placement line with the read's own length added, and the copy is published only
+ * once its bytes are there and check out: a fill that failed releases its memory and the load
+ * fails, auto placement included (a pin the machine declined fails before the read starts, where
+ * auto still falls back to the disk; what fails here is the container's read). */
+int Engine::join_table_fills() {
+    if (pending_tables_.empty()) return RAD_OK;
+    int bad = RAD_OK;
+    std::string bwhy;
+    for (PendingTable& p : pending_tables_) {
+        std::string why;
+        int rc = p.fill.wait(&why);
+        if (rc == RAD_OK && p.shared) rc = table_share_mark_ready(&p.share, p.bytes, p.id, &why);
+        if (rc != RAD_OK) {
+            if (p.shared) {
+                rad_dev_free(p.base, RAD_MEM_HOST_MAPPED);
+                table_share_close(&p.share);
+            } else if (p.locked) {
+                table_copy_free(&p.copy);
+            } else {
+                rad_dev_free(p.base, RAD_MEM_HOST_MAPPED);
+            }
+            if (bad == RAD_OK) {
+                bad = rc;
+                bwhy = fmt("%s: %s", p.line.c_str(), why.c_str());
+            }
+            continue;
+        }
+        if (p.shared) {
+            card_copies_.push_back(p.base);
+            table_shares_.push_back(p.share);
+        } else if (p.locked) {
+            table_copies_.push_back(p.copy);
+        } else {
+            card_copies_.push_back(p.base);
+        }
+        RAD_INFO("placement: %s, filled beside the container pass in %.1f s%s", p.line.c_str(),
+                 p.fill.seconds(), at_now().c_str());
+    }
+    pending_tables_.clear();
+    if (bad != RAD_OK) {
+        RAD_ERR("an n-gram table's read beside the container pass failed: %s", bwhy.c_str());
+        return bad;
+    }
     return RAD_OK;
 }
 
@@ -527,9 +662,10 @@ int Engine::table_file_map(const uint8_t* src, int64_t n, int64_t foff, void** o
     const int rc = table_file_open(*file_, src, n, foff, path, &c, &filled, why);
     if (rc != RAD_OK) return rc;
     table_files_.push_back(c);
-    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s)", path.c_str(), humanb(n).c_str(),
+    RAD_INFO("placement: n-gram table read from %s (%s%s, %.1f s%s)", path.c_str(), humanb(n).c_str(),
              filled ? ", filled from the container" : "",
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+             at_now().c_str());
     *out = c.base;
     return RAD_OK;
 }
@@ -595,7 +731,9 @@ static void log_table_room_refusal(const char* opt, const std::string& table, co
  * device kernel, or locked for the host gather); Disk in the container, read by the host gather.
  * Each tier is refused where no kernel reads it. Auto takes the first that fits, in that order.
  * The card test: the fixed weights plus a KV pool for one --max-model-len sequence (`kv_floor`).
- * The RAM test: lockable_room after the pools still to be allocated. */
+ * The RAM test: lockable_room after the pools still to be allocated. Brilliance: auto's RAM test
+ * keeps max(24 GiB, --host-headroom-mib) free, and on Windows a table larger than a quarter of RAM
+ * is read from the file even where it would fit (place/ngram_auto.h, ngram_auto_choose). */
 int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                                     const std::vector<int64_t>& emb_bytes,
                                     const std::vector<WeightFootprint>& wfs, int64_t kv_floor,
@@ -874,8 +1012,27 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
         std::string card_why, ram_why;
         const bool card = ng == TablePlacement::Auto && ngram_device && card_holds(&card_why);
         const std::vector<HostPart> parts = still_parts(true, true);
-        const bool room = !card && lockable_room(need, still, host_margin_bytes(), !ngram_device,
-                                                 &ram_why, &parts);
+        /* Brilliance: auto keeps the host floor beside the copy (place/ngram_auto.h); an explicit
+         * ram keeps the configured headroom. */
+        const int64_t margin = ng == TablePlacement::Auto ? ngram_auto_margin(host_margin_bytes())
+                                                          : host_margin_bytes();
+        const bool room = !card && lockable_room(need, still, margin, !ngram_device, &ram_why,
+                                                 &parts);
+#if defined(_WIN32)
+        const bool file_preferred = true;
+#else
+        const bool file_preferred = false;
+#endif
+        const int64_t total = meminfo_bytes("MemTotal");
+        NgramAutoIn ain;
+        ain.device = ngram_device;
+        ain.host = ngram_host;
+        ain.card_holds = card;
+        ain.ram_room = room;
+        ain.file_preferred = file_preferred;
+        ain.need = need;
+        ain.total = total;
+        const NgramAutoTier at = ngram_auto_choose(ain);
         if (ng == TablePlacement::Ram) {
             if (!room) {
                 RAD_ERR("--ngram-placement ram: the n-gram table (%s) cannot be held in memory as "
@@ -883,19 +1040,30 @@ int Engine::resolve_table_placement(const std::vector<VramFacts>& facts,
                 return RAD_E_NOMEM;
             }
             ng_why = share_note.empty() ? std::string("as asked") : "as asked, as " + share_note;
-        } else if (card) {
+        } else if (at == NgramAutoTier::Vram) {
             ng = TablePlacement::Vram;
             ng_why = "the card holds it beside the other weights and a KV pool for one "
                      "--max-model-len sequence";
-        } else if (room) {
+        } else if (at == NgramAutoTier::Ram) {
             ng = TablePlacement::Ram;
-            ng_why = fmt("%sthe memory%s and the cgroups allow %s",
+            ng_why = fmt("%sthe memory%s and the cgroups allow %s with %s to spare",
                          ngram_device ? (card_why + "; ").c_str() : "",
-                         ngram_device ? "" : ", the memlock limit", copy);
-        } else if (ngram_host) {
+                         ngram_device ? "" : ", the memlock limit", copy, humanb(margin).c_str());
+        } else if (at == NgramAutoTier::Disk && room) {
+            /* Brilliance: Windows, a copy that would fit but would lock more than a quarter of
+             * RAM; the prefetched file read serves cold prefill at the warm speed. */
             ng = TablePlacement::Disk;
-            ng_why = fmt("%s%s does not fit: %s", ngram_device ? (card_why + "; ").c_str() : "",
-                         copy, ram_why.c_str());
+            ng_why = fmt("%s%s would fit, but it would lock %s, more than a quarter of the %s of "
+                         "RAM, for the process's life; the rows are read from the file, which "
+                         "the gather prefetches (set ngram-placement: ram to pin it anyway)",
+                         ngram_device ? (card_why + "; ").c_str() : "", copy,
+                         humanb(need).c_str(), humanb(total).c_str());
+        } else if (at == NgramAutoTier::Disk) {
+            ng = TablePlacement::Disk;
+            ng_why = fmt("%s%s does not fit beside the %s auto keeps free (the larger of 24 GiB "
+                         "and --host-headroom-mib): %s",
+                         ngram_device ? (card_why + "; ").c_str() : "", copy,
+                         humanb(margin).c_str(), ram_why.c_str());
         } else {
             RAD_ERR("--ngram-placement auto: the n-gram table (%s) has nowhere to go: %s; %s does "
                     "not fit (%s); and no loaded kernel plugin gathers it on the host, which is "
@@ -1134,6 +1302,7 @@ int Engine::load_plugins() {
         RAD_TRY(rad_engine_claim(plugins_.arch_plugin, cfg_.tp, &base));
         slot_base_ = base;
         reg_->set_tp_group(base);
+        reg_->set_declare_only(cfg_.debug_graph && device_is_host());
     }
     const Plugin* ap = reg_->plugin(plugins_.arch_plugin);
     arch_step_ = ap ? ap->arch_step : nullptr;
@@ -1189,6 +1358,12 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     /* A streamed-only op is declared only when the architecture streams and the flag asks
      * (kvstream_op_gated). */
     bc.kv_stream_ok = arch_probe_.kv_stream_ok;
+    /* S-02: the trunk layers, from the first, whose persistent state a chunk's sub-step carries to
+     * the next — the whole trunk when a sliced pass can happen at all (--chunk-slices asks and the
+     * plugin reports it can run the trunk over a layer range). 0 says the builder declares no such
+     * set, so a slice has nothing to resume from and no chunk is sliced on this model. */
+    bc.layer_slices = cfg_.chunk_slices != 0 && cfg_.slice_layers_ok
+                          ? (int32_t) meta_.n_layers : 0;
     /* The control vector, when one is loaded: this rank's view, or null. A plugin reads it at
      * declare only (the direction table never changes); the per-request switch rides the derived
      * mask, not this struct. */
@@ -1208,6 +1383,13 @@ int Engine::declare() {
                std::string("architecture '") + (meta_.arch_id ? meta_.arch_id : "?") +
                    "' has no streamed KV path");
     }
+    /* S-02: the plugin reports whether its step's trunk can be stopped between two layers and
+     * resumed from a persistent set (RadArchProbe::slice_layers_ok). --chunk-slices asks for
+     * slicing; the report is what decides it, so it lands in the scheduler's cfg (the flow
+     * RadArchProbe::ckpt_snap_ok takes), and the builder is told to declare the set
+     * (RadBuildCtx::layer_slices, build_ctx) only when a sliced pass can happen. A model that does
+     * not report it plans m = 1 and the scheduler says why. */
+    cfg_.slice_layers_ok = arch_probe_.slice_layers_ok != 0;
     RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
@@ -1481,18 +1663,18 @@ int Engine::declare() {
      * `draft_suffix_max` rows of the sequence's own history while the head still drafts its own
      * `n_spec` rounds, so the verify window every consumer of `n_spec` sees (buffers, rings, the
      * scheduler's window) becomes the larger of the two and the head's rounds are kept apart in
-     * `n_spec_head`. A serial head's chain only: a block drafter's block is fixed. It works with
-     * the fixed chain, with --draft-depth adaptive (whose depth stays within the head's rounds)
-     * and with the traversal verify (a suffix row binds no coupled state, so it is a leaf of the
-     * walk); the block verify decides a head chain as a whole and is refused. */
+     * `n_spec_head`. A drafter's chain (a serial head's, or a block drafter's whose window is its
+     * block): not a tree. It works with the fixed chain, with --draft-depth adaptive (whose depth
+     * stays within the head's rounds or the block) and with the traversal verify (a suffix row
+     * binds no coupled state, so it is a leaf of the walk); the block verify decides a head chain
+     * as a whole and is refused. */
     cfg_.n_spec_head = 0;
     if (cfg_.draft_suffix) {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb, cfg_.image_gen_max_pixels, cfg_.image_gen_max_refs);
         const char* bad = nullptr;
         if (cfg_.n_spec <= 0)                         bad = "speculation is off (this container carries no draft head)";
-        else if (draft_tree_)                         bad = "it needs the head's chain, not a block drafter's tree";
-        else if (pb.draft_depth_fixed)                bad = "this drafter is a block drafter, not a serial head";
+        else if (draft_tree_)                         bad = "it needs a drafter's chain, not a block drafter's tree";
         else if (cfg_.draft_window == DraftWindow::Adaptive)
                                                       bad = "it needs the fixed window (--draft-window fixed)";
         else if (cfg_.draft_verify_block)             bad = "it cannot be combined with --draft-verify block "
@@ -1500,6 +1682,15 @@ int Engine::declare() {
         if (bad) {
             RAD_ERR("--draft-suffix on: %s", bad);
             return RAD_E_UNSUPPORTED;
+        }
+        /* A block drafter (DFlash2): its pass and its buffers are declared for the block the
+         * verify window names (num-speculative-tokens picks it), so the window stays the block's
+         * and a suffix chain is cut to it. Its context pass mirrors every row the trunk verified,
+         * so a suffix step leaves no hole in its cache. */
+        if (pb.draft_depth_fixed && cfg_.draft_suffix_max > cfg_.n_spec) {
+            RAD_WARN("--draft-suffix-max %d: a block drafter's verify window is its block, %d draft(s); "
+                     "a suffix step verifies at most that many", cfg_.draft_suffix_max, cfg_.n_spec);
+            cfg_.draft_suffix_max = cfg_.n_spec;
         }
         const int window = std::max(cfg_.n_spec, cfg_.draft_suffix_max);
         if (window > (int)RAD_SCHED_MAX_SPEC) {
@@ -1777,6 +1968,20 @@ int Engine::declare() {
     /* A tree drafter (rad_drafter_tree): its parents plane rides with the proposal. */
     tree_         = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && p0.drafter_tree;
     tree_parents_ = tree_ ? p0.drafter_parents : 0;
+    /* --draft-suffix on a block drafter: its block is the verify window it was declared for, so a
+     * window widened past num-speculative-tokens would have run a different block. */
+    if (cfg_.draft_suffix && drafter_.kind == RAD_DRAFT_BLOCK && cfg_.n_spec_head > 0 &&
+        cfg_.n_spec != cfg_.n_spec_head) {
+        RAD_ERR("--draft-suffix on: '%s' is a block drafter, whose block is the verify window; "
+                "--draft-suffix-max %d is past its %d draft(s) (set it to at most "
+                "num-speculative-tokens)", drafter_.name, cfg_.draft_suffix_max, cfg_.n_spec_head);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (cfg_.draft_suffix && drafter_.kind == RAD_DRAFT_BLOCK && tree_) {
+        RAD_ERR("--draft-suffix on: '%s' proposes a tree; the suffix selector replaces a chain "
+                "(--draft-tree off)", drafter_.name);
+        return RAD_E_UNSUPPORTED;
+    }
     /* --draft-short-from auto: a chain keeps its own block, a tree runs its short block from two
      * decoding sequences on. Its nodes are verify rows every drafting sequence pays for, which a
      * wide tree's extra nodes repay at one sequence and not at many. */
@@ -1831,7 +2036,9 @@ int Engine::declare() {
     } else if (cfg_.n_spec > 0) {
         RAD_INFO("speculation: prompt lookup only -- this container declares no draft head");
     }
+    const uint64_t t_lv = rad_mono_ns();
     probe_arena_levels();
+    phase_done("arena levels", t_lv);
     return RAD_OK;
 }
 
@@ -2020,6 +2227,25 @@ int Engine::plan() {
         std::vector<VramFacts> facts;
         facts.reserve(ranks_.size());
         late_step_bytes_ = late_lazy_bytes_ = 0;
+        /* Brilliance: every other process's use of each card, read beside the budget's own reading
+         * of it (mem/vram_others.h). The budget counts it as already held; the line names who holds
+         * it, and the settle check below names any that take more before the engine serves. */
+        {
+            std::vector<int> cards;
+            std::vector<std::string> bdfs;
+            std::vector<int64_t> reserves;
+            std::vector<bool> named;
+            for (size_t ri = 0; ri < ranks_.size(); ++ri) {
+                auto& r = ranks_[ri];
+                cards.push_back(r->device);
+                bdfs.push_back(dev_pci_address(r->device));
+                reserves.push_back(vram_budget_headroom_mib(cfg_, ri));
+                named.push_back(cfg_.card_headroom_mib.count(r->device) != 0);
+            }
+            vram_others_read_ = read_vram_holders(bdfs);
+            const std::string seen = vram_holders_report(cards, bdfs, vram_others_read_, reserves, named);
+            if (!seen.empty()) RAD_INFO("device: %s", seen.c_str());
+        }
         /* The lookup tables' sizes: per rank where sharded (the embedding; the towers are read
          * from `wfs`), once where not (the n-gram table, read by every rank from one mapping). */
         std::vector<int64_t> emb_bytes;
@@ -2447,6 +2673,20 @@ int Engine::plan() {
                          ? fmt(", and %lld MiB stay unclaimed", (long long)rs.unusable_mib).c_str()
                          : "");
         }
+        /* A named card's larger reserve determines the common TP split. Other cards may spend
+         * their additional room on experts without changing the KV coverage shared by all ranks. */
+        if (!broker_ && !cfg_.card_headroom_mib.empty() && cfg_.placement == "expert_tiered") {
+            for (size_t i = 0; i < facts.size(); ++i) {
+                const int64_t spare = vram_budget_rank_spare_mib(cfg_, facts, i);
+                const int64_t cap = (facts[i].statics + expert_vram_floor(wfs[i], 0)) / kMiB;
+                const int64_t add = std::min(spare,
+                    std::max<int64_t>(cap - rank_cfg_[i].vram_weights_mib, 0));
+                if (add <= 0) continue;
+                rank_cfg_[i].vram_weights_mib += add;
+                RAD_INFO("card %d uses %lld MiB of room above its own headroom for resident experts",
+                         ranks_[i]->device, (long long)add);
+            }
+        }
     }
 
     /* Brilliance, a test knob: BRILLIANCE_DEBUG_WEIGHTS_MIB lowers every rank's weights pool to N
@@ -2487,6 +2727,39 @@ int Engine::plan() {
             return rc;
         }
     }
+
+    /* B-03: every rank's pinned host pool is allocated inside the configure below; the phase
+     * runs from the first rank's configure to the loop's end. */
+    const uint64_t t_pin = rad_mono_ns();
+#if defined(_WIN32)
+    /* Brilliance (issue #1): a Windows job object's memory limit caps commit, and WDDM charges
+     * hipMalloc VRAM to commit, so a plan past it would see a card pool refused as out of memory
+     * with room on the card. Checked from the budgets before any pool, every start and
+     * --plan-only alike. */
+    {
+        const JobMemoryLimit job = os::job_memory_limit();
+        if (job.binding() >= 0) {
+            const int64_t MiB = (int64_t)1 << 20;
+            int64_t vram = 0, pins = cfg_.prefix_cache_mib * MiB;
+            for (const Config& rc : rank_cfg_) {
+                vram += (rc.vram_weights_mib + rc.vram_kv_mib) * MiB;
+                pins += rc.host_pool_total_mib() * MiB;
+            }
+            /* Measured (win/os/job_limit.h): hipMalloc pools are charged to commit, HIP
+             * virtual-memory ones are not; with more than one card visible every pool is a
+             * hipMalloc. */
+            const JobLimitVerdict v =
+                job_limit_verdict(job, os::process_commit(), vram, pins, !VMem::supported());
+            if (v.refuse) {
+                RAD_ERR("host: %s. Nothing was allocated for it.", v.message.c_str());
+                if (cfg_.plan_only) RAD_ERR("--plan-only: stopped before loading: the job object's "
+                                            "memory limit refused the budgets");
+                return RAD_E_NOMEM;
+            }
+            RAD_INFO("host: %s", v.message.c_str());
+        }
+    }
+#endif
 
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
@@ -2575,6 +2848,7 @@ int Engine::plan() {
                      "holds no weights; its %lld MiB (its share of --host-pool-mib) stay allocated, as on "
                      "every rank", r->index, (long long)cfg_.host_pool_mib);
     }
+    phase_done("host pool pin", t_pin);
     /* Brilliance: --plan-only stops here, every rank planned and nothing allocated or read. The
      * admission is run again from the plans, as load_weights runs it before filling the store. */
     if (cfg_.plan_only) {
@@ -3040,16 +3314,20 @@ public:
     }
     ~RelayoutPool() {
         finish();
-        for (StagedWeight& s : items_) if (s.own) delete[] s.in;
+        for (StagedWeight& s : items_) if (s.own) {
+            if (bounded_host_inputs_) host_aligned_free(s.in);
+            else delete[] s.in;
+        }
         if (region_) ::munmap(region_, (size_t)budget_);
     }
 
     /* Inputs share one budget-sized region, reused as weights finish: fresh memory per input
      * would page-fault every 4 KiB, which dominates load CPU time. An input with no hole its size
      * (larger than the budget, or fragmentation) gets its own allocation. */
-    void start(int threads, int64_t budget) {
+    void start(int threads, int64_t budget, bool bounded_host_inputs = false) {
         budget_ = budget;
-        void* p = ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
+        bounded_host_inputs_ = bounded_host_inputs;
+        void* p = bounded_host_inputs_ ? MAP_FAILED : ::mmap(nullptr, (size_t)budget_, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p != MAP_FAILED) {
             region_ = (uint8_t*)p;
@@ -3252,8 +3530,31 @@ public:
 
     bool failed() const { return failed_; }
     int64_t peak() const { return peak_; }
+    bool host_outputs_only() const {
+        return std::none_of(items_.begin(), items_.end(), [](const StagedWeight& w) { return w.dev; });
+    }
+    bool bounded_host_inputs() const { return bounded_host_inputs_; }
+    static int check_host_fill(const std::vector<StagedWeight>& items, int64_t budget) {
+        if (budget < 0) return RAD_E_INVAL;
+        int64_t input_bytes = 0;
+        for (const StagedWeight& s : items) {
+            if (!s.prog || s.wi >= s.prog->weights.size() || !s.clip) return RAD_E_STATE;
+            if (s.in_bytes < 0 || s.in_bytes > budget - input_bytes || s.in_bytes > INT64_MAX - 4095)
+                return RAD_E_FULL;
+            const int64_t rounded = std::max(align_up(s.in_bytes, (int64_t)4096), (int64_t)4096);
+            if (rounded > budget - input_bytes) return RAD_E_FULL;
+            input_bytes += rounded;
+            const WeightInfo& w = s.prog->weights[s.wi];
+            const auto parts = clip_parts(*s.clip, s.dst, w.stored_bytes);
+            const bool partial = !(parts.size() == 1 && parts[0].first == 0 && parts[0].second == w.stored_bytes);
+            if (partial && (!w.identity || w.widen || w.narrow) && w.stored_bytes > kHostOutputBytes)
+                return RAD_E_FULL;
+        }
+        return RAD_OK;
+    }
 
 private:
+    friend struct LoaderTransferTestAccess;
     void worker() {
         for (;;) {
             int i = -1;
@@ -3286,9 +3587,14 @@ private:
             StagedWeight& s = items_[(size_t)i];
             if (!failed_) input(i);
             const uint8_t* src[RAD_ENC_MAX_PLANES] = {};
-            for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k) src[k] = s.in + s.plane_off[k];
+            if (s.in)
+                for (int k = 0; k < s.prog->weights[s.wi].n_sel; ++k) src[k] = s.in + s.plane_off[k];
             const int st = failed_ ? RAD_E_STATE : run(s, src);
-            if (s.own) { delete[] s.in; s.in = nullptr; s.own = false; }
+            if (s.own) {
+                if (bounded_host_inputs_) host_aligned_free(s.in);
+                else delete[] s.in;
+                s.in = nullptr; s.own = false;
+            }
             std::lock_guard<std::mutex> lk(mu_);
             if (s.in) give_back(s.in - region_, align_up(s.in_bytes, kHole));
             s.in = nullptr;
@@ -3315,8 +3621,14 @@ private:
                     return;
                 }
             }
-            s.in = new uint8_t[(size_t)s.in_bytes];
-            s.own = true;
+            s.in = bounded_host_inputs_ ? (uint8_t*)host_aligned_alloc((size_t)kHole, (size_t)std::max(n, kHole))
+                                       : new uint8_t[(size_t)s.in_bytes];
+            s.own = s.in != nullptr;
+            if (!s.in) {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (!failed_) { failed_ = true; status_ = RAD_E_NOMEM; }
+                room_.notify_all();
+            }
         });
         return s.in;
     }
@@ -3339,7 +3651,9 @@ private:
      * one row of a column share at a time. */
     void take(const Copy& c) {
         const LoadRun& q = c.q;
-        uint8_t* base = q.stage >= 0 ? input(q.stage) + (intptr_t)q.dst : q.dst;
+        uint8_t* base = q.stage >= 0 ? input(q.stage) : q.dst;
+        if (!base) return;
+        if (q.stage >= 0) base += (intptr_t)q.dst;
         int64_t got = 0;
         for (int64_t y = c.j0 > q.foff && q.sp > 0 ? (c.j0 - q.foff) / q.sp : 0; y < q.ny; ++y) {
             const int64_t ps = q.foff + y * q.sp;
@@ -3437,11 +3751,18 @@ private:
             const int fs = s.fill(s.in);
             if (fs < 0) return fs;
         }
+        const int64_t n = w.stored_bytes;
+        std::vector<std::pair<int64_t, int64_t>> parts;
+        if (s.clip) parts = clip_parts(*s.clip, s.dst, n);
+        else parts.push_back({ 0, n });
+        if (parts.empty()) return RAD_OK;
         /* Stored as read (only reached by a weight with no sweep, no dtype conversion). */
         if (w.identity && !w.widen && !w.narrow) {
-            const int64_t n = w.stored_bytes;
-            if (!s.dev) { std::memcpy(s.dst, src[0], (size_t)n); return RAD_OK; }
-            const int us = upload(s.dst, src[0], n, s.device);
+            int us = RAD_OK;
+            for (const auto& [off, len] : parts) {
+                if (!s.dev) std::memcpy(s.dst + off, src[0] + off, (size_t)len);
+                else if ((us = upload(s.dst + off, src[0] + off, len, s.device)) < 0) break;
+            }
             if (us < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
                                 s.device, rad_strerror(us));
             return us;
@@ -3449,15 +3770,25 @@ private:
         RadTensor pt[RAD_ENC_MAX_PLANES];
         weight_planes(w, pt);
         for (int k = 0; k < w.n_sel; ++k) pt[k].data = const_cast<uint8_t*>(src[k]);
-        const int64_t n = w.stored_bytes;
-        std::vector<std::pair<int64_t, int64_t>> parts;
-        if (s.clip) parts = clip_parts(*s.clip, s.dst, n);
-        else parts.push_back({ 0, n });
         /* Laid out in a ring piece the copies read directly; one larger than a piece can be laid
          * out in host memory and goes up a chunk at a time. */
         std::unique_ptr<uint8_t[]> tmp;
         PinRing::Piece pc;
         uint8_t* out = s.dst;
+        std::unique_lock<std::mutex> host_output(host_output_mu_, std::defer_lock);
+        std::unique_ptr<uint8_t, decltype(&host_aligned_free)> host_tmp(nullptr, &host_aligned_free);
+        const bool partial_host = !s.dev &&
+            !(parts.size() == 1 && parts[0].first == 0 && parts[0].second == n);
+        if (partial_host) {
+            /* A layout hook writes a whole weight; neighbouring chunks may be unmapped. Keep
+             * one bounded output scratch, within kRefillHost's allowance, then clip CPU writes.
+             * Oversized background batches stay available for an ordinary demand restore. */
+            if (n > kHostOutputBytes) return RAD_E_FULL;
+            host_output.lock();
+            host_tmp.reset((uint8_t*)host_aligned_alloc((size_t)kHole, (size_t)align_up(n, kHole)));
+            if (!host_tmp) return RAD_E_NOMEM;
+            out = host_tmp.get();
+        }
         if (s.dev) {
             if (n <= ring_.largest()) pc = ring_.take(n);
             if (pc) {
@@ -3504,6 +3835,9 @@ private:
             if (st == RAD_OK) st = gs;
             if (st < 0) RAD_ERR("load: '%s': the upload to device %d failed: %s", w.name.c_str(),
                                 s.device, rad_strerror(st));
+        } else if (partial_host) {
+            for (const auto& [off, len] : parts)
+                std::memcpy(s.dst + off, out + off, (size_t)len);
         }
         return st;
     }
@@ -3512,6 +3846,8 @@ private:
     std::unique_ptr<std::once_flag[]> once_;   /* per item: its input is made once */
     std::unique_ptr<std::atomic<int64_t>[]> left_;   /* per item: bytes the sweep has yet to deliver */
     PinRing                    ring_;
+    static constexpr int64_t kHostOutputBytes = (int64_t)1 << 30;
+    std::mutex                 host_output_mu_;
     static constexpr int64_t kHole = 4096;     /* every input starts on a page of its own */
     uint8_t*                   region_ = nullptr;
     std::map<int64_t, int64_t> holes_;        /* the region's free ranges, offset -> bytes */
@@ -3523,6 +3859,7 @@ private:
     std::vector<int>           out_;      /* copies outstanding out of each sweep window */
     int64_t budget_ = 0, held_ = 0, pending_ = 0, peak_ = 0;
     bool done_ = false;
+    bool bounded_host_inputs_ = false;
     bool audited_ = false;   /* finish() runs its delivery audit once; the destructor calls it again */
     std::atomic<bool> failed_{false};
     int status_ = RAD_OK;
@@ -3576,7 +3913,8 @@ static SweepGate g_sweep_gate;
  * card. */
 static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                            const std::vector<int>& devices, RelayoutPool* pool,
-                           int64_t* read_out, const std::function<int()>& before_writes = {}) {
+                           int64_t* read_out, const std::function<int()>& before_writes = {},
+                           uint64_t begin_ns = 0 /* B-03: the start stamp for the (at) suffix; 0 (a refill after bring-up) leaves it out */) {
     *read_out = 0;
     if (runs.empty()) return RAD_OK;
 
@@ -3586,7 +3924,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         if (a.foff != b.foff) return a.foff < b.foff;
         return a.span > b.span;
     });
-    pool->plan_direct(runs);
+    const bool host_only = pool->bounded_host_inputs();
+    if (host_only) {
+        if (!pool->host_outputs_only() ||
+            std::any_of(runs.begin(), runs.end(), [](const LoadRun& r) { return r.dev; }))
+            return RAD_E_INVAL;
+        /* The preflight bounds all staged inputs together. Avoid per-worker direct-gather
+         * scratch, which otherwise survives until its worker exits and adds to that bound. */
+    } else pool->plan_direct(runs);
 
     /* Bytes the sweep reads, for the progress line: the union of the runs (not their sum under TP,
      * nor the file size, since the mapped tier is excluded). */
@@ -3609,7 +3954,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
      * piece approaches 64 MiB. */
     int64_t widest = 0;
     for (const LoadRun& q : runs) if (q.ny > 1 && q.wb > widest) widest = q.wb;
-    if (widest > window) window = align_up(widest, 4096);
+    if (!host_only && widest > window) window = align_up(widest, 4096);
 
     /* Read through gaps up to kSegGap instead of starting another read: with reads queued at
      * depth six, a quarter megabyte is about what another read costs the drive. A segment starts
@@ -3629,6 +3974,14 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
     constexpr size_t  kLag   = 3;
     constexpr int64_t kPiece = 8 << 20;
     constexpr int64_t kBlk   = DirectFile::alignment();
+    auto take_window = [&]() -> void* {
+        return host_only ? host_aligned_alloc((size_t)kBlk, (size_t)(window + 2 * kBlk))
+                         : sweep_take(window + 2 * kBlk);
+    };
+    auto give_window = [&](void* p) {
+        if (host_only) host_aligned_free(p);
+        else sweep_give(p, window + 2 * kBlk);
+    };
     DirectFile dio;
     const size_t nr = devices.size();
     std::vector<RadStream> st(nr, nullptr);
@@ -3641,6 +3994,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
 
     const int rc = [&]() -> int {
         for (size_t k = 0; k < nr; ++k) {
+            if (host_only) continue;
             /* Streams and events belong to the device current at creation, so bind it here; the
              * copies themselves need no bind, since a stream carries its device. */
             RAD_TRY(rad_dev_set(devices[k]));
@@ -3662,7 +4016,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     humanb(window).c_str(), kWin);
         };
         const auto pin0 = std::chrono::steady_clock::now();
-        buf[0] = sweep_take(window + 2 * kBlk);
+        buf[0] = take_window();
         if (!buf[0]) { no_window(); return RAD_E_NOMEM; }
         if (const double ps = std::chrono::duration<double>(std::chrono::steady_clock::now() - pin0).count(); ps > 1.0)
             RAD_WARN("load: pinning the first %s staging window took %.1f s", humanb(window).c_str(), ps);
@@ -3910,7 +4264,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
                     std::lock_guard<std::mutex> lk(rmu);
                     if (rstop || rerr < 0) return;
                 }
-                void* p = sweep_take(window + 2 * kBlk);
+                void* p = take_window();
                 {
                     std::lock_guard<std::mutex> lk(rmu);
                     if (!p) {
@@ -3983,7 +4337,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         }
 
         /* The last host synchronisation before serving (spec §5.4). */
-        for (size_t k = 0; k < nr; ++k) RAD_TRY(rad_stream_sync(st[k]));
+        for (size_t k = 0; k < nr; ++k) if (st[k]) RAD_TRY(rad_stream_sync(st[k]));
         for (int b = 0; b < kWin; ++b) pool->drain(b);
 
         const double s = std::chrono::duration<double>(
@@ -3991,9 +4345,10 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
         /* Wall time vs disk time: when they match, the sweep is at the drive's ceiling; the
          * difference is copies that did not overlap a read (host memcpys, the issue loop). */
         RAD_INFO("load: one pass over the container, %s read in %.1f s (%.1f GB/s) for %zu "
-                 "rank(s); %.1f s of that was the disk (%.1f GB/s)",
+                 "rank(s); %.1f s of that was the disk (%.1f GB/s)%s",
                  humanb(read_bytes).c_str(), s, read_bytes / (s > 0 ? s : 1) / 1e9, nr,
-                 read_s, read_bytes / (read_s > 0 ? read_s : 1) / 1e9);
+                 read_s, read_bytes / (read_s > 0 ? read_s : 1) / 1e9,
+                 startup_at(begin_ns, rad_mono_ns()).c_str());
         return RAD_OK;
     }();
 
@@ -4016,7 +4371,7 @@ static int sweep_container(RadFile* file, std::vector<LoadRun>& runs,
             fatal("load: failed sweep streams did not drain; refusing to recycle their pinned windows");
     }
     for (int b = 0; b < kWin; ++b) pool->drain(b);
-    for (int b = 0; b < kWin; ++b) sweep_give(buf[b], window + 2 * kBlk);
+    for (int b = 0; b < kWin; ++b) give_window(buf[b]);
     for (size_t k = 0; k < ev.size(); ++k) if (ev[k]) rad_event_destroy(ev[k]);
     for (size_t k = 0; k < nr; ++k) if (st[k]) rad_stream_destroy(st[k]);
     *read_out = read_bytes;
@@ -4153,6 +4508,14 @@ int Engine::load_weights() {
     std::vector<std::pair<int64_t, int64_t>> ngram_warm;
     bool ngram_own_file = false;
 
+    /* B-01: the Engram tables' fills run beside the container pass and are joined once, after it.
+     * Any return before that join (a failed walk, a failed sweep) still joins them, so no reader
+     * outlives the load; the normal path below joins, takes the error, and clears the guard. */
+    struct JoinFills {
+        Engine* e;
+        ~JoinFills() { if (e) e->join_table_fills(); }
+    } join_fills{this};
+
     /* Two phases. The walk decides which rank wants which bytes, where they land, and what is
      * refused, without touching the disk; sweep_container then reads the container once in file
      * order (reading per rank in declaration order would run far below the sequential rate and
@@ -4175,6 +4538,14 @@ int Engine::load_weights() {
         /* The lent slots kept free for swaps follow the swaps asked for (mover.h): a rank that
          * holds nearly all its experts gets the idle ones back as residents. */
         mc.turnover_adaptive = true;
+        /* Expert streaming X1 (b), kernels/experts-streaming.md: RADIANCE_XS_PACE -1 spreads a
+         * step's promotion copies over the next pass's routed layers, N > 0 sends N a layer, 0
+         * sends them as one list behind the pass. Bytes do not change. Default: spread without a
+         * drafter (Hy4-flash TP2, eight distinct streams: +2-3 % decode, the in-place reads of
+         * the first routed layers no longer share the link with the copies); off with one, where
+         * verify passes measured 3-7 % slower with it (notes/xs-1.md). */
+        mc.pace_units = drafter_.kind == RAD_DRAFT_NONE ? -1 : 0;
+        if (const char* e = std::getenv("RADIANCE_XS_PACE"); e && *e) mc.pace_units = std::atoi(e);
         RAD_TRY(r->mover.init(r->program, r->plan, mc, &r->pools));
         /* Brilliance: a file-tier weight the kernel relays is relaid on every read by the kernel's
          * own relayout, as the relayout pool does once for a resident one. */
@@ -4200,7 +4571,28 @@ int Engine::load_weights() {
 
         /* The heat engine, bound to the same plan. On a static plan (all_vram, --deterministic) it
          * returns RAD_OK with `enabled() == false`. */
-        RAD_TRY(r->heat.init(r->plan, HeatParams{}));
+        /* Expert streaming X0.3: the heat engine's parameters from the environment, for replay
+         * and A/B runs (RADIANCE_HEAT_DECAY, _HYSTERESIS, _MIN_GAIN, _MOVES, _CREDIT_CAP); the
+         * startup line of HeatEngine::init says what is in force. */
+        HeatParams hp{};
+        {
+            auto envf = [](const char* k, float* v) {
+                if (const char* e = std::getenv(k); e && *e) {
+                    char* end = nullptr;
+                    const float x = std::strtof(e, &end);
+                    if (end != e && x >= 0.0f) *v = x;
+                    else RAD_WARN("%s='%s' is not a number >= 0; ignored", k, e);
+                }
+            };
+            envf("RADIANCE_HEAT_DECAY", &hp.decay);
+            envf("RADIANCE_HEAT_HYSTERESIS", &hp.hysteresis);
+            envf("RADIANCE_HEAT_MIN_GAIN", &hp.min_gain);
+            envf("RADIANCE_HEAT_CREDIT_CAP", &hp.credit_cap);
+            float mv = (float)hp.moves_per_step;
+            envf("RADIANCE_HEAT_MOVES", &mv);
+            hp.moves_per_step = (int)mv;
+        }
+        RAD_TRY(r->heat.init(r->plan, hp));
 
         /* Every destination must lie inside the weights pool. A copy past its end targets memory
          * the process does not own, which on this driver does not fault: the copy never completes
@@ -4493,7 +4885,8 @@ int Engine::load_weights() {
     const auto rt0 = std::chrono::steady_clock::now();
     int sw_st = RAD_OK;
     if (file_) {
-        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes);
+        sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, {},
+                                startup_begin_ns_);
     } else {
         /* Every weight to the workers in declaration order, as the budget allows. */
         for (size_t k = 0; k < staged.size() && !pool.failed(); ++k) {
@@ -4504,8 +4897,13 @@ int Engine::load_weights() {
         }
     }
     const int pool_st = pool.finish();
+    /* The Engram fills have had the whole pass to read beside it: join them before the phase ends,
+     * so the weights phase's timers carry them and nothing maps a table before its bytes are in. */
+    const int fills_st = join_table_fills();
+    join_fills.e = nullptr;
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
+    RAD_TRY(fills_st);
     if (!staged.empty() && file_)
         RAD_INFO("load: %zu weight(s), %s of planes, rearranged for their kernels by %d worker(s) "
                  "behind the read, %s held at most; done %.1f s after the read began",
@@ -4617,7 +5015,8 @@ void Engine::warm_ngram_table(const std::vector<std::pair<int64_t, int64_t>>& ra
 }
 
 int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
-                           const std::function<int()>& before_writes) {
+                           const std::function<int()>& before_writes,
+                           RefillDestination destination) {
     if (spans.empty()) return RAD_OK;
     if (!file_) {
         RAD_ERR("restore: %zu stretch(es) of weights to refill and no container to refill them from",
@@ -4625,6 +5024,7 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
         return RAD_E_STATE;
     }
     const auto t0 = std::chrono::steady_clock::now();
+    const bool host_only = destination == RefillDestination::Host;
     std::vector<LoadRun> runs;
     std::vector<StagedWeight> staged;
     int64_t total = 0, n_weights = 0;
@@ -4671,7 +5071,7 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
             }
             const size_t run0 = runs.size(), staged0 = staged.size();
             RAD_TRY(plan_container_weight(*file_, *e, r->program, i, sh, r->index, r->device,
-                                          const_cast<uint8_t*>(at), true, runs, staged, &total));
+                                          const_cast<uint8_t*>(at), !host_only, runs, staged, &total));
             if (staged.size() > staged0) staged.back().clip = &on;
             /* A run stored as is keeps to the clip: its rows, or the parts of them, inside it. */
             std::vector<LoadRun> cut;
@@ -4705,12 +5105,27 @@ int Engine::refill_weights(const std::vector<PageSpan>& spans, const char* what,
     }
     std::vector<int> devices;
     for (auto& r : ranks_) devices.push_back(r->device);
+    if (host_only) {
+        /* This optional batch owns at most 2 GiB of inputs in total (no mapped input arena or
+         * per-worker gather scratch), 1 GiB of serialized partial-output scratch, and eight
+         * fixed 64 MiB ordinary read windows. Leave the rest of kRefillHost for metadata.
+         * Reject before mapping destination chunks; ordinary demand restores retain their path. */
+        const int checked = RelayoutPool::check_host_fill(staged, kRefillStaging);
+        if (checked < 0) {
+            if (checked == RAD_E_FULL)
+                device_set_error("host fill: this batch exceeds the bounded reconstruction staging; "
+                                 "its remaining chunks stay on the drive for demand restore");
+            return checked;
+        }
+        if (before_writes) RAD_TRY(before_writes());
+    }
     RelayoutPool pool(staged);
     const unsigned hw = std::thread::hardware_concurrency();
     const int workers = (int)std::max(2u, std::min(16u, hw > 2 ? hw - 2 : 2u));
-    pool.start(workers, kRefillStaging);
+    pool.start(workers, kRefillStaging, host_only);
     int64_t read_bytes = 0;
-    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes, before_writes);
+    const int sw_st = sweep_container(file_.get(), runs, devices, &pool, &read_bytes,
+                                     host_only ? std::function<int()>{} : before_writes);
     const int pool_st = pool.finish();
     RAD_TRY(sw_st);
     RAD_TRY(pool_st);
@@ -4746,7 +5161,6 @@ int64_t Engine::fill_host(int64_t max_bytes) {
     }
 
     if (chosen.empty()) return n;
-    if (const int rc = dev_page_fill_begin(owner_, chosen); rc < 0) return rc;
     /* Adjacent chunks as one stretch for the refill. */
     std::vector<PageSpan> spans;
     for (const PageSpan& c : chosen) {
@@ -4755,8 +5169,13 @@ int64_t Engine::fill_host(int64_t max_bytes) {
         else
             spans.push_back(c);
     }
-    const int rc = refill_weights(spans, "host fill");
-    dev_page_fill_end(owner_, chosen, rc == RAD_OK);
+    bool mapped = false;
+    const int rc = refill_weights(spans, "host fill", [&] {
+        const int status = dev_page_fill_begin(owner_, chosen);
+        mapped = status >= 0;
+        return status;
+    }, RefillDestination::Host);
+    if (mapped) dev_page_fill_end(owner_, chosen, rc == RAD_OK);
     return rc < 0 ? rc : n + got;
 }
 
@@ -5229,6 +5648,26 @@ int Engine::configure_kv() {
  * part, runs beside other engines'. */
 static std::mutex g_bringup_mu;
 
+void Engine::seal_base_weights() {
+    /* Base weights remain reconstructible from their container. Runtime adapter factors
+     * and slot tables occupy the separate persistent arena; that mutable arena keeps its
+     * normal parking copies. The mover refills weights at their current residency on return.
+     * A future in-place weight merge must opt its modified weights out of owner refill: dirty
+     * invalidation alone cannot preserve a value that differs from the container. */
+    for (auto& r : ranks_)
+        if (char* base = static_cast<char*>(r->pools.weights().base())) {
+            dev_page_seal(base);
+            if (file_) dev_page_refilled(base);
+        }
+}
+
+/* B-03: the bring-up's phase lines; startup_begin_ns_ is the `at` clock. */
+void Engine::phase_done(const char* what, uint64_t since_ns) const {
+    RAD_INFO("%s", startup_phase(what, since_ns, startup_begin_ns_, rad_mono_ns()).c_str());
+}
+
+std::string Engine::at_now() const { return startup_at(startup_begin_ns_, rad_mono_ns()); }
+
 int Engine::start() {
     EngineScope es(owner_, cfg_.served_model_name.c_str());
     std::unique_lock<std::mutex> bringup(g_bringup_mu);
@@ -5299,7 +5738,10 @@ int Engine::start() {
      * the same architecture (usable_devices), so the first engine's check holds for it. */
     if (rad_tools_registry().plugins().empty()) {
         rad_tools_registry().set_code_device(devs[0]);
-        rad_tools_registry().set_no_device_code(device_is_host());
+        /* --debug-graph only declares and prints: no kernel launches, so on the host backend (fake ranks,
+         * RADIANCE_HOST_DEVICES) the device rows stay in selection and the table shows what a card would
+         * resolve to (a real-geometry declare checked without the cards: tools/hy4flash_ready.py A6). */
+        rad_tools_registry().set_no_device_code(device_is_host() && !cfg_.debug_graph);
     }
     int plugins_st = RAD_OK;
     try {
@@ -5400,7 +5842,7 @@ int Engine::start() {
         }
     }
 
-    RAD_TRY(declare());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(declare()); phase_done("declare", t); }
 
     /* --debug-graph stops here: everything it prints is known after declare, and it must work on
      * a machine where the model does not fit. */
@@ -5428,11 +5870,51 @@ int Engine::start() {
         decide("kernel selection", libs.empty() ? "none" : libs + " op bands",
                rows.empty() ? std::string() : "attention:\n" + rows);
     }
+    {
+        /* The vocab projection's row per M band (device domain), and the rows registered for it
+         * that no band selected, so an opt-in row that is registered but inactive (the WMMA row's
+         * priority sits below the scalar row's by default) is visible rather than implied. */
+        std::set<const KernelRow*> used;
+        std::string bands_s;
+        for (const OpInfo& op : ranks_[0]->program.ops) {
+            if (op.op != "logits_gemm") continue;
+            for (const Band& b : op.bands) {
+                /* Labelled by declared op index: a drafter head's logits_gemm is its own op. */
+                const KernelRow* row = b.dom[RAD_DOMAIN_DEVICE].row;
+                bands_s += fmt("%s%s (op #%d) -> %s", bands_s.empty() ? "" : "\n", b.span.c_str(), (int)op.index,
+                               row && row->info ? fmt("%s (%s, prio %d)", row->info->name,
+                                                      row->plugin.c_str(), row->info->priority).c_str()
+                                                : "none");
+                if (row) used.insert(row);
+            }
+        }
+        std::string idle;
+        if (const auto* rows = reg_->rows_for("logits_gemm"))
+            for (const KernelRow* r : *rows)
+                if (r->info && !used.count(r) && !bands_s.empty() &&
+                    r->info->domain == RAD_DOMAIN_DEVICE) {
+                    /* Only flag the opt-in as inactive where it lost on priority to a scalar row. */
+                    bool wmma = false;
+                    if (std::strstr(r->info->name, "wmma"))
+                        for (const KernelRow* o : *rows)
+                            if (o && o->info && o != r && used.count(o) && o->info->domain == RAD_DOMAIN_DEVICE &&
+                                !std::strstr(o->info->name, "wmma") && r->info->priority < o->info->priority)
+                                wmma = true;
+                    idle += fmt("%s%s (prio %d)%s", idle.empty() ? "" : ", ", r->info->name,
+                                r->info->priority, wmma ? " [WMMA opt-in: INACTIVE]" : "");
+                }
+        if (!bands_s.empty()) {
+            RAD_INFO("logits_gemm rows by M band:\n%s%s%s", bands_s.c_str(),
+                     idle.empty() ? "" : "\n  registered but not selected: ", idle.c_str());
+        }
+    }
 
-    RAD_TRY(plan());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(plan()); phase_done("plan", t); }
     bringup.unlock();
-    RAD_TRY(load_weights());
-    RAD_TRY(configure_kv());
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(load_weights()); phase_done("weights", t); }
+    { const uint64_t t = rad_mono_ns(); RAD_TRY(configure_kv()); phase_done("kv", t); }
+    /* B-03: the per-rank context init, the stagers, the lending and step_state_init below. */
+    const uint64_t t_ctx = rad_mono_ns();
 
     for (auto& r : ranks_) {
         LogRank lr(r->index);
@@ -5571,6 +6053,21 @@ int Engine::start() {
             const int n = r->mover.pool_ranges(lo, hi, st, kXpMaxPools);
             if (n > 0) r->ctx.xp_open(lo, hi, st, n);
         }
+    /* Expert streaming X1 (b): the mover's paced copies go out from the routed layers' marks
+     * (Ctx::xp_mark), which recorded passes then carry. Not beside the TP1 prefetch, which rides
+     * on the same dispatch. */
+    for (auto& r : ranks_)
+        if (r->mover.pacing() && r->heat.enabled() && !r->ctx.xp_on()) {
+            Rank* rp = r.get();
+            r->ctx.set_pace_hook([rp](RadStream cs) { return rp->mover.pace_mark(cs); });
+            if (r->index == 0)
+                RAD_INFO("expert streaming: promotion copies paced over the routed layers (%s)",
+                         r->mover.pace_units() < 0 ? "spread over the pass"
+                                                   : fmt("%d a layer", r->mover.pace_units()).c_str());
+        }
+    if (const char* e = std::getenv("RADIANCE_XS_EARLY_PUBLISH"); e && *e)
+        xs_early_publish_ = std::atoi(e) != 0;
+    if (!xs_early_publish_) RAD_INFO("expert streaming: landed promotions publish behind the pass (RADIANCE_XS_EARLY_PUBLISH=0)");
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them
@@ -5806,10 +6303,30 @@ int Engine::start() {
      * Too much means VRAM left unused, costly when experts do not fit; up to 256 MiB of slack
      * (MiB rounding, plugin workspaces) is silent. */
     const int64_t MiB = 1024 * 1024;
-    const int64_t headroom = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) * MiB;
     const int64_t allowance = Config{}.gpu_headroom_mib * MiB;
+    phase_done("contexts", t_ctx);
+    const uint64_t t_settle = rad_mono_ns();
+    /* Brilliance: other processes' use of the cards now, read once, at the first card that took
+     * less than the budget kept (mem/vram_others.h), to compare with the budget's reading. */
+    std::vector<VramHolders> others_now;
+    bool others_read = false;
+    const VramHolders unknown_holders;
+    auto others = [&](size_t ri, bool now) -> const VramHolders& {
+        if (!now) return ri < vram_others_read_.size() ? vram_others_read_[ri] : unknown_holders;
+        if (!others_read) {
+            std::vector<std::string> bdfs;
+            for (auto& rr : ranks_) bdfs.push_back(dev_pci_address(rr->device));
+            others_now = read_vram_holders(bdfs);
+            others_read = true;
+        }
+        return ri < others_now.size() ? others_now[ri] : unknown_holders;
+    };
+    bool others_refused = false;
     for (size_t ri = 0; ri < ranks_.size(); ++ri) {
         auto& r = ranks_[ri];
+        const int64_t headroom = vram_budget_headroom_mib(cfg_, ri) * MiB;
+        const bool named_headroom = cfg_.card_headroom_mib.count(r->device) != 0;
+        const char* reserve_name = named_headroom ? "memory.card-headroom-mib" : "--gpu-headroom-mib";
         LogRank lr(r->index);
         RadDeviceProps props{};
         if (rad_dev_props(r->device, &props) < 0 || props.vram_bytes <= 0) continue;
@@ -5821,19 +6338,27 @@ int Engine::start() {
         const int64_t got  = props.vram_free;
         const int64_t room = got - late;
         const std::string asked =
-            late > 0 ? fmt("%s (the %s --gpu-headroom-mib and %s kept for the step staging and "
+            late > 0 ? fmt("%s (the %s %s and %s kept for the step staging and "
                            "for what is built on first use)", humanb(want).c_str(),
-                           humanb(headroom).c_str(), humanb(late).c_str())
-                     : fmt("%s --gpu-headroom-mib", humanb(want).c_str());
+                           humanb(headroom).c_str(), reserve_name, humanb(late).c_str())
+                     : fmt("%s %s", humanb(want).c_str(), reserve_name);
         if (room < allowance) {
             const int64_t raise_mib = (allowance - room + MiB - 1) / MiB;
-            const int64_t need_head = std::max<int64_t>(cfg_.gpu_headroom_mib, 0) + raise_mib;
-            const std::string fix = cfg_.gpu_memory_mib > 0
-                ? fmt("Set --gpu-memory-mib to at most %lld: what is left here falls with it one "
-                      "for one.",
-                      (long long)(props.vram_bytes / MiB - need_head))
-                : fmt("Set --gpu-headroom-mib to at least %lld: what is left here rises with it "
-                      "one for one.", (long long)need_head);
+            const int64_t need_head = vram_budget_headroom_mib(cfg_, ri) + raise_mib;
+            /* Brilliance: short because another process took the room after the budget read the
+             * card (a desktop app with its GPU set to this card, the 11-22 four-card start): stop
+             * here naming it, not on the next allocation, which names nobody. */
+            const VramSettleVerdict ov = vram_settle_verdict(r->device, dev_pci_address(r->device), room,
+                                                             allowance, want - got, need_head,
+                                                             others(ri, false), others(ri, true),
+                                                             ranks_.size() > 1);
+            if (ov.refuse) {
+                RAD_ERR("%s", ov.message.c_str());
+                others_refused = true;
+                continue;
+            }
+            const std::string fix = vram_budget_settle_fix(cfg_, r->device, props.vram_bytes / MiB,
+                                                           need_head, ranks_.size());
             RAD_WARN("card %d settled at %s free against %s, which leaves %s for a kernel's first "
                      "launch to load its code object and size its scratch in -- under the %s this "
                      "engine allows for its own. %s %s",
@@ -5846,11 +6371,18 @@ int Engine::start() {
                          : "",
                      fix.c_str());
         } else if (got < want) {
+            /* Brilliance: who, when it was another process. */
+            const std::vector<VramGrowth> grew = vram_holders_grown(others(ri, false), others(ri, true));
+            std::string by;
+            for (const VramGrowth& g : grew)
+                by += fmt("%s%s (pid %u) +%s", by.empty() ? "; other processes took more since: " : ", ",
+                          g.now.name.empty() ? "a process" : g.now.name.c_str(), (unsigned)g.now.pid,
+                          humanb(g.grew).c_str());
             RAD_INFO("card %d settled at %s free against %s: %s of the headroom was taken after "
                      "the budget read the card, by another process on it or an allocation the "
-                     "budget does not count, and %s is left for first launches",
+                     "budget does not count, and %s is left for first launches%s",
                      r->device, humanb(got).c_str(), asked.c_str(), humanb(want - got).c_str(),
-                     humanb(room).c_str());
+                     humanb(room).c_str(), by.c_str());
         } else if (got > want + 256 * MiB) {
             /* Not a fault: neither pool could use more (e.g. a small dense model at its largest
              * context), reported on vram_budget.cpp's `unusable` line, or a re-split rank's
@@ -5874,22 +6406,14 @@ int Engine::start() {
             RAD_INFO("card %d settled at %s free, against %s",
                      r->device, humanb(got).c_str(), asked.c_str());
     }
-    /* The weights pool is written after the load only by the mover's expert moves, and each such
-     * write invalidates the host copies of the chunks it touches (dev_page_invalidate), so the
-     * pool's copies stay exact between them: sealed, a park after the first only unmaps
-     * (docs/MULTIMODEL.md §7.2). Not with runtime adapters, which are copied into the pool. */
-    if (!cfg_.lora.enabled())
-        for (auto& r : ranks_)
-            if (char* base = static_cast<char*>(r->pools.weights().base())) {
-                dev_page_seal(base);
-                /* From a container, the pool's own source: a park unmaps it with no copy, and a
-                 * restore reads it again (refill_weights). */
-                if (file_) dev_page_refilled(base);
-            }
+    if (others_refused) return RAD_E_NOMEM;
+    phase_done("settle", t_settle);
+    seal_base_weights();
     /* Bringup done: everything this engine loads is loaded. From here the stuck-exit watchdog
      * treats a device that advances nothing as a hang; before here it treats it as a slow load
      * (device.h's dev_engine_ready). */
     dev_engine_ready.store(true, std::memory_order_release);
+    phase_done("ready", startup_begin_ns_);
     return RAD_OK;
 }
 

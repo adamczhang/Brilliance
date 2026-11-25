@@ -1,0 +1,17 @@
+# hy4-flash-bf16-f32.recipe -- hy4-flash-bf16.recipe with each Engram row's E4M3 codes taken exactly as
+# the transformers port takes them in f32: scale = amax(row) / 448 kept in f32, codes = e4m3(x / scale)
+# (a division, libquant's `divide=1`, not a multiply by the reciprocal), read by embed_lookup_q as
+# decode(code) * scale in f32. Against the port's f32 forward (`_fp8_round_trip`, the parity
+# harness's reference) every code and every scale is the port's: checked on the minis' tables (mini
+# 2112 codes, gpu-mini 441792), where the bf16 table's runtime round trip (x times 1/scale) differs
+# in 4.3e-4 of the codes and hy4-flash-bf16.recipe's bf16 scale moves more. The port's bf16 forward
+# divides in bf16 (hy4-flash-bf16.recipe's header) and matches neither exactly.
+#
+#   rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-bf16-f32.recipe -o hy4-flash-bf16-f32.rad
+#
+# 660 million rows at 96 codes and a 4-byte scale: 61.5 GiB of tables, 1.3 GiB above the bf16
+# scale's. Any other recipe's Engram line may be swapped for this one.
+#
+# PATTERN                     QUANTISER  OPTIONS
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=f32 rule=absmax divide=1

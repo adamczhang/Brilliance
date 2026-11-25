@@ -26,7 +26,9 @@ struct R4dArGather {
   const unsigned short* sg;   // [M, sg_ld] its gate, or null
   long long ye_ld, ew_ld, sh_ld, sg_ld;
   int top_k, T, sig;
+  int pad_ = 0;               // keeps the by-value kernel argument free of tail padding
 };
+static_assert(sizeof(R4dArGather) == 5 * 8 + 4 * 8 + 4 * 4, "R4dArGather carries no padding");
 
 // One word of the gather: y[row][i0 .. i0+8) = sum over the row's slots, ascending, of
 // w[row][j] * y_expert[slot][i0 ..], rounded to bf16, with the shared arm folded in as moe_gather

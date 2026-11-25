@@ -58,6 +58,7 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `gemm_mxfp4a8_decode_shortk` | the decode kernel at 33..64 rows of a wide, short weight (N ≥ 8192, K ≤ 2560), above `gemm_mxfp4a8_gemv_wide`, which loses there |
 | `gemm_mxfp4a8_tiled` | the prefill sibling: the activation re-tiled into fragment order in the op's scratch and read straight into registers, the weight unpacked once per K slab for a 256-row block |
 | `attn_decode_h128_gqa4_i8` / `..._bf16kv` | head_dim 128, 4 queries per KV head, sliding window: a block-diffusion drafter's geometry, and LFM3's. The decode band (up to 16 query rows); past it `attn_window_h128_gqa4_i8kv` / `..._bf16kv` serve this geometry |
+| `mla_attn_paged_sink_bf16` / `mla_attn_sel_sink_bf16` | Hy4-flash's absorbed latent attention (latent 512 + rope 64) with a per-head sink logit: paged with a sliding window counting the row's own token (or none), and over the indexer's per-row selection. A workgroup a row and 16/32/64 heads, WMMA scores, split history with a merge that applies the sink once. The split is the stable law (64 / 128-token slots from the row's first visible key, 16-token chunks): under `stable 1` a row's bytes are a function of the row alone at any M and stream count, so a verify row's bytes are its decode's |
 | `rowtopk_bf16` / `rowtopk_bf16_chunks` | exact per-row top-K over a bf16 matrix, two-stage |
 | `dflash_conv_t2_g16_bf16` | the drafter's causal conv, two taps, 16 groups |
 | `dflash_select_bf16` | the drafter's candidate selector: edge scores and the greedy path walk |
@@ -67,7 +68,8 @@ The table lists a selection; `r4d_rows.cpp` and `r4d.h` hold the full set.
 | `had_quant_act_i8` | the same with a block Walsh-Hadamard rotation first, which is what makes one scale per row viable |
 | `rmsnorm_had_quant_i8` | residual add, RMS norm, rotate and quantise in one kernel |
 | `ar_ln_had_quant_i8` | the all-reduce fused with the norm that follows it: the peer's contribution is a second operand on the norm's load, so the all-reduce's bf16 output never exists. Exact bf16 or rotated 6-bit wire (`wire`) |
-| `gated_had_quant_i8` | `silu(a)*b` or `sigmoid(a)*b`, then the same rotation and quantiser |
+| `gated_had_quant_i8` | `silu(a)*b`, `sigmoid(a)*b`, or SiTU (`act` situ, with optional caps), then the same rotation and quantiser |
+| `gated_quant_i8` | `act(a)*b` (silu, sigmoid or SiTU), then per-group int8 codes with one f32 scale a group, row-major: the unrotated `gated_had_quant_i8` |
 | `gdn_gated_norm_had_quant_i8` | the GDN gated norm with the rotation and quantiser fused onto it |
 | `qk_norm_rope_gate` | q/k RMS norm, rope and the attention gate in one kernel |
 | `ar_oneshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4,8}rank_exact`, `ar_twoshot_{3,4}rank_ti8`, `ar_gather_3rank` | the wider-world collectives (TP3/TP4/TP8), exact and int8-wire |

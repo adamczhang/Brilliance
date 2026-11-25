@@ -185,6 +185,8 @@ void Metrics::sample(const SchedMetrics& m) {
     c_steps_ahead_.advance_to(m.steps_ahead);
     c_prefill_capped_.advance_to(m.prefill_chunks_capped);
     c_steps_held_.advance_to(m.steps_held);
+    c_steps_sliced_.advance_to(m.steps_sliced);
+    c_substeps_.advance_to(m.substeps);
     c_mixed_step_target_steps_.advance_to(m.mixed_step_target_steps);
     c_mixed_step_target_misses_.advance_to(m.mixed_step_target_misses);
     c_rows_unspec_.advance_to(m.decode_rows_unspeculated);
@@ -203,7 +205,7 @@ void Metrics::sample(const SchedMetrics& m) {
     c_suffix_steps_.advance_to(m.suffix_steps);
     c_suffix_rows_.advance_to(m.suffix_rows);
     c_suffix_accepted_.advance_to(m.suffix_accepted);
-    c_suffix_held_ahead_.advance_to(m.suffix_held_ahead);
+    c_ahead_refused_suffix_hot_.advance_to(m.ahead_refused_suffix_hot);
     c_attn_cached_.advance_to(m.attn_cached_tokens);
     c_linear_cached_.advance_to(m.linear_cached_tokens);
     c_prefix_queries_.advance_to(m.prefix_queries);
@@ -425,6 +427,12 @@ std::string Metrics::render() const {
     w.counter("radiance:engine_steps_held_total",
               "Decode-only steps run after a prefill chunk while other sequences decode "
               "(--prefill-interleave).", L, c_steps_held_.get());
+    w.counter("radiance:engine_steps_sliced_total",
+              "Prefill chunks planned as layer-sliced sub-steps (--chunk-slices, S-02).",
+              L, c_steps_sliced_.get());
+    w.counter("radiance:engine_substeps_total",
+              "Layer-sliced sub-steps issued, the first of each group included.",
+              L, c_substeps_.get());
     w.counter("radiance:mixed_step_target_steps_total",
               "Mixed prefill/decode steps observed by --mixed-step-target-ms.",
               L, c_mixed_step_target_steps_.get());
@@ -487,7 +495,8 @@ std::string Metrics::render() const {
               "Of those rows, the drafts accepted.", L, c_suffix_accepted_.get());
     w.counter("radiance:suffix_held_ahead_total",
               "Decode steps not issued ahead of the previous commit because the sequence's "
-              "history ended in a recurring pattern (--draft-suffix).", L, c_suffix_held_ahead_.get());
+              "history ended in a recurring pattern (--draft-suffix).", L,
+              c_ahead_refused_suffix_hot_.get());
 
     /* Decoupled prefix caching (spec §7.3). vllm:gpu_prefix_cache_hit_rate is the attention hit
      * rate, as in vLLM. The linear side hits at a different granularity (whole checkpoints, not

@@ -5,7 +5,9 @@
     "qwen3.6":  { "bos": "",    "eos": "<|im_end|>", "media": "<|vision_start|><|image_pad|><|vision_end|>" },
     "minicpm5": { "bos": "<s>", "eos": "</s>",       "media": "" },
     "gemma4":   { "bos": "<bos>", "eos": "<eos>",    "media": "<|image|>" },
-    "glm53":    { "bos": "",    "eos": "<|endoftext|>", "media": "<|begin_of_image|><|image|><|end_of_image|>" }
+    "glm53":    { "bos": "",    "eos": "<|endoftext|>", "media": "<|begin_of_image|><|image|><|end_of_image|>" },
+    "hy4flash": { "bos": "<｜hy_start:opensource｜>", "eos": "<｜hy_end:opensource｜>",
+                  "media": "<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜>" }
   },
   "tools": [
     { "type": "function", "function": { "name": "read", "description": "Read a file.",
@@ -59,7 +61,7 @@
         { "role": "assistant", "reasoning_content": "Thinking about the first.", "content": "First answer." },
         { "role": "user", "content": "Second question." } ] },
     { "name": "tool_call_then_result",
-      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4"],
+      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4", "hy4flash"],
       "tools": true,
       "messages": [
         { "role": "user", "content": "Fix /work/a.py." },
@@ -68,7 +70,7 @@
             "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\", \"limit\": 40}" } } ] },
         { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" } ] },
     { "name": "tool_call_answered_then_user",
-      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4"],
+      "models": ["qwen3.8", "qwen3.6", "minicpm5", "gemma4", "hy4flash"],
       "tools": true,
       "messages": [
         { "role": "user", "content": "Fix /work/a.py." },
@@ -117,11 +119,56 @@
       "kwargs": { "reasoning_effort": "high" },
       "messages": [ { "role": "user", "content": "Hi." } ] },
     { "name": "a_picture_between_text",
-      "models": ["qwen3.8", "qwen3.6", "gemma4", "glm53"],
+      "models": ["qwen3.8", "qwen3.6", "gemma4", "glm53", "hy4flash"],
       "messages": [
         { "role": "user", "content": [
           { "type": "text", "text": "Describe" },
           { "type": "media_marker", "text": "<__media__>" },
           { "type": "text", "text": "briefly." } ] } ] }
+    ,
+    { "name": "hy4_no_think_plain", "models": ["hy4flash"], "kwargs": { "reasoning_effort": "no_think" },
+      "messages": [
+        { "role": "system", "content": "You are terse." },
+        { "role": "user", "content": "What is 2+2?" } ] },
+    { "name": "hy4_high_plain", "models": ["hy4flash"], "kwargs": { "reasoning_effort": "high" },
+      "messages": [ { "role": "user", "content": "What is 2+2?" } ] },
+    { "name": "hy4_no_think_tools_history", "models": ["hy4flash"], "tools": true,
+      "kwargs": { "reasoning_effort": "no_think" },
+      "messages": [
+        { "role": "system", "content": "Be careful." },
+        { "role": "user", "content": "Fix /work/a.py." },
+        { "role": "assistant", "reasoning_content": "Read it first.", "content": "Reading.",
+          "tool_calls": [ { "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\", \"limit\": 40}" } } ] },
+        { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" },
+        { "role": "user", "content": "Go on." } ] },
+    { "name": "hy4_high_tools_multi_turn", "models": ["hy4flash"], "tools": true,
+      "kwargs": { "reasoning_effort": "high" },
+      "messages": [
+        { "role": "user", "content": "Fix /work/a.py." },
+        { "role": "assistant", "reasoning_content": "Read it first.", "content": "",
+          "tool_calls": [ { "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\"}" } } ] },
+        { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" },
+        { "role": "assistant", "reasoning": "Looks fine.", "content": "It prints 1." },
+        { "role": "user", "content": "Thanks, now ping." },
+        { "role": "assistant", "reasoning_content": "Call ping.", "content": null,
+          "tool_calls": [ { "id": "call_p", "type": "function",
+            "function": { "name": "ping", "arguments": "{}" } } ] },
+        { "role": "tool", "tool_call_id": "call_p", "content": "pong" } ] },
+    { "name": "hy4_tool_responses_follow_call_order", "models": ["hy4flash"], "tools": true,
+      "messages": [
+        { "role": "user", "content": "Do both." },
+        { "role": "assistant", "content": "", "tool_calls": [
+          { "id": "call_a", "type": "function", "function": { "name": "read", "arguments": "{\"path\": \"/a\"}" } },
+          { "id": "call_b", "type": "function", "function": { "name": "read", "arguments": "{\"path\": \"/b\"}" } } ] },
+        { "role": "tool", "tool_call_id": "call_b", "content": "B" },
+        { "role": "tool", "tool_call_id": "call_a", "content": "A" } ] },
+    { "name": "hy4_effort_max_refused", "models": ["hy4flash"], "kwargs": { "reasoning_effort": "max" },
+      "messages": [ { "role": "user", "content": "Hi" } ] },
+    { "name": "hy4_effort_medium_refused", "models": ["hy4flash"], "kwargs": { "reasoning_effort": "medium" },
+      "messages": [ { "role": "user", "content": "Hi" } ] },
+    { "name": "hy4_effort_null_refused", "models": ["hy4flash"], "kwargs": { "reasoning_effort": null },
+      "messages": [ { "role": "user", "content": "Hi" } ] }
   ]
 }

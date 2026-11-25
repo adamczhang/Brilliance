@@ -744,13 +744,16 @@ void r4dchain_gemm_fp8a8(
     const uint8_t* __restrict__ Ap, const uint16_t* __restrict__ Sa,                           \
     const int8_t* __restrict__ Bp, const float* __restrict__ Sb, uint16_t* __restrict__ C,     \
     uint32_t rows, uint32_t cols, uint32_t M, uint32_t b_ld, uint32_t sb_ld
-template <uint32_t KW, uint32_t SB, uint32_t NT>
-__device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
+/* `rt` is the block's 16-row weight tile: its blockIdx.x, or its place in a slice of the
+ * several-weight form (gemm_i8_kpar_multi_kernel). A chained body (`CH`) issues the weight's first
+ * unit before its own acquire; the several-weight form waits before it calls the plain body. */
+template <uint32_t KW, uint32_t SB, uint32_t NT, class CH = R4dUnchained>
+__device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS, uint32_t rt) {
     constexpr uint32_t kUG = SB / kBlock;   /* 128-K units a scale group */
     __shared__ float s_red[KW][NT][8 * kWave];
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1);
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid / kWave);
-    const uint32_t rt = blockIdx.x, ngrp = cols / SB, nunit = cols / kBlock;
+    const uint32_t ngrp = cols / SB, nunit = cols / kBlock;
     const uint32_t ksuper = cols / r4d_fp8::kSuperK;
     /* Token tile j is tokens 16 j .. 16 j + 15; a column past M reads token M - 1. */
     const uint32_t col = frag_c(lane);
@@ -786,8 +789,22 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
      * further tile's fragments a tile ahead. */
     Stage8 ac[2], an[2];
     i2v bc[8], bn[8], bq[2][8];
+    /* Chained, the block waits in the poll while its predecessor runs (aql.cpp's chain plan), so
+     * the first unit of the weight and its group's scale are issued before the acquire: a static
+     * weight's bytes are not written by any op of a pass (operand role RAD_OPD_WEIGHT,
+     * core/runtime/issue.cpp's haz_note orders no read of one), so neither load can see a partial
+     * write, and both return into registers that survive the acquire. The token rows and the
+     * first tile's fragments stay behind the wait. */
+    uint4 q4p = make_uint4(0u, 0u, 0u, 0u);
+    if (CH::on) {
+        if (wave < ngrp) {
+            aload(wave * kUG, ac);
+            q4p = *(const uint4*)(Sa + ((size_t)rt * ngrp + wave) * 16u + acc_row(lane, 0));
+        }
+        r4d_chain_wait_vec();
+    }
     if (wave < ngrp) {
-        aload(wave * kUG, ac);
+        if (!CH::on) aload(wave * kUG, ac);
         bload(0u, wave * kUG, bc);
     }
     for (uint32_t g = wave; g < ngrp; g += KW) {
@@ -818,7 +835,8 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
         }
         /* The lane's eight rows' bf16 scales of this group are consecutive in the tile-major
          * plane: one 16-byte load. */
-        const uint4 q4 = *(const uint4*)(Sa + ((size_t)rt * ngrp + g) * 16u + acc_row(lane, 0));
+        const uint4 q4 = (CH::on && g == wave) ? q4p
+                        : *(const uint4*)(Sa + ((size_t)rt * ngrp + g) * 16u + acc_row(lane, 0));
         const uint32_t qd[4] = { q4.x, q4.y, q4.z, q4.w };
 #pragma unroll
         for (uint32_t j = 0; j < NT; ++j) {
@@ -865,11 +883,36 @@ __device__ __forceinline__ void gemm_i8_kpar_body(R4D_I8KPAR_PARAMS) {
 template <uint32_t KW, uint32_t SB, uint32_t NT, class CH>
 __global__ __launch_bounds__(KW * kWave) R4D_WAVES(6)
 void gemm_i8_kpar_kernel(R4D_I8KPAR_PARAMS) {
-    if (CH::on) r4d_chain_wait_vec();
-    gemm_i8_kpar_body<KW, SB, NT>(Ap, Sa, Bp, Sb, C, rows, cols, M, b_ld, sb_ld);
+    gemm_i8_kpar_body<KW, SB, NT, CH>(Ap, Sa, Bp, Sb, C, rows, cols, M, b_ld, sb_ld, blockIdx.x);
     if (CH::on) r4d_chain_done();
 }
 #undef R4D_I8KPAR_PARAMS
+
+/* Several int8 linears at one M and K in one launch (gemm_nt_q_multi): slice s owns blocks
+ * [end[s-1], end[s]) of the grid, a block its 16-row weight tile, so each slice's bytes are the
+ * K-parallel tile's for that linear alone. */
+constexpr uint32_t kI8MultiMax = 5;
+struct I8KparSlices {
+    const uint8_t*  w[kI8MultiMax];
+    const uint16_t* ws[kI8MultiMax];
+    const int8_t*   a[kI8MultiMax];
+    const float*    as[kI8MultiMax];
+    uint16_t*       c[kI8MultiMax];
+    uint32_t        rows[kI8MultiMax], a_ld[kI8MultiMax], sa_ld[kI8MultiMax], end[kI8MultiMax];
+    uint32_t        n;
+};
+
+template <uint32_t KW, uint32_t SB, uint32_t NT, class CH>
+__global__ __launch_bounds__(KW * kWave) R4D_WAVES(6)
+void gemm_i8_kpar_multi_kernel(I8KparSlices S, uint32_t cols, uint32_t M) {
+    if (CH::on) r4d_chain_wait_vec();
+    const uint32_t b = blockIdx.x;
+    uint32_t s = 0, beg = 0;
+    while (s + 1u < S.n && b >= S.end[s]) beg = S.end[s++];
+    gemm_i8_kpar_body<KW, SB, NT>(S.w[s], S.ws[s], S.a[s], S.as[s], S.c[s], S.rows[s], cols, M,
+                                  S.a_ld[s], S.sa_ld[s], b - beg);
+    if (CH::on) r4d_chain_done();
+}
 
 // Sum the split-K partials into bf16 C, in fixed z order with no atomics. Latency bound, so eight
 // loads are issued before their adds; the order of the adds is unchanged.
@@ -901,6 +944,19 @@ void gemm_8a8_prefill_kernel(const uint8_t* __restrict__ A, const float* __restr
                              uint32_t a_ld, uint32_t sa_ld, uint32_t sw_ld) {
     gemm_8a8_prefill_body<I8, RB, PrefillPlain, false, SB>(A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld,
                                                           sw_ld, PrefillPlain{});
+}
+
+/* The same int8 prefill tile over a row-major weight and row-major per-row scales: the container's
+ * bytes, so a vision tower on the mapped tier needs no relayout. `w_ld` is the weight's row pitch
+ * in bytes (one byte a code). */
+template <bool I8>
+__global__ __launch_bounds__(kPWaves * kWave) R4D_WAVES(6)
+void gemm_8a8_prefill_row_kernel(const uint8_t* __restrict__ A, const float* __restrict__ Sa,
+                                 const uint8_t* __restrict__ W, const uint16_t* __restrict__ Sw,
+                                 uint16_t* __restrict__ C, uint32_t M, uint32_t K, uint32_t N,
+                                 uint32_t a_ld, uint32_t sa_ld, uint32_t w_ld, uint32_t sw_ld) {
+    gemm_8a8_prefill_body<I8, 0, PrefillPlain, false, kBlock, true>(
+        A, Sa, W, Sw, C, M, K, N, a_ld, sa_ld, sw_ld, PrefillPlain{}, nullptr, nullptr, w_ld);
 }
 
 // The narrow tile's K width is kFKNarrow (256 B); 128 B loses at every wave count (see `kTPR`), and
@@ -1379,6 +1435,74 @@ extern "C" int r4d_rad_gemm_i8a8_m16(const RadArgs* a, RadStream stream) {
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
+/* gemm_nt_q_multi (oGemmNtQMulti in r4d_rows.cpp): up to five int8 linears at one M and K,
+ * slice i reading input src<i> (operands 2 src, 2 src + 1) with weight 6 + 2 i, its scale 7 + 2 i,
+ * into y 16 + i, in one K-parallel launch. Each slice is checked as gemm_nt_q's own operands. */
+enum { QM_A = 0, QM_B = 6, QM_Y = 16, QM_NIN = 3 };
+
+extern "C" int r4d_rad_gemm_i8a8_multi(const RadArgs* a, RadStream stream) {
+    static const char* const kN[kI8MultiMax]   = { "N0", "N1", "N2", "N3", "N4" };
+    static const char* const kSrc[kI8MultiMax] = { "src0", "src1", "src2", "src3", "src4" };
+    if (!a || !a->t) return R4D_NO(RAD_E_INVAL);
+    if (r4d_geti_or(a, "group", 0) != (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+    I8KparSlices S{};
+    long long M = -1, K = -1;
+    uint32_t blocks = 0;
+    for (uint32_t i = 0; i < kI8MultiMax; ++i) {
+        const long long Ni = r4d_geti_or(a, kN[i], 0);
+        if (Ni <= 0) break;
+        const long long src = r4d_geti_or(a, kSrc[i], 0);
+        if (src < 0 || src >= QM_NIN) return R4D_NO(RAD_E_SHAPE);
+        const int at[5] = { QM_A + 2 * (int)src, QM_A + 2 * (int)src + 1, QM_B + 2 * (int)i,
+                            QM_B + 2 * (int)i + 1, QM_Y + (int)i };
+        RadTensor t[5];
+        for (int k = 0; k < 5; ++k) {
+            const RadTensor* x = r4d_opt(a, at[k]);
+            if (!x) return R4D_NO(RAD_E_INVAL);
+            t[k] = *x;
+        }
+        RadArgs sub = *a;
+        sub.t = t;
+        sub.n_t = 5;
+        Fp8Ops g;
+        const int rc = fp8_ops(&sub, &g, 1, FP8_OPS_ROW_SCALE);
+        if (rc != RAD_OK) return rc;
+        if (g.a->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+        if (g.N != Ni || g.N % 16 || g.K % (long long)kBlock) return R4D_NO(RAD_E_SHAPE);
+        if ((M >= 0 && g.M != M) || (K >= 0 && g.K != K)) return R4D_NO(RAD_E_SHAPE);
+        if (((uintptr_t)g.y->data) & 15u) return R4D_NO(RAD_E_ALIGN);
+        M = g.M;
+        K = g.K;
+        S.w[i]  = (const uint8_t*)g.b->data;
+        S.ws[i] = (const uint16_t*)g.bscale->data;
+        S.a[i]  = (const int8_t*)g.a->data;
+        S.as[i] = (const float*)g.ascale->data;
+        S.c[i]  = (uint16_t*)g.y->data;
+        S.rows[i]  = (uint32_t)g.N;
+        S.a_ld[i]  = (uint32_t)g.a_ld;
+        S.sa_ld[i] = (uint32_t)g.sa_ld;
+        blocks += (uint32_t)(g.N / 16);
+        S.end[i] = blocks;
+        S.n = i + 1;
+    }
+    if (S.n == 0) return R4D_NO(RAD_E_SHAPE);
+    if (M < 1 || M > 16) return R4D_NO(RAD_E_SHAPE);
+    const bool chain = r4d_geti_or(a, "chain", 0) != 0;
+    const uint32_t ngrp = (uint32_t)(K / (long long)kBlock);
+    int rc = RAD_OK;
+#define R4D_I8M_E(kw_, ch_)                                                                    \
+    rc = R4D_EMIT(stream, (gemm_i8_kpar_multi_kernel<kw_, kBlock, 1u, ch_>), dim3(blocks),    \
+                  dim3(kw_ * kWave), 0, S, (uint32_t)K, (uint32_t)M)
+#define R4D_I8M(kw_)                                                                           \
+    do { if (chain) R4D_I8M_E(kw_, r4dchain); else R4D_I8M_E(kw_, R4dUnchained); } while (0)
+    if (ngrp >= 4u)      R4D_I8M(4u);
+    else if (ngrp >= 2u) R4D_I8M(2u);
+    else                 R4D_I8M(1u);
+#undef R4D_I8M
+#undef R4D_I8M_E
+    return rc == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_SHAPE;
+}
+
 extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {
     Fp8Ops g;
     int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
@@ -1394,6 +1518,28 @@ extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs* a, RadStream s) {
         (int)g.M, (int)g.K, (int)g.N, (int)g.a_ld, (int)g.sa_ld, (int)g.w_ld, (int)g.sw_ld,
         (long long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* Vision's int8 linear: the prefill tile over container-form weights. `w_rb` 1 is how the
+ * architecture names it; the fragment rows do not read the parameter, so they stay the text path. */
+extern "C" int r4d_rad_gemm_i8a8_row(const RadArgs* a, RadStream s) {
+    Fp8Ops g;
+    int rc = fp8_ops(a, &g, 1, FP8_OPS_ROW_SCALE);
+    if (rc != RAD_OK) return rc;
+    if (g.a->dtype != RAD_I8 || g.b->dtype != RAD_I8 || g.bscale->dtype != RAD_BF16 ||
+        g.ascale->dtype != RAD_F32 || g.y->dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
+    if (r4d_geti_or(a, "w_rb", 0) != 1 || g.group != R4D_FP8_BLOCK) return R4D_NO(RAD_E_SHAPE);
+    if (g.K % (int)kBlock || g.N % (int)kPBN) return R4D_NO(RAD_E_SHAPE);
+    if (((uintptr_t)g.y->data) & 15u) return R4D_NO(RAD_E_ALIGN);
+    const int e = R4D_EMIT(s, (gemm_8a8_prefill_row_kernel<true>),
+                           dim3(((uint32_t)g.M + kPBM - 1) / kPBM, (uint32_t)g.N / kPBN, 1),
+                           dim3(kPWaves * kWave), 0, (const uint8_t*)r4d_addr(g.a),
+                           (const float*)r4d_addr(g.ascale), (const uint8_t*)r4d_addr(g.b),
+                           (const uint16_t*)r4d_addr(g.bscale), (uint16_t*)r4d_addr(g.y),
+                           (uint32_t)g.M, (uint32_t)g.K, (uint32_t)g.N, (uint32_t)g.a_ld,
+                           (uint32_t)g.sa_ld, (uint32_t)g.w_ld, (uint32_t)g.sw_ld);
+    return e == RAD_OK && hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_SHAPE;
 }
 
 extern "C" int r4d_rad_gemm_i8a8_rb8_tiled(const RadArgs* a, RadStream s) {

@@ -9,6 +9,21 @@
       "terms_row": "DeepSeek-V4.1-Flash-1017",
       "use_restrictions": []
     },
+    "hy4-flash-iqr-v4-u3": {
+      "file": "keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad",
+      "licence": "tencent-hy-1.0",
+      "gated": false,
+      "index_row": "Hy4-flash",
+      "use_restrictions": [
+        "A Model-as-a-Service business needs a separate written licence from Tencent before use when its worldwide revenue exceeds US$50 million in 12 months, or in a product or service with more than 100 million monthly active users, except qualifying internal use.",
+        "Keep the licence, the copyright and attribution notices and the NOTICE file with copies and derivative works."
+      ],
+      "terms": {
+        "heading": "Hy4-flash",
+        "required_text": ["By using Hy4-flash here you agree to its licence.", "hy_partners@tencent.com"],
+        "quoted_licence_sections": [["10. Additional Commercial Terms.", "END OF TERMS AND CONDITIONS"]]
+      }
+    },
     "gemma4-12b": {
       "file": "keptn/gemma4-12b-i8g/gemma4-12b-i8g.rad",
       "licence": "apache-2.0",
@@ -54,6 +69,20 @@
       "licence": "apache-2.0",
       "gated": false,
       "index_row": "MiniCPM5-2B",
+      "use_restrictions": []
+    },
+    "inkling2-mini-iq8r": {
+      "file": "StillDeadcode/inkling-2-mini-iq8r/inkling-2-mini-iq8r.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Inkling 2 Mini",
+      "use_restrictions": []
+    },
+    "inkling2-mini-dspark": {
+      "file": "gostar77/inkling2-mini-i8-dspark-radiance/inkling2-mini-i8-vl-dspark.rad",
+      "licence": "apache-2.0",
+      "gated": false,
+      "index_row": "Inkling 2 Mini",
       "use_restrictions": []
     },
     "qwen-image": {
@@ -135,8 +164,32 @@
         "deepseek-v4.1-flash": "deepseek-v4.1-flash"
       }
     },
+    "hy4-4card-dfly": {
+      "support": "Preview",
+      "models": {
+        "hy4-flash": "hy4-flash-iqr-v4-u3"
+      }
+    },
+    "hy4-2card": {
+      "support": "Preview",
+      "models": {
+        "hy4-flash": "hy4-flash-iqr-v4-u3"
+      }
+    },
+    "hy4-2card-dfly": {
+      "support": "Preview",
+      "models": {
+        "hy4-flash": "hy4-flash-iqr-v4-u3"
+      }
+    },
     "flashnext-2card": {
       "support": "Supported",
+      "models": {
+        "qwen3.8-next-flash": "qwen3.8-next-flash"
+      }
+    },
+    "flashnext-2card-512k": {
+      "support": "Runs",
       "models": {
         "qwen3.8-next-flash": "qwen3.8-next-flash"
       }
@@ -175,6 +228,18 @@
       "support": "Qualified",
       "models": {
         "minicpm5-2b": "minicpm5-2b"
+      }
+    },
+    "inkling2-mini-1card": {
+      "support": "Supported",
+      "models": {
+        "inkling2-mini": "inkling2-mini-iq8r"
+      }
+    },
+    "inkling2-mini-dspark-1card": {
+      "support": "Supported",
+      "models": {
+        "inkling2-mini-dspark": "inkling2-mini-dspark"
       }
     },
     "qwen-image-1card": {
@@ -219,10 +284,16 @@
         "deepseek41-2card": "deepseek-v4.1-flash",
         "deepseek41-4card": "deepseek-v4.1-flash",
         "flashnext-2card": "qwen3.8-next-flash",
+        "flashnext-2card-512k": "qwen3.8-next-flash",
         "flashnext-2card-fast": "qwen3.8-next-flash",
         "flashnext-4card": "qwen3.8-next-flash",
         "gemma4-12b-1card": "gemma4-12b",
         "gemma4-31b-1card": "gemma4-31b",
+        "hy4-2card": "hy4-flash-iqr-v4-u3",
+        "hy4-2card-dfly": "hy4-flash-iqr-v4-u3",
+        "hy4-4card-dfly": "hy4-flash-iqr-v4-u3",
+        "inkling2-mini-1card": "inkling2-mini-iq8r",
+        "inkling2-mini-dspark-1card": "inkling2-mini-dspark",
         "ltx-2.5-1card": "ltx-2.5",
         "minicpm5-2b-1card": "minicpm5-2b",
         "qwen-image-1card": "qwen-image",

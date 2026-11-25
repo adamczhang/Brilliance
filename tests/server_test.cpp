@@ -1113,6 +1113,66 @@ TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
     CHECK_EQ(caps[2].get<std::string>(), std::string("low"));
 }
 
+/* Hy4-flash's template takes `no_think` and `high` and nothing else, and has no enable_thinking:
+ * the server's own ways of saying "do not think" must reach it as `no_think`, and every level it
+ * does not take is refused with the set it does. */
+TEST(a_template_taking_no_think_and_high_gets_every_thinking_off_as_no_think) {
+    Fixture f;
+    f.tmpl.efforts = { "\"high\"", "\"no_think\"" };
+    const std::vector<std::string> set = f.srv->probe_reasoning_efforts();
+    REQUIRE_EQ(set.size(), 2u);
+    CHECK_EQ(set[0], std::string("high"));
+    CHECK_EQ(set[1], std::string("no_think"));
+    OaiLimits lim = f.limits();
+    lim.reasoning_efforts = set;
+    auto prompt = [&](const std::string& extra) {
+        return chat_with(f, lim, extra).prompts.at(0).text;
+    };
+    /* Thinking on is the template's default: nothing is added. */
+    CHECK(!has(prompt(""), "reasoning_effort"));
+    CHECK(has(prompt(R"("reasoning_effort":"high")"), "[reasoning_effort=\"high\"]"));
+    CHECK(has(prompt(R"("enable_thinking":true)"), "<user>") &&
+          !has(prompt(R"("enable_thinking":true)"), "reasoning_effort"));
+    /* Every spelling of "off". */
+    for (const char* off : { R"("reasoning_effort":"none")", R"("reasoning_effort":"minimal")",
+                             R"("reasoning_effort":"no_think")", R"("enable_thinking":false)",
+                             R"("chat_template_kwargs":{"enable_thinking":false})",
+                             R"("chat_template_kwargs":{"reasoning_effort":"no_think"})",
+                             R"("thinking":{"type":"disabled"})",
+                             R"("reasoning":{"enabled":false})" }) {
+        const std::string p = prompt(off);
+        CHECK(has(p, "[reasoning_effort=\"no_think\"]"));
+        CHECK(!has(p, "\"high\""));
+    }
+    /* Off beside a level: off wins, since the other reading would think after being told not to. */
+    CHECK(has(prompt(R"("enable_thinking":false,"reasoning_effort":"high")"),
+              "[reasoning_effort=\"no_think\"]"));
+    /* A deployment default of `high` does not outvote a request that turns thinking off. */
+    lim.default_reasoning_effort = "high";
+    CHECK(has(prompt(R"("enable_thinking":false)"), "[reasoning_effort=\"no_think\"]"));
+    CHECK(has(prompt(""), "[reasoning_effort=\"high\"]"));
+    lim.default_reasoning_effort.clear();
+
+    /* The rest of the ladder is refused in OpenAI's shape, naming the two words the template takes. */
+    for (const char* bad : { "low", "medium", "xhigh", "max" }) {
+        OaiRequest r;
+        ApiError e;
+        const std::string body = std::string(R"({"messages":[{"role":"user","content":"hi"}],)") +
+                                 R"("reasoning_effort":")" + bad + "\"}";
+        CHECK(parse_chat_request(body, f.odeps(), lim, &r, &e) < 0);
+        CHECK_EQ(e.status, 400);
+        CHECK_EQ(e.param, std::string("reasoning_effort"));
+        CHECK_EQ(e.code, std::string("unsupported_value"));
+        CHECK(has(e.message, std::string("'") + bad + "'"));
+        CHECK(has(e.message, "'high' and 'no_think'"));
+        CHECK(!has(e.message, "Jinja"));
+    }
+    /* ... and a map the operator writes translates a level instead. */
+    lim.reasoning_effort_map = { { "low", "no_think" }, { "max", "high" } };
+    CHECK(has(prompt(R"("reasoning_effort":"low")"), "[reasoning_effort=\"no_think\"]"));
+    CHECK(has(prompt(R"("reasoning_effort":"max")"), "[reasoning_effort=\"high\"]"));
+}
+
 /* A template that takes any word has no set to publish or refuse with, and a template refusing
  * for another reason keeps blaming `messages` with its own sentence. */
 TEST(a_template_that_takes_any_effort_publishes_no_set) {
@@ -2029,6 +2089,9 @@ TEST(a_response_carries_its_requests_timings_and_draft_counts) {
         if (drafts) {
             CHECK_EQ(t["draft_n"].get<int64_t>(), (predicted - 1) * 3);
             CHECK_EQ(t["draft_n_accepted"].get<int64_t>(), predicted - 1);
+            CHECK_EQ(t["draft_steps"].get<int64_t>(), predicted - 1);
+        } else {
+            CHECK(!t.contains("draft_steps"));
         }
     };
     {
@@ -2105,6 +2168,15 @@ TEST(timings_rates_divide_the_tokens_by_the_time_that_produced_them) {
     CHECK_NEAR(j["predicted_per_second"].get<double>(), 100.0, 1e-9);
     CHECK_NEAR(j["predicted_per_token_ms"].get<double>(), 10.0, 1e-12);
     CHECK(!j.contains("draft_n"));
+    CHECK(!j.contains("draft_steps"));
+    t.draft_n = 12;
+    t.draft_n_accepted = 7;
+    t.draft_steps = 4;
+    j = timings_json(t);
+    CHECK_EQ(j["draft_n"].get<int64_t>(), (int64_t)12);
+    CHECK_EQ(j["draft_n_accepted"].get<int64_t>(), (int64_t)7);
+    CHECK_EQ(j["draft_steps"].get<int64_t>(), (int64_t)4);
+    t.draft_n = 0;
 
     t.decode_n = 0;
     t.predicted_ms = 0.0;
@@ -2186,6 +2258,7 @@ TEST(a_sink_keeps_its_first_admission_and_sums_its_drafts) {
     s.add_drafts(3, 3);
     CHECK_EQ(s.n_drafted(), (int64_t)7);
     CHECK_EQ(s.n_draft_accepted(), (int64_t)5);
+    CHECK_EQ(s.n_draft_steps(), (int64_t)2);
 }
 
 /* A request the scheduler refuses gets id 0 and a failed sink, so the HTTP thread waiting on the
@@ -3139,6 +3212,53 @@ TEST(the_sink_is_a_single_producer_ring_that_fails_loudly_on_overflow) {
     t.finish(Finish::Stop);
     t.finish(Finish::Cancelled);
     CHECK_EQ((int)t.finish_reason(), (int)Finish::Stop);
+}
+
+/* A producer that pushes under a lock its consumer takes (the scheduler's step lock) hands the
+ * wake to the caller instead of issuing it: the token is in the ring throughout, the consumer is
+ * woken by wake() and by nothing else, and a step's pushes to one stream owe that one wake
+ * between them. */
+TEST(the_sink_hands_its_wake_to_a_producer_that_has_a_lock_to_release) {
+    Sink s(64);
+    std::atomic<bool> woke{false};
+    std::thread consumer([&] { woke.store(s.wait(5000), std::memory_order_release); });
+    for (int i = 0; i < 500 && !s.consumer_asleep(); ++i)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    CHECK(s.consumer_asleep());
+
+    bool owed = false;
+    CHECK(s.push(11, nullptr, -1, &owed));
+    CHECK(owed);
+    /* The same step's second token to the same stream owes nothing: the one wake serves both. */
+    bool again = false;
+    CHECK(s.push(12, nullptr, -1, &again));
+    CHECK(!again);
+    /* Deferred means nothing woke the consumer: it is still asleep with the tokens in the ring. */
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    CHECK(!woke.load(std::memory_order_acquire));
+
+    /* And the wake the producer issues once it has let go returns the consumer well before the
+     * five seconds it would otherwise sleep. */
+    const auto t0 = std::chrono::steady_clock::now();
+    s.wake();
+    consumer.join();
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    CHECK(woke.load(std::memory_order_acquire));
+    CHECK(ms < 1000.0);
+
+    /* A push to a consumer that is awake owes it nothing. */
+    bool awake = false;
+    CHECK(s.push(13, nullptr, -1, &awake));
+    CHECK(!awake);
+
+    SinkToken buf[8];
+    CHECK_EQ((long long)s.read(buf, 8), 3LL);
+    CHECK_EQ(buf[0].token, 11);
+    CHECK_EQ(buf[1].token, 12);
+    CHECK_EQ(buf[2].token, 13);
+    /* And the sink is quiescent again: the flag the destructor waits on is clear. */
+    s.finish(Finish::Stop);
 }
 
 /* ================================================================== the admin surface */

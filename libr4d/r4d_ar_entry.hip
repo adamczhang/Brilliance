@@ -26,6 +26,7 @@
 #include "r4d_ar4_weights.h"  /* tp4-link-weight: the four-rank two-shot's shard weights */
 #include "r4d_ar_seq.h"     /* the two-rank flags layout (R4D_AR2_*) and the fault record */
 #include "r4d_ar_wide_x.h"  /* the wide host flags layout (R4D_ARW_*), W1 */
+#include "r4d_ihc.h"         // ar_rmsnorm_ihc_junction's operands
 
 #include <condition_variable>
 #include <cstdio>
@@ -239,6 +240,9 @@ struct ArInst {
      * kernels address them by; max_blocks may be lowered by R4D_AR_MAX_BLOCKS. */
     int  flag_nbw   = 0;
     long long gate_ctr   = 0;      /* the blocks that have seen their peer's bytes land (r4d_ar_seq.h) */
+    /* The split junction's wave sums and two words a (launch parity, row) (K-13, r4d_ihc.h's
+     * JuncSplit): rank-local and coarse, since only this rank's blocks touch it. */
+    long long jparts     = 0;
     /* The eight-rank two-shot's per-rank shard weights (r4d_ar_shards.h), fixed at build so the
      * scratch was sized for them and a recorded launch keeps its table. */
     int  shard_weighted = 0;
@@ -946,6 +950,14 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
             stg = r4d_ar_ipc_alloc((long long)(nslots + extra) * in->slot_bytes, 0, handle, &hlen));
     }
 
+    /* K-13: the split junction's scratch, one JuncSplit a rank, zeroed by the allocation: its words
+     * must read zero at the first launch. Coarse for the same reason as the counters above. */
+    long long jsp = 0;
+    if (world == 2) {
+        R4D_TRY("ar_ipc_alloc(jparts)",
+            jsp = r4d_ar_ipc_alloc((long long)sizeof(r4d_ihc::JuncSplit), 0, handle, &hlen));
+    }
+
     /* This rank's own packed copy, for the rotated 6-bit wire only: the reduce must fold exactly
      * the bytes it sent. The 6-bit payload is 3/8 of the bf16 message and the f32 scales 1/32 of
      * it, laid out from half the slot; a row padded to whole 512-element chunks
@@ -987,6 +999,7 @@ int build(ArInst* in, long long group, int rank, int world, long long max_numel,
     in->wide_x     = wide_x ? 1 : 0;
     in->locpack    = lp;
     in->my_stage   = stg;
+    in->jparts     = jsp;
     in->gate_ctr   = sq + 2LL * maxb * 4;   /* the word after the sequence counters (r4d_ar_seq.h) */
 
     Rendezvous& rv = rv_for(group);
@@ -1100,6 +1113,7 @@ void release(ArInst* in) {
     r4d_ar_ipc_free(in->my_seq);
     r4d_ar_ipc_free(in->locpack);
     r4d_ar_ipc_free(in->my_stage);
+    r4d_ar_ipc_free(in->jparts);
     delete in;
 }
 
@@ -1246,7 +1260,7 @@ static void mbgeo_note(const ArInst* in, long long w16, int nb, long long y,
     for (size_t i = 0; i < v.size(); ++i)
         if (v[i].w16 == w16 && v[i].nb == nb) {
             g = v[i];
-            if (i) { v.erase(v.begin() + (long)i); v.insert(v.begin(), g); }
+            if (i) { v.erase(v.begin() + (std::ptrdiff_t)i); v.insert(v.begin(), g); }
             break;
         }
     if (v.empty() || v[0].w16 != w16 || v[0].nb != nb) {
@@ -1877,7 +1891,7 @@ static std::string cap_path() {
         }
     }
     char b[64];
-    std::snprintf(b, sizeof b, "radiance-%lu.stall-capture", (unsigned long)GetCurrentProcessId());
+    std::snprintf(b, sizeof b, "radiance-%u.stall-capture", (unsigned)GetCurrentProcessId());
     return b;
 }
 
@@ -2289,8 +2303,8 @@ static void cap_run(const MbJob& j) {
     if (FILE* f = std::fopen((base + ".txt").c_str(), "ab")) {
         SYSTEMTIME st;
         GetLocalTime(&st);
-        std::fprintf(f, "==== %04d-%02d-%02d %02d:%02d:%02d.%03d, pid %lu\n%s%s\n\n", st.wYear, st.wMonth, st.wDay,
-                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned long)GetCurrentProcessId(),
+        std::fprintf(f, "==== %04d-%02d-%02d %02d:%02d:%02d.%03d, pid %u\n%s%s\n\n", st.wYear, st.wMonth, st.wDay,
+                     st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, (unsigned)GetCurrentProcessId(),
                      head.c_str(), rep.c_str());
         std::fclose(f);
     }
@@ -3570,7 +3584,7 @@ extern "C" int r4d_rad_ar_gather_2rank(const RadArgs* a, RadStream s) {
                             (long long)row, (long long)(uintptr_t)s, c.nblocks, c.nthreads,
                             c.drain | ar_inj_take(in, R4D_AR_OP_GATHER) | ar_resend_bit(in), c.acq,
                             (long long)dpitch,
-                            (long long)spitch, in->my_stage));
+                            (long long)spitch, in->my_stage, ar_chain(a, c.numel)));
     return RAD_OK;
 }
 
@@ -4298,6 +4312,56 @@ extern "C" int r4d_rad_ar_rmsnorm_had_quant_i8g(const RadArgs* a, RadStream s) {
     return rad_ar_rmsnorm_quant(a, s, true);
 }
 
+/* ar_rmsnorm: ar_rmsnorm_quant_fp8 without the quantiser, for a block whose linears read the bf16
+ * norm output (arch/common's bf16 blocks). Its operands are that op's minus `q` and `scale`, with
+ * `y` required; the exact wire only. The checks, the block count and the norm's width are
+ * rad_ar_rmsnorm_quant's, for the same reasons. */
+enum { AN_X = 0, AN_RESID, AN_W, AN_Y };
+
+extern "C" int r4d_rad_ar_rmsnorm(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+
+    const RadTensor* x  = r4d_opt(a, AN_X);
+    const RadTensor* rs = r4d_opt(a, AN_RESID);
+    const RadTensor* w  = r4d_opt(a, AN_W);
+    const RadTensor* y  = r4d_opt(a, AN_Y);
+    if (!x || !w || !y) return RAD_E_INVAL;
+    if (!r4d_contig(w)) return RAD_E_STRIDE;
+    if (x->rank != 2 || y->rank != 2) return RAD_E_SHAPE;
+    const long long M = x->shape[0], K = x->shape[1];
+    if (M < 1 || K < 1) return RAD_E_SHAPE;
+    if (M * K > in->max_numel) return RAD_E_SHAPE;
+    if (K % 8) return RAD_E_SHAPE;
+    if (r4d_numel(w) != K) return RAD_E_SHAPE;
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return RAD_E_DTYPE;
+    if (y->shape[0] != M || y->shape[1] != K) return RAD_E_SHAPE;
+    if (rs && (rs->rank != 2 || rs->shape[0] != M || rs->shape[1] != K)) return RAD_E_SHAPE;
+    const long long xp = r4d_row_pitch(x), yp = r4d_row_pitch(y);
+    const long long rp = rs ? r4d_row_pitch(rs) : 0;
+    if (xp < 0 || yp < 0 || rp < 0) return RAD_E_STRIDE;
+    if (xp != K) return RAD_E_STRIDE;
+    if (r4d_geti_or(a, "wire", 0) != 0) return RAD_E_UNSUPPORTED;
+
+    R4dArCfg cfgv;
+    r4d_cfg_ar(a, &cfgv);
+    int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : (int)M;
+    if (nblocks > (int)M) nblocks = (int)M;
+    constexpr int kNbCap = 256;
+    if (nblocks > kNbCap) nblocks = kNbCap;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;
+    if (nblocks < 1) nblocks = 1;
+
+    const int e = r4d_ar_rmsnorm_bf16(
+        in->peer_scratch[0], in->my_scratch, in->peer_flags[0], in->my_flags, in->my_seq,
+        in->slot16, r4d_addr(x), rs ? r4d_addr(rs) : 0, r4d_addr(w), r4d_addr(y), (int)M, (int)K,
+        (float)r4d_getf(a, "eps", 1e-6), (float)r4d_getf(a, "wadd", 0.0), w->dtype == RAD_F32,
+        (int)rp, (int)yp, (long long)(uintptr_t)s, nblocks, 0, cfgv.drain, cfgv.acq, in->my_stage,
+        r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
 /* The all-reduce and the sandwich-norm junction after it, int8 out: exact `all_reduce` of `x`, then
  * `rmsnorm_quant_i8` (post-norm of the reduced x, residual add, scalar, norm and the per-row int8
  * quantiser the w4a8 skinny GEMM reads). Operands are rmsnorm_quant_i8's with `x` inout, since the
@@ -4411,7 +4475,9 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         tail_nbt = nb_for_shard(words16 / in->world, in->nb_cap > 24 ? 24 : in->nb_cap);
         if (tail_nbt > in->max_blocks) tail_nbt = in->max_blocks;
     }
-    const long long tail_ctr = in->my_seq + (2LL * in->max_blocks + 8) * 4;
+    /* Eight words past the landed counter, at the allocation's bound (gate_ctr is at 2*maxb words):
+     * in->max_blocks may be capped below it by R4D_AR_MAX_BLOCKS and would land in the parity counters. */
+    const long long tail_ctr = in->gate_ctr + 8 * 4;
     /* `sp` (0 unless asked): the all-reduce split around the junction, P2P only. The host mailbox
      * runs the whole form, which leaves every byte the split one does. */
     const long long sp = r4d_geti_or(a, "sp", 0);
@@ -4430,6 +4496,79 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_i8_4rank(const RadArgs* a, RadStream s) 
         r4d_geti_or(a, "chain", 0) != 0 ? 1 : 0, in->host ? 0 : (int)sp);
     if (e != 0) return RAD_E_SHAPE;
     return early ? RAD_LINK_ENDED : RAD_OK;
+}
+
+/* ar_rmsnorm_ihc_junction (WP16.2): the exact all-reduce of `a` [after the add] and Hy4-flash's iHC
+ * junction over the reduced sum (r4d_ar_ihc_junction.hip). The operands are rmsnorm_ihc_junction's,
+ * checked by the same function; `a` is the message, so it must be tight. A block owns whole rows:
+ * one a row up to 256 blocks, as ar_rmsnorm_quant_i8's two-rank form. The exact wire's push is
+ * coded (r4d_ar_arc2.h, lossless) from the fused writes' floor on P2P instances, rows of whole 256
+ * values; the norms read the sum, so no lossy wire. The chained form at decode heights only. */
+static int ar_ihc_junction_common(const RadArgs* a, const ArInst* in, r4d_ihc::R4dIhcJunction* j,
+                                  R4dArCfg* cfgv, int* nblocks) {
+    if (in->dtype != 0) return RAD_E_DTYPE;
+    const int rc = r4d_ihc_junction_args(a, j);
+    if (rc != RAD_OK) return rc;
+    if (j->hc != 2 && j->hc != 4 && j->hc != 8) return RAD_E_UNSUPPORTED;
+    if (j->ap != (long long)j->r.n) return RAD_E_STRIDE;
+    if (j->M * (long long)j->r.n > in->max_numel) return RAD_E_SHAPE;
+    r4d_cfg_ar(a, cfgv);
+    int nb = cfgv->nblocks > 0 ? cfgv->nblocks : (int)j->M;
+    if (nb > (int)j->M) nb = (int)j->M;
+    if (nb > 256) nb = 256;
+    if (nb > in->max_blocks) nb = in->max_blocks;
+    *nblocks = nb < 1 ? 1 : nb;
+    return RAD_OK;
+}
+
+extern "C" int r4d_rad_ar_rmsnorm_ihc_junction(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 2) return RAD_E_SHAPE;
+    r4d_ihc::R4dIhcJunction j;
+    R4dArCfg cfgv;
+    int nblocks = 1;
+    const int rc = ar_ihc_junction_common(a, in, &j, &cfgv, &nblocks);
+    if (rc != RAD_OK) return rc;
+    const long long words16 = (long long)(j.M * (long long)j.r.n / 8);
+    const long long coded = j.r.n % 256 == 0 ? ar_coded(a, in, words16) : 0;
+    const int chain = r4d_geti_or(a, "chain", 0) != 0 && j.M <= 64 ? 1 : 0;
+    /* K-13: at decode heights several blocks a row, each owning a run of the 16 waves (the launcher
+     * splits the count into rows and parts). A caller's own block count is kept, and the launch stays
+     * within the instance's cap; both ranks derive the same split from the same M and caps. */
+    int parts = 0;
+    if (cfgv.nblocks <= 0 && in->jparts && j.M >= 1 && j.M <= (long long)r4d_ihc::kSplitRows) {
+        const int cap = in->nb_cap < in->max_blocks ? in->nb_cap : in->max_blocks;
+        for (int b = (int)r4d_ihc::kSplitParts; b > 1; b >>= 1)
+            if (j.M * b <= (long long)cap) { parts = b; break; }
+        if (parts > 1) nblocks = (int)(j.M * (long long)parts);
+    }
+    const int e = r4d_ar_ihc_junction_2rank(in->peer_scratch[0], in->my_scratch, in->peer_flags[0],
+                                            in->my_flags, in->my_seq, in->slot16, in->jparts, &j,
+                                            (long long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq,
+                                            in->my_stage, chain, coded ? 1 : 0);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
+}
+
+/* Four ranks, on the wide one-shot (r4d_rad_ar_hc_wide_init's instance, shared with
+ * ar_rmsnorm_quant_i8_4rank's key rule). One-shot only: a caller issues it at decode heights and
+ * the unfused pair above them, whose all_reduce goes two-shot. */
+extern "C" int r4d_rad_ar_rmsnorm_ihc_junction_4rank(const RadArgs* a, RadStream s) {
+    const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
+    if (!in) return RAD_E_STATE;
+    if (in->world != 4) return RAD_E_SHAPE;
+    r4d_ihc::R4dIhcJunction j;
+    R4dArCfg cfgv;
+    int nblocks = 1;
+    const int rc = ar_ihc_junction_common(a, in, &j, &cfgv, &nblocks);
+    if (rc != RAD_OK) return rc;
+    const int chain = r4d_geti_or(a, "chain", 0) != 0 && j.M <= 64 ? 1 : 0;
+    const int e = r4d_ar_ihc_junction_4rank(
+        in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2], in->peer_flags[0],
+        in->peer_flags[1], in->peer_flags[2], in->my_scratch, in->my_flags, in->my_seq,
+        in->slot16, &j, (int)in->rank, (long long)(uintptr_t)s, nblocks, cfgv.drain, cfgv.acq,
+        cfgv.pub, chain);
+    return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 
 /* The all-reduce with the gated residual write: `all_reduce` of `y`, then `hc_write` of the reduced

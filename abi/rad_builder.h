@@ -291,6 +291,17 @@ typedef struct RadBuildCtx {
      * max_tok rows. 0, the zero-initialised default, keeps the interval-tall passes. A plugin
      * without such a pass ignores it. */
     int      span_pass_step;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* The number of trunk layers, from the first, whose persistent state a pass can carry across
+     * a step boundary and pick up again at layer L: every state the layers [0, L) write is either
+     * declared as replicated persistent (the KV cache, an attention sink, a tap, a calibration
+     * table) or fully rewritten by the trunk of each pass. The core sets it to the whole trunk only
+     * when --chunk-slices asks for slicing and the plugin reports it can serve a layer range
+     * (RadArchProbe::slice_layers_ok), which is the same report the scheduler plans a chunk by. 0,
+     * the zero-initialised default, says the plugin declares no such set, so no chunk is sliced
+     * for it. */
+    int32_t  layer_slices;
 } RadBuildCtx;
 
 /* The most instances (engine ranks) one process holds at once; every slot is below it. */
@@ -620,7 +631,8 @@ int rad_build_device_p2p(RadBuilder* b);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_MATMUL = 8, RAD_MAP_SOFTMAX = 9 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -681,8 +693,18 @@ typedef struct RadNameMap {
  * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
  * of dimension 2 is the 2-D convolution it then is.
  *
- * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * RAD_MAP_MATMUL is the product of two sources, src[0] [n, k] times src[1] [k, m] (or [k], giving
+ * [n]): a linear folded into the one after it. A DSpark Markov head whose rank-r latent goes
+ * through `hidden_out` and then the target's lm_head reads `lm_head @ hidden_out` instead, a
+ * [vocab, r] table, so each draft position scores the vocabulary at the rank's width rather than
+ * the hidden width (Inkling 2's drafter: 256 against 2304).
+ *
+ * RAD_MAP_SOFTMAX is the softmax of src[0] along its last dimension, row by row; src_index[0] >= 0
+ * keeps that one row (a vector). A learned mixture a reference normalises once at load (Inkling 2's
+ * drafter mixes its four trunk taps with softmax(fuse_weight[layer])) is stored normalised.
+ *
+ * TRANSPOSE, EMA, TAP, COLS, MATMUL and SOFTMAX are computed at convert in f32 (MATMUL and SOFTMAX
+ * summed in f64), like WNORM, and stored as the recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
@@ -1152,6 +1174,14 @@ int rad_lora_root(RadBuilder* b, const char* native, const char* spellings);
 int rad_lora_alias(RadBuilder* b, const char* native, const char* from, const char* to,
                    int64_t from_lo, int64_t from_hi, int64_t to_lo);
 
+/* Is checkpoint tensor `src` a runtime-LoRA target of this build? 1 when an adapter configured
+ * for this startup targets it, 0 otherwise (no adapter, a different module, a tower, the drafter,
+ * or a generator source outside a declared root). The same predicate as lora::source_targeted:
+ * the leaf of a `.weight` name. A plugin asks before the weight exists, and sets a LoRA-only
+ * declaration (the plain bf16 view of a rotated int8 trunk weight) only on 1. Null or an empty
+ * name is 0. Additive export; RAD_ABI_VERSION does not move. */
+int rad_lora_source_targeted(RadBuilder* b, const char* src);
+
 /* ================================================================== the audio generator */
 /* A program that makes audio from text: an autoregressive language model writes the piece frame by
  * frame, with classifier-free guidance (each request runs a conditional and an unconditional
@@ -1324,8 +1354,9 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * Geometry. A video of n chunks has `frames_per_chunk n + frames_tail` frames at
  * `fps_num / fps_den` a second and `latents_per_chunk n + latents_tail` latent frames, each of
  * (height / latent_scale) x (width / latent_scale) latents of `latent_channels`; the denoiser
- * reads them in `patch` x `patch` patches. Chunk c of n is `frames_per_chunk` frames, the last
- * `frames_per_chunk + frames_tail`. A side is a multiple of `size_multiple` pixels, at least
+ * reads them in `patch` x `patch` patches. A positive `frames_tail` adds frames to the last
+ * chunk. A negative `frames_tail` trims the first chunk, which must still emit at least one
+ * frame. Every other chunk has `frames_per_chunk` frames. A side is a multiple of `size_multiple` pixels, at least
  * `min_side`, the area at most `max_area`, and the long side over the short at most `max_aspect`.
  * The soundtrack has round(frames / fps * audio_rate) latents a channel, each
  * `sample_rate / audio_rate` samples.
@@ -1379,6 +1410,9 @@ enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10
        RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12,
        RAD_GEN_PASS_VENCODE = 13, RAD_GEN_PASS_AENCODE = 14 };
 
+enum { RAD_VIDEO_SCHEDULE_UNIPC = 2 };
+enum { RAD_VIDEO_GUIDANCE_FULL = 1, RAD_VIDEO_GUIDANCE_CFG = 2 };
+
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
 
@@ -1397,7 +1431,7 @@ typedef struct RadVideoGenDecl {
     /* The size and length a request that names none is made at. */
     int64_t     default_width, default_height, default_chunks;
 
-    /* The soundtrack. */
+    /* The soundtrack. All four fields are zero for a video-only model. */
     int64_t     sample_rate, audio_rate, audio_channels, audio_latent_channels;
 
     /* The sampler (above). */
@@ -1407,7 +1441,7 @@ typedef struct RadVideoGenDecl {
     /* `max_lanes` requests may hold state at once. `frames_out` is [>= the frames of the largest
      * chunk, height, width, 3] u8 on the device, the frames a VDECODE pass made, row-major RGB;
      * `audio_out` is [>= the samples of the longest soundtrack, audio_channels] f32, interleaved,
-     * what an ADECODE pass made. */
+     * what an ADECODE pass made. Set audio_out to RAD_NULL_HANDLE for video-only models. */
     int64_t     max_lanes;
     rad_buf     frames_out;
     rad_buf     audio_out;
@@ -1433,7 +1467,11 @@ typedef struct RadVideoGenDecl {
      * `base_seq` (`base_shift`) to `max_seq` (`max_shift`); then, with `shift_terminal` > 0,
      * stretched so the last is shift_terminal; and a closing 0. A trained schedule (n_rungs > 0)
      * is the rungs taken to f32 and a closing 0, with default_steps and max_steps both n_rungs.
-     * Both modalities step the same sigmas; shift_video and shift_audio are unused. */
+     * Both modalities step the same sigmas; shift_video and shift_audio are unused.
+     * RAD_VIDEO_SCHEDULE_UNIPC: Wan's shifted 1000-step flow training grid and
+     * order-two UniPC BH2 update, with integer model timesteps. The request
+     * names the number of evaluations. Only video, with no trained rungs or
+     * latent upscaler. shift_video supplies the default shift. */
     int32_t       sched_kind;
     int32_t       dyn_shift;
     double        base_shift, max_shift;
@@ -1448,11 +1486,12 @@ typedef struct RadVideoGenDecl {
     /* The text rows of every VSTEP pass, whatever the prompt's length (0: the prompt's tokens):
      * a model whose text encoder writes a fixed number of rows. */
     int64_t       step_text_rows;
-    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is 1: the defaults a request
+    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is nonzero: the defaults a request
      * that names none gets, the video's scale, spatio-temporal scale, modality scale and rescale,
      * then the soundtrack's four. A request whose video or soundtrack scale is not 1 is guided
      * against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass then
-     * carries both prompts, the positive first (two cu_seqlens entries). */
+     * carries both prompts, the positive first (two cu_seqlens entries).
+     * RAD_VIDEO_GUIDANCE_CFG accepts only the video and soundtrack CFG scales and negative prompt. */
     int32_t       guidance;
     double        guidance_default[8];
     const char*   default_negative;
@@ -1750,6 +1789,14 @@ typedef struct RadArchProbe {
      * rather than ending the chunk there and running the rows past it as a step of their own.
      * Zero keeps that step. */
     int32_t ckpt_snap_ok;
+
+    /* ---- appended in ABI 44 (a chunk planned as layer-sliced sub-steps) */
+    /* Nonzero when the plugin honours RadBatch::layer_lo/hi: it runs a step's trunk over that
+     * range only, and starts at layer_lo from the state the previous sub-step left (the replicated
+     * persistent state declared as RadBuildCtx::layer_slices, plus its transient buffers keyed by
+     * a pass's position in the chunk). Zero, the zero-initialised default, keeps every step whole:
+     * a plugin that runs a whole trunk whatever the range says must keep it zero. */
+    int32_t slice_layers_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
@@ -1886,6 +1933,23 @@ typedef struct RadChatFormat {
      * written. When the model does reason, its header after the block is reasoning_close's.
      * NULL or "": the reply starts with its content. */
     const char* content_open;
+
+    /* RAD_CHAT_ARGS_OBJECT: the object after the name is an envelope that names the call again
+     * and holds the arguments under this key, `{"name":NAME,"KEY":{...}}` (Inkling 2's
+     * `<|content_invoke_tool_json|>{"name":"f","args":{...}}`). The reply's arguments are KEY's
+     * value. The grammar writes the envelope compactly in that order; a reply that writes the
+     * keys the other way round, names another function or leaves the envelope out is still read,
+     * as not strict. JSON objects only: no object_string_open, no bare keys. NULL or "": the
+     * object is the arguments. */
+    const char* object_args_key;
+
+    /* A header every message of the reply starts with (Inkling 2's `<|message_model|>`): before
+     * reasoning_open it is part of the block's opener, before content_open it is the content's
+     * header, and both are dropped there; before anything else it is read as written, which
+     * makes it a call's name_prefix when the format names it so (`<|message_model|>NAME...`).
+     * Needs reasoning_open or content_open; with tool calls, name_prefix must be this literal
+     * and call_open and section_open empty. NULL or "": messages have no header of their own. */
+    const char* message_open;
 } RadChatFormat;
 
 /* Return the format, or NULL for "derive it from the chat template". Called once at startup. */

@@ -1224,6 +1224,7 @@ int RadWriter::write_plane(int64_t idx, int k, int64_t off, const void* data, in
  * codes. Counted, not range-tracked: overlapping writes would pass, but no producer writes a byte
  * twice. */
 int RadWriter::check_complete() const {
+    if (holes_ok_) return RAD_OK;
     for (size_t i = 0; i < dir_.size(); ++i) {
         if (dir_abs_[i]) continue;
         for (uint32_t k = 0; k < dir_[i].n_planes; ++k) {
@@ -1394,6 +1395,12 @@ int RadWriter::finish() {
     if (!began_) return RAD_E_STATE;
     if (late_) {
         RAD_ERR("%s: a table changed after seal() fixed the layout", path_.c_str());
+        abort();
+        return RAD_E_STATE;
+    }
+    if (holes_ok_ && !sealed_) {
+        /* An unsealed writer splices its spill, which holes would leave short: a skeleton is written in place, after seal(). */
+        RAD_ERR("%s: unwritten planes are allowed only on a sealed writer", path_.c_str());
         abort();
         return RAD_E_STATE;
     }

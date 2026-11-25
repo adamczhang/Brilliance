@@ -1002,6 +1002,109 @@ static int markov_greedy(const RadArgs* a, uint32_t logits_dtype) {
 AVX_KERNEL(dflash_markov_greedy) { return markov_greedy(a, RAD_BF16); }
 AVX_KERNEL(dflash_markov_greedy_f32) { return markov_greedy(a, RAD_F32); }
 
+/* ================================================================== markov_rnn_greedy
+ *
+ * Inkling 2's recurrent DSpark head (libref ref_quant.cpp, ref_markov_rnn_greedy): a gated rank-r
+ * state over [state | w1[prev]] and the step's context, a tanh latent, and a full-vocabulary
+ * argmax of softcap(logits + fold_b + fold . latent) with the bf16 roundings the reference's torch
+ * ops take. Scalar and in libref's order, so every sum and every tie is libref's. */
+static inline float rnn_rb(float x) { return rad_bf16_to_f32(rad_f32_to_bf16(x)); }
+
+AVX_KERNEL(markov_rnn_greedy) {
+    if (a->n_t < 13) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *ctx = &a->t[1], *cseq = &a->t[2], *anc = &a->t[3];
+    const RadTensor *w1 = &a->t[4], *wsp = &a->t[5], *bias = &a->t[6], *fold = &a->t[7];
+    const RadTensor *fb = &a->t[8], *scr = &a->t[9], *tsc = &a->t[10], *ttok = &a->t[11];
+    const RadTensor *out = &a->t[12];
+    for (int i = 0; i < 13; ++i)
+        if (!a->t[i].data) return RAD_E_INVAL;
+    if (logits->dtype != RAD_F32 || ctx->dtype != RAD_F32 || cseq->dtype != RAD_F32 ||
+        w1->dtype != RAD_BF16 || wsp->dtype != RAD_BF16 || bias->dtype != RAD_BF16 ||
+        fold->dtype != RAD_BF16 || fb->dtype != RAD_BF16 || scr->dtype != RAD_F32 ||
+        tsc->dtype != RAD_F32 || ttok->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (anc->dtype != RAD_I32) return RAD_E_SHAPE;
+    const int64_t steps = p_int(a, "steps", 0), R = p_int(a, "rank", 0);
+    const int64_t V = p_int(a, "n_vocab", 0), astr = p_int(a, "anchor_stride", 1);
+    const float cap = p_f32(a, "cap", 0.0f);
+    const int64_t M = out->rank == 2 ? band_rows(out->shape[0], p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr <= 0 || out->shape[1] < steps)
+        return RAD_E_SHAPE;
+    const int64_t lw = logits->shape[logits->rank - 1];
+    const int64_t n_tiles = (V + 63) / 64;
+    if (lw < V || numel(logits) < M * steps * lw || numel(ctx) < M * steps * 3 * R ||
+        numel(cseq) < M * 3 * R || numel(anc) < (M - 1) * astr + 1 ||
+        numel(w1) < V * R || numel(wsp) < 3 * R * 2 * R || numel(bias) < 3 * R ||
+        numel(fold) < V * R || numel(fb) < V || numel(scr) < M * 3 * R ||
+        numel(tsc) < M * n_tiles || numel(ttok) < M * n_tiles)
+        return RAD_E_SHAPE;
+    if (w1->shape[w1->rank - 1] != R || fold->shape[fold->rank - 1] != R) return RAD_E_SHAPE;
+
+    const int64_t ls = laststride(logits), os = laststride(out);
+    const int64_t tss = laststride(tsc), tis = laststride(ttok);
+    AVX_PARALLEL_FOR_IF(M * steps * V * R >= AVX_PAR_MIN)
+    for (int64_t m = 0; m < M; ++m) {
+        float* buf   = scratch_f32((size_t)(7 * R));
+        float* state = buf;            /* [R] */
+        float* in    = buf + R;        /* [2R] */
+        float* raw   = buf + 3 * R;    /* [3R] */
+        float* lat   = buf + 6 * R;    /* [R] */
+        float* rowb  = scratch_f32_b((size_t)(2 * R));
+        float* frow  = scratch_f32_c((size_t)R);
+        for (int64_t r = 0; r < R; ++r) state[r] = 0.0f;
+        int64_t prev = ldi(anc, offlin(anc, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t row = m * steps + l;
+            const bool ok = prev >= 0 && prev < V;
+            for (int64_t r = 0; r < R; ++r) {
+                in[r] = state[r];
+                in[R + r] = ok ? ldt(w1, offlin(w1, prev * R + r)) : 0.0f;
+            }
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                float acc = ldt(ctx, offlin(ctx, row * 3 * R + j)) +
+                            ldt(cseq, offlin(cseq, m * 3 * R + j)) + ldt(bias, offlin(bias, j));
+                const float* wr = in_row(wsp, rowoff(wsp, j, 2 * R), 2 * R, rowb);
+                for (int64_t k = 0; k < 2 * R; ++k) acc += wr[k] * in[k];
+                raw[j] = acc;
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                const float g = rnn_rb(1.0f / (1.0f + std::exp(-rnn_rb(raw[r]))));
+                const float c = rnn_rb(std::tanh(rnn_rb(raw[R + r])));
+                const float keep = rnn_rb(g * state[r]);
+                const float upd = rnn_rb(rnn_rb(1.0f - g) * c);
+                state[r] = rnn_rb(keep + upd);
+                lat[r] = rnn_rb(std::tanh(rnn_rb(raw[2 * R + r])));
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                stt(scr, offlin(scr, m * 3 * R + (l % 2) * R + r), state[r]);
+                stt(scr, offlin(scr, m * 3 * R + 2 * R + r), lat[r]);
+            }
+            const int64_t lb = rowoff(logits, row, lw);
+            float   gbest = -INFINITY;
+            int64_t gtok  = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64, end = std::min<int64_t>(first + 64, V);
+                float   best = -INFINITY;
+                int64_t btok = first;
+                for (int64_t v = first; v < end; ++v) {
+                    const float* fr = in_row(fold, rowoff(fold, v, R), R, frow);
+                    float dot = ldt(fb, offlin(fb, v));
+                    for (int64_t r = 0; r < R; ++r) dot += fr[r] * lat[r];
+                    float x = rnn_rb(rnn_rb(ldt(logits, lb + v * ls)) + rnn_rb(dot));
+                    if (cap > 0.0f) x = rnn_rb(cap * std::tanh(x / cap));
+                    if (x > best || (x == best && v < btok)) { best = x; btok = v; }
+                }
+                stt(tsc, rowoff(tsc, m, n_tiles) + tile * tss, best);
+                st_int_dt(ttok->dtype, ttok->data, rowoff(ttok, m, n_tiles) + tile * tis, btok);
+                if (best > gbest || (best == gbest && btok < gtok)) { gbest = best; gtok = btok; }
+            }
+            st_int_dt(out->dtype, out->data, rowoff(out, m, out->shape[1]) + l * os, gtok);
+            prev = gtok;
+        }
+    }
+    return RAD_OK;
+}
+
 /* ================================================================== dflash_tree
  *
  * The same lattice grown best-first into a tree of `nodes` nodes (rad_drafter_tree), libref's rule

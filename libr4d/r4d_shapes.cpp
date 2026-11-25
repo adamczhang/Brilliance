@@ -50,6 +50,12 @@
  *       [ceil(N/128)][ceil(K/128)] plane, and fragment order is a permutation of the same count
  *       (r4d_fp8_frag.h: `frag_bytes(N,K) == N*K`).
  *
+ *   gemm_nt at bf16x12
+ *       The weight is the stored form r4d_layout.cpp lays out from a bf16x12 weight's four planes
+ *       (R4D_DT_BF16X12), whose byte count is the layout hook's. Nor would a fill be a weight: an
+ *       exponent byte of 0xFF sends a lane to the escape table at whatever index its offsets
+ *       hold. r4d_selftest builds the weight from bf16 values through the rows' own hooks.
+ *
  *   logits_gemm at fp8
  *       The declared shape and the stored plane differ. The weight is declared [n_vocab][n_embd]
  *       E4M3 but the kernel strides it by r4d_fp8::lm_row_bytes(n_embd), since each row carries
@@ -321,7 +327,9 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
      * and f32 -> bf16, and the shims refuse any other pair, so another pair is declined here. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
     const uint32_t bf = (uint32_t)RAD_BF16, f32 = (uint32_t)RAD_F32, f16 = (uint32_t)RAD_F16;
-    if (!(f == bf && (t == bf || t == f32 || t == f16)) && !(f == f32 && (t == bf || t == f32)))
+    const uint32_t i32 = (uint32_t)RAD_I32;
+    if (!(f == bf && (t == bf || t == f32 || t == f16)) && !(f == f32 && (t == bf || t == f32)) &&
+        !(f == i32 && t == i32))
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);
@@ -380,6 +388,15 @@ extern "C" int r4d_shape_grid_embed_cpe(const RadParam* p, int n_p, int operand,
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, n), opd(D, side * side, n), opd_idx(4, M, side),
                              opd(D, npre > 0 ? npre : 1, n) };
+    R4D_PICK(l);
+}
+
+/* posemb_resample: the source table [S_h * S_w, n] and the grid's table [T_h * T_w, n]. */
+extern "C" int r4d_shape_posemb_resample(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t Sh = pi(p, n_p, "S_h"), Sw = pi(p, n_p, "S_w");
+    const int64_t Th = pi(p, n_p, "T_h"), Tw = pi(p, n_p, "T_w"), n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, Sh * Sw, n), opd(D, Th * Tw, n) };
     R4D_PICK(l);
 }
 
@@ -483,6 +500,144 @@ extern "C" int r4d_shape_mhc_contract(const RadParam* p, int n_p, int operand, R
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, hc * n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+
+/* ---- Hy4-flash's small ops (r4d_ihc_bf16.hip, r4d_mla_kv_bf16.hip, r4d_engram_bf16.hip). Each is
+ * libref's description (ref_shapes.cpp) of the same op; the divergence check of rad-kbench reports
+ * a difference. */
+extern "C" int r4d_shape_ihc_pre(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows");
+    if (hc < 1 || (rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, hc * n), opd((uint32_t)RAD_F32, rows, hc * n),
+        opd((uint32_t)RAD_F32, post ? 2 : 1), opd((uint32_t)RAD_F32, rows), opd(D, M, n),
+        post ? opd((uint32_t)RAD_F32, M, hc) : opd_none() };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_ihc_post(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd((uint32_t)RAD_F32, M, hc), opd(D, M, hc * n) };
+    R4D_PICK(l);
+}
+/* rmsnorm_ihc_junction and its all-reduce twin: every optional operand described (the add form,
+ * `y` and `x` stored), the next connection's only with `tail` (default 1). */
+extern "C" int r4d_shape_rmsnorm_ihc_junction(const RadParam* p, int n_p, int operand,
+                                              RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
+    if (hc < 1 || (tail && rows != hc && rows != 2 * hc)) return RAD_E_UNSUPPORTED;
+    const bool post = rows == 2 * hc;
+    const bool codes = pi(p, n_p, "group", 0) == R4D_FP8_BLOCK;   /* G-3b: xq, xs described */
+    const uint32_t D = dt_act(p, n_p, "dtype"), F = (uint32_t)RAD_F32;
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(F, n), opd(F, M, hc), opd(D, M, hc * n),
+        tail ? opd(F, rows, hc * n) : opd_none(), tail ? opd(F, post ? 2 : 1) : opd_none(),
+        tail ? opd(F, rows) : opd_none(), tail ? opd(F, n) : opd_none(),
+        tail ? opd(D, M, n) : opd_none(), opd(D, M, n), tail ? opd(D, M, n) : opd_none(),
+        tail && codes ? opd((uint32_t)RAD_I8, M, n) : opd_none(),
+        tail && codes ? opd((uint32_t)RAD_F32, M, n / R4D_FP8_BLOCK) : opd_none() };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_gate_mul(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, n), opd(D, M, n), opd(D, M, n) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_mla_project_kv(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim");
+    const char* mode = rad_param_gets(p, n_p, "mode", "");
+    const bool absorb = !std::strcmp(mode, "absorb");
+    if (!absorb && std::strcmp(mode, "expand")) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc d[] = { opd(D, M, h, absorb ? kd : l), opd(D, h * (kd + vd), l),
+        opd(D, M, h, absorb ? l : vd) };
+    R4D_PICK(d);
+}
+extern "C" int r4d_shape_mla_expand_gate(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc d[] = { opd(D, M, h, l), opd(D, h * (kd + vd), l), opd(D, M, h * vd),
+        opd(D, M, h, vd) };
+    R4D_PICK(d);
+}
+extern "C" int r4d_shape_mla_expand_gate_had_quant_i8g(const RadParam* p, int n_p, int operand,
+                                                       RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), l = pi(p, n_p, "latent_dim"),
+                  g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g != R4D_FP8_BLOCK || (h * vd) % g) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc d[] = { opd(D, M, h, l), opd(D, h * (kd + vd), l), opd(D, M, h * vd),
+        opd((uint32_t)RAD_I8, M, h * vd), opd((uint32_t)RAD_F32, M, h * vd / g), opd(D, M, h * vd) };
+    R4D_PICK(d);
+}
+extern "C" int r4d_shape_mla_kv_split(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), kd = pi(p, n_p, "k_dim"),
+                  vd = pi(p, n_p, "v_dim"), r = pi(p, n_p, "rope_dim");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, h * (kd + vd)), opd(D, M, r), opd(D, M, h, kd + r),
+        opd(D, M, h, vd) };
+    R4D_PICK(l);
+}
+/* libref's description (ref_dfly_sel_shape): pos below 2 * ratio, so a drawn table never needs more
+ * than blocks_in + 1 entries; `count` described. */
+extern "C" int r4d_shape_dfly_sel(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), blocks = pi(p, n_p, "blocks"), bin = pi(p, n_p, "blocks_in"),
+                  ratio = pi(p, n_p, "ratio");
+    if (M <= 0 || blocks <= 0 || bin <= 0 || ratio <= 0 || blocks < bin + 2) return RAD_E_UNSUPPORTED;
+    const int64_t S = std::max<int64_t>(1, std::min<int64_t>(pi(p, n_p, "seqs", 1), M));
+    const RadOpdDesc l[] = {
+        opd_idx(M, bin, S * blocks),                  /* sel -- page ids, by trunk row */
+        opd_idx(M, 0, bin + 1),                       /* nsel -- 0 .. blocks_in */
+        opd_idx(S, 0, M),                             /* src -- trunk rows */
+        opd_idx(S, blocks, S * blocks),               /* bt -- page ids */
+        opd_idx(M, 0, 2 * ratio),                     /* pos */
+        opd_idx(S + 1, 0, 0, -1, RAD_OPD_F_IDX_CU),   /* cu */
+        opd((uint32_t)RAD_I32, M, blocks),
+        opd((uint32_t)RAD_I32, M),
+        opd((uint32_t)RAD_I32, M),
+    };
+    R4D_PICK(l);
+}
+/* One sequence, a decode step as for ngram_ids: warm state read at the deepest offset. Token ids are
+ * drawn below `map_size`; the multipliers are the constant 1000003 so a draw cannot wrap. */
+extern "C" int r4d_shape_engram_ids(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), heads = pi(p, n_p, "heads"), ngram = pi(p, n_p, "ngram"),
+                  msize = pi(p, n_p, "map_size");
+    if (ngram < 2 || ngram > 8 || heads < 1 || heads % (ngram - 1) || msize < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t ctx = ngram - 1, depth = ctx - 1 + M;
+    auto idx64 = [](int64_t n, int64_t max, int64_t konst) {
+        RadOpdDesc d = opd((uint32_t)RAD_I64, n);
+        d.fill = RAD_FILL_INDEX;
+        d.idx_max = max;
+        d.idx_const = konst;
+        return d;
+    };
+    const RadOpdDesc l[] = { opd_idx(M, 0, msize), opd_idx(1, depth, msize),
+        opd_idx(2, 0, M, -1, RAD_OPD_F_IDX_CU), opd_idx(M, 0, 0, 1 << 20),
+        opd_idx(msize, 0, 1000), idx64(ngram, 0, 1000003), idx64(heads, 0, 997),
+        idx64(heads, 0, -1), opd_idx(1, 0, 0, M), opd_none(), opd((uint32_t)RAD_I32, M, heads),
+        opd((uint32_t)RAD_I32, M), opd_none() };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_engram_norm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), H = pi(p, n_p, "heads"), n = pi(p, n_p, "n");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, H * n), opd(D, H * n), opd(D, M, H * n) };
+    R4D_PICK(l);
+}
+extern "C" int r4d_shape_engram_gate(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc");
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = { opd(D, M, hc * n), opd(D, M, n), opd_idx(M, 0, 0, 1), opd(D, hc * n),
+        opd(D, hc * n), opd(D, n), opd(D, hc * n), opd(D, M, hc * n) };
     R4D_PICK(l);
 }
 
@@ -692,6 +847,12 @@ extern "C" int r4d_shape_dsa_query(const RadParam* p, int n_p, int operand, RadO
                              opd((uint32_t)RAD_F32, M, 1) };
     R4D_PICK(l);
 }
+extern "C" int r4d_shape_dsa_query_i8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, n), opd((uint32_t)RAD_I8, M, n),
+                             opd((uint32_t)RAD_F32, M, 1) };
+    R4D_PICK(l);
+}
 extern "C" int r4d_shape_mla_project(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), d = pi(p, n_p, "head_dim"),
                   l = pi(p, n_p, "latent_dim");
@@ -722,13 +883,51 @@ extern "C" int r4d_shape_mla_attn_paged(const RadParam* p, int n_p, int operand,
                                 opd((uint32_t)RAD_BF16, M, h, L) };
     R4D_PICK(list);
 }
+/* mla_attn_paged_sink: mla_attn_paged's operands (one sequence whose context is its query, or
+ * `ctx`) with the sinks, an f32 weight, in the gate's place. */
+extern "C" int r4d_shape_mla_attn_paged_sink(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), bs = pi(p, n_p, "block_size");
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    int64_t ctx = pi(p, n_p, "ctx", 0);
+    if (ctx < M) ctx = M;
+    const int64_t blocks = (ctx + bs - 1) / bs;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, blocks, 1, bs, L + R),
+                                opd_idx(1, blocks, blocks),
+                                opd_idx(1, 0, 0, ctx),
+                                opd_idx(2, 0, M + 1, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+                                opd((uint32_t)RAD_F32, h),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
+    R4D_PICK(list);
+}
+/* mla_attn_sel_sink: mla_attn's per-row tables with the rotary query and the sinks. */
+extern "C" int r4d_shape_mla_attn_sel_sink(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), h = pi(p, n_p, "heads"), L = pi(p, n_p, "latent_dim"),
+                  R = pi(p, n_p, "rope_dim"), B = pi(p, n_p, "blocks"),
+                  bs = pi(p, n_p, "block_size"), pages = std::max((int64_t)2, B * M);
+    if (M <= 0 || h <= 0 || L <= 0 || R <= 0 || B <= 0 || bs <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc list[] = { opd((uint32_t)RAD_BF16, M, h, L),
+                                opd((uint32_t)RAD_BF16, M, h, R),
+                                opd((uint32_t)RAD_BF16, pages, 1, bs, L + R),
+                                opd_idx(M, B, pages),
+                                opd_idx(M, 0, 0, B * bs),
+                                opd((uint32_t)RAD_F32, h),
+                                opd((uint32_t)RAD_BF16, M, h, L) };
+    R4D_PICK(list);
+}
 extern "C" int r4d_shape_dsa_score(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), H = pi(p, n_p, "heads");
     const int64_t B = pi(p, n_p, "blocks"), S = pi(p, n_p, "seqs"), pages = S * B;
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_F8E4M3, M, H, n),
+    const char* dts = r4d_pgets(p, n_p, "dtype");
+    const uint32_t qk = dts && !std::strcmp(dts, "int8") ? (uint32_t)RAD_I8 : (uint32_t)RAD_F8E4M3;
+    const RadOpdDesc l[] = { opd(qk, M, H, n),
                              opd((uint32_t)RAD_F32, M, H),
                              opd((uint32_t)RAD_F32, M, H),
-                             opd((uint32_t)RAD_F8E4M3, pages, n),
+                             opd(qk, pages, n),
                              opd((uint32_t)RAD_F32, pages),
                              opd_idx(S, B, pages),
                              opd_idx(S + 1, 0, M, -1, RAD_OPD_F_IDX_CU),
@@ -772,9 +971,9 @@ extern "C" int r4d_shape_rope(const RadParam* p, int n_p, int operand,
         ++nc;
         q = e;
     }
-    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || !std::strcmp(mode, "imrope") ||
-                                  !std::strcmp(mode, "axial"));
-    if (multi && !std::strcmp(mode, "imrope")) nc = 3;
+    const bool im = !std::strcmp(mode, "imrope") || !std::strcmp(mode, "imrope_gptj");
+    const bool multi = nc > 0 && (!std::strcmp(mode, "mrope") || im || !std::strcmp(mode, "axial"));
+    if (multi && im) nc = 3;
     const RadOpdDesc l[] = {
         opd((uint32_t)RAD_BF16, M, row),
         /* Not a lookup: the kernel computes sincos from the value, so any non-negative integer is
@@ -1107,6 +1306,44 @@ extern "C" int r4d_shape_attn_paged_sink(const RadParam* p, int n_p, int operand
     R4D_PICK(l);
 }
 
+/* attn_paged_rel -- attn_paged's operands, then r [q_len, n_head, d_rel] at q's dtype, rel_proj
+ * [d_rel, extent] f32 and sinks [q_len, n_head] f32, then out. */
+extern "C" int r4d_shape_attn_paged_rel(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    if (operand < 7) return r4d_shape_attn_paged(p, n_p, operand, out);
+    if (operand == 10) return r4d_shape_attn_paged(p, n_p, 7, out);
+    const int64_t q_len = pi(p, n_p, "q_len");
+    const int64_t nh    = pi(p, n_p, "n_head");
+    const int64_t dr    = pi(p, n_p, "d_rel");
+    const int64_t ext   = pi(p, n_p, "extent");
+    if (q_len <= 0 || nh <= 0 || dr <= 0 || ext <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t Q = dt_act(p, n_p, "q_dtype");
+    const RadOpdDesc l[] = {
+        opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(), opd_none(),
+        opd(Q, q_len, nh, dr),
+        opd((uint32_t)RAD_F32, dr, ext),
+        opd((uint32_t)RAD_F32, q_len, nh),
+    };
+    R4D_PICK(l);
+}
+
+/* attn_kv_sink -- one sequence of M query rows over N >= M keys, as libref describes it. */
+extern "C" int r4d_shape_attn_kv_sink(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), h = pi(p, n_p, "heads"),
+                  d = pi(p, n_p, "head_dim");
+    if (M <= 0 || h <= 0 || d <= 0 || N < M) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, h, d),
+        opd((uint32_t)RAD_BF16, N, h, d),
+        opd((uint32_t)RAD_BF16, N, h, d),
+        opd_idx(2, 0, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+        opd_idx(2, 0, N, -1, (uint32_t)RAD_OPD_F_IDX_CU),
+        opd((uint32_t)RAD_F32, h),
+        opd((uint32_t)RAD_BF16, M, h, d),
+    };
+    R4D_PICK(l);
+}
+
 /* attn_paged_gate_quant -- attn_paged's operands, then gate_quant_fp8's gate, codes and scales,
  * flat as gate_quant_fp8 describes them: one row per (token, head) pair, `head_dim` columns. */
 extern "C" int r4d_shape_attn_paged_gate_quant(const RadParam* p, int n_p, int operand,
@@ -1375,6 +1612,20 @@ extern "C" int r4d_shape_ar_rmsnorm_quant_fp8(const RadParam* p, int n_p, int op
     R4D_PICK(l);
 }
 
+/* ar_rmsnorm: the same operands without the codes and their scales. */
+extern "C" int r4d_shape_ar_rmsnorm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, n),      /* inout: the message and the input */
+        opd((uint32_t)RAD_BF16, M, n),
+        opd((uint32_t)RAD_F32,  n),         /* f32 or bf16; the shim reads the operand's own */
+        opd((uint32_t)RAD_BF16, M, n),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, int operand,
                                                   RadOpdDesc* out) {
 
@@ -1400,7 +1651,7 @@ extern "C" int r4d_shape_ar_rmsnorm_had_quant_i8g(const RadParam* p, int n_p, in
 
 extern "C" int r4d_shape_gemm_nt_f32(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
-    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd((uint32_t)RAD_F32, N, K),
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_BF16, M, K), opd(pi(p, n_p, "weight_bf16", 0) ? RAD_BF16 : RAD_F32, N, K),
                              opd((uint32_t)RAD_F32, M, N) };
     R4D_PICK(l);
 }
@@ -1714,6 +1965,33 @@ extern "C" int r4d_shape_moe_gather_inv(const RadParam* p, int n_p, int operand,
     return r4d_shape_moe_gather(p, n_p, operand, out);
 }
 
+/* moe_gather_inv writing the sum's rotated int8 codes as well (K-19): its `y` is still the row it
+ * sums, and the shared arm's two slots hold the codes' pair -- the codes one int8 a column, and
+ * their scales one f32 a `group`-wide block (`group`: 128, or 256 for an IQ8R trunk). The linear
+ * that reads the sum reads them in place of its own quantiser's output, so they are the same
+ * [M, n] and [M, n/group] a quantiser op declares. */
+extern "C" int r4d_shape_moe_gather_inv_i8g(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t k = pi(p, n_p, "top_k"), g = pi(p, n_p, "group");
+    if (M <= 0 || n <= 0 || k <= 0 || g <= 0 || n % g != 0) return RAD_E_UNSUPPORTED;
+    /* The entry point's band (r4d_rad_moe_gather_inv_i8g, r4d_moe.hip): the codes need a whole
+     * 256-column wave live, the sixteen-slot form needs top_k = 16, and the scale is written once a
+     * `group`-wide block, which is 128 or 256 wide. */
+    if (n % 256 != 0 || k != 16 || (g != 128 && g != 256)) return RAD_E_UNSUPPORTED;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M * k, n),
+        opd(D, M, k),
+        /* Distinct, as in the plain form: the table holds distinct rows of `y_expert`. */
+        opd_idx(M * k, 0, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, n / g),
+        opd(D, M, n),
+    };
+    R4D_PICK(l);
+}
+
 /* row_topk -- exact per-row top-R of a wide bf16 matrix (shim in r4d_rowtopk_bf16.hip). R is at
  * most 32, stage 2's PT. */
 extern "C" int r4d_shape_row_topk(const RadParam* p, int n_p, int operand,
@@ -1767,6 +2045,23 @@ extern "C" int r4d_shape_pair_argmax(const RadParam* p, int n_p, int operand, Ra
         opd((uint32_t)RAD_F32, M, n, 2),
         opd((uint32_t)RAD_I32, M),
         opd((uint32_t)RAD_F32, M),
+    };
+    R4D_PICK(l);
+}
+
+/* attn_res_mix, as libref describes it. The states are dense here; a caller's pitched buffer is
+ * a view of the same operand. No states at depth 0. */
+extern "C" int r4d_shape_attn_res_mix(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t nS = pi(p, n_p, "n_state"), nQ = pi(p, n_p, "n_query");
+    if (M <= 0 || n <= 0 || nS < 0 || nQ <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        nS > 0 ? opd((uint32_t)RAD_BF16, nS, M, n) : opd_none(),   /* states */
+        opd((uint32_t)RAD_BF16, M, n),                             /* cur */
+        opd((uint32_t)RAD_BF16, M, n),                             /* addend */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* query */
+        opd((uint32_t)RAD_F32, nQ, n),                             /* w */
+        opd((uint32_t)RAD_BF16, nQ, M, n),                         /* y */
     };
     R4D_PICK(l);
 }
@@ -1889,6 +2184,25 @@ extern "C" int r4d_shape_gated_had_quant_i8(const RadParam* p, int n_p, int oper
     R4D_PICK(l);
 }
 
+/* gated_quant_i8: the same operands, the scale one per `group` of each row (default 128, and a group
+ * wider than the row is one scale per row, as libref clamps it). */
+extern "C" int r4d_shape_gated_quant_i8(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    if (n <= 0) return RAD_E_UNSUPPORTED;
+    int64_t g = pi(p, n_p, "group", 128);
+    if (g <= 0 || g > n) g = n;
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(D, M, 2 * n),
+        opd_none(),
+        opd((uint32_t)RAD_I8, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_gdn_gated_norm_had_quant_i8(const RadParam* p, int n_p, int operand,
                                                      RadOpdDesc* out) {
 
@@ -1927,6 +2241,37 @@ extern "C" int r4d_shape_quant_act_fp8(const RadParam* p, int n_p, int operand,
         opd(D, M, n),
         opd((uint32_t)RAD_F8E4M3, M, n),
         opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
+/* The narrow-group form: the same three operands at any group of 4..124. */
+extern "C" int r4d_shape_quant_act_fp8_grp(const RadParam* p, int n_p, int operand,
+                                           RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g <= 0 || g >= R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd(D, M, n),
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+    };
+    R4D_PICK(l);
+}
+
+/* dequant at E4M3 codes (libref's hook describes int8 codes). */
+extern "C" int r4d_shape_dequant_fp8(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t n = pi(p, n_p, "n");
+    const int64_t g = pi(p, n_p, "group", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (g <= 0) return RAD_E_UNSUPPORTED;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3, M, n),
+        opd((uint32_t)RAD_F32, M, (n + g - 1) / g),
+        opd(D, M, n),
     };
     R4D_PICK(l);
 }
@@ -2285,6 +2630,34 @@ extern "C" int r4d_shape_dflash_markov(const RadParam* p, int n_p, int operand,
     R4D_PICK(l);
 }
 
+extern "C" int r4d_shape_markov_rnn(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t R = pi(p, n_p, "rank");
+    const int64_t V = pi(p, n_p, "n_vocab");
+    const int64_t astr = pi(p, n_p, "anchor_stride", 1);
+    const int64_t VW = pi(p, n_p, "vocab_rows", V);
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr < 1 || VW < V) return RAD_E_UNSUPPORTED;
+    const int64_t tiles = (V + 63) / 64, rows = M * steps;
+    const uint32_t F = (uint32_t)RAD_F32, B = (uint32_t)RAD_BF16;
+    const RadOpdDesc l[] = {
+        opd(F, rows, V),
+        opd(F, rows, 3 * R),
+        opd(F, M, 3 * R),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd(B, VW, R),
+        opd(B, 3 * R, 2 * R),
+        opd(B, 3 * R),
+        opd(B, VW, R),
+        opd(B, VW),
+        opd(F, M, 3 * R),
+        opd(F, M, tiles),
+        opd_idx(M, tiles, V),
+        opd_idx(M, steps, V),
+    };
+    R4D_PICK(l);
+}
+
 extern "C" int r4d_shape_dflash_markov_f32(const RadParam* p, int n_p, int operand,
                                              RadOpdDesc* out) {
     const int rc = r4d_shape_dflash_markov(p, n_p, operand, out);
@@ -2295,3 +2668,160 @@ extern "C" int r4d_shape_dflash_markov_f32(const RadParam* p, int n_p, int opera
 #include "r4d_ds41_elem_shapes.inc"
 #include "r4d_ds41_sparse_shapes.inc"
 #include "r4d_ds41_ggml_shapes.inc"
+
+extern "C" int r4d_shape_dspark_rnn_markov(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t steps = pi(p, n_p, "steps");
+    const int64_t R = pi(p, n_p, "rank");
+    const int64_t E = pi(p, n_p, "n_embd");
+    const int64_t V = pi(p, n_p, "n_vocab");
+    const int64_t astr = pi(p, n_p, "anchor_stride", 1);
+    if (M <= 0 || steps <= 0 || R <= 0 || E <= 0 || V <= 0 || astr < 1)
+        return RAD_E_UNSUPPORTED;
+    const int64_t tiles = (V + 63) / 64;
+    const int64_t rows = M * steps;
+    const uint32_t B = RAD_BF16;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F32, rows, V),
+        opd(B, rows, E),
+        opd(B, M, E),
+        opd_idx((M - 1) * astr + 1, 0, V),
+        opd(B, V, R),
+        opd(B, 3 * R, 2 * R + 2 * E),
+        opd(B, 3 * R),
+        opd(B, V, R),
+        opd(B, V),
+        opd((uint32_t)RAD_F32, M, steps * 3 * R + 2 * R),
+        opd((uint32_t)RAD_F32, M, tiles),
+        opd_idx(M, tiles, V),
+        opd_idx(M, steps, V),
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_loop_ctl(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), rank = pi(p, n_p, "rank");
+    if (M <= 0 || n <= 0 || rank <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, M, n),          /* x */
+        opd(dt, M, n),          /* msg */
+        opd(dt, rank, 2 * n),   /* w_down */
+        opd(dt, n, rank),       /* w_gain */
+        opd(dt, n, rank),       /* w_forget */
+        opd(dt, M, n),          /* y */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_loop_ctl_blend(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, M, n),          /* x */
+        opd(dt, M, n),          /* msg */
+        opd(dt, M, n),          /* gp */
+        opd(dt, M, n),          /* fp */
+        opd(dt, M, n),          /* y */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_plane_copy(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, M, n),          /* src */
+        opd(dt, M, n),          /* ref */
+        opd(dt, M, n),          /* dst */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_kv_clip_norm_store(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M   = pi(p, n_p, "M");
+    const int64_t HD  = pi(p, n_p, "head_dim");
+    const int64_t KVH = pi(p, n_p, "n_head_kv");
+    const int64_t BS  = pi(p, n_p, "block_size");
+    if (M <= 0 || HD <= 0 || KVH <= 0 || BS <= 0) return RAD_E_UNSUPPORTED;
+    bool is_i8 = false;
+    for (int i = 0; i < n_p; ++i)
+        if (std::strcmp(p[i].key, "kv_dtype") == 0 && p[i].kind == RAD_P_STR && p[i].sval)
+            is_i8 = std::strcmp(p[i].sval, "i8") == 0;
+    const int64_t kv_cols = is_i8 ? (2 * HD + 4) : (2 * HD);
+    const uint32_t kv_dt  = is_i8 ? (uint32_t)RAD_I8 : (uint32_t)RAD_BF16;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_BF16, M, KVH * HD),   /* k */
+        opd((uint32_t)RAD_BF16, M, KVH * HD),   /* v */
+        opd((uint32_t)RAD_I32, M),              /* slot_mapping */
+        opd(kv_dt, 4, KVH, BS, kv_cols),        /* kv_cache */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_qr_l2_clip(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t nq = pi(p, n_p, "nq");
+    const int64_t nr = pi(p, n_p, "nr");
+    if (M <= 0 || nq <= 0 || nr <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, M, nq),             /* xq */
+        opd(dt, nq),                /* wq */
+        opd(dt, M, nr),             /* xr */
+        opd(dt, nr),                /* wr */
+        opd(dt, M, nq),             /* yq */
+        opd(dt, M, nr),             /* yr */
+        opd((uint32_t)RAD_I32, M),  /* positions */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_attn_res_mix3(const RadParam* p, int n_p, int operand,
+                                       RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t n  = pi(p, n_p, "n");
+    const int64_t nS = pi(p, n_p, "n_state");
+    if (M <= 0 || n <= 0 || nS < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, nS > 0 ? nS : 1, M, n), /* states */
+        opd(dt, M, n),                   /* cur */
+        opd((uint32_t)RAD_F32, n),       /* q0 */
+        opd((uint32_t)RAD_F32, n),       /* q1 */
+        opd((uint32_t)RAD_F32, n),       /* q2 */
+        opd(dt, M, n),                   /* y0 */
+        opd(dt, M, n),                   /* y1 */
+        opd(dt, M, n),                   /* y2 */
+        opd((uint32_t)RAD_F32, n),       /* w0 */
+        opd((uint32_t)RAD_F32, n),       /* w1 */
+        opd((uint32_t)RAD_F32, n),       /* w2 */
+    };
+    R4D_PICK(l);
+}
+
+extern "C" int r4d_shape_attn_res_mix4(const RadParam* p, int n_p, int operand,
+                                       RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t n  = pi(p, n_p, "n");
+    const int64_t nS = pi(p, n_p, "n_state");
+    if (M <= 0 || n <= 0 || nS < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t dt = dt_act(p, n_p, "dtype");
+    const RadOpdDesc l[] = {
+        opd(dt, nS > 0 ? nS : 1, M, n), /* states */
+        opd(dt, M, n),                   /* cur */
+        opd((uint32_t)RAD_F32, n),       /* q0 */
+        opd((uint32_t)RAD_F32, n),       /* q1 */
+        opd((uint32_t)RAD_F32, n),       /* q2 */
+        opd((uint32_t)RAD_F32, n),       /* q3 */
+        opd(dt, M, n),                   /* y0 */
+        opd(dt, M, n),                   /* y1 */
+        opd(dt, M, n),                   /* y2 */
+        opd(dt, M, n),                   /* y3 */
+    };
+    R4D_PICK(l);
+}

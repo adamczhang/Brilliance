@@ -1,0 +1,24 @@
+# hy4-flash-bf16.recipe -- Tencent Hy4-flash (hy_v4_flash) from its bf16 checkpoint, every weight as
+# the checkpoint holds it except the four Engram tables, stored as E4M3 rows.
+#
+#   rad-convert <Hy4-flash checkpoint> --recipe data/recipes/hy4-flash-bf16.recipe -o hy4-flash-bf16.rad
+#
+# The config's `engram_fp8_embedding` makes every looked-up Engram row an E4M3 round trip under the
+# row's own absmax scale (`_fp8_round_trip` in transformers' modeling_hy_v4_flash.py), so the bf16
+# rows the release ships are never what the model reads. The rule does that once at convert: E4M3
+# codes with one bf16 scale a row of 96, 660 million rows in all, 60.2 GiB where the bf16 tables are
+# 118 GiB, and 352.5 GiB for the container against 410.3 GiB with no recipe.
+#
+# It is not bit for bit the transformers port. The port divides in bf16 (x / scale is rounded to
+# eight bits of mantissa before the cast rounds it to four), and that double rounding moves a value
+# sitting on an E4M3 midpoint; rtn divides exactly. Emulated on 200,000 rows of layer 1's table,
+# 2.9% of the codes differ, each by one step: 1.5% of the rows' norm, where the round trip itself
+# is 2.6% from the bf16 rows. Which of the two the model was trained against is not something the
+# release says. The container with no recipe keeps the bf16 tables and is the one to take as the
+# reference, with the round trip left to the reader.
+#
+# arch/hyv4flash declares the weights and no graph: the container converts and inspects
+# (rad-info), and serves once the plugin's graph is written (docs/ARCHITECTURES.md).
+#
+# PATTERN                     QUANTISER  OPTIONS
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

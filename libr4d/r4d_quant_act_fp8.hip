@@ -35,7 +35,21 @@ constexpr uint32_t kWaves = kThreads / kWave;
 constexpr uint32_t kGroup = 128;
 
 // One block per row; a wave owns one 128-column group, a lane four consecutive columns (one dword
-// store, 128 contiguous bytes per wave, two v_cvt_pk_fp8_f32).
+// store, 128 contiguous bytes per wave, two v_cvt_pk_fp8_f32), and a block's waves run the groups
+// of its row kWaves at a time.
+//
+// A launch whose wavefront count lands on a multiple of the card's 2048 wavefronts is about five
+// times slower per byte (r4d_common.h), and a launch of M blocks has 8*M of them: at M 256 and its
+// multiples the whole grid is in that window. The launcher pads the row count with
+// r4d_cliff_rows, and the kernel returns at once in a row that is not there - still reaching
+// r4d_chain_done, which is what the chained form's target counts (r4d_chain.h). Measured on
+// gfx1201 (kbench, 5 rounds): K 3072 M 256 21.2 -> 6.4 us, M 512 25.4 -> 9.0, K 1536 M 256
+// 21.2 -> 3.8.
+//
+// Spreading a row's groups over several blocks (one group a wave, three blocks for the 24 groups of
+// a K 3072 row) was measured and not taken: it is faster under kbench alone (a K 16384 row at M 1
+// 7.7 -> 2.4 us) but costs 0.3 us a launch in the served chain, where 213 of them run a decode
+// pass against a 2.7-3.3 us launch, and the class went 635 -> 700 us (K-22).
 //
 // ROT applies r4d_fwht_wave<128> in registers between the load and the absmax; the mapping (four
 // values per lane) is the one it expects, so no LDS or barrier is needed, and the absmax sees the
@@ -45,8 +59,9 @@ constexpr uint32_t kGroup = 128;
 // I8 is the same quantiser at int8 codes (quant_act_i8g, had_quant_act_i8g): scale amax/127,
 // round-to-nearest-even into -127..127, same row-major layout and per-(row, 128) scales.
 //
-// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); no block returns
-// early. quant_act_fp8_kernel and r4dchain_quant_act_fp8 below are the plain and chained forms.
+// CHAIN brackets the body with the chained launch's wait and add (r4d_chain.h); a block of a row
+// the launch padded in does nothing but reach r4d_chain_done. quant_act_fp8_kernel and
+// r4dchain_quant_act_fp8 below are the plain and chained forms.
 //
 // SUB is the 128-column blocks one scale covers: 1, or 2 for IQ8R's 256-wide group (int8 only),
 // where a wave owns both blocks of a group, rotates each on its own (the rotation stays 128 wide)
@@ -54,11 +69,17 @@ constexpr uint32_t kGroup = 128;
 template <bool ROT, bool I8 = false, bool CHAIN = false, uint32_t SUB = 1>
 __device__ __forceinline__ void quant_act_fp8_body(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
-    uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld) {
+    uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld, uint32_t m_rows) {
     static_assert(SUB == 1 || (SUB == 2 && I8), "a 256 group is the int8 quantiser's");
     if (CHAIN) r4d_chain_wait_vec();
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    // A row the launch added past the full-card cliff (r4d_cliff_rows): it reads, writes and scales
+    // nothing, but the block still reaches r4d_chain_done, which the chained form's target counts.
+    if (row >= m_rows) {
+        if (CHAIN) r4d_chain_done();
+        return;
+    }
     const size_t xrow = (size_t)row * x_ld;
     const size_t qrow = (size_t)row * q_ld;
 
@@ -113,14 +134,15 @@ __device__ __forceinline__ void quant_act_fp8_body(
 }
 
 #define R4D_QAF_PARAMS const uint16_t* __restrict__ x, uint8_t* __restrict__ q,                  \
-    float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld
+    float* __restrict__ s, uint32_t K, uint32_t nkb, uint32_t x_ld, uint32_t q_ld, uint32_t s_ld,  \
+    uint32_t m_rows
 template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void quant_act_fp8_kernel(R4D_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, false, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, false, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld, m_rows);
 }
 template <bool ROT, bool I8 = false, uint32_t SUB = 1>
 __global__ __launch_bounds__(kThreads) void r4dchain_quant_act_fp8(R4D_QAF_PARAMS) {
-    quant_act_fp8_body<ROT, I8, true, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld);
+    quant_act_fp8_body<ROT, I8, true, SUB>(x, q, s, K, nkb, x_ld, q_ld, s_ld, m_rows);
 }
 #undef R4D_QAF_PARAMS
 
@@ -148,15 +170,19 @@ static int quant_act_fp8_launch(long long a, long long q, long long s, int M, in
     const int grp = wide ? 2 * (int)kGroup : (int)kGroup;
     const int nkb = (K + grp - 1) / grp;
     if (!s_ld) s_ld = nkb;
+    /* One block a row has kWaves wavefronts, so a launch of M rows is in the full-card window
+     * (r4d_common.h) at M 256 and its multiples; r4d_cliff_rows steps past it with rows that return
+     * at once. */
+    const unsigned rows = r4d_cliff_rows((uint32_t)M, 1u, kWaves);
     /* The chained form at decode heights, where the row resolved with `chain`. */
     const bool ch = chain && M <= 64;
 #define R4D_QA(ROT_, I8_, SUB_)                                                               \
-    (ch ? R4D_EMIT(stream, (r4dchain_quant_act_fp8<ROT_, I8_, SUB_>), dim3((uint32_t)M),       \
-                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
-                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld)               \
-        : R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_, SUB_>), dim3((uint32_t)M),         \
-                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K, \
-                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld))
+    (ch ? R4D_EMIT(stream, (r4dchain_quant_act_fp8<ROT_, I8_, SUB_>), dim3(rows),             \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K,  \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)M)  \
+        : R4D_EMIT(stream, (quant_act_fp8_kernel<ROT_, I8_, SUB_>), dim3(rows),                 \
+                   dim3(kThreads), 0, (const uint16_t*)a, (uint8_t*)q, (float*)s, (uint32_t)K,  \
+                   (uint32_t)nkb, (uint32_t)x_ld, (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)M))
     if (wide)    emit_rc = rot ? R4D_QA(true, true, 2u) : R4D_QA(false, true, 2u);
     else if (i8) emit_rc = rot ? R4D_QA(true, true, 1u) : R4D_QA(false, true, 1u);
     else         emit_rc = rot ? R4D_QA(true, false, 1u) : R4D_QA(false, false, 1u);
@@ -216,6 +242,13 @@ extern "C" int r4d_rad_quant_act_i8g(const RadArgs* a, RadStream stream) {
 
 extern "C" int r4d_rad_had_quant_act_i8g(const RadArgs* a, RadStream stream) {
     return rad_quant_act_fp8(a, stream, true, true);
+}
+
+/* The rotated E4M3 pair: the activation of the rotated codebook experts (w4nl64a8h, w5nl64a8h,
+ * w6nl64a8h, ...) where no fused producer writes it, e.g. behind a clamped SwiGLU or a latent
+ * projection. */
+extern "C" int r4d_rad_had_quant_act_fp8(const RadArgs* a, RadStream stream) {
+    return rad_quant_act_fp8(a, stream, true);
 }
 
 // ============================================================== quant_cols_fp8
@@ -361,4 +394,147 @@ extern "C" int r4d_rad_quant_cols_fp8(const RadArgs* a, RadStream stream) {
                        (const uint16_t*)x->data, (int)M, (int)n, (int)xl,
                        (const float*)a->scratch, (uint8_t*)y->data, (int)yl, (float*)sc->data);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}
+
+// ============================================================== quant_act_fp8 at a narrow group
+// The same quantiser as above (scale amax/448 in f32, 1 for an all-zero group, codes of
+// clamp(x * (1/scale), +-448) to nearest even) for a group narrower than the weight block: a
+// group of codes that feeds no GEMM. Hy4-flash's Engram rows go through an E4M3 round trip one
+// head (96 values) a group, as the checkpoint's FP8 table was trained to read them. The rows are
+// the FLAT groups of contiguous tensors: x read as [rows, n] whatever its declared rank ([T,
+// heads * hd] against q's [T * heads, hd]), so one group never straddles two rows.
+//
+// A wave a (row, group), a lane four consecutive columns (group <= 128, a multiple of 4), eight
+// waves a workgroup. Unused lanes hold zeros, which the amax ignores.
+namespace {
+
+__device__ __forceinline__ void quant_act_fp8_grp_body(
+    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
+    uint32_t rows, uint32_t n, uint32_t g, uint32_t nkb) {
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    const size_t unit = (size_t)blockIdx.x * kWaves + wave;
+    if (unit >= (size_t)rows * nkb) return;          // a whole wave leaves together
+    const uint32_t row = (uint32_t)(unit / nkb), kb = (uint32_t)(unit % nkb);
+    const uint32_t k0 = kb * g, k1 = min(k0 + g, n);
+    const uint32_t c0 = k0 + lane * 4u;
+    const bool mine = lane * 4u < g && c0 < k1;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t c = c0 + (uint32_t)j;
+        v[j] = mine && c < k1 ? __uint_as_float((uint32_t)x[(size_t)row * n + c] << 16) : 0.0f;
+    }
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
+    m = r4d_wave_max(m);
+    const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f;
+    if (lane == 0) s[(size_t)row * nkb + kb] = sc;
+    const float inv = 1.0f / sc;
+    if (!mine) return;
+    int pk = 0;
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[0] * inv, -448.0f), 448.0f),
+                                         fminf(fmaxf(v[1] * inv, -448.0f), 448.0f), pk, false);
+    pk = __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(v[2] * inv, -448.0f), 448.0f),
+                                         fminf(fmaxf(v[3] * inv, -448.0f), 448.0f), pk, true);
+    uint8_t* qr = q + (size_t)row * n;
+    if (c0 + 4u <= k1) {
+        *(uint32_t*)(qr + c0) = (uint32_t)pk;         // n % 4 == 0: the dword is aligned
+    } else {
+        for (uint32_t j = 0; c0 + j < k1; ++j) qr[c0 + j] = (uint8_t)((uint32_t)pk >> (8 * j));
+    }
+}
+
+// CH `r4dchain`: the chained forms of this pair (r4d_chain.h); the body keeps its early returns.
+template <class CH>
+__global__ __launch_bounds__(kThreads) void quant_act_fp8_grp_kernel(
+    const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s,
+    uint32_t rows, uint32_t n, uint32_t g, uint32_t nkb) {
+    if (CH::on) r4d_chain_wait();
+    quant_act_fp8_grp_body(x, q, s, rows, n, g, nkb);
+    if (CH::on) r4d_chain_done();
+}
+
+// dequant over E4M3 (or int8, quant_act_i8g's) codes: y = bf16(code * scale), one f32 scale per
+// (row, group). The round trip's second half; exact up to the one rounding to bf16. Flat
+// contiguous rows as above.
+__device__ __forceinline__ float dq_code(uint8_t b, bool i8) {
+    return i8 ? (float)(int8_t)b : r4d_fp8::e4m3(b);
+}
+template <bool I8, class CH>
+__global__ __launch_bounds__(kThreads) void dequant_fp8_kernel(
+    const uint8_t* __restrict__ q, const float* __restrict__ s, uint16_t* __restrict__ y,
+    size_t total, uint32_t n, uint32_t g, uint32_t nkb) {
+    if (CH::on) r4d_chain_wait();
+    for (size_t i = (size_t)blockIdx.x * kThreads + threadIdx.x; i < total;
+         i += (size_t)gridDim.x * kThreads) {
+        const size_t row = i / n;
+        const uint32_t c = (uint32_t)(i % n);
+        const float v = dq_code(q[i], I8) * s[row * nkb + c / g];
+        y[i] = f32_to_bf16(v);
+    }
+    if (CH::on) r4d_chain_done();
+}
+
+}  // namespace
+
+/* `n` is the group's row (rows = numel(q) / n); x, q and scale contiguous. */
+extern "C" int r4d_rad_quant_act_fp8_grp(const RadArgs* a, RadStream stream) {
+    const RadTensor* x  = r4d_opt(a, QF_X);
+    const RadTensor* q  = r4d_opt(a, QF_Q);
+    const RadTensor* sc = r4d_opt(a, QF_S);
+    if (!x || !q || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (q->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
+    if (sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(x) || !r4d_contig(q) || !r4d_contig(sc)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", 0), g = r4d_geti_or(a, "group", 0);
+    if (n <= 0 || n % 4 || g <= 0 || g % 4 || g > (long long)kGroup) return R4D_NO(RAD_E_SHAPE);
+    const long long rows = r4d_numel(q) / n, nkb = (n + g - 1) / g;
+    if (rows <= 0 || r4d_numel(x) < rows * n || r4d_numel(sc) < rows * nkb)
+        return R4D_NO(RAD_E_SHAPE);
+    const long long units = rows * nkb;
+    const long long blocks = (units + kWaves - 1) / kWaves;
+    if (blocks > 0x7fffffffLL) return R4D_NO(RAD_E_SHAPE);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 1024;   /* decode rows times heads */
+    hipLaunchKernelGGL(ch ? quant_act_fp8_grp_kernel<r4dchain> : quant_act_fp8_grp_kernel<R4dUnchained>,
+                       dim3((uint32_t)blocks), dim3(kThreads), 0,
+                       (hipStream_t)stream, (const uint16_t*)x->data, (uint8_t*)q->data,
+                       (float*)sc->data, (uint32_t)rows, (uint32_t)n, (uint32_t)g,
+                       (uint32_t)nkb);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+enum { DQ_Q = 0, DQ_S = 1, DQ_Y = 2 };
+
+extern "C" int r4d_rad_dequant_fp8(const RadArgs* a, RadStream stream) {
+    const RadTensor* q  = r4d_opt(a, DQ_Q);
+    const RadTensor* sc = r4d_opt(a, DQ_S);
+    const RadTensor* y  = r4d_opt(a, DQ_Y);
+    if (!q || !sc || !y) return R4D_NO(RAD_E_INVAL);
+    if (q->dtype != RAD_F8E4M3 && q->dtype != RAD_I8) return R4D_NO(RAD_E_DTYPE);
+    if (sc->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (!r4d_contig(q) || !r4d_contig(sc) || !r4d_contig(y)) return R4D_NO(RAD_E_STRIDE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    /* libref's rule: the rows are y's, the group count the scale's extent a row; `group` 0
+     * derives the group from it. */
+    const long long rows = r4d_numel(y) / n;
+    if (rows <= 0 || r4d_numel(q) < rows * n) return R4D_NO(RAD_E_SHAPE);
+    const long long ngrp = r4d_numel(sc) / rows > 0 ? r4d_numel(sc) / rows : 1;
+    long long g = r4d_geti_or(a, "group", 0);
+    if (g <= 0) g = (n + ngrp - 1) / ngrp;
+    if ((n + g - 1) / g != ngrp) return R4D_NO(RAD_E_SHAPE);
+    const size_t total = (size_t)rows * (size_t)n;
+    const size_t want = (total + kThreads - 1) / kThreads;
+    const uint32_t grid = (uint32_t)(want < 65536 ? want : 65536);
+    const bool ch = r4d_geti_or(a, "chain", 0) != 0 && rows <= 1024;
+    hipLaunchKernelGGL(q->dtype == RAD_I8
+                           ? (ch ? dequant_fp8_kernel<true, r4dchain> : dequant_fp8_kernel<true, R4dUnchained>)
+                           : (ch ? dequant_fp8_kernel<false, r4dchain> : dequant_fp8_kernel<false, R4dUnchained>),
+                       dim3(grid), dim3(kThreads), 0, (hipStream_t)stream,
+                       (const uint8_t*)q->data, (const float*)sc->data, (uint16_t*)y->data, total,
+                       (uint32_t)n, (uint32_t)g, (uint32_t)ngrp);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

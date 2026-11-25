@@ -56,6 +56,13 @@ add_executable(rad-tokcheck rad_tokcheck.cpp ${CMAKE_CURRENT_SOURCE_DIR}/iface.c
 target_link_libraries(rad-tokcheck PRIVATE rad_tokref rad_core)
 set_target_properties(rad-tokcheck PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
+# rad-heat-replay replays a RADIANCE_ROUTE_TRACE file through the heat engine (place/rtrace.h);
+# host code only, like rad-tokcheck.
+add_executable(rad-heat-replay heat_replay.cpp)
+target_link_libraries(rad-heat-replay PRIVATE rad_core)
+target_include_directories(rad-heat-replay PRIVATE ${CMAKE_SOURCE_DIR}/core ${CMAKE_SOURCE_DIR}/abi)
+set_target_properties(rad-heat-replay PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # rad-yaml writes a command line as the YAML configuration; it parses flags and nothing else.
 add_executable(rad-yaml rad_yaml.cpp)
 target_link_libraries(rad-yaml PRIVATE rad_core)

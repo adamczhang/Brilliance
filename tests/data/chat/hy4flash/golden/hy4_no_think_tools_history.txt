@@ -1,0 +1,18 @@
+<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"name": "read", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path"}, "limit": {"type": "integer"}}, "required": ["path"]}}
+{"name": "edit", "description": "Apply edits — exact text, «quoted» & <tagged>, 日本語.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"oldText": {"type": "string"}, "newText": {"type": "string"}}, "required": ["oldText", "newText"]}}, "dry_run": {"type": "boolean"}, "mode": {"type": "string", "enum": ["fast", "safe"]}}, "required": ["path", "edits"]}}
+{"name": "ping", "description": "Takes no arguments.", "parameters": {"type": "object", "properties": {}}}
+</tools>
+
+For function call returns, you should first print <tool_calls:opensource>
+For each function call, you should return object like:
+<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>
+At the end of function call returns, you should print </tool_calls:opensource>
+
+Be careful.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Fix /work/a.py.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Reading.<tool_calls:opensource><tool_call:opensource>read<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>/work/a.py</arg_value:opensource><arg_key:opensource>limit</arg_key:opensource><arg_value:opensource>40</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>print(1)
+</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Go on.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>

@@ -181,6 +181,15 @@ value binary_expression::execute_impl(context & ctx) {
         }
         throw std::runtime_error("Cannot perform operation " + op.value + " on undefined values");
     } else if (is_val<value_none>(left_val) || is_val<value_none>(right_val)) {
+        /* Python: `None in [..]` is a membership test like any other (Hy4's template tests
+         * `reasoning_effort not in [...]` before it checks for none). A list, a mapping or a
+         * string on the right is searched with the equality the test already uses. */
+        if ((op.value == "in" || op.value == "not in") && is_val<value_none>(left_val) &&
+            is_val<value_array>(right_val)) {
+            bool found = false;
+            for (const value & item : right_val->as_array()) found |= is_val<value_none>(item);
+            return mk_val<value_bool>(op.value == "in" ? found : !found);
+        }
         if (op.value == "+" || op.value == "~") {
             value res = mk_val<value_undefined>();
             if (workaround_concat_null_with_str(res)) {

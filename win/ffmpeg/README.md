@@ -116,8 +116,9 @@ The exact configure line is in the zip's `BUILDINFO.txt`.
 
 ## Building it
 
-Needs: Visual Studio Build Tools 18 with MSVC 14.51 (what `win\setup.ps1` checks for), git, and
-the network for the first run. No GPU, no administrator.
+Needs: Visual Studio Build Tools 18 with MSVC 14.51.36231 (the tested toolset `win\setup.ps1`
+prefers; this recipe takes no other, though `win\setup.ps1` accepts a newer 14.x for the engine
+build), git, and the network for the first run. No GPU, no administrator.
 
     powershell -NoProfile -ExecutionPolicy Bypass -File win\ffmpeg\build-ffmpeg.ps1 -Clean
 

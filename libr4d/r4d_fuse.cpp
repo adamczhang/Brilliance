@@ -317,6 +317,37 @@ extern "C" int r4d_fuse_gated_quant_fp8(const RadParam* p, int n_p, uint64_t pre
 }
 
 /* ==========================================================================================
+ * swiglu_clamped_had_quant_i8g -- swiglu_clamped, then had_quant_act_i8g over its product (G-3a).
+ * (kernel: libr4d/r4d_fused_quant_fp8.hip, gated_quant_fp8_kernel at ACT 3 with ROT and I8)
+ *
+ * Operands: [0] gate_up  [1] q  [2] scale  [3] out_bf16?
+ *
+ * The product is rounded to bf16 once, as swiglu_clamped_bf16 stores it, and the Hadamard and the
+ * codes are taken over those bytes: the chain's temporary (or `out_bf16`) is the buffer the
+ * quantiser reads, the unrotated product. */
+extern "C" int r4d_fuse_swiglu_clamped_had_quant_i8g(const RadParam* p, int n_p, uint64_t present,
+                                                     int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
+    const int16_t mid = RAD_FUSE_HAS(present, 3) ? (int16_t)3 : RAD_FUSE_TMP(0);
+    switch (step) {
+    case 0: {
+        Step s(out, "swiglu_clamped");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "limit").mirror(p, n_p, "dtype");
+        return s.wire({ 0, mid });                  /* gate_up, y */
+    }
+    case 1: {
+        Step s(out, "had_quant_act_i8g");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        return s.wire({ mid, 1, 2 });               /* x, q, scale */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * router_sigmoid_topk_scatter -- GLM's selection, the sort over its ids and the shared gate's fill.
  * (kernel: libr4d/r4d_glm.hip, router_sigmoid_scatter_kernel)
  *
@@ -479,6 +510,49 @@ extern "C" int r4d_fuse_gemm_nt_q_gated_iqr(const RadParam* p, int n_p, uint64_t
 }
 
 /* ==========================================================================================
+ * gemm_nt_q_dual at i8a8h -- two IQR weights of one activation's codes read in one launch (K-02's
+ * q_nope and q_rope). (row: gemm_iqr_dual, M == 1; kernel: libr4d/r4d_gemm_iqr.hip, whose dual
+ * GEMV puts the two launches' blocks in one grid at one eight-wave block size, each part doing what
+ * it does in a launch of its own, so each writes its own launch's bytes.)
+ *
+ * Operands: [0] a  [1] a_scale  [2] b  [3] b_scale  [4] y  [5] b2  [6] b2_scale  [7] y2
+ *
+ * The chain of the two `gemm_nt_q` rows it replaces: the first of the pair over `a`, then the
+ * second, over the same `a` and scales and with its own N (`N2`).
+ */
+extern "C" int r4d_fuse_gemm_nt_q_dual_iqr(const RadParam* p, int n_p, uint64_t present, int step,
+                                          RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), N2 = pi(p, n_p, "N2"),
+                  K = pi(p, n_p, "K");
+    const char* dt = r4d_pgets(p, n_p, "dtype");
+    if (M <= 0 || N <= 0 || N2 <= 0 || K <= 0) return RAD_E_UNSUPPORTED;
+    if (pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK) return RAD_E_UNSUPPORTED;
+    if (!dt || (std::strcmp(dt, "i8a8") && std::strcmp(dt, "i8a8h"))) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "gemm_nt_q");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "N").mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* a, a_scale, b, b_scale, y, a_sum, b_ref */
+        return s.wire({ 0, 1, 2, 3, 4, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    case 1: {
+        Step s(out, "gemm_nt_q");
+        /* the second weight's own N is the pair's N2 */
+        s.mirror(p, n_p, "M").pint("N", N2).mirror(p, n_p, "K")
+         .mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        /* the second weight reads the same a and a_scale */
+        return s.wire({ 0, 1, 5, 6, 7, RAD_FUSE_NONE, RAD_FUSE_NONE });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
  * gdn_conv_recurrent_update -- the decode convolution folded into the recurrent update's prologue.
  * (row: gdn_conv_recurrent_update_k128_v128_bf16; kernel: libr4d/
  * r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip, r4d_gdn_recurrent_update_kernel under CV)
@@ -621,6 +695,77 @@ extern "C" int r4d_fuse_qkv_norm_rope_kv_store(const RadParam* p, int n_p, uint6
          .mirror_opt(p, n_p, "k_scale").mirror_opt(p, n_p, "v_scale");
         /* k, v, slot_mapping, kv_cache */
         return s.wire({ 1, 2, 6, 7 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * mla_expand_gate -- mla_project_kv's expand, then gate_mul over its output.
+ * (row: mla_expand_gate_bf16; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_project_wmma with GATE)
+ *
+ * Operands: [0] x  [1] w  [2] g  [3] y
+ *
+ * One temporary, the expansion's bf16 output: the fused store rounds the sum to bf16 and widens
+ * it back before the product, which is what gate_mul reads from that buffer. */
+extern "C" int r4d_fuse_mla_expand_gate(const RadParam* p, int n_p, uint64_t present, int step,
+                                        RadFuseStep* out) {
+    (void)present;
+    if (!out) return RAD_E_INVAL;
+    const int64_t heads = pi(p, n_p, "heads"), vd = pi(p, n_p, "v_dim");
+    if (heads <= 0 || vd <= 0) return RAD_E_UNSUPPORTED;
+    switch (step) {
+    case 0: {
+        Step s(out, "mla_project_kv");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "k_dim")
+         .mirror(p, n_p, "v_dim").mirror(p, n_p, "latent_dim").pstr("mode", "expand")
+         .mirror(p, n_p, "dtype");
+        /* x, w, y = the temporary */
+        return s.wire({ 0, 1, RAD_FUSE_TMP(0) });
+    }
+    case 1: {
+        Step s(out, "gate_mul");
+        s.mirror(p, n_p, "M").pint("n", heads * vd).mirror(p, n_p, "dtype");
+        /* a = the expansion, g, y */
+        return s.wire({ RAD_FUSE_TMP(0), 2, 3 });
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * mla_expand_gate_had_quant_i8g -- the expansion, gate_mul over it, then had_quant_act_i8g (G-3c).
+ * (row: mla_expand_gate_had_quant_i8g; kernel: libr4d/r4d_mla_kv_bf16.hip, kv_expand_gate_quant)
+ *
+ * Operands: [0] x  [1] w  [2] g  [3] q  [4] scale  [5] out_bf16?
+ *
+ * The gated product is the bf16 the quantiser reads: `out_bf16` when given, else a temporary. */
+extern "C" int r4d_fuse_mla_expand_gate_had_quant_i8g(const RadParam* p, int n_p, uint64_t present,
+                                                      int step, RadFuseStep* out) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t heads = pi(p, n_p, "heads"), vd = pi(p, n_p, "v_dim");
+    if (heads <= 0 || vd <= 0 || pi(p, n_p, "group", R4D_FP8_BLOCK) != R4D_FP8_BLOCK)
+        return RAD_E_UNSUPPORTED;
+    const int16_t mid = RAD_FUSE_HAS(present, 5) ? (int16_t)5 : RAD_FUSE_TMP(1);
+    switch (step) {
+    case 0: {
+        Step s(out, "mla_project_kv");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "heads").mirror(p, n_p, "k_dim")
+         .mirror(p, n_p, "v_dim").mirror(p, n_p, "latent_dim").pstr("mode", "expand")
+         .mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, RAD_FUSE_TMP(0) });   /* x, w, y */
+    }
+    case 1: {
+        Step s(out, "gate_mul");
+        s.mirror(p, n_p, "M").pint("n", heads * vd).mirror(p, n_p, "dtype");
+        return s.wire({ RAD_FUSE_TMP(0), 2, mid }); /* a, g, y */
+    }
+    case 2: {
+        Step s(out, "had_quant_act_i8g");
+        s.mirror(p, n_p, "M").pint("n", heads * vd).mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        return s.wire({ mid, 3, 4 });               /* x, q, scale */
     }
     default:
         return RAD_E_NOTFOUND;
@@ -895,4 +1040,146 @@ extern "C" int r4d_fuse_mhc_post_collapse_rmsnorm(const RadParam* p, int n_p, ui
     case 2: { Step s(out, "rmsnorm"); mirror_norm(s, p, n_p); return s.wire({ 6, 7, 8 }); }
     default: return RAD_E_NOTFOUND;
     }
+}
+
+/* ==========================================================================================
+ * ar_rmsnorm -- ar_rmsnorm_quant_fp8 without the quantiser, for the bf16 blocks.
+ * (kernel: the same, at QZ false; shim: r4d_ar_entry.hip)
+ *
+ * Operands: [0] x (inout)  [1] residual?  [2] w  [3] y
+ *
+ * The exact wire's reduce as above, then rmsnorm_quant_fp8's chain without its last step: `add`
+ * (the sum rounded to bf16 and stored in the residual) and `rmsnorm` of the stored sum, at the
+ * same `r4d_act_threads` width, into `y`. The bf16 blocks issue exactly these three today.
+ */
+extern "C" int r4d_fuse_ar_rmsnorm(const RadParam* p, int n_p, uint64_t present, int step,
+                                   RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    const int64_t world = pi(p, n_p, "world_size");
+    if (M <= 0 || n <= 0 || world <= 0) return RAD_E_UNSUPPORTED;
+    const bool has_res = RAD_FUSE_HAS(present, 1) != 0;
+    /* Without a residual there is no `add`. */
+    const int s = (step >= 1 && !has_res) ? step + 1 : step;
+
+    switch (s) {
+    case 0: {
+        Step st(out, "all_reduce");
+        st.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+          .mirror(p, n_p, "dtype").pint("exact", 1);
+        return st.wire({ 0, RAD_FUSE_NONE });       /* x (inout), y */
+    }
+    case 1: {
+        Step st(out, "add");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+        return st.wire({ 0, 1, 1 });                /* a, b, y */
+    }
+    case 2: {
+        Step st(out, "rmsnorm");
+        st.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps")
+          .mirror(p, n_p, "dtype").mirror_opt(p, n_p, "wadd");
+        return st.wire({ has_res ? (int16_t)1 : (int16_t)0, 2, 3 });   /* x, w, y */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * rmsnorm_ihc_junction -- [add] -> rmsnorm -> ihc_post -> [ihc_pre -> rmsnorm].
+ * (kernel: libr4d/r4d_ihc_bf16.hip, ihc_junction_kernel over r4d_ihc.h's junction_row)
+ *
+ * Operands: [0] a (inout)  [1] b?  [2] w_post  [3] post (inout)  [4] h (inout)  [5] fn?  [6] scale?
+ *           [7] base?  [8] w_next?  [9] xn?  [10] y?  [11] x?  [12] xq?  [13] xs?
+ *
+ * The add (when `b` is present) writes the sum back into `a`, which the norm then reads, as the
+ * Hy4 plugin's MoE join does. `y` and `x` are the chain's intermediates: a fused operand when the
+ * caller passed one, else a temporary. `post` is ihc_post's input and, at rows == 2 hc, ihc_pre's
+ * output (the next connection's weights); the head form (rows == hc) passes ihc_pre no `post`.
+ * ihc_pre's `eps` is the junction's `ihc_eps`.
+ */
+namespace {
+int fuse_ihc_junction(const RadParam* p, int n_p, uint64_t present, int step, RadFuseStep* out,
+                      bool ar) {
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n"), hc = pi(p, n_p, "hc"),
+                  rows = pi(p, n_p, "rows"), tail = pi(p, n_p, "tail", 1);
+    if (M <= 0 || n <= 0 || hc <= 0 || (tail && rows != hc && rows != 2 * hc))
+        return RAD_E_UNSUPPORTED;
+    const bool add = RAD_FUSE_HAS(present, 1);
+    const int y = RAD_FUSE_HAS(present, 10) ? 10 : RAD_FUSE_TMP(0);
+    const int x = RAD_FUSE_HAS(present, 11) ? 11 : RAD_FUSE_TMP(1);
+    int k = step;
+    if (add) {
+        if (k == 0) {
+            Step s(out, "add");
+            s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "dtype");
+            return s.wire({ 0, 1, 0 });                     /* a, b, y = a */
+        }
+        --k;
+    }
+    if (ar) {
+        if (k == 0) {
+            Step s(out, "all_reduce");
+            s.mirror(p, n_p, "world_size").pint("numel", (long long)(M * n))
+             .pstr("dtype", "bf16").pint("exact", 1);
+            return s.wire({ 0, RAD_FUSE_NONE });            /* x (inout), y */
+        }
+        --k;
+    }
+    switch (k) {
+    case 0: {
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 2, y });                         /* x = a, w_post, y */
+    }
+    case 1: {
+        Step s(out, "ihc_post");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "dtype");
+        return s.wire({ y, 3, 4 });                         /* y, post, h */
+    }
+    case 2: {
+        if (!tail) return RAD_E_NOTFOUND;
+        const RadParam* ie = rad_param_find(p, n_p, "ihc_eps");
+        const RadParam* he = rad_param_find(p, n_p, "hc_eps");
+        if (!ie || !he) return RAD_E_UNSUPPORTED;
+        const bool post = rows == 2 * hc;
+        Step s(out, "ihc_pre");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "hc").mirror(p, n_p, "rows")
+         .pf64("eps", ie->dval).mirror(p, n_p, "hc_eps");
+        if (post) s.mirror(p, n_p, "post_mag");
+        s.mirror(p, n_p, "dtype");
+        return s.wire({ 4, 5, 6, 7, x, post ? 3 : RAD_FUSE_NONE });   /* h, fn, scale, base, x, post */
+    }
+    case 3: {
+        if (!tail) return RAD_E_NOTFOUND;
+        Step s(out, "rmsnorm");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "eps").mirror(p, n_p, "dtype");
+        return s.wire({ x, 8, 9 });                         /* x, w_next, xn */
+    }
+    case 4: {
+        /* G-3b: the codes of the next block's input norm, had_quant_act_i8g over xn */
+        if (!tail || !RAD_FUSE_HAS(present, 12) || !RAD_FUSE_HAS(present, 13)) return RAD_E_NOTFOUND;
+        Step s(out, "had_quant_act_i8g");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").pint("group", R4D_FP8_BLOCK).mirror(p, n_p, "dtype");
+        return s.wire({ 9, 12, 13 });                       /* xn, xq, xs */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+}  /* namespace */
+
+extern "C" int r4d_fuse_rmsnorm_ihc_junction(const RadParam* p, int n_p, uint64_t present,
+                                             int step, RadFuseStep* out) {
+    return fuse_ihc_junction(p, n_p, present, step, out, false);
+}
+
+/* ar_rmsnorm_ihc_junction -- [add] -> the exact all_reduce of `a` -> rmsnorm_ihc_junction's chain.
+ * (kernels: libr4d/r4d_ar_ihc_junction.hip; shims: r4d_ar_entry.hip.) The all_reduce step is
+ * ar_rmsnorm_quant_fp8's on the exact wire: `numel` M * n, `exact` 1, in place. */
+extern "C" int r4d_fuse_ar_rmsnorm_ihc_junction(const RadParam* p, int n_p, uint64_t present,
+                                                int step, RadFuseStep* out) {
+    return fuse_ihc_junction(p, n_p, present, step, out, true);
 }

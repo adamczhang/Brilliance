@@ -12,10 +12,10 @@ include_guard(GLOBAL)
 
 # Brilliance's own release: what the package name carries. The project() version stays radiance's,
 # the release this tree was taken from.
-set(BRILLIANCE_VERSION "0.3.0" CACHE INTERNAL "Brilliance's release")
+set(BRILLIANCE_VERSION "0.3.1" CACHE INTERNAL "Brilliance's release")
 # The upstream revision the port is on, as `git describe --tags` names it, and its commit; an upstream
-# merge moves it. Since the merge of upstream's v2.2.0 tag (b6b8751c, 2026-11-19) it is that release.
-set(BRILLIANCE_UPSTREAM "v2.2.0 b6b8751cccb0e834a13ae9e5afca824ee9a487aa" CACHE INTERNAL
+# merge moves it. Since the merge of upstream's main at 1c104de4 (2026-11-24) it is past v2.2.0.
+set(BRILLIANCE_UPSTREAM "v2.2.0-119-g1c104de4 1c104de400239a2c8eabb384d8ea218b30f9c9b9" CACHE INTERNAL
     "the upstream tag and commit Brilliance is pinned to")
 
 # An install goes to Program Files\Brilliance unless the configure named a prefix; CMake's own
@@ -95,7 +95,7 @@ include_directories(AFTER "${CMAKE_SOURCE_DIR}/win")
 add_library(brl_os STATIC "${CMAKE_SOURCE_DIR}/win/os/os_win32.cpp"
                           "${CMAKE_SOURCE_DIR}/win/os/gpu_win32.cpp"
                           "${CMAKE_SOURCE_DIR}/win/os/service_win32.cpp")
-target_link_libraries(brl_os PUBLIC brl_compat advapi32 shell32 ole32 rstrtmgr psapi gdi32)
+target_link_libraries(brl_os PUBLIC brl_compat advapi32 shell32 ole32 rstrtmgr psapi gdi32 pdh)
 target_compile_features(brl_os PRIVATE cxx_std_20)
 # Every target from here on -- the core, the tools, the tests, every plugin -- links both.
 link_libraries(brl_compat brl_os)

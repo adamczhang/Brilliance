@@ -4428,6 +4428,37 @@ int current_card_numa_node() {
     return node;
 }
 
+/* The node a pinned range should prefer: `memory.pinned-numa-node` names one (the fleet stores it
+ * in dev_pinned_numa_node before any engine pins), RADIANCE_PINNED_NUMA_NODE answers for a tool
+ * that reads no config file, and the card's own sysfs node answers when neither names one. A rig
+ * whose host pool is first touched by CPUs on the far node pays the cross-socket hop on every
+ * transfer otherwise; the preference is placement only, so naming a node with no memory, or naming
+ * none at all, costs nothing but the miss. Pages already pinned keep their node: a reload places
+ * what it pins after, not what was pinned before. */
+int pinned_host_numa_node() {
+    static const int env_node = [] {
+        const char* e = std::getenv("RADIANCE_PINNED_NUMA_NODE");
+        if (!e || !*e) return -1;
+        char* end = nullptr;
+        errno = 0;
+        const long n = std::strtol(e, &end, 10);
+        if (errno != 0 || *end != '\0' || n < 0 || n >= 1024) {
+            RAD_WARN("device: RADIANCE_PINNED_NUMA_NODE='%s' names no NUMA node; pinned host "
+                     "memory prefers the node nearest the card", e);
+            return -1;
+        }
+        return (int)n;
+    }();
+    const int n = dev_pinned_numa_node.load(std::memory_order_relaxed);
+    if (n >= 0) return n;
+    if (env_node < 0) return current_card_numa_node();
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        RAD_INFO("device: pinned host memory prefers NUMA node %d (RADIANCE_PINNED_NUMA_NODE), "
+                 "not the node nearest the card", env_node);
+    return env_node;
+}
+
 /* MPOL_PREFERRED | MPOL_F_STATIC_NODES, the policy ROCr's host allocations use. On refusal (seccomp
  * blocking mbind, a node without memory) pages land on the first-touching node, a placement cost
  * only: warn once and continue. */
@@ -4589,12 +4620,18 @@ void* pin_pieces(int64_t bytes) {
     if (lo + (uintptr_t)align > at) ::munmap((void*)(at + (uintptr_t)len), lo + (uintptr_t)align - at);
     char* const p = (char*)at;
 
-    prefer_numa_node(p, len, current_card_numa_node());
+    prefer_numa_node(p, len, pinned_host_numa_node());
     if (len >= ((int64_t)2 << 20)) {
         ::madvise(p, (size_t)len, MADV_HUGEPAGE);
         warn_if_no_huge_pages();
     }
     (void)::madvise(p, (size_t)len, MADV_DONTFORK);
+    /* lock_to_pool mirrors the pages through HMM and does not pin them: a swapped or reclaimed
+     * page makes the driver evict every queue of the process until it restores them.
+     * pin_pieces_file does the same; a refusal (the memlock limit) costs only that. */
+    if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
+        RAD_WARN("device: the pinned range %p (%s) could not be locked against swap (mlock2: %s)",
+                 (void*)p, humanb(len).c_str(), std::strerror(errno));
     prefault(p, len);
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_alloc")) {
@@ -4649,7 +4686,7 @@ void* pin_pieces_file(int64_t bytes, int fd, int64_t foff) {
     if (::mlock2(p, (size_t)len, MLOCK_ONFAULT) != 0)
         RAD_WARN("device: the shared file range %p (%s) could not be locked against swap (mlock2: "
                  "%s)", (void*)p, humanb(len).c_str(), std::strerror(errno));
-    prefer_numa_node(p, len, current_card_numa_node());
+    prefer_numa_node(p, len, pinned_host_numa_node());
 
     if (!lock_pieces(p, len, bytes, cards, "rad_dev_map_file")) {
         ::munmap(p, (size_t)len);

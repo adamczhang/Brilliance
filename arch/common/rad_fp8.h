@@ -542,9 +542,15 @@ struct GateQuantFP8 {
     rad_op op_quant = 0;
     bool clipped = false;
     /* Set before declare: serve the clamped path as one `swiglu_clamped_quant_fp8` where a loaded
-     * library declares it and it resolves (E4M3 codes only). Byte-identical to the pair. */
+     * library declares it and it resolves (E4M3 codes), or as one `swiglu_clamped_had_quant_i8g`
+     * (rotated int8 codes, the GLM plugin's). Byte-identical to the pair either way. */
     bool fuse_clamped = false;
     bool clamped_fused = false;
+    /* Set before declare: the same for rotated int8 codes (`a.q8_fed` with `a.q8_rot`, a rotated
+     * int8 down projection's input): one `swiglu_clamped_had_quant_i8g` where a loaded library
+     * declares it, in place of swiglu_clamped then had_quant_act_i8g (G-3a). It writes the bf16
+     * plane only where `bf16_out` asked. Byte-identical to the pair. */
+    bool fuse_clamped_i8 = false;
     /* Whether the bf16 product is written. A consumer of the bf16 value must request it
      * (docs/OPS.md), but a block-fp8 down_proj reads only codes and scales; only one that reads
      * the bf16 plane (LinearFP8::reads_x) needs it. Skipping it saves [T, n_ff] per layer (18.2 GB
@@ -619,22 +625,58 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         return op_q ? RAD_OK : RAD_E_INVAL;
     }
     if (clipped) {
-        /* The clamp writes the bf16 plane and a quantiser reads it: E4M3, plain int8, or the
+        /* The clamp writes the bf16 plane and a quantiser reads it: E4M3, plain int8, the
          * rotated int8 codes an i8a8h consumer reads (had_quant_act_i8g at that consumer's
-         * group, the quantiser the rotated trunk's other inputs use). Against the unclamped
-         * gated_had_quant_i8g that is one launch more, in the clamped layers only. No clamp
-         * with `silu_only`, and none into a rotated E4M3 consumer (`rot`). */
-        if (!gate_up || !a.x || n <= 0 || rot || silu_only || std::strcmp(act_name, "silu"))
+         * group, the quantiser the rotated trunk's other inputs use), or with `rot` the rotated
+         * E4M3 codes a codebook expert (w4nl64a8h, w5nl64a8h, w6nl64a8h) reads
+         * (had_quant_act_fp8, the chain the unclamped rotated form falls back to): clamp, then
+         * quantise. Against the unclamped gated quantiser that is one launch more, in the
+         * clamped layers only. No clamp with `silu_only`, and none into rotated codes the
+         * producer is fed as int8 (`rot` with `q8_fed`: that is `q8_rot`'s). */
+        if (!gate_up || !a.x || n <= 0 || (rot && a.q8_fed) || silu_only ||
+            std::strcmp(act_name, "silu"))
             return RAD_E_INVAL;
         const bool hi8 = a.q8_fed && a.q8_rot;
         const int64_t rows = max_rows > 0 ? max_rows : g.max_tok;
-        if (fuse_clamped && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
+        if (fuse_clamped && !rot && !step && !bf16 && !a.q8_fed && a.cq() && a.cs() &&
             rad_op_declared(b, "swiglu_clamped_quant_fp8")) {
             op =
                 RAD_OP(b, "swiglu_clamped_quant_fp8",
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS);
+            if (op) {
+                const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
+                rad_op_reads(b, op, &gate_up, 1);
+                rad_op_writes(b, op, wr, want_x ? 3 : 2);
+                clamped_fused = true;
+                return RAD_OK;
+            }
+        }
+        /* Its rotated int8 twin, for an i8a8h consumer: declared only by the GLM kernel plugin
+         * (plugin/glm), byte-identical to swiglu_clamped + had_quant_act_i8g at the consumer's
+         * group. Without that plugin the pair below is issued as before. */
+        if (fuse_clamped && !step && !bf16 && hi8 && a.cq() && a.cs() &&
+            rad_op_declared(b, "swiglu_clamped_had_quant_i8g")) {
+            op = RAD_OP(b, "swiglu_clamped_had_quant_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                   RAD_F64("limit", limit), RAD_INT("group", a.cg()),
+                                   RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS);
+            if (op) {
+                const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
+                rad_op_reads(b, op, &gate_up, 1);
+                rad_op_writes(b, op, wr, want_x ? 3 : 2);
+                clamped_fused = true;
+                return RAD_OK;
+            }
+        }
+        if (fuse_clamped_i8 && hi8 && !rot && !step && !bf16 && a.cq() && a.cs() &&
+            a.cg() == RAD_FP8_BLOCK && rad_op_declared(b, "swiglu_clamped_had_quant_i8g")) {
+            op = RAD_OP(b, "swiglu_clamped_had_quant_i8g",
+                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n), RAD_F64("limit", limit),
+                                   RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                        RAD_NOWEIGHTS);
             if (op) {
                 const rad_buf wr[3] = { a.cq(), a.cs(), a.x };
                 rad_op_reads(b, op, &gate_up, 1);
@@ -653,14 +695,22 @@ inline int GateQuantFP8::declare(RadBuilder* b, const Geom& g, rad_buf gate_up, 
         if (!bf16) {
             if (!a.cq() || !a.cs()) return RAD_E_INVAL;
             const char* qn = hi8 ? "had_quant_act_i8g" : a.q8_fed ? "quant_act_i8g"
-                                                                  : "quant_act_fp8";
+                           : rot ? "had_quant_act_fp8" : "quant_act_fp8";
             op_quant =
-                rw(b,
-                   RAD_OP(b, qn,
-                          RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
-                                     RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
-                          RAD_NOWEIGHTS),
-                   { a.x }, { a.cq(), a.cs() });
+                (hi8 || (rot && !a.q8_fed)) && g.chain_q8   /* the chained row (Geom::chain_q8) */
+                    ? rw(b,
+                         RAD_OP(b, qn,
+                                RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                           RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype),
+                                           RAD_INT("chained", 1)),
+                                RAD_NOWEIGHTS),
+                         { a.x }, { a.cq(), a.cs() })
+                    : rw(b,
+                         RAD_OP(b, qn,
+                                RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                           RAD_INT("group", a.cg()), RAD_STR("dtype", g.dtype)),
+                                RAD_NOWEIGHTS),
+                         { a.x }, { a.cq(), a.cs() });
             if (!op_quant) return RAD_E_INVAL;
         }
         return op?RAD_OK:RAD_E_INVAL;
@@ -868,6 +918,14 @@ struct LinearFP8 {
      * declared. A producer writes the bf16 plane only when asked, so the block must ask for it when
      * this is set; otherwise the linear reads unwritten arena bytes. */
     bool       reads_x = false;
+    /* Runtime LoRA detour: serve a rotated plain-int8 weight (lora_plain_view_enc) through a
+     * plain bf16 `gemm_nt` over the activation's bf16 plane, its weight declared as one view of
+     * the encoding's `codes` and `scale` planes that the reading kernel relayouts to plain bf16
+     * at load. Set before probe()/declare(); a no-op for every other encoding and for source
+     * names outside the trunk (lora_plain_view_src). See lora_plain_view_enc. */
+    bool       plain_bf16_view = false;
+    /* probe() found the plain bf16 view applicable (set by it; false until probed). */
+    bool       viewed  = false;
     bool       mapped  = false;   /* probe() made the name map; declare() does not make it again */
     /* The stored weight this linear's views take when it is not `<base>.weight`: a second linear
      * over one container entry, e.g. a whole projection beside its tensor-parallel slice. Set
@@ -928,8 +986,10 @@ struct LinearFP8 {
                           RadWeightGroup grp);
     /* Rows [r0, r0 + rows) of the input into the same rows of `y`, or from row `y0` of `y` when
      * that is set: a rank's run of a step's rows written to a buffer sized for the run. */
+    /* `codes_ready`: an int8 linear's activation codes were written by a producer this step (a
+     * fused one chosen at run time), so its own quantiser is not issued. */
     void step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0 = 0,
-              int64_t rows = 0, int64_t y0 = -1) const;
+              int64_t rows = 0, int64_t y0 = -1, bool codes_ready = false) const;
     /* A span per stacked row part (rad_weight_shard_span_parts), in weight rows; the scale plane
      * gets the same spans in its rows. Call after declare(). With a 1/128 plane every span and
      * total must be whole scale blocks. */
@@ -1078,6 +1138,54 @@ inline W8hForm linear_w8h_form(const RadEncoding& e) {
 }
 inline bool linear_is_w8h(const RadEncoding& e) { return linear_w8h_form(e) != W8hForm::None; }
 
+/* ---- the plain bf16 view a runtime-LoRA build declares over a rotated int8 trunk weight ------
+ *
+ * The core's LoRA machinery attaches adapters at plain fp GEMMs (core/lora/lora.cpp op_is_site,
+ * issue #475: a plain GEMM over a transform-basis weight is a site, the kernel's relayout hook
+ * presenting the plain basis); the fused int8 GEMM a rotated trunk runs is opaque to it. A
+ * LinearFP8 whose `plain_bf16_view` is set therefore declares its weight as one view of the
+ * encoding's `codes` and `scale` planes (read as plain bf16, which the reading kernel's
+ * layout/relayout hook produces at load: FWHT_128(codes * scale), e.g. the lora_plain plugin)
+ * and its product as a plain `gemm_nt` over the activation's bf16 plane, into the same output.
+ * The shared blocks set the flag only when rad_lora_source_targeted says a runtime adapter
+ * targets that checkpoint source. Unset, the linear keeps its stock declaration.
+ *
+ * Eligible encodings are exactly what such a hook accepts: affine, fwht128, i8 codes [x 1] with
+ * a bf16 scale per [1 x 128], two planes and nothing else. IQ8R (u8 per 256 under a bf16 second
+ * level), narrower IQR codes, asymmetric and ParoQuant weights, and every plain or fp8 container
+ * keep their stock branch, declaration-for-declaration the tree's. Sources in the scopes core
+ * never targets (lora.cpp excluded_source: `mtp` / `draft` first components, vision and audio
+ * towers) also keep it: the MTP head's same-leaf siblings stay byte-identical i8a8h GEMMs. */
+inline bool lora_plain_view_enc(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2) return false;
+    if (std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0) return false;
+    const RadEncPlane* c = rad_enc_plane(&e, "codes");
+    const RadEncPlane* s = rad_enc_plane(&e, "scale");
+    return c && s && c->dtype == RAD_I8 && c->block[1] == 1 &&
+           s->dtype == RAD_BF16 && s->block[0] == 1 && s->block[1] == RAD_FP8_BLOCK;
+}
+inline bool lora_plain_view_src(std::initializer_list<const char*> src) {
+    static const char* const kOff[] = { "mtp", "draft", "visual", "vision_tower", "vision_model",
+                                        "audio_tower", "audio_model", "embed_vision",
+                                        "embed_audio", "multi_modal_projector", "mm_projector" };
+    for (const char* q : src) {
+        if (!q || !*q) return false;
+        const size_t len = std::strlen(q);
+        for (size_t at = 0; at <= len;) {
+            size_t dot = len;
+            for (size_t i = at; i < len; ++i) if (q[i] == '.') { dot = i; break; }
+            for (const char* x : kOff) {
+                const size_t xl = std::strlen(x);
+                if (xl == dot - at && !std::strncmp(q + at, x, xl)) return false;
+            }
+            if (dot == len) break;
+            at = dot + 1;
+        }
+    }
+    return true;
+}
+
+
 /* A rotated asymmetric weight at four or five bits: u4 or u5 codes, an f16 scale and a u8 (or
  * code-width) zero point per 128 of K under the 128-wide Hadamard (libquant `codes=u5 zero=u8
  * group=128 scale=f16 transform=fwht128`). Read by gemm_nt_q at w4a8i8_asym / w5a8i8 over the
@@ -1223,14 +1331,20 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
-    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
+    /* The plain view reads the bf16 plane, not codes: pretending it were an int8 linear would
+     * tell the block its producer may skip the bf16 plane (GateQuantFP8's want_x). */
+    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+                      lora_plain_view_src(src);
+    viewed = view;
+    probed_i8 = !view && known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     probed_g8 = known ? linear_w8h_group(enc) : (int64_t)RAD_FP8_BLOCK;
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
                                    linear_is_paro_m2xfp4(enc));
     const bool blocks = known && ggml_type_of(enc);
-    reads_x = g.w_bf16 || plain || probed_i8 || rotated || blocks || (known && linear_is_w4(enc));
+    reads_x = g.w_bf16 || plain || view || probed_i8 || rotated || blocks ||
+              (known && linear_is_w4(enc));
     return RAD_OK;
 }
 
@@ -1399,14 +1513,18 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * container keeps at checkpoint precision (e.g. the QSA indexer's projection, whose top-k is a
      * hard choice; 20 MB to keep exact). Row parts and uneven slices apply without block
      * constraints. */
-    bf16 = plain || (g.w_bf16 && !quant);
+    /* The LoRA detour (plain_bf16_view): the same plain `gemm_nt`, over a rotated int8 weight's
+     * bf16-read view of its planes. */
+    const bool view = plain_bf16_view && known && !plain && lora_plain_view_enc(enc) &&
+                      lora_plain_view_src(src);
+    bf16 = plain || (g.w_bf16 && !quant) || view;
     if (bf16) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
                             "may\n", wn, stored);
             return RAD_E_INVAL;
         }
-        if (known && !plain) {
+        if (known && !plain && !view) {
             char en[256];
             rad_enc_format(&enc, en, sizeof en);
             fprintf(stderr, "radiance: '%s' is %s, but this linear runs as a plain bf16 GEMM "
@@ -1423,7 +1541,12 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
-        w = decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
+        /* A plain view over the stored encoding takes the codes' dtype and the logical extents
+         * (RadWeightDecl, spec §4.3); the reading kernel's layout hook relayouts the planes to
+         * plain bf16, the form the core's LoRA pools and weight_share expect (lora.cpp). */
+        w = view ? decl_view(b, wn, nullptr, "codes,scale", RAD_I8, { N, K }, access, shard, grp,
+                             rp.w, rp.n)
+                 : decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
         if (!w) return RAD_E_INVAL;
         if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
         op = rw(b, RAD_OP(b, "gemm_nt",
@@ -1534,7 +1657,14 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                                                col ? span_hi / wg : span_hi));
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
-        if (!a.q8_fed)
+        if (!a.q8_fed && rot8 && g.chain_q8)   /* the chained row (Geom::chain_q8) */
+            op_q = rw(b, RAD_OP(b, "had_quant_act_i8g",
+                     RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
+                                RAD_INT("group", wg), RAD_STR("dtype", "bf16"),
+                                RAD_INT("chained", 1)),
+                     RAD_NOWEIGHTS),
+                  { a.x }, { a.q8, a.s8 });
+        else if (!a.q8_fed)
             op_q = rw(b, RAD_OP(b, rot8 ? "had_quant_act_i8g" : "quant_act_i8g",
                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
                                 RAD_INT("group", wg), RAD_STR("dtype", "bf16")),
@@ -1860,7 +1990,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
  * asymmetric integer and mxfp4 grids) are passed as RAD_NONE when unused, since the runtime checks
  * the operand count against the schema (core/runtime/issue.cpp). */
 inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, int64_t r0,
-                            int64_t rows, int64_t y0) const {
+                            int64_t rows, int64_t y0, bool codes_ready) const {
     if (rows <= 0) rows = T - r0;
     const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16 || ggml) {
@@ -1868,7 +1998,7 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         return;
     }
     if (i8) {
-        if (op_q)
+        if (op_q && !codes_ready)
             RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a.q8, r0, rows, K),
                         brow_slice(a.s8, r0, rows, K / a.g8));
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),

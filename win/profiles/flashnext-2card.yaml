@@ -8,8 +8,8 @@
 #
 # What the tuned settings do:
 #   max-model-len: 262144         the model's full context. On the test machine the KV cache holds
-#                                 about 262,100 tokens across all requests (the experts take the rest of
-#                                 the cards), so a prompt longer than that is refused (400).
+#                                 about 262,260 tokens across all requests (the experts take the rest of
+#                                 the cards): one full-length context. A 512K context: flashnext-2card-512k.
 #   max-num-batched-tokens: 6144  with prefill-span: 3, a prompt alone in its step is prefilled up
 #   prefill-span: 3               to 6,144 tokens a step, three 2,048-token checkpoint intervals;
 #                                 with experts in host memory this starts at 16,384-token prompts.
@@ -17,11 +17,10 @@
 #   checkpoint-slots: 8           eight linear-state snapshots, in pinned host memory (0.9 GiB).
 #   vision-tower-placement: ram   the picture and audio encoders (857 MiB a card) pinned in host
 #                                 memory, their VRAM given to the KV cache.
-#   ngram-warm: true              the n-gram table (below) read once at load into the Windows file
-#                                 cache, so rows are not read from the drive mid-step (a cold
-#                                 row costs about 9% of one-stream decode). Not pinned;
-#                                 skipped, with the reason in the log, without the table's size
-#                                 plus 24 GiB of memory available. It adds 7 s or more to the load.
+#   ngram-warm: false             no warm read at load: since 0.3.1 the gather prefetches its rows
+#                                 (BRILLIANCE_NGRAM_PREFETCH), and cold decode, 8-stream and prefill
+#                                 measured within ~1% with and without the warm on two cards
+#                                 (2026-11-22), while the warm added ~9 s to every load.
 # The n-gram table (47.68 GiB) is read from the file (ngram-placement left at auto): a pinned copy
 # exceeds what Windows lets this process pin (46.83 GiB with two cards visible). This build serves
 # no fp8 KV cache for this model; i8 is its 8-bit cache.
@@ -58,6 +57,10 @@ server:
   port: 8000
 memory:
   gpu-headroom-mib: 160
+  # A card that also drives a display or runs other GPU applications can keep more free on its
+  # own: card-headroom-mib: {1: 1536}, by its card number in the startup report (0, 1, ...).
+  # The other card keeps 160 MiB and puts the room it has beyond the busy card into resident
+  # experts; the KV cache is the same on every card.
 scheduler:
   load-timeout: 600s
 models:
@@ -85,6 +88,6 @@ models:
     draft-depth-load: on
     max-num-batched-tokens: 6144
     prefill-span: 3
-    ngram-warm: true
+    ngram-warm: false
     # weight-prefetch off: Windows TP2 A/B on flashnext-2card-fast (prefetch-ab, 2026-11-22): update p50 18.2 -> 13.1 ms, combined decode +37%, greedy output identical; same host-staged collective path.
     weight-prefetch: off

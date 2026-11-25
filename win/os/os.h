@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "job_limit.h"
+
 namespace rad::os {
 
 /* ----------------------------------------------------------------------------- strings */
@@ -152,6 +154,11 @@ struct MemInfo {
 MemInfo mem_info();
 /* This process's working set and private commit, bytes. */
 int64_t process_rss();
+/* Brilliance (issue #1): this process's private commit (PrivateUsage), bytes; -1 unreadable. */
+int64_t process_commit();
+/* Brilliance (issue #1): the memory limits of the Windows job object this process runs in
+ * (job_limit.h); in_job false and no limits outside one. */
+JobMemoryLimit job_memory_limit();
 
 /* Brilliance: every AMD adapter's negotiated PCIe lane width, by PCI bus number.
  *
@@ -233,6 +240,20 @@ int  flock_fd(int fd, int op);
  * compares st_dev and st_ino for, or st_nlink with 0, since st_ino carries no identity on Windows.
  * False when nothing is at `path`, or the file there is a deleted one still open somewhere. */
 bool fd_names(int fd, const std::string& path);
+
+/* A file's revision as POSIX code reads it from stat(2): st_dev, st_ino, st_size, and st_mtim and
+ * st_ctim to the nanosecond. Here from the file's handle: the volume serial number, the file id
+ * (FILE_ID_INFO's 128 bits folded to 64; only compared), the size, and the last-write and change
+ * times (100 ns resolution). _stat64 has no inode, keeps whole seconds, and its st_ctime is the
+ * creation time, so a file rewritten in place within one second would keep its revision. False with
+ * errno when the file cannot be read or is not a regular file (EISDIR for a directory). */
+struct FileStamp {
+    uint64_t device = 0, inode = 0, bytes = 0;
+    int64_t  mtime_s = 0, ctime_s = 0;
+    int32_t  mtime_ns = 0, ctime_ns = 0;
+};
+bool file_stamp_fd(int fd, FileStamp* out);
+bool file_stamp(const std::string& path, FileStamp* out);
 
 /* ----------------------------------------------------------------------------- processes */
 /* One argument quoted so CommandLineToArgvW -- and so the CRT, and the SCM starting a service --
@@ -400,6 +421,31 @@ struct GpuSample {
     int64_t vram_used   = -1;          /* not reported on Windows (see above) */
 };
 std::vector<GpuSample> gpu_samples(const std::vector<std::string>* only = nullptr);
+
+/* Every OTHER process's use of each named card's own memory (win/os/gpu_win32.cpp), for the
+ * engine's startup report and its settle check (core/mem/vram_others.h). From the graphics kernel's
+ * per-process counters, "\GPU Process Memory(*)\Dedicated Usage" (Task Manager's "dedicated GPU
+ * memory"), readable without admin rights; the counter instances name the adapter by LUID, which
+ * the adapter enumeration maps to the card's PCI address. This process is left out. Names come from
+ * a process snapshot ("" when a process has exited meanwhile). Nothing here enters a GPU runtime.
+ *
+ * One entry per address asked, in that order. `known` is false for an address no adapter has, or
+ * when the counters do not answer. Thread-safe; tens of milliseconds a call or more (the counters'
+ * enumeration): startup and its checks only, never a request's path. */
+struct GpuProcVram {
+    uint32_t    pid = 0;
+    std::string name;
+    int64_t     bytes = 0;
+};
+struct GpuHolders {
+    std::string              bdf;
+    bool                     known = false;
+    std::vector<GpuProcVram> procs;     /* those holding more than 0 bytes on the card */
+};
+std::vector<GpuHolders> gpu_vram_holders(const std::vector<std::string>& bdfs);
+/* A counter instance's name, "pid_19340_luid_0x00000000_0x000181BB_phys_0", as pid and LUID (high
+ * 32 bits from the first number). False for any other shape. */
+bool gpu_process_instance(const std::string& instance, uint32_t* pid, uint64_t* luid);
 
 /* ----------------------------------------------------------------------------- service
  * `radiance --service NAME --config FILE [--log FILE] [--env-from-file VAR=FILE]...

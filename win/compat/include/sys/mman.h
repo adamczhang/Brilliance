@@ -67,4 +67,18 @@ int   mlock(const void* addr, size_t len);
 int   mlock2(const void* addr, size_t len, unsigned flags);
 int   munlock(const void* addr, size_t len);
 int   memfd_create(const char* name, unsigned flags);
+
+/* Brilliance's own, not POSIX: many ranges of mapped memory read in with one PrefetchVirtualMemory
+ * call, where Linux code would madvise(MADV_WILLNEED) each (libavx avx_ngram.cpp: the disk-tier
+ * n-gram gather's rows and its read-ahead's). The call reads the ranges' pages in parallel and
+ * returns once they are in memory, but does not map them into the process: each page's first touch
+ * is still a soft fault. Here, not in win/os, because plugins built outside the tree link this
+ * layer only. brl_prefetch_range has WIN32_MEMORY_RANGE_ENTRY's layout (checked in
+ * compat_mman.cpp), so the array is passed as is. 0, also for n == 0; or -1 with errno and, when
+ * `why` is given, the reason in up to `cap` bytes. Adapted from wmmunn's rad_compat_prefetch. */
+typedef struct {
+    void*  addr;
+    size_t bytes;
+} brl_prefetch_range;
+int   brl_prefetch_ranges(const brl_prefetch_range* ranges, size_t n, char* why, size_t cap);
 BRL_C_END

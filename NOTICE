@@ -301,6 +301,19 @@ https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16/tree/f88f8d91047267477
 It is covered by the same retained OpenMDW-1.1 license.
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+Hy4-flash
+---------
+
+The Hy4-flash architecture (arch/hyv4flash), its kernels, host ops, tests and tools, and the
+scheduler, placement and drafting changes that came with them were ported into Brilliance from
+Code000-211/RadianceHy4Flash at commit a9d03cbe (https://github.com/Code000-211/RadianceHy4Flash),
+a fork of radiance under the Apache License 2.0, by Code000 and its contributors.
+
+tests/data/chat/hy4flash/chat_template.jinja is copied unchanged from Tencent's Hy4-flash
+checkpoint (https://huggingface.co/tencent/Hy4-flash) and is distributed under the Tencent Hy
+License, Version 1.0, retained in tests/data/chat/hy4flash/LICENSE, with the notice in
+tests/data/chat/hy4flash/NOTICE.
+
 The Brilliance Windows package with HIP includes AMD ROCm Core SDK DLLs. The package's
 third_party/THIRD-PARTY.md records those DLLs and their applicable component notices. The
 MetroHash attributions, HSA loader and libelf notices, and AMD COMGR compiler notices are

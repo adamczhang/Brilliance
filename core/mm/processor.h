@@ -104,8 +104,33 @@ enum class Kind { Image, Video, Audio };
  *           <image_end>; a video one <vid_start>, then per temporal group the text `Time: T s`
  *           and <|video|>*N rows, the groups separated by <|vid_frame_separator|> and closed by
  *           <vid_end>, T the group's first frame time (the reference stamps a group once, after
- *           repeating the last frame to a whole group). */
-enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, MuseGlimmer };
+ *           repeating the last frame to a whole group).
+ *   HyV4Flash  Tencent Hy4-flash's (HYV4VL's processors): a picture resized as QwenVL's
+ *           smart_resize does into its pixel band with PIL's bicubic, a video frame to the largest
+ *           whole merged-patch grid that never upscales and keeps every frame's tokens within the
+ *           clip budget (HYV4VLVideoProcessor.smart_resize); patches (channel, y, x) normalised by
+ *           the image's mean and deviation (CLIP's by default) or the video's (0.5); temporal 1, a
+ *           video frame its own segment. Every merged row of a picture or frame ends in one
+ *           newline token whose row the tower writes (the projector's image_newline), so a
+ *           segment is rows_h x (rows_w) output rows with rows_w = grid_w / merge + 1, and the
+ *           rotary grid wraps at that width: the reference's 3-D positions exactly. A picture is
+ *           spelled <image_start> pad*N <image_end>, a video <video_start> pad*(frames N)
+ *           <video_end>, no timestamps; every placeholder, the newline ones included, is the pad
+ *           id, which is what the Engram hash and its mask read. */
+/*   Inkling2  Thinking Machines' Inkling 2 (transformers' Inkling2ImageProcessor): no resize --
+ *           the picture, its alpha composited onto an 8-pixel checkerboard of 204 and 153
+ *           (composite_checkerboard), is padded bottom and right to whole patch * merge (40 px)
+ *           cells with the raw value -1, anchored top left (a picture past the token cap is first
+ *           shrunk to it, as llama.cpp's mtmd does, aspect kept; the reference has no cap).
+ *           Values are the reference's fused rescale and normalisation, (u - 255 mean) /
+ *           (255 std) in f32 with the config's mean and deviation (0.5), rounded to bf16: its
+ *           pixel_values bit for bit. Patches (y, x, channel) in merge-block order
+ *           behind one zero row a picture, coordinate (-1, -1), that the tower fills with its class
+ *           token. A picture is spelled <|content_image|> then one <|unused_200054|> a cell
+ *           (the processor's image_token), no end marker: the chat layer gives the picture a
+ *           message block of its own. Images only, the tokens at their positions. */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr, Glm5Next, Pixtral, Radio, MuseGlimmer,
+                    Inkling2, HyV4Flash };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -127,6 +152,12 @@ struct VisionConfig {
     int32_t max_frame_rows = 768;
     float   mean[3] = { 0.5f, 0.5f, 0.5f };
     float   stdv[3] = { 0.5f, 0.5f, 0.5f };
+    /* HyV4Flash: a video's own normalisation (its processor's IMAGENET_STANDARD 0.5 defaults,
+     * where the image processor's are CLIP's), and the one-frame pixel cap of its smart_resize
+     * (`video_preprocessor.max_image_size.longest_edge`). */
+    float   vmean[3] = { 0.5f, 0.5f, 0.5f };
+    float   vstdv[3] = { 0.5f, 0.5f, 0.5f };
+    int64_t video_frame_max_pixels = 0;
     int32_t tok_image = -1, tok_video = -1, tok_start = -1, tok_end = -1;
     /* MuseGlimmer: the video run's own markers, <vid_start>, <vid_end> and the groups'
      * <|vid_frame_separator|> (a picture shares tok_start and tok_end). A container that numbers
@@ -305,6 +336,9 @@ struct Item {
      * class and register tokens): zero pixels, coordinate (-1, k), counted in patch_at and
      * n_patch but never in a segment's output rows. */
     int32_t seg_prefix = 0;
+    /* The prefix rows' coordinate is (-1, -1) rather than (-1, k) (Family::Inkling2: its one class
+     * row, whose 2-D rotary position, column + 1 and row + 1, is then the reference's (0, 0)). */
+    bool prefix_at_origin = false;
 
     int32_t seg_h(int32_t s) const { return segments.empty() ? grid_h : segments[(size_t)s].h; }
     int32_t seg_w(int32_t s) const { return segments.empty() ? grid_w : segments[(size_t)s].w; }
@@ -450,9 +484,10 @@ public:
     int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
                       int32_t max_frames, std::vector<Frame>* out, std::string* why) const;
 
-    /* A soundtrack: its first stream, mono at `rate` Hz, at most `max_samples`. */
-    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
-                      std::vector<float>* out, std::string* why) const;
+    /* A soundtrack: its first stream at `rate` Hz, at most `max_samples` a channel, as
+     * decode_audio lays `channels` (1: mono). */
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int32_t channels,
+                      int64_t max_samples, std::vector<float>* out, std::string* why) const;
 
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */
@@ -474,12 +509,15 @@ private:
     int image_pixtral(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_radio(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int image_muse(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_inkling2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_radio(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;
     int video_gemma4(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
     int video_muse(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_hy(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int video_hy(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
     VisionConfig cfg_{};
     AudioConfig  acfg_{};
@@ -521,12 +559,24 @@ int gemma4_size(int64_t h, int64_t w, int32_t patch, int32_t pool, int64_t max_p
 int muse_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t* oh, int64_t* ow,
               std::string* why);
 
+/* Inkling 2's picture size: the picture itself while its ceil(h / factor) * ceil(w / factor)
+ * cells are within `max_tokens`, else the largest aspect-kept size that is (mtmd's bound). */
+int inkling2_size(int64_t h, int64_t w, int32_t factor, int64_t max_tokens, int64_t* oh,
+                  int64_t* ow, std::string* why);
+
 /* MuseGlimmerVideoProcessor.sample_frames: `total * fps / native` frames, truncated, clamped to
  * [temporal, min(num_frames, total)] and floored to a whole temporal group, then torch's
  * linspace(0, total - 1, n) truncated to integers. A stream with no stated rate is taken at
  * 24 fps. */
 std::vector<int64_t> sample_frames_muse(const VideoInfo& info, double fps, int32_t temporal,
                                         int32_t num_frames);
+
+/* HYV4VLVideoProcessor.smart_resize: the largest whole merged-patch frame (`factor` pixels a cell)
+ * that never upscales, keeps a frame within `max_frame_px` pixels and `frames` frames of
+ * rows * (cols + 1) tokens (a newline a row) within `max_px / factor^2` tokens, its aspect on the
+ * ray of the frame's own. Refuses an aspect over 200:1 as the reference does. */
+int hy_video_size(int64_t h, int64_t w, int64_t frames, int32_t factor, int64_t max_px,
+                  int64_t max_frame_px, int64_t* oh, int64_t* ow, std::string* why);
 
 /* Radio's tile for a picture of w x h pixels (NVIDIA's _compute_target_patches, Python's
  * round-half-even included) and for a video frame (_compute_target_patches_video), in patches. */

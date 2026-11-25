@@ -82,7 +82,20 @@ static const Flag g_flags[] = {
                                         "(0 under --deterministic, KL mode, generators)" },
     { "--mixed-step-target-ms", "N",    "soft duration target in milliseconds for a mixed prefill/decode\n"
                                         "step. The scheduler learns an aggregate prefill cap from\n"
-                                        "completed mixed steps; 0 (default) is off" },
+                                        "completed mixed steps and never sizes a chunk under the\n"
+                                        "prefill stager's smallest step; 0 (default) is off" },
+    { "--chunk-slices",       "MODE",   "slice one prefill chunk into m layer-sliced sub-steps with\n"
+                                        "the decode rows between them: off (default), auto (m from\n"
+                                        "--chunk-slice-target-ms and -cost-pct), or m itself (1-8).\n"
+                                        "Only a model whose plugin reports it can run the trunk over\n"
+                                        "a layer range (RadArchProbe::slice_layers_ok) is sliced, so\n"
+                                        "it is a no-op until a plugin reports it" },
+    { "--chunk-slice-target-ms", "N",   "the duration a sub-step targets, in milliseconds; m follows\n"
+                                        "from it and the learned chunk and decode step times\n"
+                                        "(default 150)" },
+    { "--chunk-slice-cost-pct", "N",    "the share of a chunk step's time the decode waits between\n"
+                                        "two slices may pay, in percent (default 10); 0 caps m at 1\n"
+                                        "and turns slicing off" },
     { "--prefill-room-gate",  "MODE",   "on: a fresh prefill starts only when its whole prompt plus one\n"
                                         "decode position fits beside every runner; off (the default)\n"
                                         "admits a prompt when its first chunk fits" },
@@ -128,7 +141,10 @@ static const Flag g_flags[] = {
     "                                    host memory at load, pinned for the cards to read\n"
     "                                    (locked, where only a host kernel reads it); disk reads\n"
     "                                    its rows from the container on the host. auto takes the\n"
-    "                                    first of the three that holds it. ram=DIR makes the\n"
+    "                                    first of the three that holds it, keeping at least 24 GiB\n"
+    "                                    of host memory free beside a RAM copy; on Windows it\n"
+    "                                    reads a table larger than a quarter of RAM from the file\n"
+    "                                    (prefetched) rather than pin it. ram=DIR makes the\n"
     "                                    pinned copy a file in DIR (a tmpfs) mapped shared, so\n"
     "                                    two engines on separate cards hold one table: the\n"
     "                                    first fills it, the last to exit deletes it" },
@@ -292,8 +308,12 @@ static const Flag g_flags[] = {
     "                                    throughput; fewer sequences than --draft-depth-load-from keep the\n"
     "                                    stop rule. Same output law" },
     { "--draft-depth-load-from", "N",   "--draft-depth-load: the fewest drafting sequences of a step the\n"
-                                        "load-aware rule decides (default 5)" },
+                                        "load-aware rule decides (default 5; 1 = from one\n"
+                                        "sequence, the rule priced at the margin instead of a stop threshold)" },
     { "--draft-depth-load-min", "N",    "--draft-depth-load: rounds a load-aware step always runs (default 2)" },
+    { "--draft-depth-explore", "N",     "--draft-depth-load: every Nth load-aware step of fewer than five drafting sequences\n"
+                                        "verifies the whole chain, so the acceptance bins the rule never reaches are learnt\n"
+                                        "(default 20; 0 = never). Counted by steps alone: same output law" },
     { "--draft-depth-load-late", "MODE", "on (default) | off -- --draft-depth-load: choose each row's verified\n"
                                         "drafts again when the next verify is issued, from the laws read by then" },
     { "--draft-depth-load-calib", "MODE", "--draft-depth-load: online (default; acceptance by confidence,\n"
@@ -755,6 +775,14 @@ int config_parse(int argc, char** argv, Config* c) {
             else if (!parse_int(a.c_str(), v, 0, 64, &c->prefill_interleave)) return RAD_E_INVAL;
         }
         else if (S("--mixed-step-target-ms"))  { if (!num(0, 60000, &c->mixed_step_target_ms)) return RAD_E_INVAL; }
+        else if (S("--chunk-slices")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if      (!std::strcmp(v, "off"))  c->chunk_slices = 0;
+            else if (!std::strcmp(v, "auto")) c->chunk_slices = -1;
+            else if (!parse_int(a.c_str(), v, 1, 8, &c->chunk_slices)) return RAD_E_INVAL;
+        }
+        else if (S("--chunk-slice-target-ms")) { if (!num(1, 60000, &c->chunk_slice_target_ms)) return RAD_E_INVAL; }
+        else if (S("--chunk-slice-cost-pct"))  { if (!num(0, 100, &c->chunk_slice_cost_pct)) return RAD_E_INVAL; }
         else if (S("--prefill-room-gate")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "on"))   c->prefill_room_gate = true;
@@ -1106,8 +1134,9 @@ int config_parse(int argc, char** argv, Config* c) {
             else { RAD_ERR("%s takes off or on, not '%s'", a.c_str(), v); return RAD_E_INVAL; }
             (S("--draft-depth-load") ? c->draft_depth_load : c->draft_depth_load_late) = b;
         }
-        else if (S("--draft-depth-load-from")) { if (!num(2, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-load-from")) { if (!num(1, 64, &c->draft_depth_load_from)) return RAD_E_INVAL; }
         else if (S("--draft-depth-load-min"))  { if (!num(1, 16, &c->draft_depth_load_min)) return RAD_E_INVAL; }
+        else if (S("--draft-depth-explore"))   { if (!num(0, 10000, &c->draft_depth_explore)) return RAD_E_INVAL; }
         else if (S("--draft-depth-load-calib")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if      (!std::strcmp(v, "online")) c->draft_depth_load_online = true;
@@ -1806,6 +1835,11 @@ const ShowRow kShow[] = {
                                           : std::string("off"); } },
     { "--mixed-step-target-ms", [](const Config& c) {
           return c.mixed_step_target_ms > 0 ? num(c.mixed_step_target_ms) : std::string("off"); } },
+    { "--chunk-slices", [](const Config& c) {
+          return c.chunk_slices < 0 ? std::string("auto")
+               : c.chunk_slices == 0 ? std::string("off") : num(c.chunk_slices); } },
+    { "--chunk-slice-target-ms", [](const Config& c) { return num(c.chunk_slice_target_ms); } },
+    { "--chunk-slice-cost-pct",  [](const Config& c) { return num(c.chunk_slice_cost_pct); } },
     { "--prefill-room-gate", [](const Config& c) {
           return c.prefill_room_gate ? std::string("on") : std::string("off"); } },
     { "--preempt-wait-ms",    [](const Config& c) { return num(c.preempt_wait_ms); } },
@@ -1893,6 +1927,7 @@ const ShowRow kShow[] = {
     { "--draft-depth-load",   [](const Config& c) { return onoff(c.draft_depth_load); } },
     { "--draft-depth-load-from", [](const Config& c) { return num(c.draft_depth_load_from); } },
     { "--draft-depth-load-min", [](const Config& c) { return num(c.draft_depth_load_min); } },
+    { "--draft-depth-explore", [](const Config& c) { return num(c.draft_depth_explore); } },
     { "--draft-depth-load-late", [](const Config& c) { return onoff(c.draft_depth_load_late); } },
     { "--draft-depth-load-calib", [](const Config& c) {
           return std::string(c.draft_depth_load_online ? "online" : "static"); } },

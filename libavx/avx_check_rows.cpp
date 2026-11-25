@@ -53,6 +53,50 @@
 #endif
 
 #if defined(_WIN32)
+/* Brilliance: the Windows gather's prefetch (avx_ngram.cpp) reads no file either, so the file cases
+ * check it through its counters (avx_ngram_prefetch_stats), in its order: calls, pages, call_us,
+ * covered, ahead_pages, dropped, failed. With it on, every case's calls must have prefetched their
+ * rows or found them already mapped by the read-ahead, the read-ahead must have mapped pages (every
+ * case passes `ahead`), and no prefetch may have failed; with BRILLIANCE_NGRAM_PREFETCH=off nothing
+ * may move. Adapted from wmmunn's checks. */
+struct PfCount {
+    uint64_t v[7] = {};
+};
+static bool pf_count(const Lib& lib, PfCount* c) {
+    auto f = (int (*)(uint64_t*, int))dlsym(lib.h, "avx_ngram_prefetch_stats");
+    return f && f(c->v, 7) == 7;
+}
+static bool pf_off() {
+    const char* e = std::getenv("BRILLIANCE_NGRAM_PREFETCH");
+    if (!e) return false;
+    std::string v(e);
+    for (char& ch : v) ch = (char)std::tolower((unsigned char)ch);
+    return v == "off" || v == "0" || v == "no" || v == "false";
+}
+static bool pf_check(const char* what, bool have, const PfCount& a, const PfCount& b) {
+    if (!have) {
+        std::printf("  %s: FAIL -- no avx_ngram_prefetch_stats export\n", what);
+        return false;
+    }
+    uint64_t d[7];
+    bool moved = false;
+    for (int i = 0; i < 7; ++i) {
+        d[i] = b.v[i] - a.v[i];
+        moved = moved || d[i] != 0;
+    }
+    const bool off = pf_off();
+    const bool ok = off ? !moved : d[0] + d[3] > 0 && d[4] > 0 && d[6] == 0;
+    std::printf("    prefetch%s: %llu calls, %llu pages, %.1f ms in the calls, %llu already mapped; "
+                "read-ahead %llu pages, %llu lists dropped; %llu failed%s\n",
+                off ? " (BRILLIANCE_NGRAM_PREFETCH=off)" : "", (unsigned long long)d[0],
+                (unsigned long long)d[1], (double)d[2] / 1e3, (unsigned long long)d[3],
+                (unsigned long long)d[4], (unsigned long long)d[5], (unsigned long long)d[6],
+                ok ? "" : off ? " FAIL (the prefetch is off, and something moved)"
+                              : " FAIL (calls must prefetch or be covered, the read-ahead must map "
+                                "pages, none may fail)");
+    return ok;
+}
+
 /* Brilliance: no io_uring, reported as a kernel built without it reports it. Only the gather case's
  * retry reads it on Windows, where ENOSYS is not the ring-memory pressure that excuses a refusal. */
 static int ring_probe() { return ENOSYS; }
@@ -249,7 +293,8 @@ static RowTable* row_table(const std::string& dir, bool bf16, int64_t V, int64_t
     t.tab = static_cast<const uint8_t*>(map);
     t.path = path;
 #if defined(_WIN32)
-    t.note = "read as memory: no file reader on Windows";
+    t.note = pf_off() ? "read as memory, no prefetch (BRILLIANCE_NGRAM_PREFETCH=off)"
+                      : "read as memory, its pages prefetched first (PrefetchVirtualMemory)";
 #else
     t.note = reported ? "the alignment the filesystem reports"
                       : "no alignment reported, read by the block size";
@@ -259,9 +304,11 @@ static RowTable* row_table(const std::string& dir, bool bf16, int64_t V, int64_t
 }
 
 bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint64_t seed,
-                     bool verbose, bool bf16) {
+                     bool verbose, bool bf16, bool per_row) {
     const RadKernelInfo* r = lib.row("embed_lookup_q");
-    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table" : "embed_lookup_q from a file";
+    const char* what = bf16 ? "embed_lookup_q from a file, bf16 table"
+                            : (per_row ? "embed_lookup_q from a file, a scale a row"
+                                       : "embed_lookup_q from a file");
     if (!r || !r->launch) {
         std::printf("  %s: no row\n", what);
         return false;
@@ -314,6 +361,12 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
         }
     uint16_t lut[256];
     for (int b = 0; b < 256; ++b) lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * scale);
+    /* Engram's table: one bf16 scale a row, resident beside the file-backed codes. */
+    std::vector<uint16_t> row_scale;
+    if (per_row) {
+        row_scale.resize((size_t)V);
+        for (auto& v : row_scale) v = rad_f32_to_bf16(0.05f + (float)(rnd() % 1000) / 500.0f);
+    }
 
     auto tensor = [](void* p, uint32_t dt, std::initializer_list<int64_t> shape) {
         RadTensor t{};
@@ -336,7 +389,9 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
         std::vector<RadTensor> ts = {
             tensor(nullptr, RAD_I32, {M}),
             tensor(const_cast<uint8_t*>(tab), bf16 ? RAD_BF16 : RAD_F8E4M3, {V, n}),
-            tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}), tensor(out.data(), RAD_BF16, {M, n}),
+            per_row ? tensor(row_scale.data(), RAD_BF16, {V})
+                    : tensor(bf16 ? nullptr : &sc, RAD_BF16, {1}),
+            tensor(out.data(), RAD_BF16, {M, n}),
             tensor(nullptr, RAD_I32, {M}) };
         RadParam ps[3] = {};
         ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
@@ -362,6 +417,9 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
                 for (int64_t i = 0; i < n; ++i) {
                     uint16_t want = 0;
                     if (id >= 0 && bf16) std::memcpy(&want, tab + ((int64_t)id * n + i) * 2, 2);
+                    else if (id >= 0 && per_row)
+                        want = rad_f32_to_bf16(rad_fp8e4m3_to_f32(tab[(int64_t)id * n + i]) *
+                                               rad_bf16_to_f32(row_scale[(size_t)id]));
                     else if (id >= 0)    want = lut[tab[(int64_t)id * n + i]];
                     if (out[(size_t)(m * n + i)] != want) { ++bad[rk]; break; }
                 }
@@ -378,6 +436,10 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
      * not make. Under contention for ring memory the case runs again on fresh threads, which make
      * fresh rings, up to three times; it is skipped by name only if a probe saw ENOMEM meanwhile.
      * Refusals without that evidence fail. */
+#if defined(_WIN32)
+    PfCount pf_before;
+    const bool pf_have = pf_count(lib, &pf_before);
+#endif
     bool pressure = false;
     for (int attempt = 0; attempt < 3; ++attempt) {
         race();
@@ -395,6 +457,13 @@ bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint
         std::printf("  %s: SKIPPED -- %s\n", what, kRingMemory);
         return true;
     }
+#if defined(_WIN32)
+    {
+        PfCount pf_after;
+        pf_count(lib, &pf_after);
+        if (!pf_check(what, pf_have, pf_before, pf_after)) return false;
+    }
+#endif
 
     const bool pass = bad[0] + bad[1] + refused[0] + refused[1] == 0;
     if (verbose || !pass)
@@ -471,6 +540,10 @@ bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
         return t;
     };
     const uint64_t before = reads();
+#if defined(_WIN32)
+    PfCount pf_before;
+    const bool pf_have = pf_count(lib, &pf_before);
+#endif
     std::barrier<> go(2);
     int64_t bad[2] = {0, 0}, refused[2] = {0, 0};
     auto rank = [&](int rk) {
@@ -511,10 +584,13 @@ bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose) {
      * by name and the rows decide. */
     (void)read;
     (void)U;
-    const bool pass = exact;
     std::printf("  %s in %s: %lld chunks of %lld rows x 2 ranks%s; rows read: SKIPPED -- no file "
-                "reader on Windows, the table is read as memory\n", what, dir.c_str(),
-                (long long)chunks, (long long)M, exact ? ", every row exact" : ", rows FAIL");
+                "reader on Windows, the table is read as memory; its prefetch:\n", what,
+                dir.c_str(), (long long)chunks, (long long)M,
+                exact ? ", every row exact" : ", rows FAIL");
+    PfCount pf_after;
+    pf_count(lib, &pf_after);
+    const bool pass = pf_check(what, pf_have, pf_before, pf_after) && exact;
 #else
     const bool once = (int64_t)read <= U + U / 10;
     const bool pass = exact && once;

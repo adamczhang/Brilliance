@@ -68,6 +68,9 @@ struct Grid {
     float    fmax = 0.0f;          /* a float code's largest magnitude */
     int      emax = 0;             /* a float code's largest normal exponent, for rule=mx */
     enum Rule { ABSMAX, MX, FIXED, SEARCH } rule = ABSMAX;
+    /* divide=1: a float code from x / s in f32, not x * (1 / s) (their roundings differ at a
+     * code's midpoint); rule=absmax, f32 scales, one level, no transform. */
+    bool     divide = false;
     double   fixed = 0.0;
 
     /* A scalar codebook: the value of each code, in code order. */

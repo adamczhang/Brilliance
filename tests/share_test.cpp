@@ -348,4 +348,56 @@ TEST(glm_kda_tp4_takes_each_head_shard_from_all_three_convolution_parts) {
     }
 }
 
+/* The IQR trellis (libquant tcq_rows=T, the "trellis" table's block[0]): a column's codes are a
+ * path tail-biting over runs of T rows, so a rank may take only whole runs. Hy4-flash gpu-mini's
+ * shared expert gate_up is [gate 256 | up 256] x 512: at TP2 a rank takes 128 rows of each part,
+ * half a 256-row run -- refused (it served wrong rows before); runs of 128 are whole and cut
+ * cleanly. A column cut leaves every path whole. */
+TEST(a_shard_may_not_cut_a_trellis_run) {
+    auto trellis = [](int64_t run) {
+        RadEncoding e = rad_enc_affine(RAD_U5, RAD_F32, 1, 0);
+        rad_enc_copy_str(e.scheme, "trellis");
+        const int i = rad_enc_add_table(&e, "trellis", RAD_I8, 65536, 1);
+        e.plane[i].block[0] = run;
+        e.plane[i].block[1] = 1;
+        rad_enc_add_table(&e, "trellis.mad", RAD_U32, 2, 1);
+        rad_enc_add_plane(&e, "scale.col", RAD_F32, 0, 128);
+        rad_enc_copy_str(e.transform, "fwht128");
+        return e;
+    };
+    PlaneShare s[RAD_ENC_MAX_PLANES];
+    std::string why;
+    {
+        const RadEncoding e = trellis(256);
+        const WeightInfo w = decl(e, { 0, 2, 3 }, 512, 512, RAD_SHARD_ROW, 2, { 128, 128 });
+        for (int index = 0; index < 2; ++index) {
+            why.clear();
+            CHECK_EQ(share(w, 512, 512, 2, index, s, &why), RAD_E_SHAPE);
+            CHECK(why.find("trellis run") != std::string::npos);
+        }
+        /* the scale view of the same entry is refused the same way */
+        const WeightInfo ws = decl(e, { 1, 4 }, 512, 512, RAD_SHARD_ROW, 2, { 128, 128 });
+        CHECK_EQ(share(ws, 512, 512, 2, 1, s), RAD_E_SHAPE);
+        /* whole, or a run-aligned cut (two parts of 512 at TP2: 256 rows a part a rank), it is not */
+        const WeightInfo one = decl(e, { 0, 2, 3 }, 512, 512, RAD_SHARD_NONE, 2);
+        CHECK_EQ(share(one, 512, 512, 2, 1, s), RAD_OK);
+        const WeightInfo big = decl(e, { 0, 2, 3 }, 1024, 512, RAD_SHARD_ROW, 2, { 256, 256 });
+        CHECK_EQ(share(big, 1024, 512, 2, 1, s), RAD_OK);
+        /* columns: each column's path stays whole */
+        const WeightInfo col = decl(e, { 0, 2, 3 }, 512, 512, RAD_SHARD_COL, 2);
+        CHECK_EQ(share(col, 512, 512, 2, 1, s), RAD_OK);
+    }
+    {
+        const RadEncoding e = trellis(128);
+        const WeightInfo w = decl(e, { 0, 2, 3 }, 512, 512, RAD_SHARD_ROW, 2, { 128, 128 });
+        REQUIRE_EQ(share(w, 512, 512, 2, 1, s), RAD_OK);
+        REQUIRE_EQ(s[0].rects.size(), (size_t)2);
+        CHECK_EQ(s[0].rects[0].row0, (int64_t)128);
+        CHECK_EQ(s[0].rects[1].row0, (int64_t)384);
+        /* at TP4 the 64-row slices cut the 128-row runs again */
+        const WeightInfo w4 = decl(e, { 0, 2, 3 }, 512, 512, RAD_SHARD_ROW, 4, { 64, 64 });
+        CHECK_EQ(share(w4, 512, 512, 4, 0, s), RAD_E_SHAPE);
+    }
+}
+
 RAD_TEST_MAIN()

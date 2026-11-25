@@ -319,6 +319,9 @@ public:
      * parameter, so a collective's ranks rendezvous only with their own engine's; unset (-1), as
      * for the tools, no parameter is added. */
     void set_tp_group(long long g) { tp_group_ = g; }
+    /* A declare that launches nothing (--debug-graph on the host backend, fake ranks): init() is
+     * not called, so a collective that needs peer device memory resolves without a card. */
+    void set_declare_only(bool v) { declare_only_ = v; }
     void fini_instances();
     size_t n_instances() const;
 
@@ -372,6 +375,7 @@ private:
 
     Geometry device_facts_;
     long long tp_group_ = -1;
+    bool      declare_only_ = false;
 
     int  stage_(const std::string& path, Staged* out);
     int  commit_(Staged& s, int order);

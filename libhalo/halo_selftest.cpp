@@ -24221,6 +24221,16 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     std::vector<float> w((size_t)N * (size_t)K);
     for (size_t i = 0; i < w.size(); ++i)
         w[i] = (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000;
+    /* Untimed, the weight's values are bf16 values, so the same weight stored as bf16 can be run
+     * after the f32 one and compared with it byte for byte. */
+    std::vector<uint16_t> packed;
+    if (!timed) {
+        packed.resize(w.size());
+        for (size_t i = 0; i < w.size(); ++i) {
+            packed[i] = h_to_bf16(w[i]);
+            w[i] = h_bf16(packed[i]);
+        }
+    }
     for (int c = 0; c < copies; ++c)
         st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
@@ -24262,6 +24272,21 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld: byte-identical to the host arithmetic",
            (long long)M, (long long)N, (long long)K).c_str(),
        same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
+    /* The stored-bf16 weight (`weight_bf16`), widened in the kernel: the f32 weight's bytes. */
+    if (!timed && same) {
+        ts[1].dtype = RAD_BF16;
+        ps.push_back(PI("weight_bf16", 1));
+        a.p = ps.data();
+        a.n_p = (int)ps.size();
+        st_memcpy(d_w, packed.data(), packed.size() * sizeof(uint16_t), hipMemcpyHostToDevice);
+        st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
+        rc = r->launch(&a, nullptr);
+        if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+        std::vector<uint8_t> packed_y(ybytes);
+        if (rc == RAD_OK) st_memcpy(packed_y.data(), d_y, ybytes, hipMemcpyDeviceToHost);
+        ok(fmt("gemm_nt_f32 stored bf16 vs widened f32 at M=%lld N=%lld K=%lld",
+               (long long)M, (long long)N, (long long)K).c_str(), rc == RAD_OK && packed_y == got);
+    }
     if (timed && rc == RAD_OK) {
         const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
         const double flop = 2.0 * (double)M * (double)N * (double)K;
@@ -37402,6 +37427,8 @@ static void device_phase(const Plugin& pl) {
             for (int64_t cols : { 4, 32, 36, 288 }) f32_forms(pl, rows, cols, 4096, 0, false);
         f32_forms(pl, 7, 31, 129, 0, false);
         f32_forms(pl, 70, 13, 130, 0, false);
+        f32_forms(pl, 1, 512, 3072, 0, false);
+        f32_forms(pl, 256, 256, 129, 0, false);
     }
     if (sel("dsa_score_fp8")) {
         dsa_score_check(pl, 1, 17);

@@ -405,6 +405,14 @@ public:
     /* A generator's slots pack each combination's ranks from j = 0: the ranks pool p takes in
      * slot s at [p * S + s], 0 for a pool the combination does not reach (no adapter op runs). */
     std::vector<int32_t>       lora_rused;
+    struct LoraReplacement {
+        rad_buf slots = 0;
+        int64_t rows = 0;
+        bool row_mixer = false;
+        std::vector<int64_t> source_rows;
+        std::string module;
+    };
+    std::map<rad_weight, LoraReplacement> lora_replacements;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -608,6 +616,9 @@ struct ReasoningSpan {
     int32_t open = -1;            /* the token a reply opens its own block with; -1 for none */
     int32_t close = -1;           /* the token that ends the block; -1: no countable block */
     bool    starts_open = false;  /* the generation prompt left the reply inside the block */
+    /* A message header the reply writes before `open` (Inkling 2's <|message_model|>): passed
+     * over, not counted, while the reply has not yet opened its block; -1 for none. */
+    int32_t frame = -1;
     bool known() const { return close >= 0; }
 };
 
@@ -626,6 +637,7 @@ struct ReasoningCount {
     void push(const ReasoningSpan& s, int32_t tok) {
         if (st == Lead) {
             if (s.open >= 0 && tok == s.open) { st = Think; ++tokens; }
+            else if (s.frame >= 0 && tok == s.frame) {}   /* the header before the opener */
             else st = Done;
         } else if (st == Think) {
             ++tokens;
@@ -898,6 +910,23 @@ struct Config {
     /* --mixed-step-target-ms: soft duration target for a mixed prefill/decode step. The scheduler
      * learns an aggregate prefill-row cap from completed mixed steps; 0 keeps the fixed policy. */
     int64_t mixed_step_target_ms = 0;
+    /* --chunk-slices: plan one prefill chunk as m layer-sliced sub-steps (S-02). 0 = off, the
+     * default; -1 = auto, m from chunk_slice_target_ms and chunk_slice_cost_pct; N > 0 = m itself,
+     * capped at 8 and at the trunk's layers. Only a model whose plugin reports it can run the
+     * trunk over a layer range (RadArchProbe::slice_layers_ok) is sliced. */
+    int64_t chunk_slices = 0;
+    /* --chunk-slice-target-ms: the duration a sub-step targets; m follows from it and the learned
+     * chunk and decode step times (Scheduler::chunk_slice_count). */
+    int64_t chunk_slice_target_ms = 150;
+    /* --chunk-slice-cost-pct: the share of a chunk step's time the decode waits between two slices
+     * may pay (percent); 0 caps m at 1, which turns slicing off. */
+    int64_t chunk_slice_cost_pct = 10;
+    /* Engine-internal, not a flag: the model's plugin reports its step's trunk can be stopped
+     * between two layers and resumed from a persistent set (RadArchProbe::slice_layers_ok), read
+     * once in Engine::declare(). With it false no chunk is sliced however --chunk-slices asks, and
+     * the builder is told to declare no persistent set (RadBuildCtx::layer_slices) for a slice to
+     * resume from. */
+    bool    slice_layers_ok = false;
     /* --prefill-room-gate: a fresh prefill starts only when its whole prompt plus one decode
      * position fits beside every runner. Off (the default) admits the first chunk alone, which
      * can fill the pool and be preempted back to zero at the first decode step. */
@@ -925,6 +954,9 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
+    /* A fleet may replace that reserve on named cards (e.g. a desktop card). The single-model
+     * path has no broker, so the budget and each rank's pool plan need this map directly. */
+    std::map<int, int64_t> card_headroom_mib;
     /* --gpu-memory-mib: claim this much of every card; 0 uses gpu_headroom_mib. Inverse of
      * headroom: N + headroom = the card, in MiB. Not with --gpu-headroom-mib. */
     int64_t gpu_memory_mib = 0;
@@ -1182,6 +1214,8 @@ struct Config {
     bool        draft_depth_load = false;
     int         draft_depth_load_from = 5;
     int         draft_depth_load_min = 2;
+    /* every Nth load-aware step of fewer than 5 drafting rows verifies the whole chain (0 = never) */
+    int         draft_depth_explore = 20;
     bool        draft_depth_load_late = true;
     bool        draft_depth_load_online = true;
     std::string draft_depth_load_tok_ms;

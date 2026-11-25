@@ -73,7 +73,7 @@ struct RecMap {
     std::vector<int>         src_index;   /* RadNameMap::src_index, one per source */
 };
 struct RecKV    { std::string name; RadKVGroupDecl d{}; bool zero = false; bool replicated = false;
-                  bool dense = false; };
+                  bool dense = false; size_t at = 0; /* ops declared before it */ };
 struct RecIssue {
     rad_op                  op = 0;
     std::vector<RadOperand> opd;
@@ -111,6 +111,10 @@ struct RadBuilder {
         return vocab ? vocab->count(op) != 0 : undeclared.count(op) == 0;
     }
     int64_t kv_block = 16;
+    /* Each paged group's block from its consumer, as the real builder finds it
+     * (rad_builder.cpp find_kv_consumer): the first op declared after the group that carries
+     * `block_size` and no earlier group claimed. Off: every group is `kv_block`. */
+    bool kv_block_by_consumer = false;
 
     /* The buffer the plugin named as this step's logits (rad_declare_logits), or as its pooled
      * output (rad_declare_pooled). */
@@ -147,8 +151,10 @@ struct RadBuilder {
     std::string      generator_name;
 
     /* Adapter key names (rad_lora_root, rad_lora_alias): (native, spellings), and each alias as
-     * (native, from, to, from_lo, from_hi, to_lo). */
+     * (native, from, to, from_lo, from_hi, to_lo). Runtime targets (rad_lora_source_targeted):
+     * module leaf names, empty when no adapter is configured. */
     std::vector<std::pair<std::string, std::string>> lora_roots;
+    std::set<std::string> lora_targets;
     struct LoraAliasRec { std::string native, from, to; int64_t from_lo, from_hi, to_lo; };
     std::vector<LoraAliasRec> lora_aliases;
 
@@ -192,6 +198,8 @@ struct RadCtx {
     std::vector<SnapRec>  snaps;     /* rad_ckpt_snap calls */
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
     std::vector<StageRec> stages_next;
+    /* The ops this fake's step dispatches to the host (rad_op_domain); every other op is device. */
+    std::vector<rad_op>   host_ops;
 };
 
 /* -------------------------------------------------------------------- the declare-side ABI */
@@ -280,18 +288,40 @@ extern "C" int rad_op_declared(RadBuilder* b, const char* op) {
 
 extern "C" rad_kvgroup rad_decl_kv_group(RadBuilder* b, const char* name,
                                          const RadKVGroupDecl* d) {
-    b->kv_groups.push_back({name, *d, false});
+    RecKV k{name, *d, false};
+    k.at = b->ops.size();
+    b->kv_groups.push_back(k);
     return (rad_kvgroup)b->kv_groups.size();
 }
 
-extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { (void)g; return b->kv_block; }
+static int64_t fake_kv_block(const RadBuilder* b, rad_kvgroup g) {
+    if (!b->kv_block_by_consumer || !g || g > b->kv_groups.size()) return b->kv_block;
+    std::vector<bool> claimed(b->ops.size(), false);
+    for (size_t gi = 0; gi < g; ++gi) {
+        const int kind = b->kv_groups[gi].d.kind;
+        if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW && kind != RAD_KV_RING) continue;
+        for (size_t i = b->kv_groups[gi].at; i < b->ops.size(); ++i) {
+            if (claimed[i]) continue;
+            int64_t bs = 0;
+            for (const auto& p : b->ops[i].p)
+                if (p.key == "block_size") bs = p.ival;
+            if (bs <= 0) continue;
+            claimed[i] = true;
+            if (gi + 1 == g) return bs;
+            break;
+        }
+    }
+    return 0;
+}
+
+extern "C" int64_t rad_kv_block_size(RadBuilder* b, rad_kvgroup g) { return fake_kv_block(b, g); }
 
 extern "C" int64_t rad_kv_layer_bytes(RadBuilder* b, rad_kvgroup g) {
     if (!b || !g || g > b->kv_groups.size()) return 0;
     const RadKVGroupDecl& d = b->kv_groups[g - 1].d;
     if (d.kind != RAD_KV_FULL && d.kind != RAD_KV_WINDOW) return 0;
     const int64_t nh = d.n_head_kv > 0 ? d.n_head_kv : 1;
-    return rad_dtype_bytes(d.dtype, 2 * b->kv_block * nh * d.head_dim);
+    return rad_dtype_bytes(d.dtype, 2 * fake_kv_block(b, g) * nh * d.head_dim);
 }
 
 extern "C" int rad_bind_layer_kv(RadBuilder* b, int layer, rad_kvgroup g) {
@@ -371,6 +401,40 @@ extern "C" int rad_lora_alias(RadBuilder* b, const char* native, const char* fro
     if (!b || !native || !from || !to) return RAD_E_INVAL;
     b->lora_aliases.push_back({ native, from, to, from_lo, from_hi, to_lo });
     return RAD_OK;
+}
+
+/* Mirrors lora::source_targeted. A token model matches the leaf and excludes towers, mtp, draft,
+ * embed_tokens and lm_head; "*" matches nothing there. A generator (a declared root) matches "*"
+ * or the leaf, and only under a root. */
+extern "C" int rad_lora_source_targeted(RadBuilder* b, const char* src) {
+    if (!b || !src || !*src || b->lora_targets.empty()) return 0;
+    const std::string s(src);
+    if (s.size() < 8 || s.compare(s.size() - 7, 7, ".weight") != 0) return 0;
+    const std::string mod = s.substr(0, s.size() - 7);
+    if (mod.empty()) return 0;
+    const size_t dot = mod.rfind('.');
+    const std::string leaf = dot == std::string::npos ? mod : mod.substr(dot + 1);
+    auto excluded = [&]() {
+        if (leaf == "embed_tokens" || leaf == "lm_head") return true;
+        static const char* tower[] = { "visual", "vision_tower", "vision_model", "audio_tower",
+                                        "audio_model", "embed_vision", "embed_audio",
+                                        "multi_modal_projector", "mm_projector" };
+        for (size_t at = 0; at < s.size();) {
+            size_t d = s.find('.', at);
+            if (d == std::string::npos) d = s.size();
+            const std::string c = s.substr(at, d - at);
+            if (at == 0 && (c == "mtp" || c == "draft")) return true;
+            for (const char* t : tower) if (c == t) return true;
+            if (d == s.size()) break;
+            at = d + 1;
+        }
+        return false;
+    };
+    if (b->lora_roots.empty()) return !excluded() && b->lora_targets.count(leaf) ? 1 : 0;
+    if (!b->lora_targets.count("*") && !b->lora_targets.count(leaf)) return 0;
+    for (const auto& r : b->lora_roots)
+        if (!r.first.empty() && s.compare(0, r.first.size(), r.first) == 0) return 1;
+    return 0;
 }
 
 /* Recorded: gemma4's prefill overlap names the buffers its second lane reduces in place. */
@@ -518,6 +582,13 @@ extern "C" int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd,
     r.lane = c->lane;
     c->issues.push_back(r);
     return RAD_OK;
+}
+/* The domain the fake's step dispatches: an op in RadCtx::host_ops is host, every other device. */
+extern "C" int rad_op_domain(RadCtx* c, rad_op op) {
+    if (!c) return RAD_E_INVAL;
+    for (rad_op h : c->host_ops)
+        if (h == op) return RAD_DOMAIN_HOST;
+    return RAD_DOMAIN_DEVICE;
 }
 /* The second lane, recorded: each issue's lane, and each join's position among the issues. */
 extern "C" int rad_lane(RadCtx* c, int lane) {
@@ -992,6 +1063,18 @@ std::vector<std::string> lint_step(const RadBuilder& b, const std::vector<const 
                         bad.push_back(at + ": " + o->op + " reads " + std::to_string(od.cols) +
                                       " of " + std::to_string(width) + " columns of '" + name(h) +
                                       "' as its input, which is not contiguous");
+                    /* ... and its output is written as contiguous rows too: a column slice is
+                     * refused once it holds more than one row (WP13.7, the DFly2 chain at two
+                     * drafting sequences). */
+                    /* Brilliance: not gemm_nt_bias, whose rows store through the output's row
+                     * pitch (r4d_vit_bf16.hip, r4d_rows_pitch): upstream's Wan writes q, k and v
+                     * into column slices of one qkv buffer that way. */
+                    if (k == is.opd.size() - 1 && w && !r && o->op.rfind("gemm_nt", 0) == 0 &&
+                        o->op != "gemm_nt_bias" &&
+                        od.cols > 0 && od.rows != 1 && (od.cols != width || od.offset % width))
+                        bad.push_back(at + ": " + o->op + " writes " + std::to_string(od.cols) +
+                                      " of " + std::to_string(width) + " columns of '" + name(h) +
+                                      "' as its output, which is not contiguous");
                 } else if (od.kind == RAD_OPK_WEIGHT) {
                     const uint32_t h = od.handle;
                     if (h == 0 || h > b.weights.size()) {
@@ -1114,7 +1197,7 @@ std::unique_ptr<Kit> kit(const RadBuilder& bld, const std::vector<int>& dq,
         gb.seqused = k->used.data();
         gb.state_index = k->sidx.data();
         gb.state_index_pitch = 1;
-        gb.block_size = bld.kv_block;
+        gb.block_size = fake_kv_block(&bld, (rad_kvgroup)(g + 1));
         gb.max_blocks = pitch;
         k->kv.push_back(gb);
     }

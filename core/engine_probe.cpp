@@ -29,7 +29,9 @@ namespace rad {
  *
  * It shows tensors inside a step, which neither rad-kbench (one op at a time) nor --debug-graph
  * (what was declared) can. An environment variable at -vv only, because it adds a device-to-host
- * copy and a synchronisation per step. */
+ * copy and a synchronisation per step. While it is on the step loop issues no step ahead
+ * (Engine::step_loop): the read follows the step's collection, and a pass issued ahead would
+ * already have rewritten what it shows. */
 
 /* A positive integer from the environment, clamped to `hi`, or `dflt` when unset or not one. */
 static int64_t env_count(const char* name, int64_t dflt, int64_t hi) {

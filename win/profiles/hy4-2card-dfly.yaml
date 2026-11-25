@@ -1,0 +1,79 @@
+# Brilliance profile: Hy4-flash IQR-V4 u3 (keptn's quantised Tencent Hy4-flash: trellis u3 gate_up
+# and w4nl64 down projections for the 512 routed experts, a u5 trellis trunk, E4M3 Engram tables, the
+# IQ8R DFly2 drafter) on two Radeon AI PRO R9700s, tensor parallel (TP2), with the file's DFly2 block
+# drafter. Two cards cannot hold the routed experts: each rank keeps what fits on its card and the
+# rest in its share of a pinned host pool. Preview: it loads, serves chat, tools and streaming,
+# passes greedy consistency checks (drafter on against off, TP2 against TP4) and stops cleanly on
+# Ctrl-Break; no soak, stop-under-load or concurrency qualification has run on it.
+# Slower on prose than hy4-2card (drafter off): on two cards the drafter's verify reads more of the
+# pooled experts. BetterBench on the test machine: prose 43 tok/s here against 48 with hy4-2card,
+# reasoning 45 against 48; JSON (66) and summaries (59) faster; 52 against 47 combined. Use it for
+# longer contexts (32K) and two requests.
+#
+# What the settings do:
+#   placement: expert_tiered      each rank's experts (768 columns of every expert's width) go to its
+#   host-pool-mib: 17408          card first, then to its share of the pinned host pool (8.5 GiB a
+#                                 rank), read by the cards in place; one that fits neither makes the
+#                                 load refuse. On the test machine each rank held 23.3 GiB of experts
+#                                 on the card and 6.1 GiB in the pool, 30.5 GiB of the card in all.
+#                                 One process seeing two cards may pin about 46.8 GiB; the pool, its
+#                                 read windows and the mailboxes fit under it.
+#   max-model-len 32768 x 2       32,768 tokens of context, two requests at once, a bf16 KV cache (it
+#                                 holds about 1.2 full-length sequences; the cards are nearly full).
+#   max-num-batched-tokens 4096   prefill steps of up to 4,096 tokens, one checkpoint interval.
+#   num-speculative-tokens 5 ...  DFly2, the container's block drafter: five draft positions, coupled
+#                                 to the verify (fixed-seed tokens are not preserved), traversal
+#                                 verify, an adaptive and load-aware depth, and SuffixDecoding beside it.
+#   tp-wire: exact, p2p: off      the collectives carry exact bf16 through pinned host memory (no
+#                                 peer-to-peer on Windows). The iHC junction runs unfused on Windows.
+#   ngram-placement: disk         the 60.24 GiB Engram tables stay in the container's file mapping
+#                                 (above the pin limit); each step reads the rows it needs.
+#   mm-max-patches: 0             text only: the vision tower is not served.
+#   kernels: libr4d,libavx,spechub  the card kernels, the host library, and the drafter's coupling.
+#
+# Do not set RADIANCE_HY4_PIPE (the pipelined prefill): it gave wrong long-context answers.
+#
+#   .\serve.ps1 hy4-2card-dfly -Fetch -Bus 3,9     fetch the model if it is not whole, then serve it
+#   .\serve.ps1 hy4-2card-dfly -Bus 3,9
+#
+# The model file: keptn/hy4-flash-iqr-v4 on Hugging Face, hy4-flash-iqr-v4-u3.rad, 128.61 GiB
+# (138,093,449,672 bytes), SHA-256 c4a80918139f2bae4d097976fd2794ca3f1f56e9ea7eb60600188c45f4f5e7aa.
+# Tencent Hy License 1.0 (/terms/licenses/tencent-hy-1.0; a separate licence for large MaaS
+# businesses, TERMS-OF-USE.md).
+# brilliance-fetch: keptn/hy4-flash-iqr-v4 main hy4-flash-iqr-v4-u3.rad
+#
+# The cards: name the two with -Bus (the pair on the widest links). Windows HIP determines device
+# order. The engine's startup report shows each serving rank and its PCI address.
+#
+# Loopback only and no key. To serve the local network: .\serve.ps1 hy4-2card-dfly -Bus 3,9 -Listen
+# 0.0.0.0 -ApiKey env:NAME (or -ApiKey off), and allow the port for the private network only.
+server:
+  host: 127.0.0.1
+  port: 8000
+  kernels: libr4d,libavx,spechub
+scheduler:
+  load-timeout: 1200s
+models:
+  hy4-flash:
+    model: D:/models/hf/keptn/hy4-flash-iqr-v4/hy4-flash-iqr-v4-u3.rad
+    tp: 2
+    tp-wire: exact
+    p2p: off
+    placement: expert_tiered
+    host-pool-mib: 17408
+    max-model-len: 32768
+    max-num-seqs: 2
+    max-num-batched-tokens: 4096
+    checkpoint-interval: 4096
+    kv-cache-dtype: bf16
+    num-speculative-tokens: 5
+    draft-window: fixed
+    draft-coupling: on
+    draft-verify: traversal
+    draft-depth: adaptive
+    draft-depth-load: on
+    draft-depth-load-from: 1
+    draft-suffix: on
+    ngram-placement: disk
+    mm-max-patches: 0
+    deterministic: true

@@ -67,7 +67,10 @@ public:
      * Observing `done()` is not enough: the producer publishes the terminal state and only then
      * calls notify_one(), and destroying the condition_variable in between is a use-after-free in
      * pthread_cond_signal. The producer's last act is to set a quiesced flag, which this waits
-     * for. The window is a few instructions wide. */
+     * for. The window is a few instructions wide.
+     *
+     * A wake the producer deferred (push's `deferred`, issued by wake()) is its last act instead,
+     * one unlock later, so this waits for that too. */
     ~Sink();
 
     /* ------------------------------------------------------------------ producer: scheduler */
@@ -76,8 +79,22 @@ public:
      * logprobs when the request asked for them (enable_logprobs), and null otherwise. `now`, a
      * sink_now_ns() reading, is the token's time; negative reads the clock. A step's tokens share
      * one reading: where the clocksource is HPET (the TSC marked unstable) a read is a system call
-     * of about a microsecond, a token's whole cost here. */
-    bool push(int32_t token, const TokenLogprobs* lp = nullptr, int64_t now = -1);
+     * of about a microsecond, a token's whole cost here.
+     *
+     * A producer that pushes under a lock the consumer takes (the scheduler's step lock) passes
+     * `deferred` and issues wake() once it has let go, so a wake does not put the consumer's
+     * thread on that lock while the producer still holds it. *deferred is set by the push that
+     * leaves a wake owed, and not by the same step's later pushes to the same stream. */
+    bool push(int32_t token, const TokenLogprobs* lp = nullptr, int64_t now = -1,
+              bool* deferred = nullptr);
+
+    /* Whether the consumer is inside wait()'s sleep: the producer's own wake decision, and the
+     * state a test waits for rather than guessing at. */
+    bool consumer_asleep() const { return asleep_.load(std::memory_order_acquire); }
+
+    /* Issues a wake a push or set_prompt_progress deferred, and owes no more. Harmless when the
+     * consumer is awake. */
+    void wake();
 
     /* Terminal and idempotent: the first call wins, so a cancel racing a natural stop does not
      * produce two finish reasons. */
@@ -96,12 +113,13 @@ public:
      * queue time is not counted as prefill. A preempted request keeps its first mark. */
     void mark_admitted();
     /* One verify step: `n` draft tokens proposed, `accepted` taken. Summed per request for
-     * /metrics' draft counters. */
+     * /metrics' draft counters; each call is one step, counted for `timings.draft_steps`. */
     void add_drafts(int32_t n, int32_t accepted);
     /* Prompt tokens processed of `total`, `cached` of them from the prefix cache. Set at
      * admission and after every prefill step; streamed as llama-server's `prompt_progress` when
-     * a request asks for it. Wakes the consumer. */
-    void set_prompt_progress(int32_t processed, int32_t total, int32_t cached);
+     * a request asks for it. Wakes the consumer; `deferred` as push's. */
+    void set_prompt_progress(int32_t processed, int32_t total, int32_t cached,
+                             bool* deferred = nullptr);
     int32_t progress_processed() const { return prog_done_.load(std::memory_order_acquire); }
     int32_t progress_total() const    { return prog_total_.load(std::memory_order_acquire); }
     int32_t progress_cached() const   { return prog_cached_.load(std::memory_order_acquire); }
@@ -135,6 +153,7 @@ public:
      * times on one axis. */
     int64_t t_start_ns() const { return t_start_ns_; }
 
+    int64_t n_draft_steps() const    { return n_draft_steps_.load(std::memory_order_acquire); }
     int64_t n_drafted() const        { return n_draft_.load(std::memory_order_acquire); }
     int64_t n_draft_accepted() const { return n_draft_acc_.load(std::memory_order_acquire); }
 
@@ -176,6 +195,7 @@ private:
     std::atomic<int64_t>  t_first_{-1};
     std::atomic<int64_t>  t_last_{-1};
     std::atomic<int64_t>  t_admit_{-1};
+    std::atomic<int64_t>  n_draft_steps_{0};
     std::atomic<int64_t>  n_draft_{0};
     std::atomic<int64_t>  n_draft_acc_{0};
     int64_t               t_start_ns_ = 0;
@@ -193,12 +213,24 @@ private:
     std::mutex              m_;
     std::condition_variable cv_;
     std::atomic<bool>       asleep_{false};   /* the consumer is inside cv_.wait_for */
+    /* A wake owed to the consumer and not yet issued (Sink::wake): one per sink, since a step's
+     * pushes to one stream share it. The destructor waits for it beside quiesced_. */
+    std::atomic<bool>       deferred_{false};
 };
 
 /* The scheduler's call sites, so core/sched needs no casts. A null sink means nobody is
  * listening (an offline or benchmark request). */
 inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr, int64_t now = -1) {
     return s ? static_cast<Sink*>(s)->push(token, lp, now) : true;
+}
+/* The same, with the wake handed to the caller: `owed` is set when one is, and sink_wake issues
+ * it. Pushes with a null sink leave `owed` as they found it. */
+inline bool sink_push_deferred(void* s, int32_t token, const TokenLogprobs* lp, int64_t now,
+                               bool* owed) {
+    return s ? static_cast<Sink*>(s)->push(token, lp, now, owed) : true;
+}
+inline void sink_wake(void* s) {
+    if (s) static_cast<Sink*>(s)->wake();
 }
 /* The clock a sink's times are on, for push's `now`. */
 int64_t sink_now_ns();
@@ -219,6 +251,10 @@ inline void sink_admitted(void* s) {
 }
 inline void sink_prompt_progress(void* s, int32_t processed, int32_t total, int32_t cached) {
     if (s) static_cast<Sink*>(s)->set_prompt_progress(processed, total, cached);
+}
+inline void sink_prompt_progress_deferred(void* s, int32_t processed, int32_t total,
+                                          int32_t cached, bool* owed) {
+    if (s) static_cast<Sink*>(s)->set_prompt_progress(processed, total, cached, owed);
 }
 inline void sink_drafts(void* s, int32_t n, int32_t accepted) {
     if (s) static_cast<Sink*>(s)->add_drafts(n, accepted);

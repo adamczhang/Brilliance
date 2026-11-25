@@ -284,11 +284,14 @@ int PrefillStager::before_op(rad_op h, RadStream s, bool* resync) {
         if (it != layers_.end()) {
             next_ = (int32_t)(it - layers_.begin());
             first_li_ = next_;
-            if (n_early_ > 0 && next_ != 0) {
-                withdraw_early();
-                *resync = true;
+            if (n_early_ > 0) {
+                if (next_ == early_first_) {
+                    next_ = early_first_ + n_early_;
+                } else {
+                    withdraw_early();
+                    *resync = true;
+                }
             }
-            next_ = std::max(next_, n_early_);
             n_early_ = 0;
             RAD_TRY(stage_ahead(first_li_ - 1, resync));
         }
@@ -352,13 +355,22 @@ int PrefillStager::end_pass(RadStream s) {
         p.free_rec = r >= 0 || p.free_rec;
         retire(p);
     }
-    if (rc < 0 || !next_prefill_) return rc;
+    if (rc < 0) return rc;
+    if (!next_prefill_) {
+        early_first_ = 0;
+        n_early_ = 0;
+        return rc;
+    }
     const int32_t n = (int32_t)layers_.size();
-    for (int32_t k = 0; k < kLead && k < n; ++k) {
+    /* Inside a chunk group the next pass starts at its slice's first layer (S-02), which the
+     * engine named; the pass that begins there adopts these. */
+    const int32_t base = arm_first_;
+    early_first_ = base;
+    for (int32_t k = 0; k < kLead && base + k < n; ++k) {
         const int32_t g = n - kLead + k;
         if (g < first_li_ || gate_li_[g % kGates] != g) break;
         int got = kLater;
-        RAD_TRY(stage_layer(k, /*now=*/false, gate_[g % kGates], &got));
+        RAD_TRY(stage_layer(base + k, /*now=*/false, gate_[g % kGates], &got));
         if (got == kLater) break;
         n_early_ = k + 1;
     }

@@ -32,6 +32,12 @@ The rows come through `avx_ngram.cpp`, compiled baseline so the process has one 
   than duplicating them;
 - a reader thread that fetches the next prefill chunk's rows while the current one runs.
 
+Engram's tables (Hy4-flash) carry one bf16 scale a row instead of one for the table: the scale plane
+(`block = 1 x *`, 2 bytes a row) stays resident, and the decode finds a row's scale from the row's
+output address (`(dst - out) / x_ld`, `avx_rows.h`: `RowScale`), so the cache and the reads are the
+same for both forms. A scale of one entry keeps its old meaning, `n_vocab` entries are per row, any
+other count is `RAD_E_SHAPE`; rows outside the shard decode to zero either way.
+
 The level's kernel decodes the rows: at AVX-512 the call's 256-entry bf16 table sits in eight
 registers and four `vpermt2w` look up 32 codes; below it, one code at a time. The row's layout hook
 only checks the table's encoding (E4M3 with one bf16 scale, or the checkpoint's plain bf16) and asks
@@ -93,7 +99,7 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `had_quant_act_i8`, `had_quant_act_i8g`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
 | `gdn_recurrent_update` | a `state_form` other than `per_candidate` or `anchor` | the same |
-| `ple_conv`, `causal_conv1d` | a history over 64 | the same |
+| `ple_conv`, `causal_conv1d`, `sconv_res` | a history over 64 | the same |
 | `ngram_ids` | `ngram` over 8 | the same |
 | `moe_gemm`, `moe_gemm_q`, `moe_gemm_q_mod4` | an `a_order` other than `token` or `sorted` | the same |
 | `gemm_nt_q` | parts (`pb1`/`pb2`) over a weight other than MXFP4 and the ParoQuant grids, or on the bias form | the same |

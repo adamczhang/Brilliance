@@ -210,9 +210,10 @@ struct IPrefixCache {
     /* Longest cached prefix, plus the checkpoint covering the linear state for a prefix of it.
      * `blocks_out` receives block ids per cached group, in cached_groups() order, for
      * IKVManager::adopt: n_attn_tokens over the group's own block size of them. `cap`, when not
-     * null, ends the hit early (HitCap, core/mem/prefix.h). */
+     * null, ends the hit early (HitCap, core/mem/prefix.h). `chain`, when not null, is the
+     * request's kept chain (SchedReq::chain): its blocks are not hashed again. */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
-                            const HitCap* cap) const = 0;
+                            const HitCap* cap, PrefixChain* chain = nullptr) const = 0;
     virtual const std::vector<int32_t>& cached_groups() const = 0;
     /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
      * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
@@ -221,9 +222,10 @@ struct IPrefixCache {
     /* Publish what this sequence computed so a later request sharing the prefix can adopt it.
      * `blocks[i]` is the block table of cached_groups()[i]; `n_tokens` is how many tokens are
      * backed. Takes a KV reference on every newly indexed block, so call it before the sequence's
-     * own blocks are released. */
+     * own blocks are released. `chain`, when not null, is the request's kept chain: the prompt's
+     * blocks a lookup already hashed are taken from it. */
     virtual int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
-                       int64_t n_tokens) = 0;
+                       int64_t n_tokens, PrefixChain* chain = nullptr) = 0;
 
     /* Release the least recently used entries and their KV references. The scheduler tries this
      * before preempting a running request. */
@@ -548,10 +550,18 @@ struct PCBinding final : IPrefixCache {
     explicit PCBinding(PC* p) : m(p) {}
 
     CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
-                    const HitCap* cap) const override {
+                    const HitCap* cap, PrefixChain* chain = nullptr) const override {
         media_keys(r, &mm_, salt_id);
+        /* A kept chain is only kept for its own request: a SchedReq slot outlives the request, so
+         * the stamp is checked before any of its hashes are trusted. */
+        if (chain && !chain->mine(r.id, (int64_t)r.prompt.size(), mm_)) {
+            chain->reset();
+            chain->id = r.id;
+            chain->prompt = (int64_t)r.prompt.size();
+            chain->mm = mm_;
+        }
         /* r.id: the admission takes its conversation's snapshots over. */
-        return m->lookup(r.prompt, mm_, out, cap, r.id);
+        return m->lookup(r.prompt, mm_, out, cap, r.id, chain);
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */
@@ -599,15 +609,24 @@ struct PCBinding final : IPrefixCache {
     /* Indexes prompt ++ output: the next turn sends the reply back in its prompt, so indexing the
      * prompt alone would stop hitting at the first assistant token. */
     int insert(const Request& r, const std::vector<std::vector<int32_t>>& blocks,
-               int64_t n_tokens) override {
+               int64_t n_tokens, PrefixChain* chain = nullptr) override {
         std::vector<int32_t> toks;
         toks.reserve(r.prompt.size() + r.output.size());
         toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
         toks.insert(toks.end(), r.output.begin(), r.output.end());
         if (n_tokens > (int64_t)toks.size()) n_tokens = (int64_t)toks.size();
-        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by. */
+        /* r.id is the session, the same id reserve_checkpoint keys its snapshots by.
+         * The slot rides along so the session row knows which adapter answered last. */
         media_keys(r, &mm_, salt_id);
-        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label);
+        /* The chain runs over prompt ++ output, of which a lookup hashed the prompt's blocks: it
+         * is this request's, or it is dropped and taken afresh. */
+        if (chain && !chain->mine(r.id, (int64_t)r.prompt.size(), mm_)) {
+            chain->reset();
+            chain->id = r.id;
+            chain->prompt = (int64_t)r.prompt.size();
+            chain->mm = mm_;
+        }
+        return m->insert(r.id, toks, mm_, blocks, n_tokens, r.session_label, r.lora_slot, chain);
     }
     /* Installed by the engine when the idle tiers are on: lands every pending host copy now and
      * returns whether any landed. Runs on the step thread under the scheduler's lock. */

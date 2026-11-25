@@ -24,7 +24,8 @@
   The one system prerequisite is Visual Studio Build Tools with the C++ workload: ROCm's clang
   compiles against the MSVC STL/UCRT and the Windows SDK, and links with them. That is checked
   here, not installed: the MSVC toolset is pinned by version (win\env.ps1 selects it with
-  -vcvars_ver), and so is the SDK.
+  -vcvars_ver), and so is the SDK. MSVC 14.51 is the tested toolset; when it is not installed,
+  the newest installed 14.x newer than 14.51 is used instead, with a warning.
 
   The ROCm SDK wheels are installed from the downloads directory with pip --no-index, after their
   hashes are checked, so a configure never sees a version this file does not name. Recorded in
@@ -99,6 +100,9 @@ $Pins = @(
 $FfmpegInner = 'brilliance-ffmpeg-8.1.3-win64-lgpl-20261118'
 # The system half: Visual Studio Build Tools. The toolset is selected by this version prefix
 # (vcvars64 -vcvars_ver), so a VS update that adds a newer toolset does not change the build.
+# 14.51 is the tested toolset and wins whenever it is installed. Without it, the newest installed
+# 14.x newer than it is used, with a warning: a fresh Build Tools 18.12 installs 14.52 only
+# (win\tools\msvc-toolset.ps1 chooses; win\tests\msvc_toolset_test.ps1 covers it).
 $MsvcToolset = '14.51'
 $SdkVersion  = '10.0.26100.0'
 # The AMD driver. 0.3.0 is tested on 32.0.32015.12012 (Adrenalin 26.10.2) and needs it or later,
@@ -119,6 +123,7 @@ function Get-RegValue([string]$Path, [string]$Name) {
   try { return (Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
 }
 function Get-Sha256([string]$Path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() }
+. (Join-Path $PSScriptRoot 'tools\msvc-toolset.ps1')   # Select-MsvcToolset
 
 # ------------------------------------------------------------------------------------------ Windows
 Say-Step 'Windows'
@@ -144,26 +149,30 @@ else {
 if ([Environment]::GetEnvironmentVariable('HIP_PATH', 'Machine')) { Say-Warn 'a machine-wide HIP_PATH is set; win\env.ps1 overrides it per shell' }
 
 # ------------------------------------------------------------------------------------------ VS
-Say-Step "Visual Studio Build Tools (MSVC $MsvcToolset, SDK $SdkVersion)"
+Say-Step "Visual Studio Build Tools (MSVC $MsvcToolset tested, SDK $SdkVersion)"
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
 $vs = $null
 if (Test-Path $vswhere) {
   $vsPath = (& $vswhere -products * -latest -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath) | Select-Object -First 1
   if ($vsPath) {
-    $msvc = Get-ChildItem (Join-Path $vsPath 'VC\Tools\MSVC') -Directory -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like "$MsvcToolset.*" } | Sort-Object Name -Descending | Select-Object -First 1
+    $msvc = Select-MsvcToolset -MsvcRoot (Join-Path $vsPath 'VC\Tools\MSVC') -Tested $MsvcToolset
     $vs = [pscustomobject]@{
-      Path   = $vsPath
-      Msvc   = $(if ($msvc) { $msvc.Name } else { $null })
-      Vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-      Sdk    = Test-Path (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$SdkVersion")
-      Libomp = Join-Path $vsPath 'VC\Tools\Llvm\x64'
+      Path         = $vsPath
+      Msvc         = $(if ($msvc) { $msvc.Name } else { $null })
+      MsvcFallback = $(if ($msvc) { $msvc.Fallback } else { $false })
+      Vcvars       = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+      Sdk          = Test-Path (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\Include\$SdkVersion")
+      Libomp       = Join-Path $vsPath 'VC\Tools\Llvm\x64'
     }
   }
 }
 if (-not $vs) { Say-Bad 'no Visual Studio with the MSVC x64 tools (install VS Build Tools 2026 with the C++ workload)' }
 else {
-  if ($vs.Msvc) { Say-Ok "MSVC toolset $($vs.Msvc) at $($vs.Path)" } else { Say-Bad "MSVC toolset $MsvcToolset.* is not installed in $($vs.Path) (Visual Studio Installer: Individual components)" }
+  if ($vs.Msvc -and $vs.MsvcFallback) {
+    Say-Warn "MSVC toolset $($vs.Msvc) at $($vs.Path): newer than the tested $MsvcToolset.*, which is not installed, so it is used instead (add MSVC $MsvcToolset in the Visual Studio Installer's Individual components to build with the tested one)"
+  }
+  elseif ($vs.Msvc) { Say-Ok "MSVC toolset $($vs.Msvc) at $($vs.Path)" }
+  else { Say-Bad "no MSVC toolset $MsvcToolset.* or newer $($MsvcToolset.Split('.')[0]).x is installed in $($vs.Path) (Visual Studio Installer: Individual components)" }
   if ($vs.Sdk) { Say-Ok "Windows SDK $SdkVersion" } else { Say-Bad "Windows SDK $SdkVersion is not installed" }
   if (Test-Path (Join-Path $vs.Libomp 'lib\libomp.lib')) { Say-Ok 'libomp (C++ Clang tools component)' }
   else { Say-Warn 'no libomp (VS component "C++ Clang tools for Windows"): the host kernels will build single-threaded' }

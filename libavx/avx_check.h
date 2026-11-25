@@ -59,7 +59,7 @@ bool hand_cases(const Check& ck);
  * `calls` calls whose ids are drawn from `seed` (avx_check_rows.cpp). Each table is written once
  * per process and kept mapped, so later calls reuse it. */
 bool row_gather_case(const Lib& lib, const std::string& dir, int64_t calls, uint64_t seed,
-                     bool verbose, bool bf16);
+                     bool verbose, bool bf16, bool per_row = false);
 /* embed_lookup_q over a prefill whose following chunks are passed ahead, as the engine passes
  * them: every row read about once, every row exact (avx_check_rows.cpp). */
 bool row_ahead_case(const Lib& lib, const std::string& dir, bool verbose);

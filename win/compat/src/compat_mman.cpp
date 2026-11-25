@@ -4,6 +4,9 @@
 #include <windows.h>
 #include <io.h>
 #include <errno.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 
 #include <map>
 #include <mutex>
@@ -154,6 +157,35 @@ int madvise(void* addr, size_t len, int advice) {
 }
 
 int posix_madvise(void* addr, size_t len, int advice) { return madvise(addr, len, advice); }
+
+static_assert(sizeof(brl_prefetch_range) == sizeof(WIN32_MEMORY_RANGE_ENTRY) &&
+                  offsetof(brl_prefetch_range, addr) == offsetof(WIN32_MEMORY_RANGE_ENTRY, VirtualAddress) &&
+                  offsetof(brl_prefetch_range, bytes) == offsetof(WIN32_MEMORY_RANGE_ENTRY, NumberOfBytes),
+              "brl_prefetch_range is passed to PrefetchVirtualMemory as WIN32_MEMORY_RANGE_ENTRY");
+
+int brl_prefetch_ranges(const brl_prefetch_range* ranges, size_t n, char* why, size_t cap) {
+    if (n == 0) return 0;
+    if (!ranges) {
+        if (why && cap) snprintf(why, cap, "PrefetchVirtualMemory: no ranges");
+        return fail_i(EINVAL);
+    }
+    if (PrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR)n,
+                              reinterpret_cast<PWIN32_MEMORY_RANGE_ENTRY>(
+                                  const_cast<brl_prefetch_range*>(ranges)),
+                              0))
+        return 0;
+    const DWORD e = GetLastError();
+    if (why && cap) {
+        char msg[200] = "";
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, e, 0, msg,
+                       (DWORD)sizeof msg, nullptr);
+        size_t k = strlen(msg);
+        while (k && (msg[k - 1] == '\n' || msg[k - 1] == '\r' || msg[k - 1] == ' ')) msg[--k] = 0;
+        snprintf(why, cap, "PrefetchVirtualMemory over %zu ranges: Win32 error %lu%s%s", n,
+                 (unsigned long)e, k ? ": " : "", msg);
+    }
+    return fail_i(brl_errno_from_win32(e));
+}
 
 int mlock(const void* addr, size_t len) {
     if (VirtualLock(const_cast<void*>(addr), len)) return 0;

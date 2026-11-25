@@ -2376,6 +2376,19 @@ TEST(reasoning_count_follows_the_parser_s_reading_of_the_block) {
     for (int32_t t : { 1, 4, 1 }) c.push(s, t);
     CHECK_EQ(c.tokens, (int64_t)0);        /* a block opened mid-reply is not one */
 
+    /* A reply whose every message opens with a header (Inkling 2's <|message_model|>) writes it
+     * before the opener: passed over, not counted, and only ahead of the opener. */
+    s.frame = 9;
+    c.start(s);
+    for (int32_t t : { 9, 4, 1, 1, 5, 9, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)4);
+    CHECK_EQ(c.body, (int64_t)2);
+    CHECK(!c.inside());
+    c.start(s);
+    for (int32_t t : { 9, 1, 4, 1 }) c.push(s, t);
+    CHECK_EQ(c.tokens, (int64_t)0);        /* a header then text: no block */
+    s.frame = -1;
+
     c.start(ReasoningSpan{});
     c.push(ReasoningSpan{}, 1);
     CHECK_EQ(c.tokens, (int64_t)0);

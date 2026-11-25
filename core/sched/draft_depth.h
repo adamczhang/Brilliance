@@ -97,6 +97,15 @@ struct DraftDepthCfg {
     bool   load      = false;
     int    load_from = 5;        /* the fewest drafting rows of a load-aware step */
     int    load_min  = 2;        /* rounds a load-aware step always runs and drafts it never cuts */
+    /* Exploration (an exploring step verifies drafts 1 .. force whatever the tables say; 0 = none).
+     * A rule that never verifies a draft never learns its acceptance, and at one to four
+     * sequences the stop rule that ran there before kept the low-confidence bins of drafts 3 .. 5
+     * empty. The engine sets `force` for every `explore_every`-th load-aware step of fewer than
+     * kExploreBelow rows, by a counter of steps alone: no draw, token or law of the step enters, so
+     * the rule stays one with constants given the past (the exactness note above). */
+    int    force     = 0;
+    int    explore_every = 20;
+    enum { kExploreBelow = 5 };
     double load_lam[kLoadSeqs + 1]      = {};   /* by drafting rows n, [0] unused; n > kLoadSeqs takes the last */
     double load_row_ms[kLoadSeqs + 1]   = {};
     double load_round_ms[kLoadSeqs + 1] = {};
@@ -267,7 +276,7 @@ inline bool draft_depth_go_load(const DraftDepthCfg& c, DraftDepthRow* r, int n,
         /* A round the rule has read nothing for (round 2, decided one round behind) runs as under
          * the stop rule: with no law to weigh, the prices alone would turn all drafting on or off
          * for the whole step, and a calibration that is a little off must not be able to do that. */
-        else if (j <= lmin || draft_depth_need(c, j) <= 0) want[i] = true;
+        else if (j <= lmin || j <= c.force || draft_depth_need(c, j) <= 0) want[i] = true;
         else { p[i] = draft_depth_cal(c, j, r[i].conf, c.lag > 0 ? 0 : 1); cand[n_cand++] = i; }
         forced += want[i];
     }
@@ -327,7 +336,7 @@ inline void draft_depth_select(const DraftDepthCfg& c, DraftDepthRow* r, int n, 
             if (r[i].done || r[i].depth != j - 1) continue;
             /* the confidence read: conf(min(j, seen)), never a round past j */
             const int m = r[i].seen < j ? r[i].seen : j;
-            p[i] = j <= lmin ? 2.0 : draft_depth_cal(c, j, draft_depth_conf(r[i], m), m - (j - 2));
+            p[i] = j <= lmin || j <= c.force ? 2.0 : draft_depth_cal(c, j, draft_depth_conf(r[i], m), m - (j - 2));
             cand[n_cand++] = i;
         }
         for (int a = 1; a < n_cand; ++a) {
@@ -587,6 +596,66 @@ inline void draft_depth_online_refresh(DraftDepthCfg* c, DraftDepthOnline* o) {
         c->load_row_ms[n]   = clamp(y[1], 0.05, 5.0);
         c->load_round_ms[n] = clamp(y[2], 0.10, 5.0);
         for (int k = 0; k < DraftDepthCfg::kJumps; ++k) c->load_jump_ms[n][k] = clamp(y[3 + k], 0.0, 20.0);
+    }
+}
+
+/* ------------------------------------------------------------------ a block drafter's depth
+ *
+ * A block drafter (DFlash2) proposes its whole block in one pass, and its coupled walk
+ * (abi/rad_spechub.h, rad_dflash_couple_walk) draws position j from Q_j, the softmax of the
+ * lattice's scores at j given the walk's own x_{j-1}. There are no rounds to stop: the drafter's
+ * pass costs the same whatever the verify carries, so the depth is the PREFIX of the block the
+ * next verify carries, and every law of the block is known by the time that verify is issued.
+ * Hence no lag, and the stop rule reads as far as exactness allows:
+ *
+ *     draft j is verified  iff  draft j - 1 is  and  ( j <= min  or  conf_b(j) >= stop ),
+ *     conf_b(j) = prod_{i <= j} max Q_i   (`top`: Q_j is the law AT x_j's parent)
+ *     conf_b(j) = prod_{i <  j} Q_i(x_i)  (`path`: x_j's own mass is never read)
+ *
+ * Exact for the reason the serial rule is (above): whether the node x_1 .. x_{j-1} gets a child
+ * reads Q_1 .. Q_j -- functions of the committed text and of x_1 .. x_{j-1}, the node's own path
+ * -- and for `path` the masses of x_1 .. x_{j-1}. Never x_j's value, never Q_{j+1} (which is
+ * conditioned on x_j), never the target. `top` may read Q_j because the walk draws x_j from it:
+ * its largest mass does not depend on which token was drawn. The serial chain's late choice reads
+ * the same (table 2 of DraftDepthCfg::cal_p).
+ *
+ * `r` holds the block's statistics (draft_depth_observe for rounds 1 .. steps, the configured
+ * statistic); a row with no law (a greedy request) verifies `lawless` drafts, the block's own
+ * length by default. Returns the verified prefix D in [1, min(max, steps)]. */
+inline int draft_depth_block_stop(const DraftDepthCfg& c, const DraftDepthRow& r, int steps) {
+    int hi = c.max < steps ? c.max : steps;
+    if (hi < 1) return 1;
+    if (r.lawless) {
+        const int l = c.lawless > 0 ? c.lawless : 1;
+        return l < hi ? l : hi;
+    }
+    int d = 1;
+    for (int j = 2; j <= hi; ++j) {
+        if (j > c.min) {
+            const int m = c.stat == DRAFT_DEPTH_PATH ? j - 1 : j;
+            if (m > r.seen || draft_depth_conf(r, m) < c.stop) break;
+        }
+        d = j;
+    }
+    return d;
+}
+
+/* The load-aware rule over a block: the same choice the serial chain's late choice makes once its
+ * rounds have run (draft_depth_select), with every law of the block read -- draft j by
+ * conf(j) = prod_{i <= j} max Q_i (table 2), which never reads past j. The `top` statistic only
+ * (the caller observes it whatever --draft-depth-stat says: a drawn token's own mass at j is
+ * x_j's). Leaves each row's verified prefix in depth. */
+inline void draft_depth_block_load(const DraftDepthCfg& c, DraftDepthRow* r, int n, int steps, int other_rows = 0) {
+    for (int i = 0; i < n; ++i) {
+        if (r[i].lawless) {
+            const int l = c.lawless > 0 ? c.lawless : 1;
+            r[i].depth = l < steps ? l : steps;
+        }
+    }
+    draft_depth_select(c, r, n, steps < c.max ? steps : c.max, other_rows);
+    for (int i = 0; i < n; ++i) {
+        if (r[i].depth < 1) r[i].depth = 1;
+        r[i].rule = 0;
     }
 }
 

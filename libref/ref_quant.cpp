@@ -104,9 +104,14 @@ int ref_quant_act_i8g(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ had_quant_act_i8 */
 /* The rotated int8 row of the had_*_i8 ops: `v(i)` for i < n rotated in blocks of `g`, its codes
- * stored at q[qb + i * qs] against one scale for the whole row (the amax is over the whole rotated
- * row). The rotation is computed twice, for the amax and then for the codes, rather than held.
- * Returns the row's scale, amax / 127 / sqrt(g). */
+ * against one scale for the whole row (the amax is over the whole rotated row). The rotation is
+ * computed twice, for the amax and then for the codes, rather than held. Returns the row's scale,
+ * amax / 127 / sqrt(g).
+ *
+ * The codes are stored in the step order (i8_step_pos), not column order: the card's rotated
+ * quantisers (r4d_gated_had_quant_i8, r4d_rmsnorm_had_quant_i8, r4d_had_quant_act_i8) write
+ * byte i = code of column i8_step_pos(i), and the int8 WMMA reads them so. Needs n a multiple of
+ * 16 (a whole step), which the callers check. */
 template <class V>
 static float had_i8_row(const V& v, int64_t n, int64_t g, const RadTensor* q, int64_t qb,
                         int64_t qs) {
@@ -121,7 +126,8 @@ static float had_i8_row(const V& v, int64_t n, int64_t g, const RadTensor* q, in
     for (int64_t b = 0; b < n; b += g) {
         for (int64_t i = 0; i < g; ++i) buf[i] = v(b + i);
         fwht(buf, g);
-        for (int64_t i = 0; i < g; ++i) st_dt(q->dtype, q->data, qb + (b + i) * qs, buf[i] * inv);
+        for (int64_t i = 0; i < g; ++i)
+            st_dt(q->dtype, q->data, qb + i8_step_pos(b + i) * qs, buf[i] * inv);
     }
     return amax / 127.0f * (1.0f / std::sqrt((float)g));
 }
@@ -133,6 +139,7 @@ int ref_had_quant_act_i8(const RadArgs* a, RadStream) {
     const int64_t g = p_int(a, "group", 0);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(x) / n;
     if (rows <= 0 || numel(q) < rows * n || numel(s) < rows) return RAD_E_SHAPE;
 
@@ -168,6 +175,7 @@ int ref_rmsnorm_had_quant_i8(const RadArgs* a, RadStream) {
     const float wadd = p_f32(a, "wadd", 0.0f);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(x) / n;
     if (rows <= 0 || numel(q) < rows * n || numel(s) < rows || numel(w) < n) return RAD_E_SHAPE;
     if (res && numel(res) < rows * n) return RAD_E_SHAPE;
@@ -220,11 +228,15 @@ int ref_gated_had_quant_i8(const RadArgs* a, RadStream) {
     if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
     const int64_t n = p_int(a, "n", 0);
     const int64_t g = p_int(a, "group", 0);
-    static const char* kActs[] = { "silu", "sigmoid" };
-    const int act = p_enum(a, "act", kActs, 2, (int)p_int(a, "mode", 0));
+    static const char* kActs[] = { "silu", "sigmoid", "situ" };
+    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
     if (n <= 0 || !pow2(g) || n % g != 0) return RAD_E_SHAPE;
-    if (act != 0 && act != 1) return RAD_E_INVAL;
+    if (act < 0 || act > 2) return RAD_E_INVAL;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
     if (g > REF_HAD_MAX) return RAD_E_UNSUPPORTED;
+    if (n % 16) return RAD_E_SHAPE;                 /* whole steps, as quant_act_i8 */
     const int64_t rows = numel(q) / n;
     if (rows <= 0 || numel(s) < rows) return RAD_E_SHAPE;
     if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
@@ -238,9 +250,56 @@ int ref_gated_had_quant_i8(const RadArgs* a, RadStream) {
         auto gated = [&](int64_t i) {
             const float gate = ldt(ga, gb + i * gs);
             const float x    = up ? ldt(up, ub + i * us) : ldt(ga, gb + (n + i) * gs);
+            if (act == 2) return act_situ_gate(gate, gcap) * act_situ_up(x, ucap);
             return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
         };
         stt(s, r * laststride(s), had_i8_row(gated, n, g, q, rowoff(q, r, n), laststride(q)));
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ gated_quant_i8 */
+/* gated_had_quant_i8 without the rotation: the same gated product (the same `act`, SiTU included),
+ * quantised per `group` contiguous elements, default 128, against one f32 scale each as
+ * quant_act_i8g writes them. The NVFP4 experts' down projection reads this form. */
+int ref_gated_quant_i8(const RadArgs* a, RadStream) {
+    if (a->n_t < 4) return RAD_E_INVAL;
+    const RadTensor *ga = &a->t[0], *q = &a->t[2], *s = &a->t[3];
+    const RadTensor* up = t_in(a, 1);
+    if (!ga->data || !q->data || !s->data) return RAD_E_INVAL;
+    const int64_t n = p_int(a, "n", 0);
+    int64_t g = p_int(a, "group", 128);
+    static const char* kActs[] = { "silu", "sigmoid", "situ" };
+    const int act = p_enum(a, "act", kActs, 3, (int)p_int(a, "mode", 0));
+    const float gcap = p_f32(a, "gate_cap", 0.0f), ucap = p_f32(a, "up_cap", 0.0f);
+    if (n <= 0) return RAD_E_SHAPE;
+    if (act < 0 || act > 2) return RAD_E_INVAL;
+    if (!(gcap >= 0.0f) || !(ucap >= 0.0f) || !std::isfinite(gcap) || !std::isfinite(ucap))
+        return RAD_E_INVAL;
+    if (g <= 0 || g > n) g = n;
+    const int64_t ngrp = (n + g - 1) / g;
+    const int64_t rows = numel(q) / n;
+    if (rows <= 0 || numel(s) < rows * ngrp) return RAD_E_SHAPE;
+    if (numel(ga) < rows * (up ? n : 2 * n)) return RAD_E_SHAPE;
+    if (up && numel(up) < rows * n) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(rows * n * 8)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t gb = rowoff(ga, r, up ? n : 2 * n), gs = laststride(ga);
+        const int64_t ub = up ? rowoff(up, r, n) : 0, us = up ? laststride(up) : 0;
+        auto gated = [&](int64_t i) {
+            const float gate = ldt(ga, gb + i * gs);
+            const float x    = up ? ldt(up, ub + i * us) : ldt(ga, gb + (n + i) * gs);
+            if (act == 2) return act_situ_gate(gate, gcap) * act_situ_up(x, ucap);
+            return (act == 1 ? act_sigmoid(gate) : act_silu(gate)) * x;
+        };
+        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
+        for (int64_t gi = 0; gi < ngrp; ++gi) {
+            const int64_t k0 = gi * g, k1 = (k0 + g < n) ? k0 + g : n;
+            const float sc = q8_group([&](int64_t i) { return gated(k0 + i); }, k1 - k0, 127.0f, q,
+                                      qb + k0 * qs, qs);
+            stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
+        }
     }
     return RAD_OK;
 }
@@ -442,6 +501,12 @@ static int had_quant_act_q8(const RadArgs* a, float top, int64_t rot_cap = 0) {
 
 int ref_had_quant_act_i8g(const RadArgs* a, RadStream) {
     return had_quant_act_q8(a, 127.0f, 128);
+}
+
+/* The E4M3 form (`top` 448), for a rotated codebook expert (w4nl64a8h and its kin). */
+int ref_had_quant_act_fp8(const RadArgs* a, RadStream) {
+    if (p_int(a, "group", 0) != 128) return RAD_E_SHAPE;
+    return had_quant_act_q8(a, 448.0f);
 }
 
 
@@ -851,8 +916,252 @@ int ref_dflash_markov_greedy(const RadArgs* a, RadStream) {
     return ref_markov_greedy(a, RAD_BF16);
 }
 
+/* ------------------------------------------------------ dspark_rnn_markov_greedy */
+/* `logits`, `hidden`, `frnn`, `anchor`, `w1`w, `rnn_w`w, `rnn_b`w, `fold_w`w, `fold_b`w ->
+ * `scratch`, tile-local winners and `tokens`.
+ *
+ * Inkling 2's DSpark Markov head (`markov_head_type: rnn_hidden`), as the reference runs it (vLLM
+ * models/inkling2 dspark.py and ops/dspark.py). Per sequence, a rank-R recurrent state starts at
+ * zero and the predecessor at the anchor; at draft position l:
+ *
+ *   ctx[l]  = rnn_b + rnn_w[:, 2R:] @ [hidden[l], frnn]                    f32, once per position
+ *   raw     = ctx[l] + rnn_w[:, :2R] @ [state, w1[prev]]                  f32
+ *   gate    = bf(sigmoid(bf(raw[0:R]))),  cand = bf(tanh(bf(raw[R:2R]))),  out = bf(raw[2R:3R])
+ *   state   = bf(bf(gate * state) + bf(bf(1 - gate) * cand))
+ *   latent  = bf(tanh(out))
+ *   bias[v] = bf(fold_b[v] + latent . fold_w[v])                            fold = lm_head @ hidden_out
+ *   score[v]= bf(softcap * tanh(bf(bf(logits[l, v]) + bias[v]) / softcap))
+ *   prev    = argmax_v score[v], NaN as -inf, ties to the lower id
+ *
+ * `bf` rounds to bf16: every torch op of the reference rounds its output, and its base logits come
+ * from a bf16 GEMM, hence the rounding of the f32 `logits` this op is handed. The scan covers ids
+ * [0, n_vocab), which a caller sets to the trained vocabulary. `scratch` [M, steps*3R + 2R] f32
+ * holds each sequence's contexts, state and latent; the tile planes are the device row's
+ * decomposition, written here the same way. */
+int ref_dspark_rnn_markov_greedy(const RadArgs* a, RadStream) {
+    if (a->n_t < 13) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *hidden = &a->t[1], *frnn = &a->t[2], *anchor = &a->t[3];
+    const RadTensor *w1 = &a->t[4], *rw = &a->t[5], *rb = &a->t[6], *fw = &a->t[7], *fb = &a->t[8];
+    const RadTensor *scratch = &a->t[9], *tile_scores = &a->t[10], *tile_tokens = &a->t[11];
+    const RadTensor *out = &a->t[12];
+    for (const RadTensor* t : { logits, hidden, frnn, anchor, w1, rw, rb, fw, fb, scratch,
+                                tile_scores, tile_tokens, out })
+        if (!t->data) return RAD_E_INVAL;
+    if (logits->dtype != RAD_F32 || hidden->dtype != RAD_BF16 || frnn->dtype != RAD_BF16 ||
+        w1->dtype != RAD_BF16 || rw->dtype != RAD_BF16 || rb->dtype != RAD_BF16 ||
+        fw->dtype != RAD_BF16 || fb->dtype != RAD_BF16 || scratch->dtype != RAD_F32 ||
+        tile_scores->dtype != RAD_F32 || tile_tokens->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (anchor->dtype != RAD_I32) return RAD_E_SHAPE;
+
+    const int64_t steps = p_int(a, "steps", 0);
+    const int64_t R = p_int(a, "rank", 0);
+    const int64_t E = p_int(a, "n_embd", 0);
+    const int64_t V = p_int(a, "n_vocab", 0);
+    const int64_t astr = p_int(a, "anchor_stride", 1);
+    const float cap = p_f32(a, "softcap", 0.0f);
+    const int64_t lrow = logits->rank == 2 ? logits->shape[1] : 0;
+    const int64_t M = steps > 0 && lrow > 0
+                    ? band_rows(numel(logits) / (steps * lrow), p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || E <= 0 || V <= 0 || V > lrow || astr <= 0 ||
+        !(cap > 0.0f))
+        return RAD_E_SHAPE;
+    const int64_t W = 2 * R + 2 * E, n_tiles = (V + 63) / 64, sw = steps * 3 * R + 2 * R;
+    if (numel(hidden) < M * steps * E || numel(frnn) < M * E ||
+        numel(anchor) < (M - 1) * astr + 1 || numel(w1) < V * R || numel(rw) < 3 * R * W ||
+        numel(rb) < 3 * R || numel(fw) < V * R || numel(fb) < V || numel(scratch) < M * sw ||
+        numel(tile_scores) < M * n_tiles || numel(tile_tokens) < M * n_tiles ||
+        numel(out) < M * steps)
+        return RAD_E_SHAPE;
+    auto bf = [](float x) { return bf16_to_f32(f32_to_bf16(x)); };
+
+    REF_PAR_FOR(M * steps * (V * R + 3 * R * W))
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t sb = rowoff(scratch, m, sw);
+        float* ctx = (float*)scratch->data + sb;          /* [steps, 3R] */
+        float* state = ctx + steps * 3 * R;                /* [R] */
+        float* latent = state + R;                         /* [R] */
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t hb = rowoff(hidden, m * steps + l, E), fbase = rowoff(frnn, m, E);
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                const int64_t wb = rowoff(rw, j, W) + 2 * R * laststride(rw);
+                float acc = ldt(rb, j * laststride(rb));
+                for (int64_t i = 0; i < E; ++i)
+                    acc += ldt(rw, wb + i * laststride(rw)) * ldt(hidden, hb + i * laststride(hidden));
+                for (int64_t i = 0; i < E; ++i)
+                    acc += ldt(rw, wb + (E + i) * laststride(rw)) *
+                           ldt(frnn, fbase + i * laststride(frnn));
+                ctx[l * 3 * R + j] = acc;
+            }
+        }
+        for (int64_t r = 0; r < R; ++r) state[r] = 0.0f;
+
+        std::vector<float> prevw((size_t)R), raw((size_t)(3 * R));
+        int64_t pid = ld_int(anchor->dtype, anchor->data, offlin(anchor, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const bool pid_ok = pid >= 0 && pid < V;
+            for (int64_t r = 0; r < R; ++r)
+                prevw[(size_t)r] = pid_ok ? ldt(w1, rowoff(w1, pid, R) + r * laststride(w1)) : 0.0f;
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                const int64_t wb = rowoff(rw, j, W);
+                float acc = ctx[l * 3 * R + j];
+                for (int64_t i = 0; i < R; ++i) acc += ldt(rw, wb + i * laststride(rw)) * state[i];
+                for (int64_t i = 0; i < R; ++i)
+                    acc += ldt(rw, wb + (R + i) * laststride(rw)) * prevw[(size_t)i];
+                raw[(size_t)j] = acc;
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                const float g = bf(1.0f / (1.0f + std::exp(-bf(raw[(size_t)r]))));
+                const float c = bf(std::tanh(bf(raw[(size_t)(R + r)])));
+                const float o = bf(raw[(size_t)(2 * R + r)]);
+                state[r] = bf(bf(g * state[r]) + bf(bf(1.0f - g) * c));
+                latent[r] = bf(std::tanh(o));
+            }
+
+            const int64_t lb = rowoff(logits, m * steps + l, lrow);
+            float global_best = -INFINITY;
+            int64_t global_token = 0;
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64, end = std::min<int64_t>(first + 64, V);
+                float best = -INFINITY;
+                int64_t best_token = first;
+                for (int64_t v = first; v < end; ++v) {
+                    float dot = ldt(fb, v * laststride(fb));
+                    const int64_t fwb = rowoff(fw, v, R);
+                    for (int64_t r = 0; r < R; ++r) dot += latent[r] * ldt(fw, fwb + r * laststride(fw));
+                    const float x = bf(bf(ldt(logits, lb + v * laststride(logits))) + bf(dot));
+                    float score = bf(cap * std::tanh(x / cap));
+                    if (std::isnan(score)) score = -INFINITY;
+                    if (score > best || (score == best && v < best_token)) {
+                        best = score;
+                        best_token = v;
+                    }
+                }
+                stt(tile_scores, rowoff(tile_scores, m, n_tiles) + tile * laststride(tile_scores),
+                    best);
+                st_int(tile_tokens->dtype, tile_tokens->data,
+                       rowoff(tile_tokens, m, n_tiles) + tile * laststride(tile_tokens), best_token);
+                if (best > global_best || (best == global_best && best_token < global_token)) {
+                    global_best = best;
+                    global_token = best_token;
+                }
+            }
+            st_int(out->dtype, out->data, rowoff(out, m, steps) + l * laststride(out), global_token);
+            pid = global_token;
+        }
+    }
+    return RAD_OK;
+}
+
 int ref_dflash_markov_greedy_f32(const RadArgs* a, RadStream) {
     return ref_markov_greedy(a, RAD_F32);
+}
+
+/* ------------------------------------------------------- markov_rnn_greedy */
+/* `logits`, `ctx`, `ctx_seq`, `anchor`, `w1`w, `wsp`w, `bias`w, `fold`w, `fold_b`w ->
+ * `scratch`, `tile_scores`, `tile_tokens`, `tokens`.
+ *
+ * Inkling 2's recurrent (`rnn_hidden`) DSpark head, walked greedily. Per sequence m, from a zero
+ * state and prev = the anchor token, at each step l:
+ *   raw    = ctx[m steps + l] + ctx_seq[m] + bias + wsp . [state | w1[prev]]          (f32)
+ *   gate   = rb(sigmoid(rb(raw[0:r])))     cand = rb(tanh(rb(raw[r:2r])))
+ *   state  = rb(rb(gate * state) + rb(rb(1 - gate) * cand))
+ *   latent = rb(tanh(rb(raw[2r:3r])))
+ *   score[v] = sc(rb(rb(logits[row, v]) + rb(fold_b[v] + fold[v] . latent)))          v < n_vocab
+ *   prev = tokens[m, l] = the greatest score, the lower id on a tie
+ * rb is a round to bf16 and sc(x) = rb(cap tanh(x / cap)) when cap > 0, else x: the reference's
+ * bf16 torch ops in that order (vLLM's markov_gate and add_softcap kernels). The tile planes hold
+ * one winner per 64 ids, as libr4d's reduction leaves them; scratch holds step l's state in
+ * columns [(l % 2) r, (l % 2 + 1) r), so the last two steps' remain, and the last latent in
+ * [2r, 3r). */
+static inline float ref_rb(float x) { return rad_bf16_to_f32(rad_f32_to_bf16(x)); }
+
+int ref_markov_rnn_greedy(const RadArgs* a, RadStream) {
+    if (a->n_t < 13) return RAD_E_INVAL;
+    const RadTensor *logits = &a->t[0], *ctx = &a->t[1], *cseq = &a->t[2], *anchor = &a->t[3];
+    const RadTensor *w1 = &a->t[4], *wsp = &a->t[5], *bias = &a->t[6], *fold = &a->t[7];
+    const RadTensor *fb = &a->t[8], *scratch = &a->t[9], *tsc = &a->t[10], *ttk = &a->t[11];
+    const RadTensor *out = &a->t[12];
+    for (int i = 0; i < 13; ++i)
+        if (!a->t[i].data) return RAD_E_INVAL;
+    if (logits->dtype != RAD_F32 || ctx->dtype != RAD_F32 || cseq->dtype != RAD_F32 ||
+        w1->dtype != RAD_BF16 || wsp->dtype != RAD_BF16 || bias->dtype != RAD_BF16 ||
+        fold->dtype != RAD_BF16 || fb->dtype != RAD_BF16 || scratch->dtype != RAD_F32 ||
+        tsc->dtype != RAD_F32 || ttk->dtype != RAD_I32 || out->dtype != RAD_I32)
+        return RAD_E_DTYPE;
+    if (anchor->dtype != RAD_I32) return RAD_E_SHAPE;
+    const int64_t steps = p_int(a, "steps", 0), R = p_int(a, "rank", 0);
+    const int64_t V = p_int(a, "n_vocab", 0), astr = p_int(a, "anchor_stride", 1);
+    const float cap = p_f32(a, "cap", 0.0f);
+    const int64_t M = out->rank == 2 ? band_rows(out->shape[0], p_int(a, "M", 0)) : 0;
+    if (M <= 0 || steps <= 0 || R <= 0 || V <= 0 || astr <= 0 || out->shape[1] < steps)
+        return RAD_E_SHAPE;
+    const int64_t lw = logits->shape[logits->rank - 1];
+    const int64_t n_tiles = (V + 63) / 64;
+    if (lw < V || numel(logits) < M * steps * lw || numel(ctx) < M * steps * 3 * R ||
+        numel(cseq) < M * 3 * R || numel(anchor) < (M - 1) * astr + 1 ||
+        numel(w1) < V * R || numel(wsp) < 3 * R * 2 * R || numel(bias) < 3 * R ||
+        numel(fold) < V * R || numel(fb) < V || numel(scratch) < M * 3 * R ||
+        numel(tsc) < M * n_tiles || numel(ttk) < M * n_tiles)
+        return RAD_E_SHAPE;
+    const int64_t w1w = w1->shape[w1->rank - 1], fw = fold->shape[fold->rank - 1];
+    if (w1w != R || fw != R) return RAD_E_SHAPE;
+
+    REF_PAR_FOR(M * steps * V * R)
+    for (int64_t m = 0; m < M; ++m) {
+        std::vector<float> state((size_t)R, 0.0f), in((size_t)(2 * R)), raw((size_t)(3 * R));
+        std::vector<float> lat((size_t)R);
+        int64_t prev = ld_int(anchor->dtype, anchor->data, offlin(anchor, m * astr));
+        for (int64_t l = 0; l < steps; ++l) {
+            const int64_t row = m * steps + l;
+            const bool ok = prev >= 0 && prev < V;
+            for (int64_t r = 0; r < R; ++r) {
+                in[(size_t)r] = state[(size_t)r];
+                in[(size_t)(R + r)] = ok ? ldt(w1, offlin(w1, prev * R + r)) : 0.0f;
+            }
+            for (int64_t j = 0; j < 3 * R; ++j) {
+                float acc = ldt(ctx, offlin(ctx, row * 3 * R + j)) +
+                            ldt(cseq, offlin(cseq, m * 3 * R + j)) + ldt(bias, offlin(bias, j));
+                for (int64_t k = 0; k < 2 * R; ++k)
+                    acc += ldt(wsp, offlin(wsp, j * 2 * R + k)) * in[(size_t)k];
+                raw[(size_t)j] = acc;
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                const float g = ref_rb(1.0f / (1.0f + std::exp(-ref_rb(raw[(size_t)r]))));
+                const float c = ref_rb(std::tanh(ref_rb(raw[(size_t)(R + r)])));
+                const float keep = ref_rb(g * state[(size_t)r]);
+                const float upd = ref_rb(ref_rb(1.0f - g) * c);
+                state[(size_t)r] = ref_rb(keep + upd);
+                lat[(size_t)r] = ref_rb(std::tanh(ref_rb(raw[(size_t)(2 * R + r)])));
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                stt(scratch, offlin(scratch, m * 3 * R + (l % 2) * R + r), state[(size_t)r]);
+                stt(scratch, offlin(scratch, m * 3 * R + 2 * R + r), lat[(size_t)r]);
+            }
+            float gbest = -INFINITY;
+            int64_t gtok = 0;
+            const int64_t lb = rowoff(logits, row, lw);
+            for (int64_t tile = 0; tile < n_tiles; ++tile) {
+                const int64_t first = tile * 64, end = std::min<int64_t>(first + 64, V);
+                float best = -INFINITY;
+                int64_t btok = first;
+                for (int64_t v = first; v < end; ++v) {
+                    float dot = ldt(fb, offlin(fb, v));
+                    for (int64_t r = 0; r < R; ++r)
+                        dot += ldt(fold, offlin(fold, v * R + r)) * lat[(size_t)r];
+                    float x = ref_rb(ref_rb(ldt(logits, lb + v * laststride(logits))) + ref_rb(dot));
+                    if (cap > 0.0f) x = ref_rb(cap * std::tanh(x / cap));
+                    if (x > best || (x == best && v < btok)) { best = x; btok = v; }
+                }
+                stt(tsc, rowoff(tsc, m, n_tiles) + tile * laststride(tsc), best);
+                st_int(ttk->dtype, ttk->data, rowoff(ttk, m, n_tiles) + tile * laststride(ttk), btok);
+                if (best > gbest || (best == gbest && btok < gtok)) { gbest = best; gtok = btok; }
+            }
+            st_int(out->dtype, out->data, rowoff(out, m, out->shape[1]) + l * laststride(out), gtok);
+            prev = gtok;
+        }
+    }
+    return RAD_OK;
 }
 
 /* ------------------------------------------------------------- dflash_tree */

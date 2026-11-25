@@ -135,6 +135,11 @@ struct HyperConn {
         rad_buf ye = 0, ew = 0, sorted = 0, sh = 0, sg = 0;   /* sh and sg: the shared arm, or 0 */
         int64_t top_k = 0;
         int64_t rows = 0;                                      /* one pass of the block, at most */
+        /* The block's gather also writes the sum's rotated int8 codes (`moe_gather_inv_i8g`, the
+         * block's `gather_q8`). This write replaces that gather and writes no codes, so folding it
+         * in would leave the linear that reads them with codes of a sum never written; the caller
+         * sets it from the block and no fold is declared. */
+        bool sum_codes = false;
     };
     GatherSrc  gsrc{};
     rad_op     op_ar_gather_write = 0, op_ar_gather_write6 = 0;
@@ -340,6 +345,9 @@ inline int HyperConn::declare(RadBuilder* b, Names& nm, const Geom& geom, const 
 
 inline int HyperConn::declare_gather(RadBuilder* b, const GatherSrc& src) {
     if (!op_ar_write || src.top_k <= 0 || !src.ye || !src.ew || !src.sorted) return RAD_OK;
+    /* A block whose gather keeps its sum's codes needs that launch: this write replaces it and
+     * writes no codes. The block gathers as it declared and the plain write reduces. */
+    if (src.sum_codes) return RAD_OK;
     /* Two or four ranks. At four only the exact form exists (op_ar_write6 is 0). Other widths keep
      * the block's own gather and both bounds stay 0. */
     if (g.world != 2 && g.world != 4) return RAD_OK;

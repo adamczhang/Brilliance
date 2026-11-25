@@ -687,6 +687,30 @@ static bool is_socket_upgrade(const httplib::Request& q) {
     return q.get_header_value("Sec-WebSocket-Version") == "13";
 }
 
+/* Brilliance: the listener owns its port, on every platform.
+ *
+ * httplib's default socket option (default_socket_options) is SO_REUSEPORT where the system has
+ * it, else SO_REUSEADDR. Either lets a second listener share a port the first is listening on:
+ *   - Windows: SO_REUSEADDR lets a second socket bind a port another one is listening on. A second
+ *     server started on a taken port came up with no error while every request still went to the
+ *     first. SO_EXCLUSIVEADDRUSE refuses that bind (and any other process's).
+ *   - Linux (and the BSDs): SO_REUSEPORT lets a second process of the same user bind the same
+ *     address and port, and the kernel then splits new connections between the two: the same
+ *     silent double listener. SO_REUSEADDR alone refuses a second bind of the same address and
+ *     port while a socket listens there.
+ * Both still let a restart bind at once: connections the last listener left in TIME_WAIT do not
+ * hold the port. The one option is chosen here, and the rest of the path is the same code on every
+ * platform (only the Windows branch is built and tested by this port). */
+#if defined(_WIN32)
+static constexpr int kListenerOwnsPort = SO_EXCLUSIVEADDRUSE;
+#else
+static constexpr int kListenerOwnsPort = SO_REUSEADDR;
+#endif
+
+static void listener_socket_options(socket_t sock) {
+    httplib::set_socket_opt(sock, SOL_SOCKET, kListenerOwnsPort, 1);
+}
+
 /* The calling thread's last socket error. */
 static int last_socket_error() {
 #if defined(_WIN32)
@@ -719,11 +743,7 @@ static int bind_error(std::string host, int port) {
     } else {
         if (res->ai_family == AF_INET6)   /* as httplib sets it on the listener */
             httplib::set_socket_opt(s, IPPROTO_IPV6, IPV6_V6ONLY, CPPHTTPLIB_IPV6_V6ONLY ? 1 : 0);
-#if defined(_WIN32)
-        httplib::set_socket_opt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
-#else
-        httplib::default_socket_options(s);
-#endif
+        listener_socket_options(s);
         if (::bind(s, res->ai_addr, (socklen_t)res->ai_addrlen) != 0) err = last_socket_error();
 #if defined(_WIN32)
         ::closesocket(s);
@@ -773,17 +793,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * included) for a delayed ACK, which is latency on every token for no throughput gain at
      * these write sizes. */
     svr.set_tcp_nodelay(true);
-#if defined(_WIN32)
-    /* Brilliance: the listener owns its port. httplib's default socket option is SO_REUSEADDR
-     * here, which on Windows lets a second socket bind a port another one is listening on: a
-     * second server started on a taken port came up with no error while every request still went
-     * to the first. SO_EXCLUSIVEADDRUSE refuses that bind (and any other process's), so the start
-     * fails at once. A restart on the same port still binds: TIME_WAIT connections left by the
-     * last listener do not hold it. Elsewhere httplib's default stays. */
-    svr.set_socket_options([](socket_t sock) {
-        httplib::set_socket_opt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
-    });
-#endif
+    /* Brilliance: the listener owns its port (listener_socket_options), so a second server on a
+     * taken port fails at once instead of sharing it. */
+    svr.set_socket_options(listener_socket_options);
 
     const int nt = idle_workers(o.n_threads);
     const size_t most = (size_t)std::max<int64_t>(o.max_threads, nt);

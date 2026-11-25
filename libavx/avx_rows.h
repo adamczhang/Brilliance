@@ -15,10 +15,30 @@
 
 namespace avx {
 
+/* A scale a row (Engram's tables): row m of the output is decoded with the scale of table row
+ * ids[m] - voff, read from the resident scale plane in f32. The decode finds m from the row's
+ * output address, `(dst - out) / x_ld`, so the cache and the reads stay ignorant of scales. */
+struct RowScale {
+    const int32_t*  ids;
+    int64_t         voff;
+    const uint16_t* out;
+    int64_t         x_ld;
+    const void*     scale;      /* one entry a table row */
+    uint32_t        dtype;
+    int64_t         stride;     /* elements between entries */
+};
+
+/* What a decode reads besides the codes: the 256 codes already scaled and rounded to bf16 (one
+ * scale for the whole table), or, with `per_row`, the plane of row scales. */
+struct DecodeTab {
+    uint16_t        lut[256];
+    const RowScale* per_row = nullptr;
+};
+
 /* dst[i][0, n) = lut[src[i][0, n)] for every i < count: E4M3 codes through a table of all 256
- * codes already scaled and rounded to bf16. */
+ * codes already scaled and rounded to bf16; with a per-row scale, bf16(decode(code) * scale). */
 typedef void (*RowDecode)(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                          int64_t n, const uint16_t* lut);
+                          int64_t n, const DecodeTab* tab);
 
 /* One call's gather, validated by the caller: `ids` holds M row ids, `tab` n_vocab rows of n_embd
  * elements -- E4M3 codes, or bf16 as stored -- `row_bytes` apart, `out` M rows of n_embd bf16
@@ -37,6 +57,7 @@ struct RowGather {
     const int32_t* ahead;
     int64_t        n_ahead;
     int            rank, world_size;
+    const RowScale* row_scale = nullptr;   /* a scale a table row instead of `scale` */
 };
 
 /* The gather, through the row cache when a file backs the table and from the table's memory when

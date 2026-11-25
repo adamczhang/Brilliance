@@ -904,6 +904,73 @@ extern "C" int r4d_rad_unrelayout_iqr_vocab(const RadParam* p, int n_p, int oper
     return r4d_rad_unrelayout_iqr(q, 4, il, enc, sel, src, src_bytes, pl, n);
 }
 
+/* ==================================================================== a dual launch's two weights
+ *
+ * gemm_nt_q_dual's operands are a, a_scale, b, b_scale, y, b2, b2_scale, y2 (r4d_rows.cpp): the
+ * second weight's codes and scales at 5 and 6 where the first's are at 2 and 3. Both are the row's
+ * K and group and both `i8a8h` of the one form a dual launch reads -- its second part's blocks
+ * read that weight exactly as a launch of their own would -- so the dense hooks answer for either
+ * once the operand is renumbered, with the second weight's own N (the op's `N2`) as its geometry. */
+namespace {
+constexpr int kDualParams = 8;
+
+/* The op's parameters with `N` replaced by `N2`: the second weight is laid out over its own N. */
+int dual_params(const RadParam* p, int n_p, RadParam (&q)[kDualParams]) {
+    const RadParam* n2 = rad_param_find(p, n_p, "N2");
+    if (!n2 || n_p > kDualParams) return 0;
+    int n_q = 0;
+    for (int i = 0; i < n_p; ++i) {
+        q[n_q] = p[i];
+        if (q[n_q].key && std::strcmp(q[n_q].key, "N") == 0) {
+            q[n_q].kind = RAD_P_INT;
+            q[n_q].ival = n2->ival;
+            q[n_q].ihi  = 0;
+        }
+        ++n_q;
+    }
+    return n_q;
+}
+
+inline int dual_operand(int operand) {
+    return operand == 5 ? IL_B : operand == 6 ? IL_BSCALE : operand;
+}
+}  /* namespace */
+
+extern "C" int r4d_rad_layout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                       const RadEncoding* enc, const int* sel,
+                                       const RadTensor* pl, int n, RadLayout* out) {
+    if (dual_operand(operand) == operand)
+        return r4d_rad_layout_iqr(p, n_p, operand, enc, sel, pl, n, out);
+    RadParam q[kDualParams];
+    const int n_q = dual_params(p, n_p, q);
+    if (!n_q) return RAD_E_INVAL;
+    return r4d_rad_layout_iqr(q, n_q, dual_operand(operand), enc, sel, pl, n, out);
+}
+
+extern "C" int r4d_rad_relayout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                         const RadEncoding* enc, const int* sel,
+                                         const RadTensor* pl, int n, void* dst,
+                                         int64_t dst_bytes) {
+    if (dual_operand(operand) == operand)
+        return r4d_rad_relayout_iqr(p, n_p, operand, enc, sel, pl, n, dst, dst_bytes);
+    RadParam q[kDualParams];
+    const int n_q = dual_params(p, n_p, q);
+    if (!n_q) return RAD_E_INVAL;
+    return r4d_rad_relayout_iqr(q, n_q, dual_operand(operand), enc, sel, pl, n, dst, dst_bytes);
+}
+
+extern "C" int r4d_rad_unrelayout_iqr_dual(const RadParam* p, int n_p, int operand,
+                                           const RadEncoding* enc, const int* sel,
+                                           const void* src, int64_t src_bytes,
+                                           const RadTensor* pl, int n) {
+    if (dual_operand(operand) == operand)
+        return r4d_rad_unrelayout_iqr(p, n_p, operand, enc, sel, src, src_bytes, pl, n);
+    RadParam q[kDualParams];
+    const int n_q = dual_params(p, n_p, q);
+    if (!n_q) return RAD_E_INVAL;
+    return r4d_rad_unrelayout_iqr(q, n_q, dual_operand(operand), enc, sel, src, src_bytes, pl, n);
+}
+
 /* ==================================================================== the routed experts
  *
  * moe_gemm_iqr's tables: every entry is one expert's IQR weight, relayouted by the dense hooks at

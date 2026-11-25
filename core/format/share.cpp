@@ -169,6 +169,25 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                               "%lld x %lld", (long long)q.r0, (long long)q.r1, (long long)q.c0,
                               (long long)q.c1, (long long)VR, (long long)VC));
 
+    /* A trellis's codes are a path down each column, tail-biting over runs of `block[0]` rows of
+     * the entry (libquant's tcq_rows): a row's value is the state its run's preceding codes shift
+     * into, so a run is decoded only whole. A row cut inside a run would hand the rank a slice the
+     * kernel decodes as runs of its own -- its first rows' states from the wrong neighbours, its
+     * wrap-around from another part -- and serve wrong values without any other sign. Columns cut
+     * freely (each column is its own path). */
+    if (!whole && rad_enc_is(&enc, "trellis")) {
+        const RadEncPlane* tp = rad_enc_plane(&enc, "trellis");
+        const int64_t run = tp ? tp->block[0] : 0;
+        for (const VRect& q : view)
+            if (run > 1 && ((q.r0 % run) || (q.r1 % run && q.r1 != VR)))
+                return refuse(fmt("rows [%lld, %lld) of %lld cut a %lld-row trellis run (the runs a "
+                                  "trellis is tail-biting over); this shard needs a container "
+                                  "whose runs divide each rank's rows (tcq_rows= at most the "
+                                  "rows a rank takes of each part, %lld)",
+                                  (long long)q.r0, (long long)q.r1, (long long)VR,
+                                  (long long)run, (long long)(q.r1 - q.r0)));
+    }
+
     for (int k = 0; k < w.n_sel; ++k) {
         const RadEncPlane& p = enc.plane[w.sel[k]];
         PlaneShare& s = out[k];

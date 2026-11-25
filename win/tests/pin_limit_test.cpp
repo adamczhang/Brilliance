@@ -94,4 +94,19 @@ TEST(with_no_budget_known_the_override_is_used_as_given) {
     CHECK(tiny.clamped);
 }
 
+TEST(a_pin_larger_than_the_ram_available_now_is_refused) {
+    /* 2026-11-22: the 47.68 GiB n-gram copy was pinned under a 97.67 GiB limit while the RAM log
+     * read 12.40 GiB available; the next GPU call hung. The check after the limit refuses it. */
+    const int64_t table = (int64_t)(47.68 * (double)kGiB);
+    CHECK(rad::pin_past_physical(table, (int64_t)(12.40 * (double)kGiB), rad::kPinPhysReserve));
+    /* With the machine idle there is room. */
+    CHECK(!rad::pin_past_physical(table, (int64_t)(99.79 * (double)kGiB), rad::kPinPhysReserve));
+    /* The reserve is kept: exactly available less a GiB passes, a byte more is refused. */
+    CHECK(!rad::pin_past_physical(9 * kGiB, 10 * kGiB, rad::kPinPhysReserve));
+    CHECK(rad::pin_past_physical(9 * kGiB + 1, 10 * kGiB, rad::kPinPhysReserve));
+    /* Unreadable memory refuses nothing; the limit still applies. */
+    CHECK(!rad::pin_past_physical(table, -1, rad::kPinPhysReserve));
+    CHECK_EQ(rad::kPinPhysReserve, kGiB);
+}
+
 RAD_TEST_MAIN()

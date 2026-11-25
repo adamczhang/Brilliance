@@ -74,7 +74,7 @@ if (Test-Path $tcj) {
   $tc = Get-Content -Raw $tcj | ConvertFrom-Json
   if ($tc.vs_path) { $VsPath = $tc.vs_path }
 }
-Need (Test-Path (Join-Path $VsPath 'VC\Tools\MSVC\14.51.36231')) "MSVC 14.51.36231 not found under $VsPath (win\setup.ps1 installs it)"
+Need (Test-Path (Join-Path $VsPath 'VC\Tools\MSVC\14.51.36231')) "MSVC 14.51.36231 not found under $VsPath (add it in the Visual Studio Installer's Individual components)"
 $BundledVcpkg = Join-Path $VsPath 'VC\vcpkg\vcpkg.exe'
 Need (Test-Path $BundledVcpkg) "no vcpkg in $VsPath\VC\vcpkg"
 

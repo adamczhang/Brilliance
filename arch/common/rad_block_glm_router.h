@@ -13,6 +13,9 @@ struct GlmRouter {
     struct Config {
         int64_t experts = 288, top_k = 8, rows = 32, groups = 1, topk_groups = 1;
         int norm = 1;
+        /* Declare the projection weight as stored bf16 (gemm_nt_f32's `weight_bf16`) when its
+         * stored encoding is bf16 or unknown; otherwise, or when false, it is declared f32. */
+        bool weight_bf16 = false;
         double route_scale = 2.5;
         /* The score function by name (router_scored_topk: "sqrtsoftplus" for DeepSeek-V4); null is
          * GLM's sigmoid (router_sigmoid_topk). */
@@ -45,19 +48,16 @@ struct GlmRouter {
         const char *pn = nm.f("%s.weight", name), *cn = nm.f("%s.correction", name);
         RAD_ARCH_TRY(map_copy(b, pn, src.weight));
         RAD_ARCH_TRY(map_copy(b, cn, src.correction));
-        projection = decl_w(b, pn, RAD_F32, { c.experts, g.n_embd }, RAD_ACCESS_PER_TOKEN,
-                            RAD_SHARD_NONE, grp_layer(layer));
+        const bool packed = c.weight_bf16 && weight_codes_dtype(b, pn, RAD_BF16) == RAD_BF16;
+        projection = decl_w(b, pn, packed ? RAD_BF16 : RAD_F32, { c.experts, g.n_embd },
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_layer(layer));
         correction = decl_w(b, cn, RAD_F32, { c.experts }, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
                             grp_layer(layer));
         if (!projection || !correction) return RAD_E_INVAL;
-        op_project = rw(b,
-                        RAD_OP(b, "gemm_nt_f32",
-                               RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("N", c.experts),
-                                          RAD_INT("K", g.n_embd), RAD_STR("dtype", "bf16")),
-                               RAD_WEIGHTS(projection)),
-                        { w.input }, { w.logits });
+        op_project = declare_glm_projection(b, c.rows, c.experts, g.n_embd, projection, packed,
+                                            w.input, w.logits);
         RAD_ARCH_TRY(split.declare(b, nm, g, name, c.rows, c.experts, g.n_embd, projection, w.input,
-                                   w.logits));
+                                   w.logits, packed));
         if (c.score)
             op_select =
                 rw(b,

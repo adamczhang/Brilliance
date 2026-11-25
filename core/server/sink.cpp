@@ -43,7 +43,10 @@ Sink::Sink(size_t capacity) {
 Sink::~Sink() {
     /* Only a sink the producer terminated can have a notify in flight. */
     if (finish_.load(std::memory_order_acquire) == (int)Finish::None) return;
-    for (int spins = 0; !quiesced_.load(std::memory_order_acquire); ++spins) {
+    /* A wake the producer deferred outlives its finish (the scheduler issues it once it has
+     * released the lock the push was under), so the last touch is that wake and not quiesced_. */
+    for (int spins = 0; !quiesced_.load(std::memory_order_acquire) ||
+                        deferred_.load(std::memory_order_acquire); ++spins) {
         /* The window is a few instructions wide, so a short spin covers it; the sleep keeps a
          * descheduled producer from burning a core. */
         if (spins > 256) std::this_thread::sleep_for(std::chrono::microseconds(20));
@@ -64,7 +67,7 @@ void Sink::enable_logprobs(int n) {
     alt_n_.assign(ring_.size(), 0);
 }
 
-bool Sink::push(int32_t token, const TokenLogprobs* lp, int64_t now) {
+bool Sink::push(int32_t token, const TokenLogprobs* lp, int64_t now, bool* deferred) {
     const uint64_t h = head_.load(std::memory_order_relaxed);
     const uint64_t t = tail_.load(std::memory_order_acquire);
     if (h - t > mask_) {
@@ -92,10 +95,24 @@ bool Sink::push(int32_t token, const TokenLogprobs* lp, int64_t now) {
      * scheduler thread. Every push while it sleeps wakes it, so a wake that lands after its
      * predicate test but before it sleeps (notify() takes no lock) is repaired by the next
      * push, not left to the bounded wait. The fence orders the head store before the flag's
-     * load, against the consumer's flag store before its predicate's head load. */
+     * load, against the consumer's flag store before its predicate's head load.
+     *
+     * With `deferred`, the decision is the caller's to issue: it takes the wake and calls wake()
+     * after releasing the lock it pushed under. The exchange keeps it to one wake per sink, since
+     * a step's pushes to one stream are all covered by the one its consumer wakes for. */
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (asleep_.load(std::memory_order_relaxed)) notify();
+    if (asleep_.load(std::memory_order_relaxed)) {
+        if (!deferred) notify();
+        else if (!deferred_.exchange(true, std::memory_order_acq_rel)) *deferred = true;
+    }
     return true;
+}
+
+void Sink::wake() {
+    notify();
+    /* After the notify, as quiesced_ is after finish's: the destructor reads this flag to learn
+     * that the producer has stopped touching this object. */
+    deferred_.store(false, std::memory_order_release);
 }
 
 void Sink::finish(Finish f) {
@@ -120,11 +137,15 @@ void Sink::set_prompt_stats(int32_t n_prompt, int32_t n_cached) {
     n_cached_.store(n_cached, std::memory_order_release);
 }
 
-void Sink::set_prompt_progress(int32_t processed, int32_t total, int32_t cached) {
+void Sink::set_prompt_progress(int32_t processed, int32_t total, int32_t cached,
+                               bool* deferred) {
     prog_total_.store(total, std::memory_order_release);
     prog_cached_.store(cached, std::memory_order_release);
     prog_done_.store(processed, std::memory_order_release);
-    notify();
+    if (!deferred) { notify(); return; }
+    /* Progress is news whether the consumer sleeps or drains, and push's deferral covers it: one
+     * wake serves both when a step does them together. */
+    if (!deferred_.exchange(true, std::memory_order_acq_rel)) *deferred = true;
 }
 
 void Sink::mark_admitted() {
@@ -134,6 +155,7 @@ void Sink::mark_admitted() {
 
 /* One producer, so a load and a store suffice. */
 void Sink::add_drafts(int32_t n, int32_t accepted) {
+    n_draft_steps_.store(n_draft_steps_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
     n_draft_.store(n_draft_.load(std::memory_order_relaxed) + n, std::memory_order_release);
     n_draft_acc_.store(n_draft_acc_.load(std::memory_order_relaxed) + accepted,
                        std::memory_order_release);

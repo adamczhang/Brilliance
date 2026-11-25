@@ -20,12 +20,14 @@
 // within f32 rounding.
 //
 // Two grids over x, and the weight's tile groups over y:
-//   decode   inside r4d_moe.hip's decode band. x is (16-row tile of the sorted rows, run within
-//            it), T slots in all since a tile of r rows holds at most r runs. The block's first
-//            wave finds the run from the expert offsets in one round of loads and the others take
-//            it from LDS, so a decode step issues no map. A wave takes a tile and a block four
-//            tiles; under twenty routed rows four waves share a wide-K tile (gate_up), and through
-//            the middle of the band a narrow-K wave (down) takes two tiles in turn.
+//   decode   inside r4d_moe.hip's decode band. x is the runs' 16-row tiles, numbered in expert
+//            and then row order and each from its run's own first row (moe_down_dec's numbering),
+//            so a run that crosses a 16-row boundary is decoded once and not in two pieces; the
+//            last block zeroes the dropped slots' rows. The block finds its tile from the expert
+//            offsets in one round of loads (NPT experts a thread) through LDS, so a decode step
+//            issues no map. A wave takes a tile and a block four tiles; under twenty routed rows
+//            four waves share a wide-K tile (gate_up), and through the middle of the band a
+//            narrow-K wave (down) takes two tiles in turn.
 //   map      above it (a prefill chunk). x is an entry of the run map moe_blockmap_kernel builds in
 //            the op's scratch, (expert, first row) at 64 rows an entry: a block decodes its
 //            expert's tiles once for up to four token tiles, a wave a weight tile down all of K.
@@ -283,59 +285,65 @@ __device__ __forceinline__ void moe_iqr_body(R4D_MOEIQR_PARAMS) {
         e = lo;
         re = rs + 1u;
     } else {
-        /* The (tile, run) grid. The block's first wave finds the run and the others take it from
-         * LDS after one barrier: each of its lanes holds kMaxExpert / 32 consecutive experts'
-         * offsets clamped to the tile's rows, so an expert's run meets the tile where its clamped
-         * bounds differ and those bounds are the run's rows there. The runs are numbered in expert
-         * order (a lane's own, then a running count over the lanes before it), and the lane holding
-         * run `jrun` hands over its expert and bounds. Offsets past the last expert read the last
-         * one's end: an empty run. */
-        constexpr uint32_t NPT = kMaxExpert / kWave;
-        static_assert(kMaxExpert % kWave == 0 && NPT <= 16, "a lane's experts in one mask");
-        const uint32_t r0 = (blockIdx.x / kRows) * kRows, jrun = blockIdx.x % kRows;
-        if (r0 >= T) return;
-        const uint32_t rN = r0 + kRows < T ? r0 + kRows : T;
-        if (wave == 0u) {
-            uint32_t cv[NPT + 1];
+        /* The run-tile grid (moe_down_dec's numbering, r4d_moe.hip): every run in expert order,
+         * split into 16-row tiles from its own first row, so a run that crosses a boundary is
+         * decoded once and not twice. Each thread holds NPT consecutive experts' offsets and the
+         * next, clamped to T; it counts its own run tiles, the threads before it in its wave scan
+         * them and the waves before it read the per-wave counts from LDS after one barrier, so the
+         * thread holding tile `blockIdx.x` hands over its expert and the tile's rows. The last
+         * block owns no run: it zeroes the dropped slots' rows, past the live count. */
+        constexpr uint32_t NPT = kMaxExpert / NTHR;
+        static_assert(NPT * NTHR == kMaxExpert && NPT <= 16, "a thread's experts in one round");
+        __shared__ uint32_t s_rc[NW];
+        if (blockIdx.x == gridDim.x - 1u) {
+            const uint32_t live = (uint32_t)off[n_expert];
+            if (live < T) zero_rows(live, T);
+            return;
+        }
+        uint32_t ov[NPT + 1];
 #pragma unroll
-            for (uint32_t k = 0; k <= NPT; ++k) {
-                const uint32_t x = lane * NPT + k;
-                const uint32_t o = (uint32_t)off[x < n_expert ? x : n_expert];
-                cv[k] = o < r0 ? r0 : o > rN ? rN : o;
+        for (uint32_t k = 0; k <= NPT; ++k) {
+            const uint32_t x = tid * NPT + k;
+            const uint32_t o = x <= n_expert ? (uint32_t)off[x] : T;
+            ov[k] = o < T ? o : T;
+        }
+        uint32_t nt[NPT], cnt = 0;
+#pragma unroll
+        for (uint32_t k = 0; k < NPT; ++k) {
+            nt[k] = tid * NPT + k < n_expert ? (ov[k + 1] - ov[k] + kRows - 1u) / kRows : 0u;
+            cnt += nt[k];
+        }
+        const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
+        if (lane == kWave - 1) s_rc[wave] = inc;
+        lds_barrier();
+        uint32_t before = inc - cnt, ntile = 0;
+#pragma unroll
+        for (uint32_t w = 0; w < NW; ++w) {
+            const uint32_t c = s_rc[w];
+            ntile += c;
+            if (w < wave) before += c;
+        }
+        if (blockIdx.x >= ntile) return;
+        if (blockIdx.x >= before && blockIdx.x < before + cnt) {
+            /* the thread's (blockIdx.x - before)-th tile: its expert and the tile's first row */
+            uint32_t rem = blockIdx.x - before, k = 0;
+            bool hit = false;
+#pragma unroll
+            for (uint32_t q = 0; q < NPT; ++q) {
+                const bool take = !hit && rem < nt[q];
+                k = take ? q : k;
+                rem = (hit || take) ? rem : rem - nt[q];
+                hit = hit || take;
             }
-            uint32_t pm = 0;
-#pragma unroll
-            for (uint32_t k = 0; k < NPT; ++k) pm |= (cv[k] < cv[k + 1] ? 1u : 0u) << k;
-            const uint32_t cnt = (uint32_t)__builtin_popcount(pm);
-            const uint32_t inc = (uint32_t)wave_incl_scan_i32((int32_t)cnt, lane);
-            if (lane == kWave - 1) s_sel[3] = inc;
-            const uint32_t before = inc - cnt;
-            if (jrun >= before && jrun < before + cnt) {
-                /* the lane's (jrun - before)-th run: a search of its mask by halves */
-                uint32_t rem = jrun - before, pos = 0, bits = pm;
-#pragma unroll
-                for (uint32_t h = NPT / 2u; h; h >>= 1) {
-                    const uint32_t c = (uint32_t)__builtin_popcount(bits & ((1u << h) - 1u));
-                    const bool up = rem >= c;
-                    rem -= up ? c : 0u;
-                    pos += up ? h : 0u;
-                    bits = up ? bits >> h : bits;
-                }
-                const uint32_t ex = lane * NPT + pos;
-                const uint32_t oa = (uint32_t)off[ex], ob = (uint32_t)off[ex + 1];
-                s_sel[0] = ex;
-                s_sel[1] = oa > r0 ? oa : r0;
-                s_sel[2] = ob < rN ? ob : rN;
-            }
+            s_sel[0] = tid * NPT + k;
+            s_sel[1] = ov[k] + rem * kRows;
+            s_sel[2] = ov[k + 1];
         }
         lds_barrier();
-        /* The tile's dropped slots, by one of its blocks. */
-        const uint32_t live = (uint32_t)off[n_expert];
-        if (jrun == 0 && live < rN) zero_rows(r0 > live ? r0 : live, rN);
-        if (jrun >= s_sel[3]) return;
         e = s_sel[0];
         rs = s_sel[1];
-        re = s_sel[2];
+        const uint32_t rl = s_sel[2];
+        re = rs + kRows < rl ? rs + kRows : rl;
     }
     /* The run is the block's: in scalar registers, and with it the expert's buffers. */
     e = __builtin_amdgcn_readfirstlane(e);
@@ -931,9 +939,13 @@ int moe_iqr_launch(const RadArgs* a, RadStream stream, int ncls) {
 
     if (band) {
         g.map = nullptr;
-        /* A tile of r rows holds at most r runs, so T slots serve every tile: slot x is run
-         * x % 16 of tile x / 16, and the last tile's slots end with its rows. */
-        g.gx = (uint32_t)T;
+        /* The runs' 16-row tiles, numbered in expert order from each run's own first row: a run of
+         * r rows is ceil(r / 16) tiles, and a run of one row is one, so the T rows over at most
+         * min(T, n_expert) experts make at most (T + 15 * min(T, n_expert)) / 16 tiles. One block
+         * past them zeroes the dropped slots' rows. */
+        g.gx = (uint32_t)((((uint64_t)T + (uint64_t)(kRows - 1) * (T < n_expert ? T : n_expert)) /
+                           kRows) +
+                          1u);
         /* The band's one launch has a chained form; the run map's two launches stay plain. */
         g.chain = r4d_geti_or(a, "chain", 0) != 0;
     } else {

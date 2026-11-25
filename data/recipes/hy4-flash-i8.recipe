@@ -1,0 +1,41 @@
+# hy4-flash-i8.recipe -- Tencent Hy4-flash at eight bits: every trunk linear but kv_a, kv_b and the indexer,
+# and the routed experts, as int8 codes rotated by the 128-wide Hadamard with a bf16 scale a (row,
+# 128 of K) (`i8*bf16[1x128]/fwht128`, read at i8a8h against rotated int8 activations); the lm_head
+# as unrotated int8 (logits_gemm's int8 head); the Engram tables as E4M3 rows; the rest as the
+# checkpoint holds it.
+#
+#   rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-i8.recipe -o hy4-flash-i8.rad
+#
+# Left as shipped, by design: kv_a (576 rows: libr4d's int8 prefill tile, gemm_i8a8_tiled, needs whole
+# 128-row tiles, so above 64 tokens an int8 kv_a has no device kernel and its layer falls back to the
+# host -- measured on gpu-mini, WP8; 3.4 MiB a layer at real size), kv_b (DECISIONS U2: the absorbed attention reads its per-head blocks;
+# the plugin refuses a quantised one), the indexer's projections (its top-k is a hard choice), the
+# router, the hyper-connections, sinks, norms and the Engram's projections (the plugin refuses a
+# recipe over those), the token embedding, DFly2 (a recipe of its own, hy4-flash-dfly-i8.recipe) and the tower (declared, not served).
+#
+# Each int8 trunk linear quantises its own input (had_quant_act_i8g, or quant_act_i8g for the head)
+# from the bf16 plane its producer writes. Every K here is a whole number of 128 blocks on every
+# rank at TP1, TP2 and TP4 (the attention output's 8192 / 16384 by heads, the dense down's 13824 and
+# the shared down's 1536 by columns), and every row count a multiple of 16. The experts: rotated int8
+# on the int8 routed arm, clamped at 10 (swiglu_clamped, then had_quant_act_i8g).
+#
+# Swap `rtn ... rule=search` for `gptq ... damp=0.01 calib=$CALIB` on any line to fit it against
+# the Grams of a calibration run (docs/ARCHITECTURES.md, "Calibrating Hy4-flash"; every trunk
+# linear and expert projection has its file under its declared stem).
+#
+# PATTERN                          QUANTISER  OPTIONS
+blk.*.attn_q_a.weight              rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_q_nope.weight           rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_q_rope.weight           rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_gate.weight             rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight           rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight           rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight              rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight     rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight        rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_latent_in.weight         rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_latent_out.weight        rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+blk.*.ffn_*_exps.*.weight          rtn        codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search
+output.weight                      rtn        codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.engram_table.weight     rtn        codes=fp8_e4m3 block=1x* scale=bf16 rule=absmax

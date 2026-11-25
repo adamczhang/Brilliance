@@ -282,7 +282,7 @@ static void wave_barrier(int w) {
  * lanes that met at different ops (a cross-lane op called under divergence, each side reaching
  * one) are reported, not combined. */
 enum { kOpBpermute = 1 << 24, kOpReadlane = 2 << 24, kOpBallot = 3 << 24, kOpDpp = 4 << 24,
-       kOpPermlanex16 = 5 << 24 };
+       kOpPermlanex16 = 5 << 24, kOpLoadTr = 6 << 24 };
 static const int* exchange(int v, int* lane, int tag) {
     const int t = (int)S.f[S.cur].tid.x, w = t >> 5;
     const unsigned par = S.xparity[t]++ & 1u;
@@ -415,9 +415,36 @@ emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
     std::memcpy(pb.v, &b, 8);
     return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return g_fp8.v[v]; });
 }
-emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
-    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
-    std::abort();
+emu_v8i emu_wmma_iu8(bool sa, emu_v2i a, bool sb, emu_v2i b, emu_v8i c, bool clamp) {
+    Bytes8 pa, pb;
+    std::memcpy(pa.v, &a, 8);
+    std::memcpy(pb.v, &b, 8);
+    const int t = (int)S.f[S.cur].tid.x, w = t >> 5, l = t & 31;
+    const unsigned par = S.xparity[t]++ & 1u;
+    for (int e = 0; e < 8; ++e) { g_qa[w][par][l][e] = pa[e]; g_qb[w][par][l][e] = pb[e]; }
+    wmma_whole_wave(w);
+    wave_barrier(w);
+    const int N = l & 15, h = l >> 4;
+    auto cvt = [](uint8_t v, bool s) -> int { return s ? (int)(int8_t)v : (int)v; };
+    int64_t acc[8];
+    for (int e = 0; e < 8; ++e) acc[e] = (int64_t)c[e];
+    for (int k = 0; k < 16; ++k) {
+        const int slot = 16 * (k >> 3), el = k & 7;
+        const int bk = cvt(g_qb[w][par][N + slot][el], sb);
+        for (int e = 0; e < 8; ++e) {
+            acc[e] += (int64_t)cvt(g_qa[w][par][8 * h + e + slot][el], sa) * (int64_t)bk;
+        }
+    }
+    emu_v8i d;
+    for (int e = 0; e < 8; ++e) {
+        int64_t v = acc[e];
+        if (clamp) {
+            if (v < -2147483648LL) v = -2147483648LL;
+            if (v >  2147483647LL) v =  2147483647LL;
+        }
+        d[e] = (int)v;
+    }
+    return d;
 }
 unsigned emu_ballot(bool p) {
     int l;
@@ -448,9 +475,28 @@ int emu_permlanex16(int, int src, unsigned sel_lo, unsigned sel_hi, bool, bool) 
     const unsigned sel = (r < 8 ? sel_lo >> (4 * r) : sel_hi >> (4 * (r - 8))) & 15u;
     return s[(16 - (l & 16)) | (int)sel];
 }
-emu_v8s emu_load_tr_b128(const void*) {
-    std::fprintf(stderr, "emu: global_load_tr_b128 is not emulated\n");
-    std::abort();
+/* global_load_tr_b128 (gfx12): an 8x8 transpose of 16-bit elements in each group of eight lanes.
+ * Lane i of a group names a 16-byte row; lane j of the group receives element j of each of the
+ * eight rows, row i in element i. The addresses go round the wave in two exchanges (a pointer is
+ * two words), then every lane reads its column of its group's rows. */
+emu_v8s emu_load_tr_b128(const void* p) {
+    const uint64_t a = (uint64_t)(uintptr_t)p;
+    int l;
+    const int* s = exchange((int)(uint32_t)a, &l, kOpLoadTr);
+    uint32_t lo[8];
+    for (int i = 0; i < 8; ++i) lo[i] = (uint32_t)s[(l & ~7) + i];
+    s = exchange((int)(uint32_t)(a >> 32), &l, kOpLoadTr | 1);
+    emu_v8s v;
+    for (int i = 0; i < 8; ++i) {
+        const uint64_t ai = (uint64_t)lo[i] | (uint64_t)(uint32_t)s[(l & ~7) + i] << 32;
+        if (ai & 15) {
+            std::fprintf(stderr, "emu: global_load_tr_b128 row address %p is not 16-byte aligned (kernel %s)\n",
+                         (void*)(uintptr_t)ai, emu_last_kernel);
+            std::abort();
+        }
+        v[i] = ((const short*)(uintptr_t)ai)[l & 7];
+    }
+    return v;
 }
 
 /* Dynamic LDS: a mapping whose last page is inaccessible, the buffer placed against it with its

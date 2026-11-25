@@ -372,6 +372,53 @@ TEST(arena_offsets_and_operand_offsets) {
     CHECK_EQ((int)g_rec[0].t[1].dtype, (int)RAD_BF16);
 }
 
+
+/* Check the operand delivered to a kernel, rather than only its replacement descriptor. */
+TEST(generator_replacement_slots_bind_without_changing_the_base_weight) {
+    Fixture f;
+    uint16_t base[4] = {0x3f80,0x4000,0x4040,0x4080}; // BF16 1,2,3,4.
+    const uint16_t slot_values[8] = {0x4120,0x4130,0x4140,0x4150,
+                                     0x41a0,0x41a8,0x41b0,0x41b8};
+    const rad_weight w = f.add_weight("projector.weight", RAD_BF16, 1, 4, base);
+    const rad_buf x = f.add_buffer("x", RAD_BF16, 1, 4, 0);
+    const rad_buf y = f.add_buffer("y", RAD_BF16, 1, 1, 128);
+    const rad_buf slots = f.add_buffer("replacement.slots", RAD_BF16, 2, 4, 256);
+    auto& replacement = f.P.lora_replacements[w];
+    replacement.slots = slots; replacement.rows = 4; replacement.row_mixer = true;
+    const rad_op op = f.add_op("gemm_nt", "M", {16}, {k_m16}, {"replacement"},
+                               &g_gemm_schema, {w});
+    f.P.ops[op].base.set_i("N", 1);
+    f.P.ops[op].bands[0].dom[RAD_DOMAIN_DEVICE].geom.set_i("N", 1);
+    REQUIRE_EQ(f.start(), RAD_OK);
+    auto* packed = static_cast<uint16_t*>(f.ctx.buf_ptr(slots));
+    REQUIRE(packed);
+    std::memcpy(packed, slot_values, sizeof(slot_values));
+    f.batch.gen = 1;
+    int tick = 0;
+    for (const int slot : {-1,0,1,-1}) {
+        f.ctx.set_gen_lora_slot(slot);
+        g_rec.clear();
+        CHECK_OK(f.step(1, tick++, [&](Ctx& ctx) {
+            RadOperand operands[3] = {RAD_B(x), RAD_W(w), RAD_B(y)};
+            CHECK_OK(ctx.issue(op, operands, 3, RAD_N_BATCH));
+        }));
+        REQUIRE_EQ(g_rec.size(), size_t(1));
+        const uint16_t* expected = slot < 0 ? base : slot_values + 4 * slot;
+        REQUIRE(g_rec[0].t[1].data == (slot < 0 ? base : packed + 4 * slot));
+        CHECK_EQ(g_rec[0].t[1].dtype, uint32_t(RAD_BF16));
+        auto* actual = static_cast<const uint16_t*>(g_rec[0].t[1].data);
+        for (int i = 0; i < 4; ++i) CHECK_EQ(actual[i], expected[i]);
+        CHECK(f.ctx.weight_ptr(w) == base);
+        CHECK_EQ(base[0], uint16_t(0x3f80));
+    }
+    f.ctx.set_gen_lora_slot(2);
+    CHECK_EQ(f.step(1, tick, [&](Ctx& ctx) {
+        RadOperand operands[3] = {RAD_B(x), RAD_W(w), RAD_B(y)};
+        ctx.issue(op, operands, 3, RAD_N_BATCH);
+    }), RAD_E_STATE);
+    f.ctx.set_gen_lora_slot(-1);
+}
+
 /* rows > 0 narrows dim 0 and leaves every stride alone. That is how a prefill chunk of `rows`
  * tokens issues against a buffer sized at max_tok; it is only sound on the outermost dimension,
  * which is why the ABI narrows dim 0 and nothing else. */
@@ -2567,6 +2614,27 @@ static uint64_t test_prefill_geometry_key(RadCtx* c, const RadBatch* b, const in
                                                     (int)b->n_tok, (int)b->n_seq, kv_heads,
                                                     declared_max_ctx, used[0], wgps);
     return rad_prefill_grid_key((int)b->max_q_len, bq, splits, kv_heads, (int)b->n_seq, threads);
+}
+
+/* A layer-sliced pass (S-02) resumes the chunk from the plugin's persistent state, which the batch
+ * does not carry: its launch cannot be replayed from the key, so it never gets one. */
+TEST(a_layer_sliced_pass_is_never_recorded) {
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    rad_op op = loose_op(f);
+    attach_host_row(f, op, k_host_read, "sliced_prefill");
+    CHECK_OK(f.start());
+
+    RadBatch b{};
+    b.phase = RAD_PHASE_PREFILL;
+    b.n_tok = 128; b.n_seq = 1; b.max_q_len = 128;
+    CHECK(f.ctx.pass_key(&b) != 0);           /* the whole trunk: recordable */
+    b.layer_lo = 0; b.layer_hi = 4;
+    CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+    b.layer_lo = 4; b.layer_hi = 8;
+    CHECK_EQ(f.ctx.pass_key(&b), (uint64_t)0);
+    b.layer_lo = 0; b.layer_hi = 0;
+    CHECK(f.ctx.pass_key(&b) != 0);           /* and the whole trunk keys again */
 }
 
 TEST(legacy_prefill_keying_only_fails_closed_for_dynamic_split_rows) {

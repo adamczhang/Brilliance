@@ -301,6 +301,7 @@ struct SelJob {
     int64_t nb, topk, ratio;
     int64_t s_rs, s_cs, bt_rs, bt_cs, o_rs, o_cs;
     bool sgn;                          /* the `signed` order */
+    bool own;                          /* the query's own block is never a candidate, always last */
 };
 
 /* The order key of each of the row's first `n` blocks: bits(max(score, 0)) + 1 for a live block
@@ -476,7 +477,10 @@ static void emit(const SelJob& j, const uint32_t* key, int64_t n, int64_t s, uin
 static void select_row(const SelJob& j, int64_t m) {
     const int64_t s = j.seq[m];
     const int64_t p = ldi(j.po, offlin(j.po, m));
-    const int64_t n = std::min(std::min(ldi(j.nc, offlin(j.nc, s)), j.nb), (p + 1) / j.ratio);
+    /* `own`: the block holding the query is never a candidate, complete or not (HF's
+     * `group_ids >= query_group`), so only the blocks before it compete. */
+    const int64_t n = std::min(std::min(ldi(j.nc, offlin(j.nc, s)), j.nb),
+                               j.own ? p / j.ratio : (p + 1) / j.ratio);
     const int64_t topk = j.topk;
     uint32_t* key = (uint32_t*)scratch_f32((size_t)std::max<int64_t>(n, 1));
     int32_t* row = (int32_t*)scratch_f32_b((size_t)(4 * kBins + topk + 1));
@@ -494,8 +498,11 @@ static void select_row(const SelJob& j, int64_t m) {
         emit(j, key, n, s, thr, gt, topk - gt, row);
         out = topk;
     }
-    if (n < j.nb && (p + 1) % j.ratio != 0) {
-        const int64_t part = ldi(j.bt, s * j.bt_rs + n * j.bt_cs);
+    /* The partial page follows; with `own` the block holding the query always does, complete or
+     * not (libref checks it against the table's width, not the scores'). */
+    const int64_t pidx = j.own ? p / j.ratio : n;
+    if (j.own ? pidx < j.bt->shape[1] : (n < j.nb && (p + 1) % j.ratio != 0)) {
+        const int64_t part = ldi(j.bt, s * j.bt_rs + pidx * j.bt_cs);
         if (part >= 0) row[out++] = (int32_t)part;
     }
     for (int64_t i = out; i <= topk; ++i) row[i] = -1;
@@ -519,15 +526,18 @@ static void select_row(const SelJob& j, int64_t m) {
  * by max(score, 0), or with `signed` 1 those with a finite score, ranked by it. All of them when `topk` or fewer are live, else every block above the topk-th
  * largest value in block order, then the blocks equal to it in block order until topk are taken.
  * The partial page bt[n] follows when (pos + 1) % ratio != 0 and n < width, and -1 pads the row
- * to topk + 1. A row no sequence holds reads sequence 0, as libref's and libr4d's do. */
+ * to topk + 1. A row no sequence holds reads sequence 0, as libref's and libr4d's do.
+ * `own` 1 (Hy4-flash's indexer): the block holding the query is never a candidate, complete or
+ * not, so n = min(nc[seq], width, pos / ratio), and bt[pos / ratio] is always appended last. */
 AVX_KERNEL(qsa_select) {
     if (!rad_args_have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
-    const int64_t sgn = p_int(a, "signed", 0);
+    const int64_t sgn = p_int(a, "signed", 0), own = p_int(a, "own", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
     if (sgn != 0 && sgn != 1) return RAD_E_INVAL;
+    if (own != 0 && own != 1) return RAD_E_INVAL;
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
     const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], sc->shape[1]);
     const int64_t n_seq = numel(cu) - 1;
@@ -549,6 +559,7 @@ AVX_KERNEL(qsa_select) {
     j.bt_rs = bt->stride[0]; j.bt_cs = bt->stride[1];
     j.o_rs = se->stride[0]; j.o_cs = se->stride[1];
     j.sgn = sgn != 0;
+    j.own = own != 0;
     AVX_PARALLEL_FOR_IF(M * nb >= AVX_PAR_MIN && M > 1)
     for (int64_t m = 0; m < M; ++m) select_row(j, m);
     return RAD_OK;

@@ -34,7 +34,7 @@ Without --only, the checks are chosen from the model's capabilities at /v1/model
   rerank_limits       a pair past the context is a 400, not truncated; no documents, no query or a
                       number as a document is a 400; top_n 0 returns all
   rerank_image        (capability image) a red picture outranks a blue one for "red", and the reverse
-  speech              by default on Windows: the build refuses speech (Brilliance 0.3.0, the owner's
+  speech              by default on Windows: the build refuses speech (Brilliance on Windows, the owner's
                       decision): /v1/audio/speech and /audio/speech answer 501 with an error body,
                       type not_implemented_error, saying "not supported in this build", and the
                       /v1/audio/speech/stream socket sends that as an error event and closes 1008.
@@ -1578,7 +1578,7 @@ def main():
     ap.add_argument("--speech", choices=("refused", "served"),
                     default="refused" if sys.platform == "win32" else "served",
                     help="what the speech check expects: refused (the default on Windows, where "
-                    "Brilliance 0.3.0 builds answer 501) or served (a WAV; a build that serves "
+                    "Brilliance's Windows builds answer 501) or served (a WAV; a build that serves "
                     "speech)")
     ap.add_argument("--image-size", default="512x512")
     ap.add_argument("--image-size2", default="768x512",

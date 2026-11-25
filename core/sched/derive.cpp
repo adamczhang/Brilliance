@@ -4,6 +4,7 @@
 
 #include "rad_core.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace rad {
@@ -71,7 +72,7 @@ static int chunk_walk(const DeriveInput& in, int32_t* out, int64_t cap, int64_t*
     return RAD_OK;
 }
 
-/* [n_chunks+1] token indices: chunk c covers [out[c], out[c+1]). out[0] is 0 and the last entry is
+/* [n_chunks + 1] token indices: chunk c covers [out[c], out[c+1]). out[0] is 0 and the last entry is
  * n_tok, like cu_seqlens. */
 static int d_state_chunk_bounds(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* n_out) {
     return chunk_walk<false>(in, out, cap, n_out);
@@ -109,14 +110,84 @@ static int d_projection_on_rows(const DeriveInput& in, int32_t* out, int64_t cap
     return RAD_OK;
 }
 
+/* Queries keep their order within each sequence, so a compact suffix attends to precisely
+ * the same keys (the causal kernels align Q to the end of K). Scoring can repeat sampled
+ * rows and append them out of order. Leave the logits gather's original indices intact. */
+template<bool anchors>
+static int d_prefill_tail(const DeriveInput& in, int32_t* out, int64_t cap, int64_t* produced) {
+    *produced = 0;
+    const auto& p = *in.plan;
+    if (p.phase == RAD_PHASE_DECODE || p.draft_pass || p.n_seq_decode == in.n_seq) return RAD_OK;
+    if (cap < 1) return RAD_E_FULL;
+    *produced = 1;
+    out[0] = 0;
+    if (!in.n_out) return RAD_OK;
+    std::vector<uint8_t> keep(in.n_tok, 0);
+    for (int64_t j = 0; j < in.n_out; ++j) {
+        const int32_t r = in.out_ids[j];
+        if (r < 0 || r >= in.n_tok) return RAD_E_INVAL;
+        keep[r] = 1;
+    }
+    /* Every decode row, sampled or not: the compact pass reads its rows [0, DT) as the batch's
+     * decode rows (block table, seqused, the stable instance), so they stay whole and in place
+     * in both variants (the plugin checks it: hyv4flash.cpp, tail_keeps_decode). */
+    std::fill_n(keep.begin(), p.n_tok_decode, 1);
+    if (anchors) {
+        for (int64_t s = p.n_seq_decode; s < in.n_seq; ++s)
+            if (in.cu_seqlens[s + 1] > in.cu_seqlens[s])
+                keep[in.cu_seqlens[s + 1] - 1] = 1;
+    }
+    const int64_t m = std::count(keep.begin(), keep.end(), 1);
+    out[0] = m;
+    if (m == in.n_tok) return RAD_OK;
+    const int64_t size = 4 + 2 * in.n_seq - p.n_seq_decode + (in.rope_pos ? 5 : 2) * m;
+    if (size + (in.ckpt_cut ? 3 : 0) > cap) return RAD_E_FULL;
+    int32_t* cu = out + 2;
+    int32_t* pf_cu = cu + in.n_seq + 1;
+    int32_t* ids = pf_cu + in.n_seq - p.n_seq_decode + 1;
+    int32_t* pos = ids + m;
+    cu[0] = 0;
+    int n = 0;
+    for (int64_t s = 0; s < in.n_seq; ++s) {
+        for (int r = in.cu_seqlens[s]; r < in.cu_seqlens[s + 1]; ++r) {
+            if (!keep[r]) {
+                if (n != cu[s]) { out[0] = in.n_tok; return RAD_OK; }
+                continue;
+            }
+            ids[n] = r;
+            pos[n] = in.positions[r];
+            if (in.rope_pos)
+                for (int j = 0; j < 3; ++j)
+                    pos[(j + 1) * m + n] = in.rope_pos[j * in.n_tok + r];
+            ++n;
+        }
+        cu[s + 1] = n;
+    }
+    out[1] = cu[p.n_seq_decode];
+    for (int64_t i = p.n_seq_decode; i <= in.n_seq; ++i)
+        pf_cu[i - p.n_seq_decode] = cu[i] - out[1];
+    *produced = size;
+    if (in.ckpt_cut) {
+        /* A checkpoint cut belongs to a single prefill sequence. Translate it from
+         * original rows into that sequence's retained suffix. */
+        out[size] = 0;
+        out[size + 1] = std::clamp<int64_t>(in.ckpt_cut - ids[0], 0, m);
+        out[size + 2] = m;
+        *produced += 3;
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ the table */
 static const DeriveRow g_rows[] = {
+    { "prefill_tail", d_prefill_tail<false>, "compact prefill query suffixes" },
+    { "prefill_tail_anchors", d_prefill_tail<true>, "compact query suffixes including draft anchors" },
     { "seq_start_index",  d_seq_start_index,
       "[n_seq+1] first token index of each sequence in this step, and the total" },
     { "conv_state_index", d_conv_state_index,
       "[n_seq] conv rolling-window entry to read, base slot * window + accepted cursor" },
     { "state_chunk_bounds", d_state_chunk_bounds,
-      "[n_chunks+1] token indices bounding each linear-state chunk; never crosses a sequence" },
+      "[n_chunks + 1] token indices bounding each linear-state chunk; never crosses a sequence" },
     { "state_chunk_seq",    d_state_chunk_seq,
       "[n_chunks] the sequence each chunk belongs to" },
     { "projection_on_rows", d_projection_on_rows,

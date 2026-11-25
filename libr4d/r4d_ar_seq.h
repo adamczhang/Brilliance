@@ -866,6 +866,20 @@ __device__ __forceinline__ bool r4d_archk_exchange(unsigned int* my_flags, unsig
 // drain 4 is the plain kernels' test mode (r4d_ar_late_push_pin): the flag ahead of the push and
 // the push ~20 us behind it.
 #define R4D_ARW_SPIN_MAX 4000000000ULL
+/* A dead peer shows as a flag that never arrives. The iteration cap above is minutes to hours, so
+ * the spins also give up on the wall clock: 30 s at wall_clock64's 100 MHz. The clock is read once
+ * every 65536 polls (a poll is a system-scope load, microseconds), and first then, so the hot path
+ * never reads it. */
+#define R4D_AR_FLAG_DEADLINE 3000000000ull
+/* Brilliance: kept for the fork's junction kernel (r4d_ar_ihc_junction.hip), whose waits give up
+ * through R4D_AR_GIVE_UP(); the two-rank exchange's own waits keep Brilliance's checked deadlines
+ * (r4d_ar_flag_wait, r4d_archk_exchange) and do not call it. */
+__device__ __forceinline__ bool r4d_ar_spin_late(unsigned long long z, unsigned long long& t0) {
+  if ((z & 0xffffull) != 0ull) return false;
+  const unsigned long long now = wall_clock64();
+  if (t0 == 0ull) { t0 = now; return false; }
+  return now - t0 > R4D_AR_FLAG_DEADLINE;
+}
 
 // A barrier that orders LDS only.
 __device__ __forceinline__ void r4d_lds_barrier() {

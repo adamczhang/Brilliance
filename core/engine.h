@@ -26,6 +26,7 @@
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
+#include "mem/vram_others.h"   /* Brilliance: other processes on the serving cards */
 #include "runtime/ctx.h"   /* KVStageRun */
 #include "sched/mem_iface.h"
 #include "sched/scheduler.h"
@@ -48,6 +49,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace rad {
@@ -65,12 +67,18 @@ struct TierJob;
 struct StepSlot;
 class ExpertStats;   /* place/xstats.h */
 class XsTally;
+class ExpertMemoryOps;
 
 struct VramFacts;   /* mem/vram_budget.h */
 struct WeightFootprint;   /* place/planner.h */
 
+struct EngineMemoryTestAccess;
+
+class RouteTrace;
+
 class Engine {
 public:
+    friend struct EngineMemoryTestAccess;
     explicit Engine(Config cfg);
     ~Engine();
 
@@ -135,6 +143,12 @@ public:
      * Set at bring-up. */
     bool one_step() const { return embedding_; }
     bool parked() const { return parked_.load(std::memory_order_acquire); }
+    /* A failed fence forbids paging and fallback unload until a later complete drain succeeds. */
+    int memory_fence_status() const { return memory_fence_status_.load(std::memory_order_acquire); }
+    int prepare_unload(); // only after all producer threads have joined
+    int retry_memory_fence();
+    bool producers_stopped() const { return producers_stopped_.load(std::memory_order_acquire); }
+    bool stopping() const { return stopping_.load(std::memory_order_acquire); }
     /* While parked, the linear-state snapshot store's pinned host memory goes back to the host:
      * the park emptied the prefix cache, so the store holds no snapshot, and the next unpark pins
      * it again before paging in (4 GiB pins in about 0.3 s, far less than the host copies of
@@ -147,9 +161,9 @@ public:
      * container, whole weights at a time. The bytes filled, or a negative status. From the fleet's
      * thread, with the model idle. */
     int64_t fill_host(int64_t max_bytes);
-    /* Host memory a refill (a restore's or a host fill's) holds while it runs, at most: the
-     * relayout pool's staged inputs (kRefillStaging), its workers' output buffers and the sweep's
-     * pinned windows. The fleet keeps this much room for it. */
+    /* Host-room allowance for a refill's staged inputs, output scratch and read windows. CPU
+     * container warming preflights its aggregate inputs and partial output against this allowance;
+     * ordinary loading may still need a complete unusually large weight. */
     static constexpr int64_t kRefillStaging = (int64_t)2 << 30;
     static constexpr int64_t kRefillHost = (int64_t)4 << 30;
     /* What release_host_spare gave back and unpark will pin again. */
@@ -250,6 +264,9 @@ public:
     uint64_t cvec_salt_for(bool on) const { return on ? cvec_salt_ : 0; }
 
 private:
+    friend struct EngineBaseWeightsTestAccess;
+    friend struct EngineQuietTestAccess;
+    friend struct TableFillTestAccess;
     /* One thread per tensor-parallel rank, each owning one device. Ranks share the address
      * space, so there is no IPC or serialisation and the step batch is shared by pointer rather
      * than broadcast (spec §1). */
@@ -269,6 +286,10 @@ private:
     /* rad_mono_ns at the top of start(), so serve() can report how long bringup took. The same
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
+    /* B-03: logs startup_phase(what, since_ns, startup_begin_ns_, now) at info level. */
+    void phase_done(const char* what, uint64_t since_ns) const;
+    /* B-03: " (at y.y s)" since the start, for the lines that give their own duration. */
+    std::string at_now() const;
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;
@@ -291,6 +312,11 @@ private:
 
     /* --expert-stats FILE (place/xstats.h); null without the flag. */
     std::unique_ptr<ExpertStats> xstats_;
+    /* RADIANCE_ROUTE_TRACE=FILE (place/rtrace.h): rank 0's credited routing; null without it. */
+    std::shared_ptr<class RouteTrace> rtrace_;
+    /* Expert streaming X1 (a): publish the mover's landed promotions right before a pass is
+     * played (RADIANCE_XS_EARLY_PUBLISH, default on). */
+    bool xs_early_publish_ = true;
 
     RadModelMeta   meta_{};
     LoadedPlugins  plugins_;
@@ -345,18 +371,35 @@ public:
     /* The adapter files a generator request may name: --lora's and those under --lora-dir. */
     std::vector<std::string> gen_lora_names() const;
 private:
-    /* A generator's adapter files by name (--lora, POST /v1/load_lora_adapter, --lora-dir), opened
-     * once and kept mapped; compositions read them when a combination is put in a slot. */
-    int gen_lora_open(const std::string& name, std::shared_ptr<const lora::AdapterFile>* out,
-                      std::string* err);
+    /* A generator keeps explicitly loaded files and snapshots discovered files on a cache miss. */
     int gen_lora_start();
+    struct LoraReplacement {
+        rad_buf buffer;
+        std::vector<uint16_t> values;
+    };
+    using LoraReplacements = std::vector<std::vector<LoraReplacement>>;
+    int gen_lora_prepare_replacements(const std::map<std::string, lora::Composite>& modules,
+                                      const std::map<std::string, std::vector<float>>& deltas,
+                                      LoraReplacements* replacements, std::string* err) const;
     /* Every rank's packed bytes into `slot` of its pools, each rank on a stream of its own. */
     int lora_copy(int slot, const std::vector<std::vector<lora::PackedSite>>& packed,
-                  std::string* err);
+                  std::string* err, const LoraReplacements* replacements = nullptr);
     bool                        lora_gen_ = false;
     std::unique_ptr<lora::KeyMap> lora_keys_;
     mutable std::mutex          lora_lib_mu_;
-    std::map<std::string, std::pair<std::string, std::shared_ptr<const lora::AdapterFile>>> lora_lib_;
+    struct AdapterEntry {
+        std::string path;
+        std::optional<FileRevision> revision; // Empty for an explicitly loaded adapter.
+        std::shared_ptr<const lora::AdapterFile> file;
+        uint64_t version;
+    };
+    int resolve_gen_adapter(const std::string& name, AdapterEntry* entry, std::string* err);
+    int snapshot_gen_adapter(const std::string& path, std::shared_ptr<const lora::AdapterFile>* file,
+                             std::string* err, const FileRevision* expected = nullptr) const;
+    std::map<std::string, AdapterEntry> lora_lib_;
+    std::set<std::string> unloaded_gen_adapters_;
+    std::set<std::string> gen_bias_modules_; // Bias operands supported on every tensor-parallel rank.
+    uint64_t next_adapter_version_ = 1;
 private:
     std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
     lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
@@ -385,9 +428,29 @@ private:
                                 int64_t host_late);
     /* --ngram-placement ram: one copy of the container's [src, src + n) at file offset `foff`,
      * shared by every rank. Locked for the host gather, or pinned for a device kernel to read
-     * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too. */
+     * over the link (`card`); with ram=DIR the pinned copy is a file other engines map too.
+     * The memory is reserved and published here; the bytes are read by a TableFill that
+     * join_table_fills joins after the container pass, so the four Engram tables fill beside it
+     * (B-01) instead of one after the other before it. */
     int copy_table(const uint8_t* src, int64_t n, int64_t foff, bool card, void** out,
                    std::string* why);
+    /* An Engram table whose bytes are still being read: copy_table has reserved and published its
+     * memory, and the load may not use it until join_table_fills has joined it. */
+    struct PendingTable {
+        TableFill   fill;
+        std::string line;         /* "n-gram table ... <size>", the placement line's subject */
+        void*       base = nullptr;
+        int64_t     bytes = 0;
+        TableCopy   copy;         /* the locked region, when `locked` */
+        TableShare  share;        /* the shared file to mark ready, when `shared` */
+        std::string id;           /* the share's id, with `shared` */
+        bool        locked = false;
+        bool        shared = false;
+    };
+    /* Waits for every fill copy_table started, checks each, marks a shared file ready and releases
+     * what failed; logs one line per table. RAD_OK, or the first failure. */
+    int join_table_fills();
+    std::vector<PendingTable> pending_tables_;
     /* An auto-chosen pinned copy failed: move every rank's n-gram gather to the host. */
     bool ngram_gather_to_host();
     /* The table copies: locked ones as [base, base + bytes), pinned ones as rad_dev_alloc
@@ -413,12 +476,15 @@ private:
      * rank's planner in place of the container's activation profile. */
     std::vector<RadFileProfile> expert_profile_;
     int load_weights();
+    void seal_base_weights();
     /* After a page-in: every weight with a byte in `spans` (memory the page-in mapped back empty,
      * dev_page_refilled) is read from the container and laid out again at its current address,
      * through the load's sweep and relayout pool. */
     /* `before_writes`, when set, runs once before the refill's first write into the spans. */
+    enum class RefillDestination { Device, Host };
     int refill_weights(const std::vector<PageSpan>& spans, const char* what = "restore",
-                       const std::function<int()>& before_writes = {});
+                       const std::function<int()>& before_writes = {},
+                       RefillDestination destination = RefillDestination::Device);
     /* dev_page_in (or the live form with `left`) and the refill of what it mapped back empty. */
     int page_back_in(int64_t* left);
     int configure_kv();
@@ -509,6 +575,10 @@ private:
      * once it is idle with nothing in flight and waits there until hold_req_ clears. */
     std::atomic<bool>             hold_req_{false};
     std::atomic<bool>             hold_ack_{false};
+    std::atomic<int>              hold_status_{RAD_OK};
+    std::atomic<int>              memory_fence_status_{RAD_OK};
+    std::atomic<bool>             producers_stopped_{true};
+    std::atomic<bool>             map_fence_pending_{false};
     /* hold_point's wait: woken when the hold clears (hold_release) or the engine stops
      * (wake_hold). */
     std::mutex                    hold_mu_;
@@ -517,7 +587,11 @@ private:
     void                          hold_release();
     void                          wake_hold();
     int                           unpark_with(std::string* why, int64_t* left);
-    void                          drain_streams();
+    int                           drain_streams();
+    int                           drain_tier_streams();
+    int                           report_tier_jobs(std::vector<TierJob>& jobs,
+                                                   const std::vector<char>& ok, uint64_t now);
+    int                           release_deferred_quietly();
     std::vector<int>              rank_devices() const;   /* each rank's card, in rank order */
     server::Server*               srv_ = nullptr;   /* run_server's, while it runs */
     std::atomic<int64_t>          background_jobs_{0};  /* server::Deps::background */
@@ -529,7 +603,9 @@ private:
     int64_t                       flex_want_ = 0;
     bool                          flex_preempt_ = false;
     bool                          flex_kv_ = true;          /* the cache's flex may go too */
-    int64_t                       flex_got_ = -1;
+    int64_t                       flex_got_ = 0;
+    bool                          flex_done_ = false;
+    int                           flex_status_ = RAD_OK;
     uint64_t                      flex_room_ns_ = 0;
     void                          flex_service();
     void                          flex_room_tick(uint64_t now_ns);
@@ -547,7 +623,9 @@ private:
     void                          xflex_tick(bool busy);
     int64_t                       xflex_give(int64_t bytes);
     int64_t                       xflex_settle();
+    int                           xflex_grow_to(int64_t bytes, ExpertMemoryOps& memory);
     /* run_quiet's handoff to the step loop (quiet_service). */
+    std::mutex quiet_call_mu_;  /* one caller owns the pending callback through completion */
     std::mutex                    quiet_mu_;
     std::condition_variable       quiet_cv_;
     std::atomic<bool>             quiet_pending_{false};
@@ -700,16 +778,23 @@ private:
     gen::ShapeDriver*                 shp_gen_ = nullptr;
     int  gen_loop();
     /* Zeroes the state slots the KV manager granted since the last step, on every rank's stream,
-     * before the step or pass that first reads them. */
+     * before the step or pass that first reads them: the loop clears for a step it releases
+     * itself, and issue_ahead for the step it releases ahead of its commit. */
     void clear_fresh_states();
+    /* Enqueues the recurrent half of a prefix hit (StepEntry::ckpt_restore) into the state slots
+     * the hit's admission took, on every rank's stream, before the pass that first reads them: the
+     * loop for a step it releases itself, issue_ahead for the step it releases ahead. */
+    int  restore_hits(const StepPlan& plan);
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
     int  issue_ahead(const RadBatch** out);
-    /* The arena level and the followers' pools, before any release that runs a forward pass. */
-    int  prepare_release(const RadBatch* b);
+    /* The arena level and the followers' pools, before any release that runs a forward pass.
+     * `ahead` says the batch is a step issued ahead of its commit: the stager then reads whether
+     * *that* step continues a prompt (the scheduler's next plan), not the committed one. */
+    int  prepare_release(const RadBatch* b, bool ahead = false);
     /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
      * prompt-lookup drafter reads the committed sequence). */
     bool pipelining_ = false;
@@ -788,6 +873,8 @@ private:
     std::chrono::steady_clock::time_point depth_note_t_{};
     int           depth_note_step_ = -2, depth_note_rows_ = 0;
     uint64_t      depth_note_n_ = 0;
+    uint64_t      depth_explore_n_ = 0;                  /* load-aware steps counted for DraftDepthCfg::force */
+    int           depth_explore_force(bool load, int n);
     void          depth_step_note(const RadBatch* b, const StepOut& so);
     void          depth_load_log(const char* when) const;
     /* RADIANCE_DEBUG_CONC_LOG=<file>, diagnostics of the load-aware rule: one line a decode step (rows,
@@ -891,6 +978,14 @@ private:
     /* The proposals a row of the query pass took (block_shape), for finish_block_drafter and
      * issue_ahead's expect_draft. */
     int  block_steps_ = 0;
+    /* --draft-depth adaptive over a block drafter's coupled walk: the prefix of the block each
+     * drafting row's next verify carries is chosen from the walk's laws (depth_of_), once the
+     * state copy behind the query pass has landed (depth_ev_[0]). */
+    bool depth_block_ = false;
+    bool block_depth_pending_ = false;
+    bool block_early_ = false;
+    int  block_depth_decide();
+    void couple_settle(const StepOut& so);
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */
@@ -920,7 +1015,7 @@ private:
      * level k serves (level 0 is the full plan); empty when the arena lends nothing. The floor is
      * the largest recent step: the loan grows past it only after no step that large has run for a
      * while, so a run of prefill chunks does not refill and recall the slab between chunks. */
-    int  arena_step(const RadBatch* b);
+    int  arena_step(const RadBatch* b, bool ahead);
     void arena_tick(uint64_t now_ns);
     int  arena_level(int64_t rows) const;
     std::vector<int64_t> arena_rows_;
@@ -940,6 +1035,9 @@ private:
      * checked against both. */
     int64_t  late_step_bytes_ = 0;
     int64_t  late_lazy_bytes_ = 0;
+    /* Brilliance: every other process's use of each rank's card when the budget read it (plan()),
+     * rank order; the settle check compares a later reading with it (mem/vram_others.h). */
+    std::vector<VramHolders> vram_others_read_;
     /* Linear-state snapshot store: pinned host memory, --checkpoint-slots slots, each holding every
      * rank's shard of one snapshot (KVManager::set_checkpoint_store). Off the card because no
      * kernel reads a snapshot; it is only copied back into a sequence's state. */

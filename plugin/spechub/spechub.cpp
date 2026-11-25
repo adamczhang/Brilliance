@@ -13,7 +13,7 @@ namespace {
 
 #define PI(k) { k, RAD_P_INT, RAD_REQUIRED, 0 }
 const RadParamSpec kProposeParams[] = {
-    PI("M"), PI("n_vocab"), PI("round"), PI("max_rounds"),
+    PI("M"), PI("n_vocab"), PI("round"), PI("max_rounds"), { "q_temp", RAD_P_F64, RAD_OPTIONAL, 0 },
 };
 const RadParamSpec kVerifyParams[] = { PI("M"), PI("n_cand"), PI("n_vocab") };
 const RadParamSpec kDflashParams[] = {
@@ -68,8 +68,8 @@ const RadOperandSpec kDflashOperands[] = {
 };
 
 const RadOpSchema kSchemas[] = {
-    { "mtp_couple_propose", kProposeParams, 4, kProposeOperands, 5,
-      "Linear MTP round `round`: x~Q, Q = FP64 T1 softmax of the final top8 scores; x into idx "
+    { "mtp_couple_propose", kProposeParams, 5, kProposeOperands, 5,
+      "Linear MTP round `round`: x~Q, Q = FP64 softmax of the final top8 scores / q_temp (default 1); x into idx "
       "column 0 and the state into state[round-1][row]. mode0 rows keep column 0 (status 0); bad "
       "ids/scores or seq_ids != draw.card keep it too (status -1)." },
     { "mtp_couple_verify", kVerifyParams, 3, kVerifyOperands, 5,
@@ -252,6 +252,8 @@ int rad_mtp_couple_propose_args(const RadArgs* a, RadMtpCoupleProposeCall* out) 
     c.M = M;
     c.vocab = v;
     c.round = (int)rad_param_geti(a->p, a->n_p, "round", 0);
+    c.q_temp = (float)rad_param_getf(a->p, a->n_p, "q_temp", 1.0);
+    if (!(c.q_temp > 0.0f) || c.q_temp != c.q_temp || c.q_temp > 1e6f) return RAD_E_INVAL;
     c.idx   = (int32_t*)a->t[0].data;
     c.val   = (const float*)a->t[1].data;
     c.card  = (const int32_t*)a->t[2].data;

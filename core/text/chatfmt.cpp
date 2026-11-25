@@ -117,6 +117,33 @@ int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
     return RAD_OK;
 }
 
+/* A message header is told from what follows it by the opener after it, so it may not be
+ * confused with either opener, and the two openers not with each other. A call is the header
+ * followed by anything else, so it is the call's opener. */
+int message_open_check(const ChatFormat& f, std::string* why) {
+    const std::string& m = f.message_open;
+    if (m.empty()) return RAD_OK;
+    if (trim_ws(m) != m) return refuse(why, "message_open may not begin or end with whitespace");
+    const std::string ro = trim_ws(f.reasoning_open), co = f.content_open;
+    if (ro.empty() && co.empty())
+        return refuse(why, "message_open needs reasoning_open or content_open to follow it");
+    for (const std::string* s : { &ro, &co })
+        if (!s->empty() && confusable(m, *s))
+            return refuse(why, "message_open " + show(m) + " and " + show(*s) + " cannot be told "
+                               "apart");
+    if (!ro.empty() && !co.empty() && confusable(ro, co))
+        return refuse(why, "reasoning_open " + show(ro) + " and content_open " + show(co) +
+                           " cannot be told apart after message_open");
+    if (f.has_tools() && (f.name_prefix != m || !f.call_open.empty() || !f.section_open.empty()))
+        return refuse(why, "with message_open, a call opens with it: name_prefix must be " +
+                           show(m) + ", and call_open and section_open empty");
+    /* The envelope is found where name_suffix ends, by the reader that also finds the header. */
+    if (f.has_tools() && f.args_envelope() && confusable(m, f.name_suffix))
+        return refuse(why, "message_open " + show(m) + " and name_suffix " + show(f.name_suffix) +
+                           " cannot be told apart");
+    return RAD_OK;
+}
+
 /* Does the template write an argument's value on lines of its own? Then one newline at each end
  * is the tags' (ChatFormat::value_newlines). A template that writes it flush against its tags
  * (`<arg_value>VALUE</arg_value>`) leaves those newlines to the value; reading them as the tags'
@@ -158,8 +185,14 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     /* A block that opens later in the reply is found by its opener, in content. */
     if (f.reasoning_anywhere && (!f.has_reasoning() || trim_ws(f.reasoning_open).empty()))
         return no("reasoning_anywhere needs a reasoning block with an opener");
+    {
+        const int st = message_open_check(f, why);
+        if (st < 0) return st;
+    }
 
     if (!f.has_tools()) {
+        if (!f.object_args_key.empty())
+            return no("object_args_key describes a call's arguments but name_prefix is empty");
         for (const std::string* s : { &f.section_open, &f.section_close, &f.call_separator,
                                       &f.call_open, &f.call_close, &f.name_suffix, &f.call_end,
                                       &f.arg_prefix, &f.arg_name_suffix, &f.arg_value_prefix,
@@ -236,7 +269,7 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         if ((uint32_t)f.other_value > (uint32_t)ChatValue::Json)
             return no("other_value is not a RAD_CHAT_VALUE_* value");
         if (!f.object_string_open.empty() || !f.object_string_close.empty() ||
-            f.object_bare_keys)
+            f.object_bare_keys || !f.object_args_key.empty())
             return no("the object_* fields describe an argument object, and args_form is "
                       "RAD_CHAT_ARGS_TAGGED");
         if (f.typed_tags()) {
@@ -262,6 +295,17 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
                           "RAD_CHAT_ARGS_OBJECT");
         if (!f.call_end.empty() && trim_ws(f.call_end).empty())
             return no("call_end is only whitespace");
+        if (!f.object_args_key.empty()) {
+            /* The envelope is read as JSON, before the arguments' own reader sees them. */
+            if (!f.object_string_open.empty() || f.object_bare_keys)
+                return no("object_args_key reads a JSON envelope, and the object is written in a "
+                          "dialect (object_string_open or object_bare_keys)");
+            if (f.object_args_key.find_first_of("\"\\") != std::string::npos)
+                return no("object_args_key " + show(f.object_args_key) + " holds a quote or a "
+                          "backslash");
+            if (f.name_suffix.empty())
+                return no("object_args_key needs a name_suffix: the envelope begins after it");
+        }
         const int st = object_check(f, why);
         if (st < 0) return st;
     }
@@ -358,6 +402,8 @@ int chat_format_from_abi(const RadChatFormat* in, ChatFormat* out, std::string* 
     f.reasoning_anywhere  = c.reasoning_anywhere != 0;
     f.arg_json_value_prefix = s(c.arg_json_value_prefix);
     f.content_open        = s(c.content_open);
+    f.object_args_key     = s(c.object_args_key);
+    f.message_open        = s(c.message_open);
     *out = std::move(f);
     return RAD_OK;
 }
@@ -474,6 +520,7 @@ std::string chat_format_describe(const ChatFormat& f) {
     else
         s += " no reasoning";
     if (!f.content_open.empty()) s += "; content " + show(f.content_open);
+    if (!f.message_open.empty()) s += "; messages open with " + show(f.message_open);
     if (f.has_tools() && !f.section_open.empty())
         s += "; section " + show(f.section_open) + ".." + show(f.section_close);
     if (f.has_tools() && f.object_args()) {
@@ -482,7 +529,10 @@ std::string chat_format_describe(const ChatFormat& f) {
         if (!f.object_string_open.empty())
             s += ", strings " + show(f.object_string_open) + ".." + show(f.object_string_close);
         if (f.object_bare_keys) s += ", bare keys";
-        s += "} " + show(f.call_end) + show(f.call_close);
+        s += "}";
+        if (f.args_envelope())
+            s += " in the envelope {\"name\":NAME,\"" + f.object_args_key + "\":OBJECT}";
+        s += " " + show(f.call_end) + show(f.call_close);
     } else if (f.has_tools()) {
         s += "; calls " + show(f.call_open) + show(f.name_prefix) + "NAME" + show(f.name_suffix) +
              " " + show(f.arg_prefix) + "ARG" + show(f.arg_name_suffix) + show(f.arg_value_prefix) +
@@ -510,7 +560,7 @@ std::vector<std::string> chat_format_markers(const ChatFormat& f) {
                                   &f.name_suffix, &f.call_end, &f.arg_prefix, &f.arg_name_suffix,
                                   &f.arg_value_prefix, &f.arg_json_value_prefix,
                                   &f.arg_value_suffix, &f.object_string_open,
-                                  &f.object_string_close }) {
+                                  &f.object_string_close, &f.message_open }) {
         const std::string t = trim_ws(*s);
         if (!t.empty() && std::find(out.begin(), out.end(), t) == out.end()) out.push_back(t);
     }
@@ -857,7 +907,11 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                     if (at != std::string::npos) gp = gp.substr(0, at);
                 }
                 std::vector<G> root{ gp.empty() ? eps() : lit(gp), space() };
-                if (f.has_reasoning() && req.extract_reasoning) root.push_back(reasoning_expr(f, breaks, closed_stops_at_breaks));
+                /* A reasoning block's message opens with the format's message header. */
+                ChatFormat rf = f;
+                if (!f.message_open.empty() && !f.reasoning_open.empty())
+                    rf.reasoning_open = f.message_open + f.reasoning_open;
+                if (f.has_reasoning() && req.extract_reasoning) root.push_back(reasoning_expr(rf, breaks, closed_stops_at_breaks));
                 root.push_back(space());
                 return root;
             };
@@ -889,10 +943,16 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                     /* The name, then the object; the object's own closing brace may be all
                      * that ends the call. */
                     G open = wrap(seq({ lit(f.name_prefix), wrap(lit(name)), lit(f.name_suffix) }));
+                    /* An envelope names the call again and holds the object under its key,
+                     * written compactly as the template writes it. */
+                    G args = rule_ref("obj-object");
+                    if (f.args_envelope())
+                        args = seq({ lit("{\"name\":" + Json(name).dump() + ",\"" +
+                                         f.object_args_key + "\":"),
+                                     rule_ref("obj-object"), lit("}") });
                     G func = f.call_end.empty()
-                                 ? seq({ open, rule_ref("obj-object") })
-                                 : seq({ open, rule_ref("obj-object"), space(),
-                                         wrap(lit(f.call_end)) });
+                                 ? seq({ open, args })
+                                 : seq({ open, args, space(), wrap(lit(f.call_end)) });
                     b.add_rule(rule_name("tool-" + name), render(func));
                     choices.push_back(rule_ref(rule_name("tool-" + name)));
                     continue;

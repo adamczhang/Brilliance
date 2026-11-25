@@ -227,6 +227,38 @@ TEST(a_concatenated_string_equals_its_text) {
     CHECK(p.prompt.find("eq eq 1 in") != std::string::npos);
 }
 
+/* Inkling 2's template writes a block per content part, and a picture has its own; the chat layer
+ * joins a message's parts around the media marker, so the marker lands inside a text block. The
+ * render cuts it out into a block of its own, the text on each side keeping one (llama.cpp's
+ * inkling_split_media). The template here is the release's shape, reduced to what the cut reads. */
+TEST(an_inkling_picture_gets_its_own_message_block) {
+    ChatTemplate t;
+    REQUIRE(t.load(
+        "{# <|message_user|> <|content_image|> #}{% for m in messages %}<|message_{{ m.role }}|><|content_text|>"
+        "{{ m.content }}<|end_message|>{% endfor %}",
+        "", "") >= 0);
+    auto render = [&](const json& content) {
+        ChatPrompt p;
+        json msgs = json::array({ { { "role", "user" }, { "content", content } } });
+        CHECK(t.apply(msgs, json(), ChatOptions(), &p) >= 0);
+        return p.prompt;
+    };
+    const json marker = { { "type", "media_marker" }, { "text", "<__media__>" } };
+    CHECK_EQ(render(json::array({ { { "type", "text" }, { "text", "Describe" } }, marker,
+                                  { { "type", "text" }, { "text", "briefly" } } })),
+             std::string("<|message_user|><|content_text|>Describe<|end_message|>"
+                         "<|message_user|><__media__><|end_message|>"
+                         "<|message_user|><|content_text|>briefly<|end_message|>"));
+    /* A picture alone, and two in a row: no empty text block. */
+    CHECK_EQ(render(json::array({ marker })),
+             std::string("<|message_user|><__media__><|end_message|>"));
+    CHECK_EQ(render(json::array({ marker, marker, { { "type", "text" }, { "text", "x" } } })),
+             std::string("<|message_user|><__media__><|end_message|><|message_user|><__media__>"
+                         "<|end_message|><|message_user|><|content_text|>x<|end_message|>"));
+    /* Text with no picture is untouched. */
+    CHECK_EQ(render("hi"), std::string("<|message_user|><|content_text|>hi<|end_message|>"));
+}
+
 /* Tool-call arguments sent as an object reach a template that only takes them as text as their
  * compact JSON, as when the request sent that text. */
 TEST(a_refused_request_cannot_grow_an_unbounded_dom_in_its_tool_call_arguments) {
@@ -529,8 +561,8 @@ TEST(every_shipped_template_renders_as_reference_jinja_does) {
                                 "reference render " + first_difference(ref, got));
         }
     }
-    /* Five templates, every case each one renders. */
-    CHECK(compared >= 74);
+    /* Six templates, every case each one renders. */
+    CHECK(compared >= 101);
 }
 
 /* ------------------------------------------------------------------ reading the reply back */
@@ -1617,6 +1649,74 @@ TEST(a_schema_nested_past_the_limit_is_refused_before_it_is_rendered) {
                      {"function", {{"name", "f"}, {"parameters", json::parse(deep)}}}});
     ChatPrompt q;
     CHECK_EQ(t.apply(msgs, tools, ChatOptions{}, &q), RAD_E_INVAL);
+}
+
+/* Inkling 2 Mini's template writes its tool list with `tools | tojson(sort_keys=true, ...)`, which
+ * the vendored engine threw "tojson sort_keys=true not implemented" on: the probe swallowed the
+ * throw, reported the model without tool support, and tools were off for it. */
+TEST(tojson_sorts_object_keys_when_sort_keys_is_true) {
+    auto render = [](const char* filter) {
+        ChatTemplate t;
+        CHECK_OK(t.load(
+            std::string("{% set data = {'name':'f','args':{'z':1,'a':[{'y':2,'b':3}]}} %}"
+                        "{{ data|tojson(") + filter + ") }}", "", ""));
+        json msgs = json::array();
+        msgs.push_back({{"role", "user"}, {"content", "hi"}});
+        ChatPrompt p;
+        ChatOptions opt;
+        opt.add_generation_prompt = false;
+        CHECK_OK(t.apply(msgs, json(), opt, &p));
+        return p.prompt;
+    };
+    CHECK_EQ(render("sort_keys=true, separators=(',',':')"),
+             std::string(R"({"args":{"a":[{"b":3,"y":2}],"z":1},"name":"f"})"));
+    CHECK_EQ(render("separators=(',',':')"),
+             std::string(R"({"name":"f","args":{"z":1,"a":[{"y":2,"b":3}]}})"));
+}
+
+TEST(a_template_that_sorts_its_tools_reports_tool_support) {
+    ChatTemplate inkling;
+    CHECK_OK(inkling.load(
+        "{%- if tools -%}<tools>{{- tools | tojson(sort_keys=true, separators=(\",\", \":\")) -}}</tools>{%- endif -%}"
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(inkling.caps().tools);
+    CHECK(inkling.caps().probe_error.empty());
+}
+
+/* Inkling 2 Mini's own tool declaration: the tool list it writes has each object's keys in order. */
+TEST(inklings_tool_declaration_renders_its_tools_with_sorted_keys) {
+    ChatTemplate inkling;
+    CHECK_OK(inkling.load(
+        "{%- if tools -%}"
+        "{%- set tool_state = namespace(specs=[]) -%}"
+        "{%- for tool in tools -%}"
+        "{%- set fn = tool.function if tool.function is defined else tool -%}"
+        "{%- set spec = {"
+        "\"description\": (fn.description if fn.description is defined and fn.description else \"\"),"
+        "\"name\": fn.name,"
+        "\"parameters\": (fn.parameters if fn.parameters is defined and fn.parameters else {}),"
+        "\"type\": (tool.type if tool.type is defined and tool.type else \"function\"),"
+        "} -%}"
+        "{%- set tool_state.specs = tool_state.specs + [spec] -%}"
+        "{%- endfor -%}"
+        "{{- \"<|message_system|>tool_declare<|content_xml|>\" -}}"
+        "{{- tool_state.specs | tojson(sort_keys=true, separators=(\",\", \":\")) -}}"
+        "{{- \"<|end_message|>\" -}}"
+        "{%- endif -%}"
+        "{%- for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(inkling.caps().tools);
+    CHECK(inkling.caps().probe_error.empty());
+    json tools = json::parse(R"([{"type":"function","function":{"name":"get_weather","description":"Weather",
+        "parameters":{"type":"object","required":["city"],"properties":{"unit":{"type":"string"},"city":{"type":"string"}}}}}])");
+    json msgs = json::array({ { { "role", "user" }, { "content", "hi" } } });
+    ChatPrompt p;
+    CHECK_OK(inkling.apply(msgs, tools, ChatOptions(), &p));
+    CHECK_EQ(p.prompt, std::string(
+        R"(<|message_system|>tool_declare<|content_xml|>[{"description":"Weather","name":"get_weather",)"
+        R"("parameters":{"properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"],"type":"object"},)"
+        R"("type":"function"}]<|end_message|><user>hi</user><assistant>)"));
 }
 
 RAD_TEST_MAIN()

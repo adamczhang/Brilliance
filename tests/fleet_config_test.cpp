@@ -86,6 +86,19 @@ TEST(server_and_memory_keys_reach_every_model) {
     CHECK_EQ(fc.host_mib, 4096);
     CHECK_EQ(fc.disk_tier, "/var/cache/r");
     CHECK(fc.card_headroom_mib.empty());
+    CHECK_EQ(fc.queue_reserve, 0);   /* unset: fleet.cpp's own default stands */
+}
+
+/* memory.queue-reserve: the hardware queues a card keeps ready, for a fleet whose entries claim
+ * whole cards (docs/MULTIMODEL.md §7.1). Its bound is the device's ceiling on queues a card holds
+ * ahead of its streams, so 24 is the last accepted number and 25 is refused by name. */
+TEST(queue_reserve_key) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("memory:\n  queue-reserve: 2\nmodels:\n  a:\n    model: /m/a.rad\n", &fc), RAD_OK);
+    CHECK_EQ(fc.queue_reserve, 2);
+    CHECK(refused("memory:\n  queue-reserve: 0\nmodels:\n  a:\n    model: /m/a.rad\n"));
+    CHECK(refused("memory:\n  queue-reserve: 25\nmodels:\n  a:\n    model: /m/a.rad\n"));
+    CHECK(refused("memory:\n  queue-reserve: eight\nmodels:\n  a:\n    model: /m/a.rad\n"));
 }
 
 /* memory.card-headroom-mib: one card's reserve by ordinal, the others keep gpu-headroom-mib. */
@@ -101,6 +114,21 @@ TEST(a_card_keeps_its_own_headroom) {
     CHECK(refused("memory:\n  card-headroom-mib: {gpu0: 4096}\nmodels:\n  a: {model: /m/a.rad}\n"));
     CHECK(refused("memory:\n  card-headroom-mib: {0: -1}\nmodels:\n  a: {model: /m/a.rad}\n"));
     CHECK(refused("models:\n  a: {model: /m/a.rad, card-headroom-mib: {0: 1}}\n"));
+}
+
+/* memory.pinned-numa-node: the node pinned host memory prefers, -1 (unset) for each card's own. */
+TEST(pinned_host_memory_can_name_its_node) {
+    fleet::FleetConfig fc;
+    CHECK_EQ(yload("memory:\n  host-mib: 4096\n  pinned-numa-node: 1\n"
+                   "models:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.pinned_numa_node, 1);
+    CHECK_EQ(yload("models:\n  a: {model: /m/a.rad}\n", &fc), RAD_OK);
+    CHECK_EQ(fc.pinned_numa_node, -1);
+    CHECK(refused("memory:\n  pinned-numa-node: -1\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  pinned-numa-node: 1024\nmodels:\n  a: {model: /m/a.rad}\n"));
+    CHECK(refused("memory:\n  pinned-numa-node: node0\nmodels:\n  a: {model: /m/a.rad}\n"));
+    /* The fleet's own key: a model entry that names it is the misplaced message, not a misspelling. */
+    CHECK(refused("models:\n  a: {model: /m/a.rad, pinned-numa-node: 0}\n"));
 }
 
 TEST(structured_values_are_spelled_for_their_flag) {

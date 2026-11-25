@@ -14,6 +14,8 @@ operator has replaced them).
 | Qwen3.8-27B | Apache 2.0 | `/terms/licenses/apache-2.0` |
 | Qwen3.8-Flash-Next | Qwen Community License 1.0, Qwen (commercial-use and attribution conditions) | `/terms/licenses/qwen-community-1.0` |
 | MiniCPM5-2B | Apache 2.0 | `/terms/licenses/apache-2.0` |
+| Inkling 2 Mini | Apache 2.0 | `/terms/licenses/apache-2.0`; Thinking Machines' Model Acceptable Use Policy: https://thinkingmachines.ai/model-acceptable-use-policy/ |
+| Hy4-flash | Tencent Hy License 1.0, Tencent (a separate licence for large MaaS businesses, Section 10) | `/terms/licenses/tencent-hy-1.0` |
 | Qwen3-ASR 1.7B (transcription) | Apache 2.0 | `/terms/licenses/apache-2.0` |
 | Nemotron 3.5 Rerank 8B (rerank) | OpenMDW 1.1 | `/terms/licenses/openmdw-1.1`; NVIDIA's notice: `/terms/licenses/nemotron-3.5-rerank-notice` |
 | Gemma 4 31B and 12B | Apache 2.0 | `/terms/licenses/apache-2.0`; Google's licence page for Gemma: https://ai.google.dev/gemma/docs/gemma_4_license |

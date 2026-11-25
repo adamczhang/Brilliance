@@ -8,7 +8,7 @@ The canonical weight is an affine `u6` code plane with a 64-entry `f32` table, `
 
 The container's six-bit codes are packed LSB-first. At load, `libr4d` arranges each row as the permuted low nibbles followed by two bit planes (the high magnitude bit and sign). Both arrangements occupy `6*K/8` code bytes per row. The kernel expands the two 16-entry halves of the magnitude table to E4M3, selects between them and merges sign before the existing FP8 WMMA. The loader checks the entire table, the fixed upper scale, transform and shape; same-width encodings with different semantics are refused.
 
-A trellis gate reads rotated INT8 activations; W6NL down reads a separately quantized rotated E4M3 gated intermediate, like W5NL. The architecture must select that producer and the W6 kernel for the down projection. The BF16 protected experts retain their separate path.
+A trellis gate reads rotated INT8 activations; W6NL down reads a separately quantized rotated E4M3 gated intermediate, like W5NL. The architecture must select that producer and the W6 kernel for the down projection. The BF16 protected experts retain their separate path. A layer that clamps its SwiGLU (`swiglu_limit`, Hy4-flash in every layer) is served too: `swiglu_clamped` writes the clamped bf16 product and `had_quant_act_fp8` quantises it into that rotated E4M3 pair (clamp, then quantise; one launch more than the fused unclamped form).
 
 ## Codebook pilot
 
@@ -27,3 +27,7 @@ A `rad-convert --plan-only` pass over the BF16 checkpoint declared 51,489 weight
 For a synthetic TP2-shaped down-projection latency comparison, run `r4d_selftest /path/to/libr4d.so --perfw6nl M [iters] [experts] [top_k]`. It compares W5NL and W6NL using the same routing and resident, synthetic weights, with automatic and pinned launch forms; byte-parity checks compare launch forms **within** each format, not W5 values to W6 values. Repeated synthetic kernel timing is not end-to-end model throughput.
 
 These tests are not an end-to-end model validation. No full W6 model has been converted or scored; mixed-model inference, model throughput, placement, and speculative parity require separate validation. The main calibration directory must be reassembled and verified before conversion, with the separate draft Gram directory supplied as `MTP_CALIB`.
+
+## Host (libavx)
+
+libavx serves `w6nl64a8h` in `moe_gemm_q` and `moe_gemm_q_mod4` with the same joined planes as libref (u6 codes + 64-entry f32 table, E4M3 scale per 64 times the fixed f32). The register decode (AVX2 and AVX-512) reads 6-bit codes in chunks (lane j at bit 6j, table in four AVX-512 / eight AVX2 registers, bit 5 selecting the half); scalar, AVX and any geometry whose K or scale group is not whole chunks take the generic table decode. rad-avx-check covers the form at the four codebook geometries; the AVX-512 path compiles but has not been executed (the development host has AVX2 only). At AVX2 a decode step is about 1.7x w5nl64's time.

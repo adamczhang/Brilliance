@@ -4,7 +4,9 @@
 #include <cmath>
 using namespace avx;
 
-AVX_KERNEL(dsa_query) {
+/* `i8`: dsa_query_i8 (RADIANCE_HY4_INDEXER=int8): the Hadamard kept in f32, symmetric int8 codes at
+ * an f32 scale max(amax, 1e-4) / 127 (libref's ref_dsa_query_i8). */
+static int query_impl(const RadArgs* a, bool i8) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const auto &x = a->t[0], &q = a->t[1], &s = a->t[2];
     const int64_t n = p_int(a, "n", 0);
@@ -12,7 +14,8 @@ AVX_KERNEL(dsa_query) {
         x.shape[0] < 1 || q.shape[0] != x.shape[0] || x.shape[1] != n || q.shape[1] != n ||
         s.shape[0] != x.shape[0] || s.shape[1] != 1)
         return RAD_E_SHAPE;
-    if (x.dtype != RAD_BF16 || q.dtype != RAD_F8E4M3 || s.dtype != RAD_F32) return RAD_E_DTYPE;
+    if (x.dtype != RAD_BF16 || q.dtype != (i8 ? RAD_I8 : RAD_F8E4M3) || s.dtype != RAD_F32)
+        return RAD_E_DTYPE;
     if (!x.data || !q.data || !s.data) return RAD_E_INVAL;
     AVX_PARALLEL_FOR_IF(x.shape[0] * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < x.shape[0]; ++r) {
@@ -28,8 +31,16 @@ AVX_KERNEL(dsa_query) {
         float am = 1e-4f;
         const float norm = 1.0f / std::sqrt((float)n);
         for (int64_t d = 0; d < n; ++d) {
-            v[d] = rad_bf16_to_f32(rad_f32_to_bf16(v[d] * norm));
+            v[d] = i8 ? v[d] * norm : rad_bf16_to_f32(rad_f32_to_bf16(v[d] * norm));
             am = std::max(am, std::fabs(v[d]));
+        }
+        if (i8) {
+            const float sc = am * (1.0f / 127.0f), inv = 1.0f / sc;
+            stt(&s, r * s.stride[0], sc);
+            for (int64_t d = 0; d < n; ++d)
+                stt(&q, r * q.stride[0] + d * q.stride[1],
+                    std::nearbyint(std::clamp(v[d] * inv, -127.0f, 127.0f)));
+            continue;
         }
         int exponent = 0;
         const float fraction = std::frexp(am * (1.0f / 448.0f), &exponent);
@@ -41,12 +52,16 @@ AVX_KERNEL(dsa_query) {
     return RAD_OK;
 }
 
+AVX_KERNEL(dsa_query) { return query_impl(a, false); }
+AVX_KERNEL(dsa_query_i8) { return query_impl(a, true); }
+
 AVX_KERNEL(dsa_score) {
     if (!a || !a->t || a->n_t < 9) return RAD_E_INVAL;
     RadTensor q = a->t[0], qs = a->t[1];
     const auto& g = a->t[2];
     RadTensor k = a->t[3], ks = a->t[4];
     const bool packed = k.dtype == RAD_U8;
+    const bool i8 = std::strcmp(p_str(a, "dtype", "fp8_e4m3"), "int8") == 0;
     if (packed) {
         if (ks.data || k.rank != 4 || k.shape[1] != 1 || k.shape[2] != 4 || k.shape[3] != 34 ||
             k.stride[3] != 1 || k.stride[2] != 34 || k.stride[0] < 136 || k.stride[0] % 4 ||
@@ -58,7 +73,7 @@ AVX_KERNEL(dsa_score) {
         ks.rank = 1;
         ks.shape[0] = k.shape[0];
         ks.stride[0] = k.stride[0] / 4;
-        k.dtype = RAD_F8E4M3;
+        k.dtype = i8 ? RAD_I8 : RAD_F8E4M3;
         k.rank = 2;
         k.shape[1] = 128;
         k.stride[1] = 1;
@@ -94,7 +109,8 @@ AVX_KERNEL(dsa_score) {
     if (cu_part && (part < 0 || cu_part->rank != 1 || cu_part->shape[0] != cu.shape[0]))
         return part < 0 ? RAD_E_INVAL : RAD_E_SHAPE;
     if (cu_part && cu_part->dtype != RAD_I32) return RAD_E_DTYPE;
-    if (q.dtype != RAD_F8E4M3 || k.dtype != RAD_F8E4M3 || qs.dtype != RAD_F32 ||
+    const auto qk = i8 ? RAD_I8 : RAD_F8E4M3;
+    if (q.dtype != qk || k.dtype != qk || qs.dtype != RAD_F32 ||
         ks.dtype != RAD_F32 || g.dtype != RAD_F32 || bt.dtype != RAD_I32 || cu.dtype != RAD_I32 ||
         nc.dtype != RAD_I32 || out.dtype != RAD_F32)
         return RAD_E_DTYPE;

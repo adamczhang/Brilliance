@@ -44,6 +44,7 @@
 #include "r4d_plugin.h"
 #include "r4d_emit.h"
 #include "r4d_gemm_args.h"
+#include "r4d_launch.h"
 #include "r4d_moe_sort.h"
 #include "r4d_moe_gather.h"
 
@@ -74,7 +75,11 @@ using r4d_moesort::scatter_small_kernel;
 using r4d_moegather::kGatherSlots;
 using r4d_moegather::kGatherSelfT;
 using r4d_moegather::gather_kernel;
+using r4d_moegather::gather_kernel16;
+using r4d_moegather::gather_kernel16_q8;
+using r4d_moegather::kGatherCols;
 using r4d_moegather::r4dchain_moe_gather;
+using r4d_moegather::r4dchain_moe_gather16;
 constexpr uint32_t kBlock = 128;          // the fp8 scale block, along K and along N
 /* Run-map entry that owns no expert: rows above `off[n_expert]` are dropped slots whose output must
  * be zeroed. Declared here because the GEMM reads it; the map is built further down. */
@@ -333,7 +338,7 @@ constexpr uint32_t kScatterTile = 256;
 __global__ __launch_bounds__(kScatterTile) void scatter_hist_kernel(
     const int32_t* __restrict__ ids, int32_t* __restrict__ bcnt, uint32_t T, uint32_t n_expert,
     int32_t base, Protect prot) {
-    extern __shared__ int32_t s_h[];
+    R4D_DYN_LDS(int32_t, s_h);
     const uint32_t tid = threadIdx.x, b = blockIdx.x;
     for (uint32_t e = tid; e < n_expert; e += blockDim.x) s_h[e] = 0;
     __syncthreads();
@@ -2255,13 +2260,14 @@ constexpr uint32_t kGatherWideSlots = 16;      /* top_k at most this: the slots 
 constexpr uint32_t kGatherWideCols  = 8;       /* columns a lane, one sixteen-byte load */
 static_assert(kGatherWideSlots <= kWave, "slot j is read off lane j");
 
-template <uint32_t NW>
-__global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
-    const uint16_t* __restrict__ ye, const uint16_t* __restrict__ ew,
+template <uint32_t NW, bool F32 = false, bool Q = false>
+__device__ __forceinline__ void gather_wide_body(
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
     uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
-    uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    uint32_t sh_ld, uint32_t sg_ld, int sig, uint8_t* __restrict__ q8 = nullptr,
+    float* __restrict__ s8 = nullptr, uint32_t q_ld = 0, uint32_t s_ld = 0, uint32_t g8 = 128) {
     const uint32_t lane = threadIdx.x % kWave;
     const uint32_t wave = (uint32_t)__builtin_amdgcn_readfirstlane((int)(threadIdx.x / kWave));
     const uint32_t t = blockIdx.x * NW + wave;
@@ -2275,13 +2281,20 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
      * any lane. */
     const uint32_t jl = lane < top_k ? lane : 0u;
     const int32_t  il = inv[(size_t)t * top_k + jl];
-    const int32_t  wl = (int32_t)ew[(size_t)t * ew_ld + jl];
+    int32_t wl;
+    if constexpr (F32) {
+        const float wf = ((const float*)ew)[(size_t)t * ew_ld + jl];
+        wl = __float_as_int(wf);
+    } else {
+        wl = (int32_t)((const uint16_t*)ew)[(size_t)t * ew_ld + jl];
+    }
     int32_t si[kGatherWideSlots];
     float   sw[kGatherWideSlots];
 #pragma unroll
     for (uint32_t j = 0; j < kGatherWideSlots; ++j) {
         si[j] = __builtin_amdgcn_readlane(il, (int)j);
-        sw[j] = bf16_to_f32((uint16_t)__builtin_amdgcn_readlane(wl, (int)j));
+        const int32_t wj_raw = __builtin_amdgcn_readlane(wl, (int)j);
+        sw[j] = F32 ? __int_as_float(wj_raw) : bf16_to_f32((uint16_t)wj_raw);
     }
     if (c >= n) return;
     /* No break or continue in these loops: an early exit keeps the slot loop rolled and `yv` goes
@@ -2314,8 +2327,13 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
             const uint32_t d[4] = { yv[j].x, yv[j].y, yv[j].z, yv[j].w };
 #pragma unroll
             for (uint32_t q = 0; q < 4; ++q) {
-                acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
-                acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                if constexpr (F32) {
+                    acc[2 * q]     = fmaf(wj, bf16_to_f32((uint16_t)(d[q] & 0xFFFFu)), acc[2 * q]);
+                    acc[2 * q + 1] = fmaf(wj, bf16_to_f32((uint16_t)(d[q] >> 16)), acc[2 * q + 1]);
+                } else {
+                    acc[2 * q]     += wj * bf16_to_f32((uint16_t)(d[q] & 0xFFFFu));
+                    acc[2 * q + 1] += wj * bf16_to_f32((uint16_t)(d[q] >> 16));
+                }
             }
         }
     }
@@ -2335,6 +2353,26 @@ __global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
         o[q] = (uint32_t)lo | ((uint32_t)hi << 16);
     }
     *(uint4*)(y + (size_t)t * y_ld + c) = make_uint4(o[0], o[1], o[2], o[3]);
+    /* The same sums, as the rotated int8 codes and scales lat_out's linear reads (K-19). Every lane
+     * of the wave is here -- n is a whole number of 256-column waves in this form -- so both
+     * 128-wide blocks the wave holds are complete. */
+    if constexpr (Q)
+        r4d_moegather::gather_quant(o, lane, c, g8, q8 + (size_t)t * q_ld + c, s8 + (size_t)t * s_ld);
+}
+
+/* `F32` reads f32 weights (Inkling 2's router) in place of bf16. `Q` adds the sum's rotated int8 codes and their scales (moe_gather_inv_i8g, K-19) to the same
+ * sums and store, so one kernel and one argument list serve both forms (moe_gather_body's wide
+ * branch); the codes' operands are unused and may be null without it. */
+template <uint32_t NW, bool F32 = false, bool Q = false>
+__global__ __launch_bounds__(NW * kWave) void gather_wide_kernel(
+    const uint16_t* __restrict__ ye, const void* __restrict__ ew,
+    const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
+    uint32_t M, uint32_t n, uint32_t top_k, uint32_t ye_ld, uint32_t ew_ld, uint32_t y_ld,
+    const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
+    uint32_t sh_ld, uint32_t sg_ld, int sig, uint8_t* __restrict__ q8, float* __restrict__ s8,
+    uint32_t q_ld, uint32_t s_ld, uint32_t g8) {
+    gather_wide_body<NW, F32, Q>(ye, ew, inv, y, M, n, top_k, ye_ld, ew_ld, y_ld, sh, sg, sh_ld, sg_ld,
+                            sig, q8, s8, q_ld, s_ld, g8);
 }
 
 /* ================================================================== scale_rows
@@ -2363,9 +2401,10 @@ __global__ __launch_bounds__(NTHR) void scale_rows_kernel(
 }  /* namespace */
 
 /* The gather's form, pinnable for tests: 0 the launcher's rule, 1 gather_kernel (a column per
- * thread), 2 gather_wide_kernel (a wave per token). The rule takes 2 past the self-scan bound where
- * the shape allows (r4d_rad_moe_gather); an impossible pin is refused. Both are bit-identical
- * (r4d_selftest). */
+ * thread), 2 gather_wide_kernel (a wave per token), 3 gather_kernel16 (sixteen slots, eight
+ * columns a lane). The rule takes 2 past the self-scan bound where the shape allows and 3 wherever
+ * top_k is 16 and the rows are sixteen-byte aligned (r4d_rad_moe_gather); an impossible pin is
+ * refused. All are bit-identical (r4d_selftest). */
 static int g_moe_gather_pin = 0;
 extern "C" void r4d_moe_gather_pin_form(int form) { g_moe_gather_pin = form; }
 
@@ -2546,6 +2585,19 @@ static int moe_scatter_body(const RadArgs* a, RadStream s, const RadTensor* inv)
     int32_t* ip = inv ? (int32_t*)inv->data : nullptr;
 
     if (T <= (long long)kScatterSmall) {
+        if (r4d_geti_or(a, "chain", 0) != 0) {
+            /* the chained form (r4d_chain.h), at the decode step's routed slots */
+            const int crc =
+                ip ? R4D_EMIT(s, (scatter_small_kernel<true, r4dchain>), dim3(1),
+                              dim3(kScatWaves * kWave), 0, idp, sp, op, cp, (uint32_t)T,
+                              (uint32_t)n_expert, (int32_t)base, prot, ip)
+                   : R4D_EMIT(s, (scatter_small_kernel<false, r4dchain>), dim3(1),
+                              dim3(kScatWaves * kWave), 0, idp, sp, op, cp, (uint32_t)T,
+                              (uint32_t)n_expert, (int32_t)base, prot, ip);
+            if (crc != RAD_OK) return crc;
+            R4D_MOE_CHK();
+            return RAD_OK;
+        }
         if (ip)
             hipLaunchKernelGGL(scatter_small_kernel<true>, dim3(1), dim3(kScatWaves * kWave), 0,
                                (hipStream_t)s, idp, sp, op, cp, (uint32_t)T, (uint32_t)n_expert,
@@ -3389,13 +3441,22 @@ extern "C" int64_t r4d_rad_moe_gather_scratch(const RadArgs* a) {
 }
 
 /* moe_gather, or with `given` moe_gather_inv, whose third operand is the inverse moe_scatter_inv
- * wrote: no prepass and no self-scan, and the same kernel at the same T, so the same sums. */
-static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
+ * wrote: no prepass and no self-scan, and the same kernel at the same T, so the same sums.
+ *
+ * With `quant` (moe_gather_inv_i8g, K-19) the same launch also writes the sum's rotated int8 codes
+ * and their per-group scales -- the third and fourth operands, lat_out's input -- from the values it
+ * has already summed, so the layer spends one launch less and the codes are the ones the standalone
+ * quantiser read back from `y` (gather_quant, r4d_moe_gather.h). */
+static int moe_gather_body(const RadArgs* a, RadStream s, bool given, bool quant = false) {
     const RadTensor* ye     = r4d_opt(a, 0);
     const RadTensor* ew     = r4d_opt(a, 1);
     const RadTensor* sorted = r4d_opt(a, 2);
-    const RadTensor* sh     = r4d_opt(a, 3);
-    const RadTensor* sg     = r4d_opt(a, 4);
+    const RadTensor* sh     = quant ? nullptr : r4d_opt(a, 3);
+    const RadTensor* sg     = quant ? nullptr : r4d_opt(a, 4);
+    /* The quantising form's operands sit where the shared arm's would: no shared expert in it (the
+     * plane and its gate are the plain form's), and the codes' pair in their place. */
+    const RadTensor* q8     = quant ? r4d_opt(a, 3) : nullptr;
+    const RadTensor* s8     = quant ? r4d_opt(a, 4) : nullptr;
     const RadTensor* Y      = r4d_opt(a, 5);
     if (!ye || !ew || !sorted || !Y) return R4D_NO(RAD_E_INVAL);
     if (!ye->data || !ew->data || !sorted->data || !Y->data) return R4D_NO(RAD_E_INVAL);
@@ -3454,34 +3515,104 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
         else if (act && std::strcmp(act, "none"))  return R4D_NO(RAD_E_UNSUPPORTED);
     }
 
+    /* The quantising form's operands and shape rules. The rotation is 128 wide, so the codes' scale
+     * groups are 128 columns, or 256 for an IQ8R trunk; a wave holds 256 columns (two rotation
+     * blocks) and every lane has to be in the block a 128-wide amax covers, so n is a whole number
+     * of waves, and the four-code stores are four-byte aligned. */
+    long long q_ld = 0, s_ld = 0, g8 = 0;
+    if (quant) {
+        if (!given || !q8 || !s8 || !q8->data || !s8->data) return R4D_NO(RAD_E_INVAL);
+        if (q8->dtype != RAD_I8 || s8->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+        g8 = r4d_geti_or(a, "group", 0);
+        if (g8 != 128 && g8 != 256) return R4D_NO(RAD_E_UNSUPPORTED);
+        if (n % 256 != 0 || n % g8 != 0 || top_k != 16) return R4D_NO(RAD_E_UNSUPPORTED);
+        long long Mq = 0, Ms = 0;
+        q_ld = r4d_rows_pitch(q8, n, &Mq);
+        s_ld = r4d_rows_pitch(s8, n / g8, &Ms);
+        if (q_ld < 0 || s_ld < 0) return R4D_NO(RAD_E_STRIDE);
+        if (Mq < M || Ms < M || r4d_numel(q8) < M * n || r4d_numel(s8) < M * (n / g8))
+            return R4D_NO(RAD_E_SHAPE);
+        if (q_ld % 8 != 0 || ((uintptr_t)q8->data % 4) != 0 || ((uintptr_t)s8->data % 4) != 0)
+            return R4D_NO(RAD_E_STRIDE);
+    }
+
     /* The prefill form (gather_wide_kernel, a wave per token, sixteen bytes per lane) past the
      * self-scan bound, where top_k fits kGatherWideSlots and every row is 16-byte aligned. Same
      * sums as gather_kernel, which serves everything else. */
     auto al16 = [](const void* p, long long ld) {
         return ((uintptr_t)p % 16) == 0 && ld % (long long)kGatherWideCols == 0;
     };
-    const bool wide_ok = ew->dtype == RAD_BF16 && !small && top_k <= (long long)kGatherWideSlots &&
+    /* Brilliance: f32 weights (Inkling 2) on the plain wide form only; the quantising form
+     * (moe_gather_inv_i8g, Hy4-flash) keeps the fork's bf16-only rule, which r4d_emu_moefuse checks. */
+    const bool wide_ok = (ew->dtype == RAD_BF16 || (ew->dtype == RAD_F32 && !quant)) && !small &&
+                         top_k <= (long long)kGatherWideSlots &&
                          n % (long long)kGatherWideCols == 0 && al16(ye->data, ye_ld) &&
                          al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
+    /* The sixteen-slot form (gather_kernel16, eight columns a lane, one sixteen-byte load a slot):
+     * top_k = 16 with the rows sixteen-byte aligned. At any T, so it serves the decode shapes and
+     * the passes that keep the prepass. */
+    const bool sixteen = top_k == 16 && n % (long long)kGatherCols == 0 && al16(ye->data, ye_ld) &&
+                         al16(Y->data, y_ld) && (!sh || al16(sh->data, sh_ld));
     const int gpin = g_moe_gather_pin;
-    if (gpin < 0 || gpin > 2) return R4D_NO(RAD_E_INVAL);
-    if (gpin >= 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
-    if ((gpin == 0 && wide_ok) || gpin >= 2) {
+    if (gpin < 0 || gpin > 3) return R4D_NO(RAD_E_INVAL);
+    if (gpin == 2 && !wide_ok) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (gpin == 3 && !sixteen) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (quant && gpin == 1) return R4D_NO(RAD_E_UNSUPPORTED);
+    if ((gpin == 0 && wide_ok) || gpin == 2) {
         constexpr uint32_t NW = 8;
         const unsigned gw = (unsigned)((n + kWave * kGatherWideCols - 1) / (kWave * kGatherWideCols));
-        hipLaunchKernelGGL((gather_wide_kernel<NW>), dim3((unsigned)((M + NW - 1) / NW), gw),
-                           dim3(NW * kWave), 0, (hipStream_t)s,
-                           (const uint16_t*)ye->data, (const uint16_t*)ew->data, inv,
-                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,
-                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,
-                           sh ? (const uint16_t*)sh->data : nullptr,
-                           sh ? (const uint16_t*)sg->data : nullptr,
-                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig);
+        const dim3 grid((unsigned)((M + NW - 1) / NW), gw), blk(NW * kWave);
+        /* No shared expert in the quantising form, so its plane and gate are absent there and the
+         * codes take their place (moe_gather_inv_i8g has no scalar). The weights are bf16, or f32
+         * (Inkling 2's router) without the codes. */
+        uint8_t* const qp = quant ? (uint8_t*)q8->data : nullptr;
+        float*   const sp = quant ? (float*)s8->data : nullptr;
+#define R4D_MGW(...)                                                                             \
+        hipLaunchKernelGGL((__VA_ARGS__), grid, blk, 0, (hipStream_t)s,                          \
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,                \
+                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,        \
+                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                     \
+                           sh ? (const uint16_t*)sh->data : nullptr,                             \
+                           sh ? (const uint16_t*)sg->data : nullptr,                             \
+                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig, qp, sp,                        \
+                           (uint32_t)q_ld, (uint32_t)s_ld, (uint32_t)g8)
+        const bool f32w = ew->dtype == RAD_F32;
+        if (f32w)       R4D_MGW(gather_wide_kernel<NW, true, false>);   /* never quant (wide_ok) */
+        else if (quant) R4D_MGW(gather_wide_kernel<NW, false, true>);
+        else            R4D_MGW(gather_wide_kernel<NW, false, false>);
+#undef R4D_MGW
         R4D_MOE_CHK();
         return RAD_OK;
     }
 
-    const unsigned gy = (unsigned)((n + 255) / 256);
+    /* The eight-column form's grid, one group of eight columns a lane. */
+    const bool form16 = sixteen && gpin != 1;
+    /* The quantising form has no scalar and no chained kernel: it is the two 256-column-wave forms
+     * above, and their codes need the whole wave live (a chained call brackets the body). */
+    if (quant) {
+        if (!form16) return R4D_NO(RAD_E_UNSUPPORTED);
+        const unsigned gy = (unsigned)((n + 256 * kGatherCols - 1) / (256 * kGatherCols));
+        const dim3 grid((unsigned)M, gy), blk(256);
+#define R4D_MGQ(...)                                                                             \
+        hipLaunchKernelGGL((__VA_ARGS__), grid, blk, 0, (hipStream_t)s,                          \
+                           (const uint16_t*)ye->data, (const void*)ew->data, inv,                \
+                           (uint16_t*)Y->data, (uint32_t)M, (uint32_t)n, (uint32_t)top_k,        \
+                           (uint32_t)ye_ld, (uint32_t)ew_ld, (uint32_t)y_ld,                     \
+                           (const int32_t*)nullptr, (uint32_t)T,                                 \
+                           sh ? (const uint16_t*)sh->data : nullptr,                             \
+                           sh ? (const uint16_t*)sg->data : nullptr,                             \
+                           (uint32_t)sh_ld, (uint32_t)sg_ld, sig,                                \
+                           (uint8_t*)q8->data, (float*)s8->data, (uint32_t)q_ld,                 \
+                           (uint32_t)s_ld, (uint32_t)g8)
+        if (ew->dtype == RAD_F32) R4D_MGQ(gather_kernel16_q8<256, true>);
+        else                      R4D_MGQ(gather_kernel16_q8<256>);
+#undef R4D_MGQ
+        R4D_MOE_CHK();
+        return RAD_OK;
+    }
+    const unsigned gy = form16
+        ? (unsigned)((n + 256 * kGatherCols - 1) / (256 * kGatherCols))
+        : (unsigned)((n + 255) / 256);
     /* The chained form where the row resolved with `chain` and this launch is the op's only one
      * (no prepass before it: a decode step). */
     const bool chain = r4d_geti_or(a, "chain", 0) != 0 && (self || given) && M <= 64;
@@ -3495,11 +3626,21 @@ static int moe_gather_body(const RadArgs* a, RadStream s, bool given) {
                        sh ? (const uint16_t*)sg->data : nullptr,                                 \
                        (uint32_t)sh_ld, (uint32_t)sg_ld, sig)
     if (ew->dtype == RAD_F32) {
-        if (chain) R4D_MG(r4dchain_moe_gather<256, true>);
-        else       R4D_MG(gather_kernel<256, true>);
+        if (chain) {
+            if (form16) R4D_MG(r4dchain_moe_gather16<256, true>);
+            else        R4D_MG(r4dchain_moe_gather<256, true>);
+        } else {
+            if (form16) R4D_MG(gather_kernel16<256, true>);
+            else        R4D_MG(gather_kernel<256, true>);
+        }
     } else {
-        if (chain) R4D_MG(r4dchain_moe_gather<256>);
-        else       R4D_MG(gather_kernel<256>);
+        if (chain) {
+            if (form16) R4D_MG(r4dchain_moe_gather16<256>);
+            else        R4D_MG(r4dchain_moe_gather<256>);
+        } else {
+            if (form16) R4D_MG(gather_kernel16<256>);
+            else        R4D_MG(gather_kernel<256>);
+        }
     }
 #undef R4D_MG
     R4D_MOE_CHK();
@@ -3512,6 +3653,11 @@ extern "C" int r4d_rad_moe_gather(const RadArgs* a, RadStream s) {
 
 extern "C" int r4d_rad_moe_gather_inv(const RadArgs* a, RadStream s) {
     return moe_gather_body(a, s, true);
+}
+
+/* moe_gather_inv, and the sum's rotated int8 codes and scales in the same launch (K-19). */
+extern "C" int r4d_rad_moe_gather_inv_i8g(const RadArgs* a, RadStream s) {
+    return moe_gather_body(a, s, true, true);
 }
 
 extern "C" int r4d_rad_scale_rows(const RadArgs* a, RadStream s) {
@@ -3663,7 +3809,10 @@ __global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_kernel(
     /* The GEMM's partial tiles, then (last block only, after two barriers) the sort's LDS; the
      * shim sizes it for the larger. */
     if (CH::on) r4d_chain_wait();
-    extern __shared__ __align__(16) unsigned char rg_smem[];
+    /* R4D_DYN_LDS is `extern __shared__` in a build and the emulator's own storage where that one
+     * drives this source (r4d_launch.h); the uint4 element keeps the 16-byte alignment. */
+    R4D_DYN_LDS(uint4, rg_smem16);
+    unsigned char* const rg_smem = (unsigned char*)rg_smem16;
     float* const red = (float*)rg_smem;
     const uint32_t tid = threadIdx.x, wave = tid / kWave, lane = tid % kWave;
 

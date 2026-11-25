@@ -145,14 +145,25 @@ std::vector<Case> build_cases() {
         if (!std::strcmp(dt, "bf16"))
             add("dsa_query", { HI("M", 7), HI("n", 128), HS("dtype", "bf16") });
         if (!std::strcmp(dt, "bf16"))
-            add("gemm_nt_f32", { HI("M", 4), HI("N", 32), HI("K", 129), HS("dtype", "bf16") });
+            add("dsa_query_i8", { HI("M", 7), HI("n", 128), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            for (int packed : { 0, 1 })
+                add("gemm_nt_f32", { HI("M", 4), HI("N", 32), HI("K", 129), HS("dtype", "bf16"),
+                                     HI("weight_bf16", packed) });
         if (!std::strcmp(dt, "bf16"))
             for (const char* mode : { "absorb", "expand" })
                 add("mla_project", { HI("M", 3), HI("heads", 2), HI("head_dim", 17),
                                      HI("latent_dim", 31), HS("mode", mode), HS("dtype", "bf16") });
-        if (!std::strcmp(dt, "bf16"))
+        if (!std::strcmp(dt, "bf16")) {
             add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 32), HI("blocks", 17),
                                HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                               HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                               HI("seqs", 2), HS("dtype", "int8") });
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 32), HI("blocks", 17),
+                               HI("seqs", 2), HS("dtype", "int8") });
+        }
         for (int norm : { 0, 1 })
             add("router_sigmoid_topk",
                 { HI("M", 5), HI("n_expert", 288), HI("top_k", 8), HI("norm", norm),
@@ -175,6 +186,88 @@ std::vector<Case> build_cases() {
                                 HS("dtype", dt) });
         add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
                           HI("block_size", 4), HF("scale", 0.125), HS("dtype", dt) });
+        /* Hy4-flash (docs/OPS.md): odd widths so the vector bodies and their tails both run. */
+        add("ihc_pre", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("rows", 8), HF("eps", 1e-5),
+                         HF("hc_eps", 1e-6), HF("post_mag", 2.0), HS("dtype", dt) });
+        add("ihc_pre", { HI("M", 5), HI("n", 65), HI("hc", 2), HI("rows", 2), HF("eps", 1e-5),
+                         HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("ihc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("rows", 8),
+                                      HF("eps", 1e-6), HF("ihc_eps", 1e-5), HF("hc_eps", 1e-6),
+                                      HF("post_mag", 2.0), HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 2), HI("n", 65), HI("hc", 2), HI("rows", 2),
+                                      HF("eps", 1e-6), HF("ihc_eps", 1e-5), HF("hc_eps", 1e-6),
+                                      HS("dtype", dt) });
+        add("rmsnorm_ihc_junction", { HI("M", 3), HI("n", 64), HI("hc", 4), HI("rows", 8),
+                                      HF("eps", 1e-6), HI("tail", 0), HS("dtype", dt) });
+        add("gate_mul", { HI("M", 5), HI("n", 133), HS("dtype", dt) });
+        add("mla_kv_split", { HI("M", 5), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
+                              HI("rope_dim", 8), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 5), HI("N", 9), HI("heads", 3), HI("head_dim", 37),
+                              HI("window", 0), HF("scale", 0.1644), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 9), HI("N", 9), HI("heads", 2), HI("head_dim", 64),
+                              HI("window", 4), HF("scale", 0.125), HS("dtype", dt) });
+        add("attn_kv_sink", { HI("M", 1), HI("N", 70), HI("heads", 2), HI("head_dim", 32),
+                              HI("window", 0), HF("scale", 0.125), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 5), HI("heads", 3), HI("latent_dim", 64),
+                                     HI("rope_dim", 16), HI("block_size", 4), HI("window", 0),
+                                     HF("scale", 0.0721687836), HI("ctx", 23), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 5), HI("heads", 3), HI("latent_dim", 37),
+                                     HI("rope_dim", 8), HI("block_size", 16), HI("window", 9),
+                                     HF("scale", 0.0721687836), HI("ctx", 40), HS("dtype", dt) });
+        add("mla_attn_paged_sink", { HI("M", 1), HI("heads", 2), HI("latent_dim", 32),
+                                     HI("rope_dim", 8), HI("block_size", 4), HI("window", 512),
+                                     HF("scale", 0.125), HI("ctx", 50), HS("dtype", dt) });
+        add("mla_attn_sel_sink", { HI("M", 3), HI("heads", 2), HI("latent_dim", 40),
+                                   HI("rope_dim", 8), HI("blocks", 7), HI("block_size", 4),
+                                   HF("scale", 0.125), HS("dtype", dt) });
+        add("idx_pool_gated", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                HS("dtype", dt) });
+        add("idx_pool_gated", { HI("M", 3), HI("n", 36), HI("ratio", 4), HI("rotary_dim", 12),
+                                HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_pool_gated_fp8", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                    HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                    HS("dtype", dt) });
+        add("idx_pool_gated_fp8", { HI("M", 3), HI("n", 32), HI("ratio", 4), HI("rotary_dim", 12),
+                                    HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                    HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_pool_gated_i8", { HI("M", 3), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                                   HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                                   HS("dtype", dt) });
+        add("idx_pool_gated_i8", { HI("M", 3), HI("n", 32), HI("ratio", 4), HI("rotary_dim", 12),
+                                   HF("eps", 1e-5), HF("theta", 1e4), HS("mode", "imrope_gptj"),
+                                   HS("sections", "2 2 2"), HS("dtype", dt) });
+        add("idx_score", { HI("M", 5), HI("n", 128), HI("heads", 16), HI("blocks", 70),
+                           HI("seqs", 2), HS("dtype", dt) });
+        add("idx_score", { HI("M", 4), HI("n", 36), HI("heads", 3), HI("blocks", 9),
+                           HI("seqs", 3), HS("dtype", dt) });
+        add("engram_norm", { HI("M", 5), HI("heads", 10), HI("n", 9), HF("eps", 0.0078125),
+                             HS("dtype", dt) });
+        add("engram_norm", { HI("M", 3), HI("heads", 4), HI("n", 96), HF("eps", 1.19e-7),
+                             HS("dtype", dt) });
+        add("engram_gate", { HI("M", 5), HI("n", 129), HI("hc", 2), HF("eps", 0.0078125),
+                             HS("dtype", dt) });
+        add("engram_gate", { HI("M", 4), HI("n", 96), HI("hc", 4), HF("eps", 1.19e-7),
+                             HS("dtype", dt) });
+        if (!std::strcmp(dt, "bf16"))
+            for (const char* mode : { "absorb", "expand" }) {
+                add("mla_project_kv", { HI("M", 3), HI("heads", 3), HI("k_dim", 17), HI("v_dim", 23),
+                                        HI("latent_dim", 61), HS("mode", mode), HS("dtype", "bf16") });
+                add("mla_project_kv", { HI("M", 2), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                        HI("latent_dim", 512), HS("mode", mode), HS("dtype", "bf16") });
+            }
+        if (!std::strcmp(dt, "bf16"))
+            add("mla_expand_gate", { HI("M", 3), HI("heads", 2), HI("k_dim", 192), HI("v_dim", 256),
+                                     HI("latent_dim", 512), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            add("mla_expand_gate_had_quant_i8g", { HI("M", 3), HI("heads", 2), HI("k_dim", 192),
+                                                   HI("v_dim", 256), HI("latent_dim", 512),
+                                                   HI("group", 128), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            add("swiglu_clamped_had_quant_i8g", { HI("M", 5), HI("n", 256), HF("limit", 4.0),
+                                                  HI("group", 128), HS("dtype", "bf16") });
         for (const char* mode : { "prefill", "verify" })
             add("kda_update", { HI("M", 3), HI("heads", 2), HI("head_k", 32), HI("head_v", 32),
                                 HF("lower_bound", -5), HF("scale", 0.1767766952966369),
@@ -208,19 +301,47 @@ std::vector<Case> build_cases() {
         add("ple_conv",  { HI("M", 9), HI("n", 128), HI("width", 4), HI("dilation", 2),
                            HS("dtype", dt) });
         add("causal_conv1d", { HI("M", 9), HI("n", 128), HI("width", 3), HS("dtype", dt) });
+        /* Inkling 2's QK clip: per-head norms of 16 over 8 heads, with positions. */
+        add("l2_clip", { HI("M", 9), HI("n", 128), HI("group", 16), HF("threshold", 1.5),
+                          HS("dtype", dt), HF("floor", 2.0), HF("alpha", 0.3) });
+        add("l2_clip", { HI("M", 9), HI("n", 128), HI("group", 128), HF("threshold", 0.5),
+                          HS("dtype", dt) });
+        /* Inkling 2's short convolution: the dynamic form at 8 heads (head width 16 here), and the
+         * plain form at the stream's own width. */
+        add("sconv_res", { HI("M", 9), HI("n", 128), HI("width", 4), HI("heads", 8),
+                           HS("dtype", dt) });
+        add("sconv_res", { HI("M", 9), HI("n", 128), HI("width", 4), HI("heads", 0),
+                           HS("dtype", dt) });
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
+    add("engram_ids", { HI("M", 9), HI("heads", 6), HI("ngram", 3), HI("pad", 2),
+                        HI("map_size", 300), HI("image", 5), HI("video", 7) });
+    add("engram_ids", { HI("M", 5), HI("heads", 9), HI("ngram", 4), HI("pad", 0),
+                        HI("map_size", 40) });
+    add("dfly_sel", { HI("M", 12), HI("blocks_in", 4), HI("blocks", 6), HI("ratio", 4), HI("seqs", 2) });
+    add("dfly_sel", { HI("M", 7), HI("blocks_in", 9), HI("blocks", 11), HI("ratio", 2), HI("seqs", 3) });
+    add("dfly_sel", { HI("M", 1), HI("blocks_in", 1), HI("blocks", 3), HI("ratio", 4), HI("seqs", 1) });
 
     for (const char* order : { "token", "sorted" })
         add("moe_gemm_q",
             { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
               HI("group", 128), HS("a_order", order), HS("dtype", "mxfp4a8") });
+    /* NVFP4 experts: e2m1 codes, an E4M3 scale per 16 of K and a level, against an int8
+     * activation at one scale per 64 of K (the scale grid is libref's logical description). */
+    for (const char* order : { "token", "sorted" })
+        add("moe_gemm_q",
+            { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
+              HI("group", 64), HS("a_order", order), HS("dtype", "nvfp4a8i8") });
+    add("moe_gemm_q",
+        { HI("M", 9), HI("N", 128), HI("K", 256), HI("N_odd", 64), HI("n_expert", 8),
+          HI("top_k", 2), HI("group", 64), HS("a_order", "token"), HS("dtype", "nvfp4a8i8") });
     /* One scale per column over the rows: no group. */
     add("quant_cols_fp8", { HI("M", 5), HI("n", 256), HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
     add("quant_cols_fp8", { HI("M", 7), HI("n", 96), HS("dtype", "f32") }, EB(7, 96, 4, 1.25));
 
     /* IQ8R's activation: one scale per 256 columns, each 128-wide half rotated on its own. */
     add("had_quant_act_i8g", { HI("M", 5), HI("n", 512), HI("group", 256), HS("dtype", "bf16") });
+    add("had_quant_act_fp8", { HI("M", 5), HI("n", 384), HI("group", 128), HS("dtype", "bf16") });
 
     /* The packed four-bit weight read back: two's complement at a group of 64, a zero point at
      * 128, one fragment tile of rows each. */
@@ -247,7 +368,11 @@ std::vector<Case> build_cases() {
                                     HS("dtype", "bf16") });
         add("dequant",            { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16") });
-        add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),
+        /* The unrotated sibling, grouped at 128 and at a width of two groups, plain and SiTU. */
+    add("gated_quant_i8", { HI("M", 3), HI("n", 256), HI("group", 128), HS("dtype", "f32") });
+    add("gated_quant_i8", { HI("M", 4), HI("n", 192), HI("group", 64), HS("dtype", "f32"),
+                            HS("act", "situ"), HF("gate_cap", 4.0), HF("up_cap", 25.0) });
+    add("gated_had_quant_i8", { HI("M", 5), HI("n", 256), HI("group", group),
                                     HS("dtype", "bf16"), HS("act", "silu"), HI("mode", 0) });
         add("rmsnorm_had_quant_i8", { HI("M", 5), HI("n", 256), HF("eps", 1e-6),
                                       HI("group", group), HS("dtype", "bf16"), HF("wadd", 0) });
@@ -414,6 +539,24 @@ std::vector<Case> build_cases() {
                                          HI("window", window), HS("q_dtype", dt),
                                          HS("kv_dtype", dt), HF("scale", 0.125),
                                          HI("max_ctx", 128), HI("n_head", 8), HI("max_seqs", 2) });
+    /* attn_paged_rel (Inkling 2): a decode row, a verify block and a prefill panel over GQA 3 and
+     * 1, window 0 and 16, causal and a two-sided window. The extent of 40 is below the contexts of
+     * 128, so keys past it take no bias. */
+    for (const char* dt : { "f32", "bf16" })
+        for (int qlen : { 1, 4, 40 })
+            for (int gqa : { 1, 3 })
+                for (int window : { 0, 16 }) {
+                    add("attn_paged_rel", { HI("q_len", qlen), HI("head_dim", 64), HI("gqa", gqa),
+                                            HI("block_size", 16), HI("causal", 1),
+                                            HI("window", window), HS("q_dtype", dt),
+                                            HS("kv_dtype", dt), HF("scale", 0.125),
+                                            HI("max_ctx", 128), HI("n_head", 2 * gqa),
+                                            HI("max_seqs", 2), HI("d_rel", 4), HI("extent", 40) });
+                }
+    add("attn_paged_rel", { HI("q_len", 8), HI("head_dim", 64), HI("gqa", 3), HI("block_size", 16),
+                            HI("causal", 0), HI("window", 16), HS("q_dtype", "f32"),
+                            HS("kv_dtype", "f32"), HF("scale", 0.125), HI("max_ctx", 128),
+                            HI("n_head", 6), HI("max_seqs", 2), HI("d_rel", 4), HI("extent", 40) });
     for (const char* dt : { "f32", "bf16" })
         for (int causal : { 0, 1 })
             add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 2),
@@ -542,6 +685,12 @@ std::vector<Case> build_cases() {
                             HS("dtype", dt), HF("yarn_factor", 2), HF("yarn_low", 14),
                             HF("yarn_high", 22), HF("yarn_magnitude", 1.069314718) });
     }
+    /* Hy4-flash's M-RoPE: imrope's components on GPT-J pairs, a rope-only slice of 64 (the
+     * latent key and each head's rope part), sections 12 10 10; with [3, M] positions drawn. */
+    for (const char* dt : { "f32", "bf16" })
+        add("rope", { HI("M", 12), HI("head_dim", 64), HI("n_head", 4), HI("n_head_kv", 0),
+                      HF("theta", 1e7), HF("scale", 1), HS("mode", "imrope_gptj"),
+                      HS("sections", "12 10 10"), HS("dtype", dt) });
     for (double magnitude : {2.0, (double)NAN}) {
         add("rope", { HI("M", 12), HI("head_dim", 128), HI("n_head", 4), HI("n_head_kv", 2),
                       HF("theta", 1e7), HF("scale", 1), HS("mode", "neox"),
@@ -595,6 +744,15 @@ std::vector<Case> build_cases() {
                         HI("seqs", 1), HI("signed", 1) });
     add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
                         HI("seqs", 3), HI("signed", 1) });
+    /* `own`: the query's own block never competes and is always last (Hy4-flash's indexer). */
+    add("qsa_select", { HI("M", 4), HI("blocks", 300), HI("topk", 32), HI("ratio", 4),
+                        HI("seqs", 1), HI("signed", 1), HI("own", 1) });
+    add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
+                        HI("seqs", 3), HI("own", 1) });
+    add("qsa_select", { HI("M", 3), HI("blocks", 300), HI("topk", 511), HI("ratio", 4),
+                        HI("seqs", 1), HI("signed", 1), HI("own", 1) });
+    add("qsa_select", { HI("M", 2), HI("blocks", 1), HI("topk", 1), HI("ratio", 3),
+                        HI("seqs", 1), HI("own", 1) });
     add("qsa_tail_store", { HI("M", 3), HI("n", 37), HI("ratio", 2), HI("ring", 2), HI("seqs", 3),
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
@@ -671,6 +829,49 @@ std::vector<Case> build_cases() {
         add("grid_embed_cpe", { HI("M", 40), HI("n", 72), HI("side", 4), HS("dtype", dt) });
         add("grid_embed_cpe", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 3),
                                 HS("dtype", dt) });
+        add("grid_embed_hw", { HI("M", 20), HI("n", 72), HI("side", 16), HS("dtype", dt) });
+        add("grid_embed_hw", { HI("M", 24), HI("n", 72), HI("side", 8), HI("n_prefix", 1),
+                               HS("dtype", dt) });
+        /* The table resample as its own table: the identity grid, a grid that shrinks the table
+         * and one that grows it past it. */
+        add("posemb_resample", { HI("S_h", 8), HI("S_w", 8), HI("T_h", 8), HI("T_w", 8),
+                                 HI("n", 72), HS("dtype", dt) });
+        add("posemb_resample", { HI("S_h", 6), HI("S_w", 6), HI("T_h", 3), HI("T_w", 11),
+                                 HI("n", 72), HS("dtype", dt) });
+        add("posemb_resample", { HI("S_h", 4), HI("S_w", 6), HI("T_h", 13), HI("T_w", 9),
+                                 HI("n", 72), HS("dtype", dt) });
+        /* Hy4-flash's offset; the drawn grids reach the table's own side, the identity axis. */
+        add("grid_embed_sf", { HI("M", 20), HI("n", 72), HI("side", 16), HF("offset", 0.1),
+                               HS("dtype", dt) });
+        add("grid_embed_sf", { HI("M", 40), HI("n", 72), HI("side", 4), HF("offset", 0.1),
+                               HS("dtype", dt) });
+    }
+
+    /* SiTU at the model's caps, uncapped on one side, and at a width past the vector body. */
+    for (const char* dt : { "f32", "bf16" }) {
+        add("situ_mul", { HI("M", 6), HI("n", 645), HS("dtype", dt), HF("gate_cap", 4.0),
+                          HF("up_cap", 25.0) });
+        add("situ_mul", { HI("M", 5), HI("n", 96), HS("dtype", dt), HF("gate_cap", 0.0),
+                          HF("up_cap", 25.0) });
+        add("situ_mul", { HI("M", 3), HI("n", 33), HS("dtype", dt), HF("gate_cap", 4.0),
+                          HF("up_cap", 0.0) });
+    }
+
+    /* The rotated gated op with act "situ" at the caps; libavx's SiTU runs scalar, so the rotation
+     * and the quantiser see the same values the reference does. */
+    add("gated_had_quant_i8", { HI("M", 3), HI("n", 64), HI("group", 32), HS("dtype", "f32"),
+                                HS("act", "situ"), HF("gate_cap", 4.0), HF("up_cap", 25.0) });
+
+    /* Block attention residuals at the model's depths (0 to 8 states) and query counts. */
+    for (const char* dt : { "f32", "bf16" }) {
+        for (long long ns : { 0, 1, 8 }) {
+            add("attn_res_mix", { HI("M", 37), HI("n", 96), HI("n_state", ns), HI("n_query", 3),
+                                  HS("dtype", dt), HF("eps", 1e-6) });
+        }
+        add("attn_res_mix", { HI("M", 5), HI("n", 64), HI("n_state", 2), HI("n_query", 1),
+                              HS("dtype", dt), HF("eps", 1e-6) });
+        add("attn_res_mix", { HI("M", 9), HI("n", 48), HI("n_state", 3), HI("n_query", 4),
+                              HS("dtype", dt), HF("eps", 1e-6) });
     }
 
     /* LiLiCorr's lattice ops, at its geometry (7 positions of 8 candidates, 8 heads) narrowed in
@@ -822,6 +1023,12 @@ std::vector<Case> build_cases() {
         add(op, { HI("M", 2), HI("steps", 3), HI("rank", 37), HI("n_vocab", 97),
                   HI("anchor_stride", 2), HS("dtype", "bf16") });
     }
+    /* Inkling 2's recurrent walk: a ragged last tile, an anchor stride of the block, the cap on
+     * and off. */
+    add("markov_rnn_greedy", { HI("M", 3), HI("steps", 4), HI("rank", 32), HI("n_vocab", 300),
+                               HI("anchor_stride", 5), HF("cap", 30.0), HS("dtype", "bf16") });
+    add("markov_rnn_greedy", { HI("M", 2), HI("steps", 3), HI("rank", 64), HI("n_vocab", 97),
+                               HI("anchor_stride", 1), HS("dtype", "bf16") });
     /* The same lattices grown into trees: more nodes than steps, and fewer. */
     add("dflash_tree", { HI("M", 3), HI("steps", 4), HI("top_k", 8), HI("rank", 64),
                          HI("n_vocab", 300), HI("anchor_stride", 1), HI("nodes", 6),
@@ -1479,6 +1686,52 @@ std::vector<Case> build_cases() {
                   (double)M * blocks * 8, 0);
     speed("qsa_select", { HI("M", 2048), HI("blocks", 16384), HI("topk", 512), HI("ratio", 4),
                           HI("seqs", 1) }, 2048.0 * 16384 * 8, 0);
+    /* Hy4-flash at its own widths (hidden 3072, hc 4, 32 heads a rank of 64 over 512 + 64 latent
+     * columns, the indexer's 16 heads of 128, Engram's 16 heads of 96): a decode row and a prefill
+     * chunk. */
+    for (int M : { 1, 512 }) {
+        speed("ihc_pre", { HI("M", M), HI("n", 3072), HI("hc", 4), HI("rows", 8), HF("eps", 1e-5),
+                           HF("hc_eps", 1e-6), HF("post_mag", 2.0), HS("dtype", "bf16") },
+              (double)M * 12288 * 2 + 8.0 * 12288 * 4, 2.0 * M * 9 * 12288);
+        speed("ihc_post", { HI("M", M), HI("n", 3072), HI("hc", 4), HS("dtype", "bf16") },
+              (double)M * 3072 * 5 * 2 * 2, 0);
+        speed("gate_mul", { HI("M", M), HI("n", 4096), HS("dtype", "bf16") },
+              (double)M * 4096 * 2 * 3, 0);
+        speed("engram_norm", { HI("M", M), HI("heads", 16), HI("n", 96), HF("eps", 0.0078125),
+                               HS("dtype", "bf16") }, (double)M * 1536 * 2 * 2, 0);
+        speed("engram_gate", { HI("M", M), HI("n", 3072), HI("hc", 4), HF("eps", 0.0078125),
+                               HS("dtype", "bf16") }, (double)M * 12288 * 2 * 3, 0);
+        speed("engram_ids", { HI("M", M), HI("heads", 16), HI("ngram", 3), HI("pad", 120002),
+                              HI("map_size", 120818) }, 0, 0);
+    }
+    for (int M : { 1, 16 }) {
+        speed("mla_project_kv", { HI("M", M), HI("heads", 32), HI("k_dim", 192), HI("v_dim", 256),
+                                  HI("latent_dim", 512), HS("mode", "absorb"), HS("dtype", "bf16") },
+              0, 2.0 * M * 32 * 192 * 512);
+        speed("mla_project_kv", { HI("M", M), HI("heads", 32), HI("k_dim", 192), HI("v_dim", 256),
+                                  HI("latent_dim", 512), HS("mode", "expand"), HS("dtype", "bf16") },
+              0, 2.0 * M * 32 * 256 * 512);
+    }
+    speed("mla_attn_paged_sink", { HI("M", 1), HI("heads", 32), HI("latent_dim", 512),
+                                   HI("rope_dim", 64), HI("block_size", 16), HI("window", 0),
+                                   HF("scale", 0.0625), HI("ctx", 2048), HS("dtype", "bf16") },
+          2048.0 * 576 * 2, 2.0 * 32 * 2048 * 1088);
+    speed("mla_attn_paged_sink", { HI("M", 1), HI("heads", 64), HI("latent_dim", 512),
+                                   HI("rope_dim", 64), HI("block_size", 16), HI("window", 512),
+                                   HF("scale", 0.0625), HI("ctx", 512), HS("dtype", "bf16") },
+          512.0 * 576 * 2, 2.0 * 64 * 512 * 1088);
+    speed("attn_kv_sink", { HI("M", 64), HI("N", 576), HI("heads", 8), HI("head_dim", 256),
+                            HI("window", 512), HF("scale", 0.0625), HS("dtype", "bf16") },
+          0, 2.0 * 64 * 8 * 256 * 2 * 544);
+    speed("idx_pool_gated", { HI("M", 256), HI("n", 128), HI("ratio", 4), HI("rotary_dim", 64),
+                              HF("eps", 1e-5), HF("theta", 1e7), HS("mode", "gptj"),
+                              HS("dtype", "bf16") }, 0, 256.0 * 131072 * 2);
+    for (const int64_t blocks : { 2048, 16384 })
+        for (const int64_t M : { 1, 4 })
+            speed("idx_score", { HI("M", M), HI("n", 128), HI("heads", 16), HI("blocks", blocks),
+                                 HI("seqs", 1), HS("dtype", "bf16") },
+                  (double)blocks * 128 * 2 + (double)M * blocks * 4,
+                  2.0 * M * blocks * 16 * 128);
     /* The residency map at a decode step: an 8K-block id space over a 2048-slot ring, one query row
      * and a four-row verify, 512 blocks a row. All-resident, so this times the selection passes,
      * the claim compaction, the rewrite and the bookkeeping, not the copies. */

@@ -154,12 +154,12 @@ static bool drain_until_closed(int fd) {
     }
 }
 
-/* Brilliance: a listener owns its port. On Windows, httplib's default SO_REUSEADDR let a second
- * server bind a host:port another was listening on, with no error, while requests still went to
- * the first. Now the second start is refused at once and the log names the address. And a restart
- * on the same port still binds at once after the last listener closed a connection itself (its
- * side of that connection sits in TIME_WAIT). Off Windows, httplib's default option is kept, so
- * only the restart is checked there. */
+/* Brilliance: a listener owns its port. httplib's default option let a second server bind a
+ * host:port another was listening on, with no error: SO_REUSEADDR on Windows, SO_REUSEPORT on
+ * Linux (a second process of the same user; the kernel then splits connections between them). Now
+ * the second start is refused at once and the log names the address. And a restart on the same
+ * port still binds at once after the last listener closed a connection itself (its side of that
+ * connection sits in TIME_WAIT). Both halves run on every platform; this port runs the Windows build. */
 TEST(a_taken_port_is_refused_and_a_restart_on_it_binds_at_once) {
     const Log saved = log_level();
     log_set_level(Log::Error);
@@ -168,7 +168,6 @@ TEST(a_taken_port_is_refused_and_a_restart_on_it_binds_at_once) {
         LiveServer first(/*n_threads=*/2, /*max_seqs=*/1);
         port = first.srv->port();
         REQUIRE(port > 0);
-#if defined(_WIN32)
         {
             FakeScheduler sched;
             FakeTokenizer tok;
@@ -188,7 +187,6 @@ TEST(a_taken_port_is_refused_and_a_restart_on_it_binds_at_once) {
             CHECK(has(log, "server: cannot bind 127.0.0.1:" + std::to_string(port) +
                                ": the port is already in use"));
         }
-#endif
         /* The first still answers on its port, and closes the connection itself. */
         const int fd = first.open("GET /health HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
         REQUIRE(fd >= 0);

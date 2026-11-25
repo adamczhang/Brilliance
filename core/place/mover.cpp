@@ -2235,23 +2235,108 @@ void Mover::queue_move_copy(void* dst, const void* src, int64_t bytes, int rec) 
  * kernels: at 64 swaps a step, Qwen3.8-Flash-Next on one card spends about 10 ms of a 36 ms step
  * in them. Without a DMA queue of this process's own, rad_memcpy_list_async falls back to copy
  * kernels. The list yields to the link's collectives, like the prefill stager's. */
-int Mover::flush_moves() {
-    if (move_segs_.empty()) return RAD_OK;
-    int rc = rad_memcpy_list_async(move_segs_.data(), (int)move_segs_.size(), RAD_COPY_YIELD,
-                                   mover_);
-    for (int32_t rec : move_recs_) {
-        const int er = rad_event_record(moves_[(size_t)rec].ev, mover_);
-        if (rc >= 0) rc = er;
+int Mover::flush_moves(bool with_held) {
+    int rc = RAD_OK;
+    if (!move_segs_.empty()) {
+        /* Pacing holds this step's promotion copies (pace_collect); the rest goes out now. */
+        size_t keep = 0;
+        if (pace_collect_) {
+            for (size_t i = 0; i < move_segs_.size(); ++i) {
+                Move& m = moves_[(size_t)move_recs_[i]];
+                if (m.kind != Move::Kind::Promote) {
+                    move_segs_[keep] = move_segs_[i];
+                    move_recs_[keep] = move_recs_[i];
+                    ++keep;
+                    continue;
+                }
+                m.held = true;
+                held_.push_back(Held{ move_segs_[i], move_recs_[i] });
+            }
+            move_segs_.resize(keep);
+            move_recs_.resize(keep);
+        }
+        if (!move_segs_.empty()) {
+            rc = rad_memcpy_list_async(move_segs_.data(), (int)move_segs_.size(), RAD_COPY_YIELD,
+                                       mover_);
+            for (int32_t rec : move_recs_) {
+                const int er = rad_event_record(moves_[(size_t)rec].ev, mover_);
+                if (rc >= 0) rc = er;
+            }
+        }
+        move_segs_.clear();
+        move_recs_.clear();
     }
-    move_segs_.clear();
-    move_recs_.clear();
+    /* While collecting, what is held stays held: it is this step's, for the next pass. */
+    if (with_held && !pace_collect_ && pace_held() > 0) {
+        stats_.paced_late += (uint64_t)pace_held();
+        const int hr = send_held(pace_held());
+        if (rc >= 0) rc = hr;
+    }
     return rc;
 }
 
-int Mover::retire(HeatEngine* heat) {
-    RAD_TRY(flush_moves());
+/* The next `n` held copies as one list on the mover's stream, behind whatever the stream already
+ * waits for, each move's event recorded after it. */
+int Mover::send_held(size_t n) {
+    n = std::min(n, pace_held());
+    if (n == 0) return RAD_OK;
+    pace_segs_.clear();
+    for (size_t i = 0; i < n; ++i) pace_segs_.push_back(held_[held_next_ + i].seg);
+    int rc = rad_memcpy_list_async(pace_segs_.data(), (int)pace_segs_.size(), RAD_COPY_YIELD,
+                                   mover_);
+    for (size_t i = 0; i < n; ++i) {
+        Move& m = moves_[(size_t)held_[held_next_ + i].rec];
+        const int er = rad_event_record(m.ev, mover_);
+        if (rc >= 0) rc = er;
+        m.held = false;
+    }
+    held_next_ += n;
+    if (held_next_ == held_.size()) { held_.clear(); held_next_ = 0; }
+    return rc;
+}
+
+void Mover::pace_begin(int marks_hint) {
+    pace_collect_ = false;
+    if (pace_marks_ > 0) pace_marks_last_ = pace_marks_;
+    const int marks = pace_marks_last_ > 0 ? pace_marks_last_ : std::max(1, marks_hint);
+    pace_marks_ = 0;
+    const int64_t held = (int64_t)pace_held();
+    if (cfg_.pace_units > 0) pace_quota_ = cfg_.pace_units;
+    else pace_quota_ = (int)((held + marks - 1) / marks);
+}
+
+int Mover::pace_mark(RadStream cs) {
+    if (!pacing()) return RAD_OK;
+    ++pace_marks_;
+    if (pace_held() == 0 || pace_quota_ <= 0 || !mover_) return RAD_OK;
+    /* The share goes out behind the next dispatch on the compute stream (a ride: no packet of its
+     * own), i.e. once this layer's routed GEMMs are done. Refused while another ride waits on the
+     * stream; the share then waits only for the mover's own stream. */
+    void* ride = nullptr;
+    if (cs && rad_ride(cs, &ride) == RAD_OK && ride) RAD_TRY(rad_ride_wait(mover_, ride));
+    const size_t n = std::min((size_t)pace_quota_, pace_held());
+    stats_.paced_units += (uint64_t)n;
+    ++stats_.paced_marks;
+    return send_held(n);
+}
+
+int Mover::pace_flush() {
+    if (pace_held() == 0) return RAD_OK;
+    stats_.paced_late += (uint64_t)pace_held();
+    return send_held(pace_held());
+}
+
+int Mover::publish_landed(HeatEngine* heat) {
+    const uint64_t before = stats_.promotions;
+    RAD_TRY(retire(heat, false));
+    stats_.early_published += stats_.promotions - before;
+    return RAD_OK;
+}
+
+int Mover::retire(HeatEngine* heat, bool with_held) {
+    RAD_TRY(flush_moves(with_held));
     for (Move& m : moves_) {
-        if (m.state != Move::State::Copying) continue;
+        if (m.state != Move::State::Copying || m.held) continue;
         const int q = rad_event_query(m.ev);
         if (q < 0) return RAD_E_DEVICE;
         if (q == 0) continue;
@@ -2383,7 +2468,7 @@ int Mover::retire(HeatEngine* heat) {
 
 std::string Mover::report() const {
     const double gib = 1.0 / 1073741824.0;
-    std::string s = fmt("mover: %llu dispatches, %llu promotions, %llu demotions, %llu staged "
+    std::string s = fmt("mover: %llu dispatches, %llu promotions, %llu demotions, %llu prefetches "
                         "(%.2f GiB h2d, %.2f GiB d2h)\n",
                         (unsigned long long)stats_.dispatches,
                         (unsigned long long)stats_.promotions,
@@ -2395,6 +2480,18 @@ std::string Mover::report() const {
              "slot; %llu slots quarantined\n",
              (unsigned long long)stats_.no_record, (unsigned long long)stats_.starved_slab,
              (unsigned long long)stats_.starved_pool, (unsigned long long)stats_.quarantined);
+    /* The prefill stager (stage_units): the routed layers' pooled units copied into a pass's
+     * buffers. Not `prefetched`, which counts the units heat moved into a slab slot: a long-context
+     * prefill stages terabytes through here and prefetches nothing, so the promotion line's
+     * "staged" read 0 beside /stats's staged bytes (M-16). `overflow` is the units no buffer had
+     * room for, read in place: a heavy pooled layer outgrowing the staging ring (M-04). */
+    if (stats_.stage_layers || stats_.stage_overflow)
+        s += fmt("  stager: %llu routed layers, %llu units staged (%.2f GiB) in %llu copies, %llu "
+                 "units no buffer had room for (read in place)\n",
+                 (unsigned long long)stats_.stage_layers,
+                 (unsigned long long)stats_.staged_units, (double)stats_.staged_bytes * gib,
+                 (unsigned long long)stats_.stage_copies,
+                 (unsigned long long)stats_.stage_overflow);
     if (stats_.donated)
         s += fmt("  %llu host copies given by lent units to budgeted victims, %llu such units moved "
                  "by a recall, %llu left past one with no free slot\n",

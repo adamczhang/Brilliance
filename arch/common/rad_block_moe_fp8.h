@@ -201,6 +201,9 @@ struct MoeFP8 {
         /* With `swiglu_limit`: the clamped product and its quantiser as one launch
          * (GateQuantFP8::fuse_clamped), for the routed and the shared arm. */
         int     swiglu_quant = 0;
+        /* With `swiglu_limit`: the same for the rotated int8 codes of an int8 / IQR down projection
+         * (GateQuantFP8::fuse_clamped_i8, swiglu_clamped_had_quant_i8g), the routed arm only. */
+        int     swiglu_quant_i8 = 0;
         /* A shared arm without its sigmoid gate: the gate plane is filled with 1. */
         int     shared_ungated = 0;
         /* At TP1 the caller may fill the ungated arm's ones plane once for the whole step,
@@ -220,6 +223,12 @@ struct MoeFP8 {
          * this block's Geom is the experts'). 0 means n_embd. With it the router reads
          * Wire::route. The sigmoid router only. */
         int64_t router_k = 0;
+        /* Read the router's projection weight as it is stored, bf16, rather than widened to f32 at
+         * load (GlmRouter::Config::weight_bf16; the projection widens it exactly in the kernel, so
+         * the logits are the f32 path's). It takes effect only when the weight's stored encoding
+         * is bf16, or unknown (a builder with no model behind it); a checkpoint that stores the
+         * router in f32 keeps the f32 weight and kernel path. The sigmoid router only. */
+        bool router_weight_bf16 = false;
         /* The caller reduces the block's delta across ranks, because it applies more linear work
          * to it first (Nemotron-H's latent up-projection); no all-reduce is declared. */
         int     no_reduce = 0;
@@ -339,6 +348,11 @@ struct MoeFP8 {
         ActFP8  sff{};         /* [max_tok, n_ff_shared] */
         rad_buf sout    = 0;   /* [max_tok, n_embd]           bf16 */
         rad_buf sgate   = 0;   /* [max_tok, 1]                bf16 */
+        /* The routed sum's rotated int8 codes and scales, and their scale group (0: off). With them
+         * the gather writes the sum's codes in the launch that sums it (moe_gather_inv_i8g, K-19)
+         * and the linear reading the sum declares no quantiser of its own (`q8`, `s8` and `g8` are
+         * what it reads; `x` is `h`'s). */
+        ActFP8  sum{};
     };
 
     /* Checkpoint names. `experts` is a prefix ("....mlp.experts") from which per-expert names are
@@ -407,8 +421,9 @@ struct MoeFP8 {
     LinearFP8    sh_gate_up{}, sh_down{};
     rad_op op_router = 0, op_topk = 0, op_scatter = 0;
     /* `op_scatter` is moe_scatter_inv and `op_gather` moe_gather_inv: the sort writes `w.inv` and
-     * the gather reads it (Wire::inv). */
-    bool   scatter_inv = false, gather_inv = false;
+     * the gather reads it (Wire::inv). `gather_q8`: `op_gather` is moe_gather_inv_i8g, which also
+     * writes the sum's rotated int8 codes into `w.sum` (K-19). */
+    bool   scatter_inv = false, gather_inv = false, gather_q8 = false;
     /* `router_topk_scatter`, if it resolves: topk and scatter in one launch. The pair is declared
      * either way, since the fused form is bounded by the sort's single workgroup and a prefill
      * chunk exceeds it. */
@@ -956,6 +971,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         rc.experts = c.n_expert_all;
         rc.top_k = c.top_k;
         rc.rows = c.rows;
+        rc.weight_bf16 = c.router_weight_bf16;
         rc.norm = c.norm_topk;
         rc.route_scale = c.route_scale;
         rc.score = c.router_score;
@@ -1161,20 +1177,17 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const bool down_supported = down_codebook_fp8 ? (w.eff.q && w.eff.s && kServed[fmt[1]])
                                                 : kServed8[fmt[1]] != nullptr;
         /* A clamped layer: GateQuantFP8 clamps into the bf16 plane, then quantises it into the
-         * rotated codes. A codebook (W5NL, W6NL) down projection reads rotated E4M3, which no
-         * clamp writes, so it is served unclamped only. */
-        const bool clamp_codebook = down_codebook_fp8 && c.swiglu_limit > 0;
-        if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib ||
-            clamp_codebook) {
+         * rotated codes the down projection reads: the rotated int8 pair, or for a codebook
+         * (W5NL, W6NL) down projection behind a trellis gate_up the rotated E4M3 pair
+         * (had_quant_act_fp8), as an E4M3 routed arm does. */
+        if (!pair || !c.expert_rot || !kServed8[fmt[0]] || !down_supported || c.calib) {
             fprintf(stderr, "radiance: layer %d: int8 activations meet rotated experts (int8, "
                             "four-bit, or the codebook at E4M3 scales a 64 or 32 of K) through "
                             "rotated codes at one scale a 128 of K, outside calibration; these "
-                            "are %s / %s%s%s\n", l,
+                            "are %s / %s%s\n", l,
                     kServed[fmt[0]] ? kServed[fmt[0]] : kServed8[fmt[0]],
                     kServed[fmt[1]] ? kServed[fmt[1]] : kServed8[fmt[1]],
-                    pair ? "" : ", and the gated product's int8 pair is not that",
-                    clamp_codebook ? ", and a W5NL or W6NL down projection is served unclamped only"
-                                   : "");
+                    pair ? "" : ", and the gated product's int8 pair is not that");
             return RAD_E_UNSUPPORTED;
         }
     }
@@ -1365,7 +1378,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         gin_q = w.hr.cq();
         gin_s = w.hr.cs();
         gin_g = w.hr.cg();
-        if (!hr_in)
+        if (!hr_in && g.chain_q8)   /* the chained row (Geom::chain_q8) */
+            op_hq = rw(b, RAD_OP(b, a8 ? "had_quant_act_i8g" : "had_quant_act_fp8",
+                          RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                     RAD_INT("group", gin_g), RAD_STR("dtype", g.dtype),
+                                     RAD_INT("chained", 1)),
+                          RAD_NOWEIGHTS),
+                      {w.h.x}, {gin_q, gin_s});
+        else if (!hr_in)
             op_hq = rw(b, RAD_OP(b, a8 ? "had_quant_act_i8g" : "had_quant_act_fp8",
                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
                                      RAD_INT("group", gin_g), RAD_STR("dtype", g.dtype)),
@@ -1417,6 +1437,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
+    gq_exp.fuse_clamped_i8 = c.swiglu_quant_i8 != 0 && !c.calib;
     /* Gate_up and down are separate GEMMs. A trellis gate uses int8 input while a codebook (W5NL,
      * W6NL) down reads rotated E4M3: select the latter pair only for the gated intermediate. */
     ActFP8 down_eff = w.eff;
@@ -1464,7 +1485,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         /* This rank's range within one plain expert, in model numbering; `phi` 0 is the even split,
          * which the loader divides itself. */
         int64_t plo = 0, phi = 0;
-        if (split) {
+        /* A plugin that slices every expert evenly (hyv4flash: `n_ff_exp` is the rank's share of
+         * `n_ff_all`, no `ff_hi`) has `split` false, yet the file stores each bf16 expert whole:
+         * the loader cuts the rank's share, so the weight is declared sharded at the share's
+         * extents like the quantised experts', not as an unsharded slice. */
+        const bool even_slice = !split && !ep && g.world > 1 && g.n_ff_all > c.n_ff_exp;
+        if (split || even_slice) {
             /* The expert's whole width: `n_ff_all` (the max of `ff_hi` is the whole width only at
              * two ranks). A plain expert has no scale blocks, so the unit is the GEMM's 64-wide
              * output tile. */
@@ -1623,6 +1649,25 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     const bool separate_fp32_combine = shared && c.shared_fp32_combine &&
                                        (g.world > 1 || !c.shared_ungated);
     gfold = shared && !separate_fp32_combine;
+    /* K-19: the gather wave also writes the sum's rotated int8 codes when the linear that reads the
+     * sum takes them (`w.sum.q8`, which ActFP8 leaves 0 until a model declares it). Only the
+     * slot-table form has it, only without the shared arm, and only where the gather writes the sum
+     * itself -- with a separate f32 combine the plane it writes is `w.moe`, an arm's partial, not
+     * the latent `h.x` the codes would have to describe. */
+    if (w.sum.q8 && w.sum.s8 && scatter_inv && !gfold && !separate_fp32_combine) {
+        rad_buf grd[3] = { w.edn, w.ew, w.inv };
+        rad_buf gwr[3] = { w.sum.q8, w.sum.s8, w.h.x };
+        op_gather = RAD_OP(b, "moe_gather_inv_i8g",
+                           RAD_PARAMS(RAD_RANGE("M", 1, c.rows), RAD_INT("n", g.n_embd),
+                                      RAD_INT("top_k", c.top_k), RAD_STR("dtype", g.dtype),
+                                      RAD_INT("group", w.sum.g8)),
+                           RAD_NOWEIGHTS);
+        if (op_gather) {
+            gather_inv = gather_q8 = true;
+            rad_op_reads (b, op_gather, grd, 3);
+            rad_op_writes(b, op_gather, gwr, 3);
+        }
+    }
     for (int form = scatter_inv ? 0 : 1; form < 2 && !op_gather; ++form) {
         rad_buf grd[5] = { w.edn, w.ew, form ? w.sorted : w.inv, w.sout, w.sgate };
         rad_buf gwr[1] = { separate_fp32_combine ? w.moe : w.h.x };
@@ -1657,6 +1702,11 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                     ? src.shared_mlp_up
                                     : nm.ckpt("%s.up_proj.weight", src.shared);
         /* An architecture that sized the gate's code pair from this weight has probed it. */
+        /* qwen4exp_lora: mlp.shared_expert.down_proj is a LoRA module kind. The plain bf16
+         * view is taken only when a runtime adapter targets this source (see the gated attn
+         * block). Probing it as the view (reads_x, not probed_i8) makes the SwiGLU producer write
+         * the bf16 plane below; with no adapter the probe stays the int8 one. */
+        sh_down.plain_bf16_view = shared_down && rad_lora_source_targeted(b, shared_down);
         if (!sh_down.mapped) RAD_ARCH_TRY(sh_down.probe(b, nm, g, down_base, { shared_down }));
         /* The code pair the gate writes, E4M3 or int8 (ActFP8::q8_fed); an int8 down projection
          * that quantises for itself also writes the int8 pair on this lane. */
@@ -2156,8 +2206,10 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (!fused_gather || op_combine || !gather_taken(g, T, gather_out_rows, gather_out_rows6))
         RAD_ISSUE_N(c_, op_gather, rows, brows(w.edn, rows * k), brow_slice(w.ew, r0, rows, k),
                     brows(gather_inv ? w.inv : w.sorted, rows * k),
-                    gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE,
-                    gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE,
+                    gather_q8 ? brow_slice(w.sum.q8, r0, rows, g.n_embd)
+                              : (gfold ? brow_slice(w.sout, r0, rows, g.n_embd) : RAD_NONE),
+                    gather_q8 ? brow_slice(w.sum.s8, r0, rows, g.n_embd / w.sum.g8)
+                              : (gfold ? brow_slice(w.sgate, r0, rows, 1) : RAD_NONE),
                     brow_slice(op_combine ? w.moe : w.h.x, r0, rows, g.n_embd));
     if (op_moe_ar)
         RAD_ISSUE_N(c_, op_moe_ar, rows * g.n_embd,

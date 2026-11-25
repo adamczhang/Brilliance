@@ -653,4 +653,20 @@ TEST(concurrent_callers_share_the_row_pool) {
     CHECK(seen.size() > 1);
 }
 
+/* B-03: a bring-up phase line says how long the phase took and when it ended, counted from the
+ * engine's start; a line that already gives its own duration takes the `at` part alone. */
+TEST(startup_phase_lines_say_how_long_and_since_the_start) {
+    const uint64_t s = 1000000000ull;
+    CHECK_EQ(startup_phase("declare", 3 * s, 1 * s, 5 * s + 3 * s / 10),
+             std::string("startup: declare in 2.3 s (at 4.3 s)"));
+    CHECK_EQ(startup_at(1 * s, 5 * s + 3 * s / 10), std::string(" (at 4.3 s)"));
+    /* No start stamp: the duration alone. */
+    CHECK_EQ(startup_at(0, 5 * s), std::string());
+    CHECK_EQ(startup_phase("plan", 1 * s, 0, 2 * s), std::string("startup: plan in 1.0 s"));
+    /* The whole bring-up: the phase began at the start, so `at` would repeat `in`. */
+    CHECK_EQ(startup_phase("ready", 2 * s, 2 * s, 68 * s), std::string("startup: ready in 66.0 s"));
+    /* A clock read before the phase's own stamp counts as no time, never a negative one. */
+    CHECK_EQ(startup_phase("settle", 5 * s, 1 * s, 4 * s), std::string("startup: settle in 0.0 s (at 3.0 s)"));
+}
+
 RAD_TEST_MAIN()

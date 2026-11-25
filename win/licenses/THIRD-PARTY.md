@@ -39,7 +39,7 @@ contexts those encoders open. Hardware decoding is configured out (`--disable-hw
 
 What ships and what does not:
 
-- **No H.264 encoder implementation ships in Brilliance 0.3.0.** OpenH264 and x264 are not in
+- **No H.264 encoder implementation ships in Brilliance 0.3.1.** OpenH264 and x264 are not in
   the package; `avcodec-62.dll` holds none of OpenH264's `Wels*` symbols.
 - **The bundled FFmpeg keeps exactly two H.264 encoders.** Both are thin wrappers that hand the
   work to an encoder its maker licenses; neither contains an H.264 encoder of its own.
@@ -53,7 +53,7 @@ What ships and what does not:
 - **What produces H.264.** Video generation (`/v1/videos`) writes its MP4s through them, and an
   image-to-video model's first frame goes through an H.264 round trip with the same two. Video
   generation works on one card and is not yet qualified. Speech synthesis (TTS) is not supported
-  in 0.3.0, and music generation, which shares its route, is not served; music writes WAV or raw
+  in 0.3.1, and music generation, which shares its route, is not served; music writes WAV or raw
   PCM itself and needs no encoder.
 - **Who covers H.264 output.** H.264 output through `h264_amf` or `h264_mf` is covered by the
   licence terms of that encoder's vendor (AMD for AMF, Microsoft for Media Foundation), not by
@@ -65,7 +65,7 @@ What ships and what does not:
   makers, so H.264 output goes only through them.
 - **Decoding H.264 input** (video sent in requests) uses FFmpeg's built-in H.264 decoder. H.264
   decoding is patent-encumbered, and the package supplies no H.264 patent licence.
-- **The source of 0.3.0's FFmpeg.** It is built with vcpkg from the recipe in the source tree's
+- **The source of the package's FFmpeg.** It is built with vcpkg from the recipe in the source tree's
   `win\ffmpeg\`, as a zip pinned by its SHA-256 (`win\setup.ps1`). The zip and FFmpeg's own
   `n8.1.3` source archive are assets of the 0.3.0-alpha.1 release
   (https://github.com/adamczhang/Brilliance/releases/tag/v0.3.0-alpha.1); `ffmpeg.SOURCE` has

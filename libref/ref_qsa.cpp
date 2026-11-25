@@ -108,15 +108,23 @@ int ref_qsa_score(const RadArgs* a, RadStream) {
  * order until topk are taken. The partial page bt[n] follows when (pos + 1) % ratio != 0 and
  * n < width, and -1 pads the row to topk + 1. nsel counts the entries, seqused is
  * (nsel - 1) * ratio + pos % ratio + 1 (0 for an empty table). A row no sequence holds reads
- * sequence 0, as libr4d's does. */
+ * sequence 0, as libr4d's does.
+ *
+ * `own` 1 (Hy4-flash's indexer, HF's `group_ids >= query_group_index` and the appended own group):
+ * the block holding the query, bt[pos / ratio], is never a candidate and is always appended last,
+ * complete or not, so n = min(nc, pos / ratio, width). It differs from the default only for a
+ * query on a block boundary ((pos + 1) % ratio == 0), whose own block is then complete: the
+ * default ranks it among the candidates and appends nothing, `own` keeps it out of the top-k and
+ * appends it (seqused then covers it whole). */
 int ref_qsa_select(const RadArgs* a, RadStream) {
     if (!have(a, 8)) return RAD_E_INVAL;
     const RadTensor *sc = &a->t[0], *bt = &a->t[1], *nc = &a->t[2], *po = &a->t[3];
     const RadTensor *cu = &a->t[4], *se = &a->t[5], *ns = &a->t[6], *su = &a->t[7];
     const int64_t topk = p_int(a, "topk", 0), ratio = p_int(a, "ratio", 0);
-    const int64_t sgn = p_int(a, "signed", 0);
+    const int64_t sgn = p_int(a, "signed", 0), own = p_int(a, "own", 0);
     if (topk <= 0 || ratio <= 0) return RAD_E_SHAPE;
     if (sgn != 0 && sgn != 1) return RAD_E_INVAL;
+    if (own != 0 && own != 1) return RAD_E_INVAL;
     if (sc->rank != 2 || bt->rank != 2 || se->rank != 2) return RAD_E_SHAPE;
     const int64_t M = sc->shape[0], nb = std::min(bt->shape[1], sc->shape[1]);
     const int64_t n_seq = numel(cu) - 1;
@@ -135,7 +143,10 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
     for (int64_t m = 0; m < M; ++m) {
         const int64_t s = seq_holding(cu, n_seq, m, 0);
         const int64_t p = ldi(po, offlin(po, m));
-        const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb), (p + 1) / ratio);
+        /* `own` 1: the block holding the query is never a candidate, complete or not, and is
+         * always the last entry (HF's `group_ids >= query_group`, then the own group appended). */
+        const int64_t n = std::min(std::min(ldi(nc, offlin(nc, s)), nb),
+                                   own ? p / ratio : (p + 1) / ratio);
         std::vector<float> val((size_t)n);
         std::vector<int64_t> live;
         for (int64_t b = 0; b < n; ++b) {
@@ -161,8 +172,9 @@ int ref_qsa_select(const RadArgs* a, RadStream) {
         int64_t out = 0;
         for (int64_t b : take) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs,
                                       ldi(bt, s * bt_rs + b * bt_cs));
-        if (n < nb && (p + 1) % ratio != 0) {
-            const int64_t part = ldi(bt, s * bt_rs + n * bt_cs);
+        const int64_t pidx = own ? p / ratio : n;     /* the block holding the query, when own */
+        if (own ? pidx < bt->shape[1] : (n < nb && (p + 1) % ratio != 0)) {
+            const int64_t part = ldi(bt, s * bt_rs + pidx * bt_cs);
             if (part >= 0) st_int(se->dtype, se->data, m * o_rs + (out++) * o_cs, part);
         }
         for (int64_t i = out; i <= topk; ++i) st_int(se->dtype, se->data, m * o_rs + i * o_cs, -1);

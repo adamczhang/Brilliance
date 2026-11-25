@@ -331,7 +331,7 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
     std::string plain;
     if (!render("", &plain) || render("radiance-probe-not-a-level", nullptr)) return {};
     std::vector<std::string> set, same;
-    for (const char* w : { "low", "medium", "high", "xhigh", "max" }) {
+    for (const char* w : { "low", "medium", "high", "xhigh", "max", "no_think" }) {
         std::string text;
         if (!render(w, &text)) continue;
         set.push_back(w);
@@ -874,6 +874,7 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t receiv
         const Sink& s = *sinks[i];
         const int64_t produced = s.n_produced();
         t.predicted_n      += produced;
+        t.draft_steps      += s.n_draft_steps();
         t.draft_n          += s.n_drafted();
         t.draft_n_accepted += s.n_draft_accepted();
         const int64_t tf = s.t_first_token_ns();

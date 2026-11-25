@@ -38,6 +38,10 @@ struct SchedMetrics {
     /* --prefill-interleave: decode-only steps the hold inserted, issued ahead or not; each kept a
      * ready chunk out. */
     int64_t steps_held = 0;
+    /* --chunk-slices: chunk groups started, and the layer-sliced sub-steps they issued (a group
+     * of m contributes m, its first included). */
+    int64_t steps_sliced = 0;
+    int64_t substeps = 0;
     int64_t decode_rows_unspeculated = 0;
     /* Steps whose forward pass was enqueued behind the previous step before it committed
      * (Scheduler::step_next). Every other step leaves the card idle during the host's commit and
@@ -52,6 +56,18 @@ struct SchedMetrics {
     int64_t mixed_step_target_misses = 0;
     int64_t mixed_step_target_prefill_cap = 0;
 
+    /* Runtime LoRA, by slot index (the names ride the same index: rad::Engine::lora_names()).
+     * What has completed under each slot, and what runs there now. The scheduler counts rows;
+     * a slot with no adapter is all-zero. */
+    static const int MAX_LORA_SLOTS = 16;
+    struct LoraCount {
+        int64_t requests = 0;       /* closed Finished */
+        int64_t prompt_tokens = 0;  /* summed over those */
+        int64_t output_tokens = 0;
+        int64_t running = 0;        /* instantaneous: rows on the card right now */
+    };
+    LoraCount loras[MAX_LORA_SLOTS] = {};
+
     /* Cumulative nanoseconds spent inside steps, total and for decode steps only. Wall time over
      * a step count is not a step time: it charges idle gaps between requests to steps and mixes
      * prefill with decode. `step_ns_decode / steps_decode` is the decode step time. Measured from
@@ -64,6 +80,19 @@ struct SchedMetrics {
      * step at more sequences is a different measurement and does not count. */
     int64_t step_ns_decode_best = 0;
     int64_t step_ns_decode_recent = 0;
+
+    /* The encoder (engine_mm.cpp): items and patches encoded and the nanoseconds the passes took,
+     * cumulative, and the items waiting for it or being encoded now. Encoding runs between
+     * steps, so a model that is encoding steps nothing and its step figures stay flat; these say
+     * where the time went. */
+    int64_t encode_items = 0;
+    int64_t encode_patches = 0;
+    int64_t encode_ns = 0;
+    int64_t encode_pending = 0;
+    /* When the pass under way began (steady clock, ns), 0 when none. metrics() and
+     * observed_metrics() add the time since to encode_ns, so a long pass reads as busy while
+     * it runs; the field is how the observers' copy carries that between publications. */
+    int64_t encode_started_ns = 0;
 
     /* Per KV group. `name` points into the Program, which outlives any scrape. */
     int n_kv_groups = 0;
@@ -143,6 +172,10 @@ struct SchedMetrics {
     int64_t draft_refill_tokens = 0;
     float   draft_acceptance = 0.0f;
     int     draft_depth = 0;          /* what the controller would choose right now */
+    /* The deepest chain the latest step with a drafting row allowed (Scheduler::serial_begin's rounds, after every
+     * cut: the head's depth and --draft-depth-max); 0 before the first such step, and under a block drafter, which
+     * never begins a serial chain. */
+    int     draft_ceiling = 0;
     /* Per draft position: `reached` counts verifies where every earlier position was accepted,
      * `accepted` how often this one was then taken. Their ratio is the conditional acceptance,
      * which says what a deeper draft would buy. `draft_depth_seen` bounds the valid entries. */
@@ -165,12 +198,30 @@ struct SchedMetrics {
     int64_t lookup_held_drafts = 0;
     int64_t lookup_held_hits = 0;
     /* --draft-suffix (suffix.h): verifies that carried a suffix chain, the rows they carried and the
-     * drafts accepted; decode steps not issued ahead because the sequence was in a recurring
-     * pattern (where the lookup could run after the commit instead). */
+     * drafts accepted. A decode step not issued ahead because the sequence was in a recurring
+     * pattern is counted in SchedMetrics::ahead_refused_suffix_hot. */
     int64_t suffix_steps = 0;
     int64_t suffix_rows = 0;
     int64_t suffix_accepted = 0;
-    int64_t suffix_held_ahead = 0;
+    /* Why Scheduler::step_next_locked did not issue the next step ahead of the commit (S-07): one
+     * counter per reason, and only the first check that refuses counts. With steps_ahead they are
+     * every step_next the engine made once a step was in flight, so /stats can say where the gap
+     * between the engine's steps and engine_steps_ahead_total goes. A staging failure is not a
+     * reason: it is a failure, not a policy. */
+    int64_t ahead_refused_waiting = 0;     /* the queue head cannot be admitted here (a wait, a
+                                            * card, a slot, an encode owed), or a row of the step
+                                            * is no longer a running sequence */
+    int64_t ahead_refused_held = 0;        /* --prefill-interleave or --mixed-step-target left the
+                                            * step to step(), or the shares held a chunk back */
+    int64_t ahead_refused_mid_prompt = 0;  /* a second chunk wants the step, or the next step would
+                                            * carry a prefill row with no decode row beside it */
+    int64_t ahead_refused_grammar = 0;     /* a grammar that cannot rewind decides at the commit */
+    int64_t ahead_refused_suffix_hot = 0;  /* --draft-suffix: the history ended in a recurring
+                                            * pattern (suffix_held_ahead of old) */
+    int64_t ahead_refused_ends_every = 0;  /* the step in flight likely ends every request it
+                                            * carries, or brings a scored row to its last token */
+    int64_t ahead_refused_kv = 0;          /* the context limit, the KV pool, or a snapshot the
+                                            * store dropped */
 };
 
 
@@ -231,9 +282,9 @@ private:
  * most a quarter of the measured headroom. A one-quantum probe lets a conservative cap recover
  * when fixed decode cost makes proportional scaling alone predict no larger legal chunk.
  *
- * The controller is deliberately model-agnostic. It may take a cap below an expert stager's
- * throughput floor: satisfying an explicitly requested latency target while decoders are active
- * is the point of the flag. With the flag off no caller consults it. */
+ * The controller is deliberately model-agnostic. The scheduler clamps a chunk it sizes at the
+ * prefill stager's smallest step (busy_cap), so a cap below that floor runs at the floor and its
+ * target misses stay visible in the counters. With the flag off no caller consults it. */
 struct MixedStepTarget {
     void reset() { cap_ = 0; good_ = 0; }
 

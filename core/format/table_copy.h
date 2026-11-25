@@ -13,7 +13,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <thread>
 
 namespace rad {
 
@@ -22,10 +24,48 @@ struct TableCopy {
     size_t bytes = 0;       /* the mapping's length: the table rounded up to 2 MiB */
 };
 
+/* One table's read, started and waited on apart from the memory it fills, so several tables read at
+ * once: the engine starts the four Engram tables' fills as it meets them and joins them beside its
+ * container pass (B-01), instead of reading 59 GiB one table after the other.
+ *
+ * start() reads [foff, foff + n) of `file` into caller-allocated [dst, dst + n) with `readers`
+ * reader threads (each its own span of 64 MiB pieces, dropping the container's pages behind it) and
+ * returns at once; `file` must outlive the read. wait() joins them and then runs table_copy_check
+ * against `src`. A TableFill destroyed while reading joins first, so no reader outlives the memory
+ * its caller would free; move-only. */
+class TableFill {
+  public:
+    TableFill() = default;
+    ~TableFill();
+    TableFill(TableFill&& o) noexcept = default;
+    TableFill& operator=(TableFill&& o) noexcept;   /* joins a read still in flight */
+    TableFill(const TableFill&) = delete;
+    TableFill& operator=(const TableFill&) = delete;
+
+    int  start(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff, uint8_t* dst,
+               int readers = 16);
+    /* Joins the readers, then checks the copy: RAD_OK, or an error with `why`. */
+    int  wait(std::string* why);
+    /* The read's own duration in seconds, once wait() has joined it; 0 before. */
+    double seconds() const;
+
+  private:
+    struct State;
+    std::shared_ptr<State> st_;    /* the readers' result and times */
+    const uint8_t*         src_ = nullptr;
+    uint8_t*               dst_ = nullptr;
+    int64_t                n_ = 0;
+    std::thread            th_;
+};
+
 /* Copy [src, src + n) of `file`'s mapping (file offset `foff`) into a new locked region. RAD_OK with
  * `out` filled, or an error with `why` and nothing held. */
 int  table_copy_make(const RadFile& file, const uint8_t* src, int64_t n, int64_t foff,
                      TableCopy* out, std::string* why);
+
+/* table_copy_make's locked region on its own, for a fill started apart from the reservation and
+ * waited on with TableFill::wait (or released with table_copy_free). Nothing is read yet. */
+int  table_copy_reserve(int64_t n, TableCopy* out, std::string* why);
 
 /* table_copy_make's read and check, into caller-allocated [dst, dst + n): pinned memory a card
  * reads in place when a device kernel gathers the table. */

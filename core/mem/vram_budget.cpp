@@ -33,6 +33,53 @@ static double paged_share(const VramBudget& b) {
     return ctx > 0 ? std::max(0.0, (double)(b.kv - b.kv_fixed)) / ctx : 0.0;
 }
 
+int64_t vram_budget_headroom_mib(const Config& cfg, size_t rank) {
+    if (rank < cfg.devices.size()) {
+        const auto it = cfg.card_headroom_mib.find(cfg.devices[rank]);
+        if (it != cfg.card_headroom_mib.end()) return std::max<int64_t>(it->second, 0);
+    }
+    return std::max<int64_t>(cfg.gpu_headroom_mib, 0);
+}
+
+std::string vram_budget_settle_fix(const Config& cfg, int device, int64_t card_mib, int64_t need_head_mib,
+                                   size_t n_ranks) {
+    if (cfg.card_headroom_mib.count(device))
+        return fmt("Set memory.card-headroom-mib for card %d to at least %lld.", device,
+                   (long long)need_head_mib);
+    const std::string flag = cfg.gpu_memory_mib > 0
+        ? fmt("--gpu-memory-mib to at most %lld", (long long)(card_mib - need_head_mib))
+        : fmt("--gpu-headroom-mib to at least %lld", (long long)need_head_mib);
+    if (n_ranks > 1)
+        return fmt("Set memory.card-headroom-mib to {%d: %lld} to keep that on this card alone: the "
+                   "common split follows the card with least room%s. (Setting %s would cost every "
+                   "card the same.)",
+                   device, (long long)need_head_mib,
+                   cfg.placement == "expert_tiered"
+                       ? ", and the other cards spend what they have beyond it on resident experts"
+                       : "",
+                   flag.c_str());
+    return cfg.gpu_memory_mib > 0
+        ? fmt("Set %s: what is left here falls with it one for one.", flag.c_str())
+        : fmt("Set %s: what is left here rises with it one for one.", flag.c_str());
+}
+
+static int64_t rank_room(const Config& cfg, const VramFacts& f, size_t rank) {
+    return f.free - std::max(vram_budget_headroom_mib(cfg, rank) * kMiB, f.host_reserve);
+}
+
+int64_t vram_budget_rank_spare_mib(const Config& cfg, const std::vector<VramFacts>& per_rank,
+                                   size_t rank) {
+    if (cfg.vram_claim > 0 || rank >= per_rank.size()) return 0;
+    bool named = false;
+    for (size_t i = 0; i < per_rank.size() && i < cfg.devices.size(); ++i)
+        named = named || cfg.card_headroom_mib.count(cfg.devices[i]) != 0;
+    if (!named) return 0;
+    int64_t least = INT64_MAX;
+    for (size_t i = 0; i < per_rank.size(); ++i)
+        least = std::min(least, rank_room(cfg, per_rank[i], i));
+    return std::max<int64_t>((rank_room(cfg, per_rank[rank], rank) - least) / kMiB, 0);
+}
+
 /* The resolver. `log` is false for vram_budget_trial, whose split may never be used, so its
  * refusals must not print as startup failures. */
 static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudget* out, bool log) {
@@ -107,11 +154,25 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         cfg.gpu_headroom_mib = cap_mib - cfg.gpu_memory_mib;
         cfg.given["--gpu-headroom-mib"] = "derived from --gpu-memory-mib";
     }
-    b.headroom = claimed ? 0 : std::max<int64_t>(cfg.gpu_headroom_mib, 0) * kMiB;
-    int64_t host_reserve = 0;
-    for (const VramFacts& f : per_rank) host_reserve = std::max(host_reserve, f.host_reserve);
-    const bool shared = !claimed && host_reserve > b.headroom;
-    if (shared) b.headroom = host_reserve;
+    b.headroom = 0;
+    bool shared = false;
+    /* The rank whose card has least room after its own reserve: it sets the common split, and a
+     * refusal names it (Brilliance, issue #1: with memory.card-headroom-mib the binding card is
+     * not necessarily the one with the largest reserve). */
+    size_t bind = 0;
+    if (!claimed) {
+        int64_t least_room = INT64_MAX;
+        for (size_t i = 0; i < per_rank.size(); ++i) {
+            const int64_t configured = vram_budget_headroom_mib(cfg, i) * kMiB;
+            shared = shared || per_rank[i].host_reserve > configured;
+            b.headroom = std::max(b.headroom, std::max(configured, per_rank[i].host_reserve));
+            const int64_t room = rank_room(cfg, per_rank[i], i);
+            if (room < least_room) { least_room = room; bind = i; }
+        }
+        /* Keep one common split, bounded by the card with least room after its own reserve.
+         * Express that bound as free + the largest reserve for the existing budget report. */
+        freeb = least_room + b.headroom;
+    }
 
     /* A device that reports no capacity has nothing to split, and inventing one is the inference
      * §6 forbids. Each pool gets what it needs: weights what the planner copies out of the
@@ -147,7 +208,20 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
                                 b.queues + b.prefetch + b.host_pinned);
 
     if (b.claimable < 0) {
-        const char* how = cfg.gpu_memory_mib > 0
+        /* With per-card reserves, the binding card and its own reserve, so the operator knows
+         * which entry to lower (or which card to free). */
+        const bool per_card = !claimed && !cfg.card_headroom_mib.empty();
+        const int bind_dev = bind < cfg.devices.size() ? cfg.devices[bind] : (int)bind;
+        const bool bind_named = per_card && cfg.card_headroom_mib.count(bind_dev) != 0;
+        const std::string how = per_card
+            ? fmt("Card %d binds: it has least room after its own %lld MiB reserve (%s). %s, lower "
+                  "--max-num-batched-tokens (the arena scales with it), or free that card.\n",
+                  bind_dev, (long long)vram_budget_headroom_mib(cfg, bind),
+                  bind_named ? "memory.card-headroom-mib" : "--gpu-headroom-mib",
+                  bind_named ? fmt("Lower memory.card-headroom-mib for card %d", bind_dev).c_str()
+                             : cfg.gpu_memory_mib > 0 ? "Raise --gpu-memory-mib"
+                                                      : "Lower --gpu-headroom-mib")
+            : cfg.gpu_memory_mib > 0
             ? "Raise --gpu-memory-mib, lower --max-num-batched-tokens (the arena scales with it), "
               "or free the card.\n"
             : "Lower --gpu-headroom-mib, lower --max-num-batched-tokens (the arena scales with it), "
@@ -165,7 +239,7 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  card total         %10s\n"
             "  already held       %10s   (driver context, code objects, anything else on the card)\n"
             "  driver drift       %10s   (what that moves by after it is read)\n"
-            "  --gpu-headroom-mib %10s\n"
+            "  %s %10s\n"
             "  activation arena   %10s   (buffer plan + kernel scratch)\n"
             "  step staging       %10s   (block tables, media and KV tier staging)\n"
             "  hardware queues    %10s   (%d at %s each, measured, + resident queue scratch)\n"
@@ -174,9 +248,10 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
             "  short by           %10s\n"
             "%s",
             humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
+            per_card ? "card reserve (max)" : "--gpu-headroom-mib",
             humanb(b.headroom).c_str(), humanb(b.arena).c_str(), humanb(b.staging).c_str(),
             humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(),
-            humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how);
+            humanb(b.prefetch).c_str(), humanb(-b.claimable).c_str(), how.c_str());
         if (*kld_hint) b.report += kld_hint;
         if (log) RAD_ERR("%s", b.report.c_str());
         if (out) *out = b;
@@ -308,11 +383,13 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
     cfg.vram_weights_mib = to_mib_up(b.weights);
     const int64_t w_over = cfg.vram_weights_mib * kMiB - b.weights;
     cfg.vram_kv_mib      = to_mib(std::max<int64_t>(b.kv - w_over, 0));
-    /* A streamed plan's maps are charged in kv_one but reserved outside the paged split, so the MiB
-     * truncation would leave the pool short of the one conversation kv_one was sized for. Under
-     * streaming kv_one is a requirement, so it is rounded up. */
-    if (cfg.kv_streams && kv_one > 0 &&
-        b.kv >= kv_one && cfg.vram_kv_mib * kMiB < kv_one)
+    /* One --max-model-len sequence is a requirement, never a share: a cache given at least kv_one
+     * is rounded up to cover it, out of the headroom as the weights' MiB is. Truncated, and less
+     * the weights' rounding taken back above, the pool fell up to a MiB short of the one
+     * conversation kv_one was sized for (Brilliance, issue #1: Flash-Next on two cards held
+     * 262,120 of 262,144 tokens and refused the last 24). A streamed plan's maps, charged in
+     * kv_one but reserved outside the paged split, are covered the same way. */
+    if (kv_one > 0 && b.kv >= kv_one && cfg.vram_kv_mib * kMiB < kv_one)
         cfg.vram_kv_mib = to_mib_up(kv_one);
     /* A cache given its whole ceiling is rounded up to cover it, out of the headroom as the
      * weights' MiB is: truncated, a ceiling under a MiB would be an empty pool and one just over a
@@ -354,7 +431,8 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         humanb(b.capacity).c_str(), humanb(b.already_held).c_str(), humanb(b.drift).c_str(),
         humanb(b.arena).c_str(), humanb(b.staging).c_str(),
         humanb(b.queues).c_str(), b.n_queues, humanb(b.queue_bytes).c_str(), humanb(b.prefetch).c_str(),
-        shared ? "left to the host" : "--gpu-headroom-mib", humanb(b.headroom).c_str(),
+        shared ? "left to the host" : cfg.card_headroom_mib.empty()
+            ? "--gpu-headroom-mib" : "card headroom (maximum)", humanb(b.headroom).c_str(),
         shared ? "integrated graphics: this memory is the host's"
                : "left unclaimed on purpose",
         humanb(b.claimable).c_str(),
@@ -409,6 +487,12 @@ static int resolve(Config& cfg, const std::vector<VramFacts>& per_rank, VramBudg
         b.report += fmt("  unified memory: the pinned host pools (%s) are charged above, in "
                         "\"claimable\", against this same ledger\n",
                         humanb(b.host_pinned).c_str());
+    if (!claimed && !cfg.card_headroom_mib.empty())
+        for (size_t i = 0; i < per_rank.size() && i < cfg.devices.size(); ++i)
+            b.report += fmt("  card %d reserve: %s (%s)\n", cfg.devices[i],
+                            humanb(vram_budget_headroom_mib(cfg, i) * kMiB).c_str(),
+                            cfg.card_headroom_mib.count(cfg.devices[i])
+                                ? "memory.card-headroom-mib" : "--gpu-headroom-mib");
 
     /* Resident weights that fill everything the card gives after the arena leave the cache
      * nothing; with experts the planner streams them instead, so this is a model whose fixed

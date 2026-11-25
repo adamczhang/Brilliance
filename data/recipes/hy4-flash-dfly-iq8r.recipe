@@ -1,0 +1,22 @@
+# hy4-flash-dfly-iq8r.recipe -- Hy4-flash's DFly2 drafter (the `dfly.*` tensors) as IQ8R: the same linears as
+# hy4-flash-dfly-i8.recipe, as int8 codes rotated by the 128-wide Hadamard with a u8 scale a (row, 256
+# of K) under a bf16 second level a row (`i8*u8[1x256]*bf16[1x*]/fwht128`, the form of flint-iq8r.recipe
+# and of the friend's container). Every K a rank reads must be a whole number of 256 blocks (the
+# real sizes are: 3072, 1024, 6144, 8192 by heads and 9216 by columns; 4096 and 4608 at TP2, 2048 and
+# 2304 at TP4). The gpu-mini test model's draft MLP is 192 wide, so its down projection is left out
+# there. See hy4-flash-dfly-i8.recipe for what stays as shipped and why.
+#
+#   rad-convert <Hy4-flash checkpoint> --add engram-tables.safetensors \
+#       --recipe data/recipes/hy4-flash-dfly-iq8r.recipe -o hy4-flash-dfly-iq8r.rad
+#
+# PATTERN                              QUANTISER  OPTIONS
+dfly.blk.*.attn_q_a.weight             rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_q_b.weight             rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_gate.weight            rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.blk.*.attn_output.weight          rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.blk.*.ffn_gate_up.weight          rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.blk.*.ffn_down.weight             rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.fusion.weight                     rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.correct_gate.weight               rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.correct_up.weight                 rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+dfly.correct_down.weight               rtn        codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search

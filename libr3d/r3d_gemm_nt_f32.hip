@@ -1,9 +1,9 @@
 /* r3d_gemm_nt_f32.hip -- gemm_nt_f32: the router's and the index gate's F32 projection.
 
-     x [M][K] bf16, w [N][K] f32  ->  y [M][N] f32,  y = x @ w^T
+     x [M][K] bf16, w [N][K] f32 or bf16  ->  y [M][N] f32,  y = x @ w^T
 
    Routing logits and index-head gates stay F32 projections even in a BF16 checkpoint (libref's
-   ref_gemm_nt_f32), so nothing narrows: the accumulation is f32, the weight is read as f32 and the
+   ref_gemm_nt_f32), so nothing narrows: the accumulation is f32, a stored bf16 weight is widened exactly and the
    store writes f32. N is tiny -- a checkpoint's expert count, a handful of gate columns, at most
    512 -- against a hidden width K, so the op streams the weight plane and is bandwidth-bound, not
    compute-bound. There is no matrix tile here and RDNA3's wave matrix could not take it: the wave
@@ -28,7 +28,7 @@
 
    ---- what the launcher checks ---------------------------------------------------------------
 
-   The three operands present, x bf16, w f32 and y f32 (RAD_E_DTYPE), 1 <= N <= 512 and
+   The three operands present, x bf16, w f32 or bf16 and y f32 (RAD_E_DTYPE), 1 <= N <= 512 and
    1 <= K <= 16384, x, w and y rank 2 with x [M][K], w [N][K] and y [M][N] for x's own M
    (RAD_E_SHAPE), every row k-contiguous with a pitch of at least the row's width (the same
    RAD_E_SHAPE, as in libr4d), and M within the row-count grid, 1..65535. Nothing is staged in
@@ -68,15 +68,18 @@ constexpr long long kNMax = 512, kKMax = 16384, kMMax = 65535;
  * byte count is 0 and the cap below is the exemplar's, for the launcher to enforce. */
 constexpr size_t kStageBytes = 0;
 
-template <int R, int C, int U>
+__device__ __forceinline__ float load_weight(const float* p) { return ldg_f32(p); }
+__device__ __forceinline__ float load_weight(const uint16_t* p) { return bf16_to_f32((uint16_t)ldg_u16(p)); }
+
+template <int R, int C, int U, class W>
 __global__ void __launch_bounds__(kThreads) R3D_WAVES(kWavesPerSimd)
-    gemm_nt_f32_tile_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp, long yp,
+    gemm_nt_f32_tile_kernel(const uint16_t* x, const W* w, float* y, long xp, long wp, long yp,
                             int m, int n, int k) {
     const int lane = (int)(threadIdx.x & (kWave - 1)), wave = (int)(threadIdx.x / kWave);
     const int c0 = (int)(blockIdx.x * kWaves + (unsigned)wave) * C, r0 = (int)blockIdx.y * R;
     if (c0 >= n) return;
     const uint16_t* xr[R];
-    const float* wc[C];
+    const W* wc[C];
 #pragma unroll
     for (int q = 0; q < R; ++q) xr[q] = x + (long)(r0 + q < m ? r0 + q : m - 1) * xp;
 #pragma unroll
@@ -93,7 +96,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(kWavesPerSimd)
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
-            for (int c = 0; c < C; ++c) weight[u][c] = ldg_f32(wc[c] + j + 32 * u);
+            for (int c = 0; c < C; ++c) weight[u][c] = load_weight(wc[c] + j + 32 * u);
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
@@ -112,7 +115,7 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(kWavesPerSimd)
         for (int q = 0; q < R; ++q) {
             const float v = bf16_to_f32((uint16_t)ldg_u16(xr[q] + j));
 #pragma unroll
-            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, ldg_f32(wc[c] + j), sum[q][c]);
+            for (int c = 0; c < C; ++c) sum[q][c] = fmaf(v, load_weight(wc[c] + j), sum[q][c]);
         }
     }
 #pragma unroll
@@ -131,11 +134,16 @@ __global__ void __launch_bounds__(kThreads) R3D_WAVES(kWavesPerSimd)
 /* One tile form at the grid it owns: x * 4 * C columns, y * R rows, no LDS. */
 template <int R, int C, int U = 1>
 int gemm_f32_tile(RadStream s, const void* x, const void* w, void* y, long xp, long wp, long yp,
-                  long m, long n, long k) {
+                  long m, long n, long k, bool bf16) {
     const dim3 grid((unsigned)((n + (long)kWaves * C - 1) / ((long)kWaves * C)),
                     (unsigned)((m + R - 1) / R)), blk(kThreads);
-    R3D_KLAUNCH(R3D_KNAME((gemm_nt_f32_tile_kernel<R, C, U>)), grid, blk, (hipStream_t)s,
+    if (bf16) {
+        R3D_KLAUNCH(R3D_KNAME((gemm_nt_f32_tile_kernel<R, C, U, uint16_t>)), grid, blk, (hipStream_t)s,
+                (const uint16_t*)x, (const uint16_t*)w, (float*)y, xp, wp, yp, (int)m, (int)n, (int)k);
+    } else {
+        R3D_KLAUNCH(R3D_KNAME((gemm_nt_f32_tile_kernel<R, C, U, float>)), grid, blk, (hipStream_t)s,
                 (const uint16_t*)x, (const float*)w, (float*)y, xp, wp, yp, (int)m, (int)n, (int)k);
+    }
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -151,7 +159,7 @@ int gemm_f32_body(const RadArgs* a, RadStream s) {
     if (!a || a->n_t < 3) return R3D_NO(RAD_E_INVAL);
     const RadTensor *xt = &a->t[0], *wt = &a->t[1], *yt = &a->t[2];
     const long long n = r3d_geti_or(a, "N", 0), k = r3d_geti_or(a, "K", 0);
-    if (xt->dtype != RAD_BF16 || wt->dtype != RAD_F32 || yt->dtype != RAD_F32)
+    if (xt->dtype != RAD_BF16 || (wt->dtype != RAD_F32 && wt->dtype != RAD_BF16) || yt->dtype != RAD_F32)
         return R3D_NO(RAD_E_DTYPE);
     if (!r3d_p(xt) || !r3d_p(wt) || !r3d_wp(yt)) return R3D_NO(RAD_E_INVAL);
     if (n < 1 || n > kNMax || k < 1 || k > kKMax || xt->rank != 2 || wt->rank != 2 ||
@@ -170,10 +178,11 @@ int gemm_f32_body(const RadArgs* a, RadStream s) {
     const void* pw = r3d_p(wt);
     void* py = r3d_wp(yt);
     const long xp = (long)xt->stride[0], wp = (long)wt->stride[0], yp = (long)yt->stride[0];
-    if (n <= 8) return gemm_f32_tile<4, 1>(s, px, pw, py, xp, wp, yp, m, n, k);
-    if (m <= 16 || (m < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(s, px, pw, py, xp, wp, yp, m, n, k);
-    if (m < 64) return gemm_f32_tile<8, 1, 8>(s, px, pw, py, xp, wp, yp, m, n, k);
-    return gemm_f32_tile<8, 4>(s, px, pw, py, xp, wp, yp, m, n, k);
+    const bool bf16 = wt->dtype == RAD_BF16;
+    if (n <= 8) return gemm_f32_tile<4, 1>(s, px, pw, py, xp, wp, yp, m, n, k, bf16);
+    if (m <= 16 || (m < 64 && n < 128)) return gemm_f32_tile<2, 2, 16>(s, px, pw, py, xp, wp, yp, m, n, k, bf16);
+    if (m < 64) return gemm_f32_tile<8, 1, 8>(s, px, pw, py, xp, wp, yp, m, n, k, bf16);
+    return gemm_f32_tile<8, 4>(s, px, pw, py, xp, wp, yp, m, n, k, bf16);
 }
 
 }  // namespace

@@ -243,7 +243,7 @@ struct ServerOptions {
 
 /* Brilliance: what the speech routes answer when ServerOptions::speech_refused is set. */
 inline std::string speech_refusal(const std::string& path) {
-    return path + " is not supported in this build: Brilliance 0.3.0 does not serve audio "
+    return path + " is not supported in this build: Brilliance does not serve audio "
                   "generation (speech synthesis, or music on the same endpoint)";
 }
 
