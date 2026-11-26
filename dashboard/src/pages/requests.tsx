@@ -23,9 +23,11 @@ export function Requests({ scope, model }: { scope: Scope<Stats>; model: string 
   const done = adapter ? scope.finished.filter((r) => r.lora === adapter) : scope.finished
   const [shown, setShown] = useState(50)
   const now = scope.series.end * 1000
-  const speeds = done.map((r) => r.tps).filter((v): v is number => fin(v) && v > 0)
+  /* Speed weighted by tokens: each request counts for the output it produced, so a one-token
+   * completion at 250 tok/s cannot lift an hour in which 24k tokens were generated at ~55. */
+  const weighted = done.filter((r) => fin(r.tps) && r.tps! > 0 && r.out > 0)
   const ttfts = done.map((r) => r.ttft).filter((v): v is number => fin(v))
-  const mean = speeds.length ? speeds.reduce((a, b) => a + b, 0) / speeds.length : null
+  const mean = weighted.length ? weighted.reduce((a, r) => a + r.tps! * r.out, 0) / weighted.reduce((a, r) => a + r.out, 0) : null
   const running = (s?.requests ?? []).filter((r) => r.state !== "done" && (!adapter || r.lora === adapter))
   const latest = useMemo(() => done.slice().reverse(), [done, scope.version]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -43,7 +45,7 @@ export function Requests({ scope, model }: { scope: Scope<Stats>; model: string 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Kpi label="Served" value={adapter ? fNum(lora?.requests) : fNum(s?.total_requests)} detail={adapter ? `requests completed under ${adapter}` : "since the model started"} />
         <Kpi label="Preempted" value={fNum(s?.preemptions)} detail={adapter ? "model-wide: pauses are the scheduler's, not the adapter's" : "requests paused for another and resumed"} />
-        <Kpi label="Mean speed" value={fin(mean) ? fSig(mean) : DASH} unit="tok/s" detail={`over ${fNum(speeds.length)} finished`} />
+        <Kpi label="Mean speed" value={fin(mean) ? fSig(mean) : DASH} unit="tok/s" detail={`token-weighted over ${fNum(weighted.length)} finished`} />
         <Kpi label="Median time to first token" value={ttfts.length ? fDur(median(ttfts)) : DASH} detail={`over ${fNum(ttfts.length)} finished`} />
       </div>
 
